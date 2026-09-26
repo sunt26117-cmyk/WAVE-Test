@@ -15,39 +15,78 @@ import { resampleUniform } from '../modules/resampler';
 const TIME_HEADER_REGEX = /^(time|t|timestamp|time_s|time_ms|seconds|sec|t_sec|t_s)($|[\s_(\[])/i;
 
 /**
- * Detects the most likely delimiter for the CSV text.
+ * Detects the most likely delimiter for the CSV/Text text.
+ * Fully supports Tab (\t), Comma (,), Semicolon (;), and single/multiple spaces (' ').
  */
 export function detectDelimiter(text: string): string {
-  const firstLines = text.split(/\r?\n/).slice(0, 10).filter((l) => l.trim().length > 0);
+  const firstLines = text.split(/\r?\n/).slice(0, 15).filter((l) => l.trim().length > 0);
   if (firstLines.length === 0) return ',';
 
+  // 1. Check for tab '\t' first (standard in TSV, LTspice, LabVIEW)
+  const tabCounts = firstLines.map((l) => (l.match(/\t/g) || []).length);
+  if (tabCounts.every((c) => c > 0 && c === tabCounts[0])) {
+    return '\t';
+  }
+
+  // 2. Check for comma ','
+  const commaCounts = firstLines.map((l) => (l.match(/,/g) || []).length);
+  if (commaCounts.every((c) => c > 0 && c === commaCounts[0])) {
+    return ',';
+  }
+
+  // 3. Check for semicolon ';'
+  const semiCounts = firstLines.map((l) => (l.match(/;/g) || []).length);
+  if (semiCounts.every((c) => c > 0 && c === semiCounts[0])) {
+    return ';';
+  }
+
+  // 4. Check for space / multiple whitespace alignment
+  // If each line has multiple tokens separated by whitespace (\s+), and token count is consistent (> 1)
+  const whitespaceTokens = firstLines.map((l) => l.trim().split(/\s+/).length);
+  if (whitespaceTokens.length > 0 && whitespaceTokens[0] > 1 && whitespaceTokens.every((c) => c === whitespaceTokens[0])) {
+    return ' ';
+  }
+
+  // Fallback candidate scoring for slightly irregular lines
   const candidates = [',', '\t', ';', ' '];
   let bestDelim = ',';
   let bestScore = -1;
 
   for (const delim of candidates) {
-    const counts = firstLines.map((line) => {
-      let count = 0;
-      for (let i = 0; i < line.length; i++) {
-        if (line[i] === delim) count++;
+    if (delim === ' ') {
+      // Score whitespace token counts
+      const counts = firstLines.map((l) => l.trim().split(/\s+/).length - 1);
+      const min = Math.min(...counts);
+      const max = Math.max(...counts);
+      if (min > 0 && max - min <= 1) {
+        const score = min * 8;
+        if (score > bestScore) {
+          bestScore = score;
+          bestDelim = ' ';
+        }
       }
-      return count;
-    });
-
-    // Check consistency across lines
-    const minCount = Math.min(...counts);
-    const maxCount = Math.max(...counts);
-    if (minCount > 0 && minCount === maxCount) {
-      const score = minCount * 10;
-      if (score > bestScore) {
-        bestScore = score;
-        bestDelim = delim;
-      }
-    } else if (minCount > 0 && maxCount - minCount <= 1) {
-      const score = minCount * 5;
-      if (score > bestScore) {
-        bestScore = score;
-        bestDelim = delim;
+    } else {
+      const counts = firstLines.map((line) => {
+        let count = 0;
+        for (let i = 0; i < line.length; i++) {
+          if (line[i] === delim) count++;
+        }
+        return count;
+      });
+      const min = Math.min(...counts);
+      const max = Math.max(...counts);
+      if (min > 0 && min === max) {
+        const score = min * 10;
+        if (score > bestScore) {
+          bestScore = score;
+          bestDelim = delim;
+        }
+      } else if (min > 0 && max - min <= 1) {
+        const score = min * 5;
+        if (score > bestScore) {
+          bestScore = score;
+          bestDelim = delim;
+        }
       }
     }
   }
@@ -56,9 +95,43 @@ export function detectDelimiter(text: string): string {
 }
 
 /**
- * Splits a CSV line taking quotes into account.
+ * Splits a CSV/Text line taking quotes and whitespace into account.
+ * When delimiter is ' ', treats one or more whitespace characters as a single delimiter.
  */
 export function splitCsvLine(line: string, delimiter: string): string[] {
+  if (delimiter === ' ') {
+    const trimmed = line.trim();
+    if (!trimmed) return [];
+    if (!trimmed.includes('"')) {
+      return trimmed.split(/\s+/);
+    }
+    const fields: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (ch === '"') {
+        if (inQuotes && i + 1 < trimmed.length && trimmed[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (/\s/.test(ch) && !inQuotes) {
+        if (current.length > 0) {
+          fields.push(current);
+          current = '';
+        }
+      } else {
+        current += ch;
+      }
+    }
+    if (current.length > 0) {
+      fields.push(current);
+    }
+    return fields;
+  }
+
   const fields: string[] = [];
   let current = '';
   let inQuotes = false;
@@ -84,10 +157,11 @@ export function splitCsvLine(line: string, delimiter: string): string[] {
 }
 
 /**
- * Parses initial CSV structure to generate preview information.
+ * Parses initial CSV/Text structure to generate preview information.
+ * Allows customDelimiter override.
  */
-export function previewCsv(text: string): CsvPreviewInfo {
-  const delimiter = detectDelimiter(text);
+export function previewCsv(text: string, customDelimiter?: string): CsvPreviewInfo {
+  const delimiter = customDelimiter || detectDelimiter(text);
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length === 0) {
     throw new Error('CSV file is empty.');
@@ -165,12 +239,21 @@ export function previewCsv(text: string): CsvPreviewInfo {
         unit: timeUnit,
       };
     }
+    let detectedUnit = 'V';
+    if (/^(i\(|current|i_)/i.test(header)) {
+      detectedUnit = 'A';
+    } else if (/^(p\(|power|p_)/i.test(header)) {
+      detectedUnit = 'W';
+    } else if (/^(v\(|volt|v_)/i.test(header)) {
+      detectedUnit = 'V';
+    }
+
     return {
       index: idx,
       header,
       role: 'channel',
       channelName: header || `CH ${idx + 1}`,
-      unit: 'V',
+      unit: detectedUnit,
     };
   });
 

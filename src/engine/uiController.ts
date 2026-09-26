@@ -25,6 +25,8 @@ import {
   drawTriggerLine,
   drawCursors,
   drawAxisLabels,
+  drawSubplotAxisLabels,
+  drawGroundMarkers,
   formatEng,
 } from './canvasRenderer';
 import { computeFFT, computeBLDCHarmonics } from '../modules/fft';
@@ -37,6 +39,34 @@ import { serializeSession, deserializeSession } from './session';
 import { previewCsv, parseFullCsv } from '../parsers/csvParser';
 import { parseWfmBuffer } from '../parsers/wfmParser';
 import { runAllTests } from '../tests/testSuite';
+
+// Standard 1-2-5 scale step sequence for oscilloscope vertical steps
+const SCALE_STEPS = [
+  1e-6, 2e-6, 5e-6,
+  1e-5, 2e-5, 5e-5,
+  1e-4, 2e-4, 5e-4,
+  1e-3, 2e-3, 5e-3,
+  1e-2, 2e-2, 5e-2,
+  0.1, 0.2, 0.5,
+  1, 2, 5,
+  10, 20, 50,
+  100, 200, 500,
+  1000, 2000, 5000,
+];
+
+function getNextScale(current: number, direction: 'up' | 'down'): number {
+  if (direction === 'up') {
+    for (const step of SCALE_STEPS) {
+      if (step > current * 1.05) return step;
+    }
+    return current * 2;
+  } else {
+    for (let i = SCALE_STEPS.length - 1; i >= 0; i--) {
+      if (SCALE_STEPS[i] < current * 0.95) return SCALE_STEPS[i];
+    }
+    return current / 2;
+  }
+}
 
 export class OscilloscopeApp {
   private canvas: HTMLCanvasElement;
@@ -55,7 +85,13 @@ export class OscilloscopeApp {
   private isAreaZooming: boolean = false;
   private areaZoomStart: { x: number; y: number } | null = null;
   private areaZoomEnd: { x: number; y: number } | null = null;
-  private draggingCursor: 'x1' | 'x2' | null = null;
+  private draggingCursor:
+    | 'x1'
+    | 'x2'
+    | 'y1'
+    | 'y2'
+    | { groundChId: string; startY: number; initialOffset: number }
+    | null = null;
 
   // Cached FFT result for current tab
   private cachedSpectrum: SpectrumResult | null = null;
@@ -179,7 +215,7 @@ export class OscilloscopeApp {
     if (tab.separateView && visibleChs.length > 1) {
       // Separate diagram subplots
       const totalH = p.height;
-      const gap = 10;
+      const gap = 12;
       const subH = (totalH - (visibleChs.length - 1) * gap) / visibleChs.length;
 
       visibleChs.forEach((ch, idx) => {
@@ -191,6 +227,7 @@ export class OscilloscopeApp {
         };
         drawGrid(this.ctx, subP, this.theme, 10, 4);
         drawChannelWaveform(this.ctx, tab, ch, p, subP);
+        drawSubplotAxisLabels(this.ctx, subP, ch, this.theme, 4);
       });
     } else {
       // Overlapped diagram
@@ -200,6 +237,7 @@ export class OscilloscopeApp {
           drawChannelWaveform(this.ctx, tab, ch, p);
         }
       }
+      drawGroundMarkers(this.ctx, tab, p);
     }
 
     // Trigger Line
@@ -373,6 +411,114 @@ export class OscilloscopeApp {
     this.draw();
   }
 
+  public ensureCursorPositions(tab: TabState): void {
+    const primaryCh = tab.channels[tab.drawOrder[0]];
+    if (!primaryCh) return;
+    const dt = primaryCh.dt || 1e-4;
+    const span = (tab.view.endIndex - tab.view.startIndex) * dt;
+    const start = tab.view.startIndex * dt;
+
+    if (tab.cursors.x1 === null || tab.cursors.x2 === null) {
+      tab.cursors.x1 = start + span * 0.25;
+      tab.cursors.x2 = start + span * 0.75;
+    }
+
+    const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+    const targetCh = tab.channels[trackingId] || primaryCh;
+    if (targetCh && (tab.cursors.y1 === null || tab.cursors.y2 === null)) {
+      const vSpan = targetCh.vMax - targetCh.vMin;
+      tab.cursors.y1 = targetCh.vMin + vSpan * 0.3;
+      tab.cursors.y2 = targetCh.vMin + vSpan * 0.7;
+    }
+  }
+
+  public setChannelScale(channelId: string, newVPerDiv: number): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[channelId]) return;
+    const ch = tab.channels[channelId];
+    if (newVPerDiv <= 0 || !isFinite(newVPerDiv)) return;
+
+    const currentOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
+    const halfSpan = newVPerDiv * 4; // 8 divisions
+    ch.vPerDiv = newVPerDiv;
+    ch.vOffset = currentOffset;
+    ch.vMin = currentOffset - halfSpan;
+    ch.vMax = currentOffset + halfSpan;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public setChannelOffset(channelId: string, newOffset: number): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[channelId]) return;
+    const ch = tab.channels[channelId];
+    if (!isFinite(newOffset)) return;
+
+    const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
+    const halfSpan = vPerDiv * 4;
+    ch.vOffset = newOffset;
+    ch.vPerDiv = vPerDiv;
+    ch.vMin = newOffset - halfSpan;
+    ch.vMax = newOffset + halfSpan;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public nudgeChannelOffset(channelId: string, direction: 'up' | 'down'): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[channelId]) return;
+    const ch = tab.channels[channelId];
+    const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
+    const currentOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
+    const delta = direction === 'up' ? vPerDiv : -vPerDiv;
+    this.setChannelOffset(channelId, currentOffset + delta);
+  }
+
+  public zeroChannelOffset(channelId: string): void {
+    this.setChannelOffset(channelId, 0);
+  }
+
+  public stepChannelScale(channelId: string, direction: 'up' | 'down'): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[channelId]) return;
+    const ch = tab.channels[channelId];
+    const currentScale = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
+    const newScale = getNextScale(currentScale, direction);
+    this.setChannelScale(channelId, newScale);
+  }
+
+  public autoScaleChannel(channelId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[channelId]) return;
+    const ch = tab.channels[channelId];
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < ch.v.length; i++) {
+      const val = ch.v[i];
+      if (!isNaN(val)) {
+        if (val < min) min = val;
+        if (val > max) max = val;
+      }
+    }
+    if (!isFinite(min) || !isFinite(max)) return;
+    const span = max - min || 1.0;
+    const center = (max + min) / 2;
+    const vPerDivRaw = span / 6; // Leave 1 division headroom
+    let snapped = 1.0;
+    for (const step of SCALE_STEPS) {
+      if (step >= vPerDivRaw) {
+        snapped = step;
+        break;
+      }
+    }
+    ch.vPerDiv = snapped;
+    ch.vOffset = center;
+    ch.vMin = center - snapped * 4;
+    ch.vMax = center + snapped * 4;
+    this.renderSidebar();
+    this.draw();
+  }
+
   private handleMouseDown(e: MouseEvent): void {
     const tab = this.getActiveTab();
     if (!tab) return;
@@ -382,25 +528,81 @@ export class OscilloscopeApp {
     const y = e.clientY - rect.top;
     const p = getPlotArea(rect.width, rect.height);
 
+    // Check Ground Reference markers on left margin (x in [p.x - 22, p.x])
+    if (!tab.separateView && x >= p.x - 22 && x <= p.x && y >= p.y && y <= p.y + p.height) {
+      const visibleChs = tab.drawOrder
+        .map((id) => tab.channels[id])
+        .filter((c) => c && c.visible);
+
+      for (const ch of visibleChs) {
+        const vRange = ch.vMax - ch.vMin;
+        if (vRange > 0) {
+          const frac = (0 - ch.vMin) / vRange;
+          const clampedFrac = Math.max(0, Math.min(1, frac));
+          const gndY = p.y + p.height - clampedFrac * p.height;
+          if (Math.abs(y - gndY) < 12) {
+            this.draggingCursor = {
+              groundChId: ch.id,
+              startY: y,
+              initialOffset: ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2,
+            };
+            return;
+          }
+        }
+      }
+    }
+
     if (x < p.x || x > p.x + p.width || y < p.y || y > p.y + p.height) return;
 
-    // Check if clicking near cursor X1 or X2
+    // Check Cursors (X and Y)
     if (tab.cursors.enabled) {
-      const primaryCh = tab.channels[tab.drawOrder[0]];
-      const dt = primaryCh?.dt || 1e-4;
-      const tStart = tab.view.startIndex * dt;
-      const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+      const cursorType = tab.cursors.type || 'x';
+      const showX = cursorType === 'x' || cursorType === 'xy';
+      const showY = cursorType === 'y' || cursorType === 'xy';
 
-      if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
-        const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
-        const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
+      // Check X Cursors (Time)
+      if (showX) {
+        const primaryCh = tab.channels[tab.drawOrder[0]];
+        const dt = primaryCh?.dt || 1e-4;
+        const tStart = tab.view.startIndex * dt;
+        const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
 
-        if (Math.abs(x - x1Px) < 10) {
-          this.draggingCursor = 'x1';
-          return;
-        } else if (Math.abs(x - x2Px) < 10) {
-          this.draggingCursor = 'x2';
-          return;
+        if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+          const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
+          const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
+
+          if (Math.abs(x - x1Px) < 10) {
+            this.draggingCursor = 'x1';
+            return;
+          } else if (Math.abs(x - x2Px) < 10) {
+            this.draggingCursor = 'x2';
+            return;
+          }
+        }
+      }
+
+      // Check Y Cursors (Voltage)
+      if (showY) {
+        const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+        const targetCh = tab.channels[trackingId];
+        if (targetCh) {
+          const vRange = targetCh.vMax - targetCh.vMin;
+          if (vRange > 0) {
+            if (tab.cursors.y1 !== null) {
+              const y1Px = p.y + p.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * p.height;
+              if (Math.abs(y - y1Px) < 10) {
+                this.draggingCursor = 'y1';
+                return;
+              }
+            }
+            if (tab.cursors.y2 !== null) {
+              const y2Px = p.y + p.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * p.height;
+              if (Math.abs(y - y2Px) < 10) {
+                this.draggingCursor = 'y2';
+                return;
+              }
+            }
+          }
         }
       }
     }
@@ -427,22 +629,106 @@ export class OscilloscopeApp {
     const y = e.clientY - rect.top;
     const p = getPlotArea(rect.width, rect.height);
 
-    // Dragging Cursors
+    // Dragging Cursors or Ground Marker
     if (this.draggingCursor) {
-      const primaryCh = tab.channels[tab.drawOrder[0]];
-      const dt = primaryCh?.dt || 1e-4;
-      const tStart = tab.view.startIndex * dt;
-      const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
-      const tCur = tStart + ((x - p.x) / p.width) * tSpan;
-
-      if (this.draggingCursor === 'x1') {
-        tab.cursors.x1 = tCur;
-      } else {
-        tab.cursors.x2 = tCur;
+      if (typeof this.draggingCursor === 'object' && 'groundChId' in this.draggingCursor) {
+        const ch = tab.channels[this.draggingCursor.groundChId];
+        if (ch) {
+          const dy = this.draggingCursor.startY - y; // dragging up increases offset
+          const vPerPixel = (ch.vMax - ch.vMin) / p.height;
+          const newOffset = this.draggingCursor.initialOffset + dy * vPerPixel;
+          this.setChannelOffset(ch.id, newOffset);
+        }
+        return;
       }
-      this.draw();
-      this.renderSidebar();
-      return;
+
+      if (this.draggingCursor === 'x1' || this.draggingCursor === 'x2') {
+        const primaryCh = tab.channels[tab.drawOrder[0]];
+        const dt = primaryCh?.dt || 1e-4;
+        const tStart = tab.view.startIndex * dt;
+        const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+        const tCur = tStart + ((x - p.x) / p.width) * tSpan;
+
+        if (this.draggingCursor === 'x1') {
+          tab.cursors.x1 = tCur;
+        } else {
+          tab.cursors.x2 = tCur;
+        }
+        this.draw();
+        this.renderSidebar();
+        return;
+      }
+
+      if (this.draggingCursor === 'y1' || this.draggingCursor === 'y2') {
+        const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+        const targetCh = tab.channels[trackingId];
+        if (targetCh) {
+          const vRange = targetCh.vMax - targetCh.vMin;
+          const voltFrac = (p.y + p.height - y) / p.height;
+          const vCur = targetCh.vMin + voltFrac * vRange;
+
+          if (this.draggingCursor === 'y1') {
+            tab.cursors.y1 = vCur;
+          } else {
+            tab.cursors.y2 = vCur;
+          }
+          this.draw();
+          this.renderSidebar();
+        }
+        return;
+      }
+    }
+
+    // Dynamic mouse cursor pointer style
+    if (!this.isDragging && !this.isAreaZooming) {
+      let isNearCursor = false;
+      if (tab.cursors.enabled) {
+        const cursorType = tab.cursors.type || 'x';
+        if (cursorType === 'x' || cursorType === 'xy') {
+          const primaryCh = tab.channels[tab.drawOrder[0]];
+          const dt = primaryCh?.dt || 1e-4;
+          const tStart = tab.view.startIndex * dt;
+          const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+          if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+            const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
+            const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
+            if (Math.abs(x - x1Px) < 10 || Math.abs(x - x2Px) < 10) {
+              this.canvas.style.cursor = 'ew-resize';
+              isNearCursor = true;
+            }
+          }
+        }
+        if (!isNearCursor && (cursorType === 'y' || cursorType === 'xy')) {
+          const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+          const targetCh = tab.channels[trackingId];
+          if (targetCh) {
+            const vRange = targetCh.vMax - targetCh.vMin;
+            if (vRange > 0) {
+              if (tab.cursors.y1 !== null) {
+                const y1Px = p.y + p.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * p.height;
+                if (Math.abs(y - y1Px) < 10) {
+                  this.canvas.style.cursor = 'ns-resize';
+                  isNearCursor = true;
+                }
+              }
+              if (!isNearCursor && tab.cursors.y2 !== null) {
+                const y2Px = p.y + p.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * p.height;
+                if (Math.abs(y - y2Px) < 10) {
+                  this.canvas.style.cursor = 'ns-resize';
+                  isNearCursor = true;
+                }
+              }
+            }
+          }
+        }
+      }
+      if (!isNearCursor && !tab.separateView && x >= p.x - 22 && x <= p.x) {
+        this.canvas.style.cursor = 'ns-resize';
+        isNearCursor = true;
+      }
+      if (!isNearCursor) {
+        this.canvas.style.cursor = 'crosshair';
+      }
     }
 
     // Area Zoom drag
@@ -532,6 +818,17 @@ export class OscilloscopeApp {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const p = getPlotArea(rect.width, rect.height);
+
+    // If mouse is on left voltage axis: Zoom vertical scale (V/div) with wheel!
+    if (x < p.x && x >= p.x - 70) {
+      const activeId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
+      const ch = tab.channels[activeId];
+      if (ch) {
+        this.stepChannelScale(activeId, e.deltaY < 0 ? 'down' : 'up');
+      }
+      return;
+    }
+
     if (x < p.x || x > p.x + p.width) return;
 
     const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
@@ -571,24 +868,11 @@ export class OscilloscopeApp {
     tab.view.startIndex = 0;
     tab.view.endIndex = primaryCh.v.length;
 
-    // Also auto-fit vertical ranges for all visible channels
+    // Auto-fit 1-2-5 vertical scale and center offset for all visible channels
     for (const id of tab.drawOrder) {
       const ch = tab.channels[id];
       if (ch && ch.visible) {
-        let min = Infinity;
-        let max = -Infinity;
-        for (let i = 0; i < ch.v.length; i++) {
-          const val = ch.v[i];
-          if (!isNaN(val)) {
-            if (val < min) min = val;
-            if (val > max) max = val;
-          }
-        }
-        if (isFinite(min) && isFinite(max)) {
-          const margin = (max - min) * 0.1 || 1.0;
-          ch.vMin = min - margin;
-          ch.vMax = max + margin;
-        }
+        this.autoScaleChannel(id);
       }
     }
 
@@ -741,8 +1025,25 @@ export class OscilloscopeApp {
     const rowCountEl = document.getElementById('csvTotalRows');
     if (rowCountEl) rowCountEl.innerText = `${p.totalRows.toLocaleString()} rows`;
 
-    const delimEl = document.getElementById('csvDelimiter');
-    if (delimEl) delimEl.innerText = p.delimiter === '\t' ? 'Tab (\\t)' : `"${p.delimiter}"`;
+    const delimSel = document.getElementById('csvDelimiterSelect') as HTMLSelectElement;
+    if (delimSel) {
+      if (p.delimiter === ' ') delimSel.value = ' ';
+      else if (p.delimiter === '\t') delimSel.value = '\t';
+      else if (p.delimiter === ',') delimSel.value = ',';
+      else if (p.delimiter === ';') delimSel.value = ';';
+      else delimSel.value = 'auto';
+
+      delimSel.onchange = (e: any) => {
+        const selected = e.target.value;
+        const chosenDelim = selected === 'auto' ? undefined : selected;
+        try {
+          this.pendingCsvPreview = previewCsv(this.pendingCsvText, chosenDelim);
+          this.renderCsvModalContent();
+        } catch (err: any) {
+          console.error('Error re-parsing CSV preview with selected delimiter:', err);
+        }
+      };
+    }
   }
 
   public confirmCsvImport(resample: boolean): void {
@@ -1094,6 +1395,8 @@ export class OscilloscopeApp {
       mathCountBadge.innerText = mathChannelIds.length.toString();
     }
 
+    const activeId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
+
     if (inputChannelsListEl) {
       inputChannelsListEl.innerHTML = '';
       if (inputChannelIds.length === 0) {
@@ -1103,19 +1406,55 @@ export class OscilloscopeApp {
           const ch = tab.channels[id];
           if (!ch) return;
 
+          const isActive = id === activeId;
+          const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
+          const vOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
+
           const row = document.createElement('div');
-          row.className = 'channel-item flex items-center justify-between p-2 rounded bg-neutral-800/80 hover:bg-neutral-800 mb-1 text-xs border-l-4';
+          row.className = `channel-item flex flex-col p-2.5 rounded mb-2 text-xs border-l-4 transition ${
+            isActive ? 'bg-neutral-800 border border-cyan-800/80' : 'bg-neutral-800/80 hover:bg-neutral-800 border border-neutral-700/50'
+          }`;
           row.style.borderLeftColor = ch.color;
 
           row.innerHTML = `
-            <div class="flex items-center gap-2 overflow-hidden">
-              <input type="checkbox" class="ch-vis-chk cursor-pointer" ${ch.visible ? 'checked' : ''} />
-              <input type="color" class="ch-col-picker w-4 h-4 rounded cursor-pointer border-none bg-transparent" value="${ch.color}" />
-              <span class="font-medium truncate text-neutral-200 max-w-[110px]" title="${ch.name}">${ch.name}</span>
+            <div class="flex items-center justify-between mb-1.5">
+              <div class="flex items-center gap-1.5 overflow-hidden">
+                <input type="checkbox" class="ch-vis-chk cursor-pointer" ${ch.visible ? 'checked' : ''} />
+                <input type="color" class="ch-col-picker w-4 h-4 rounded cursor-pointer border-none bg-transparent" value="${ch.color}" />
+                <span class="font-bold truncate text-neutral-100 max-w-[110px] cursor-pointer ch-select-name hover:text-cyan-300" title="Click to make Active Channel">${ch.name}</span>
+              </div>
+              <div class="flex items-center gap-1 font-mono text-[10px]">
+                ${isActive ? '<span class="bg-cyan-950 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/60 font-semibold">ACTIVE</span>' : ''}
+                <button class="ch-fit-btn px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded font-medium transition" title="Auto-scale 1-2-5 & center">AutoFit</button>
+              </div>
             </div>
-            <div class="flex items-center gap-1 font-mono text-[11px] text-neutral-400">
-              <span>[${ch.vMin.toFixed(1)}, ${ch.vMax.toFixed(1)}] ${ch.unit}</span>
-              <button class="ch-fit-btn px-1 py-0.5 bg-neutral-700 hover:bg-neutral-600 text-[10px] text-neutral-200 rounded" title="Fit scale to this channel">Fit</button>
+
+            <!-- Scale (步进 V/div) -->
+            <div class="flex items-center justify-between text-[11px] py-1 border-t border-neutral-700/40">
+              <span class="text-neutral-400 font-medium">Scale (步进):</span>
+              <div class="flex items-center gap-1">
+                <button class="ch-scale-down px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 font-bold" title="Decrease V/div (Zoom In)">−</button>
+                <input type="number" step="any" class="ch-scale-input w-16 bg-neutral-900 border border-neutral-600 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vPerDiv.toPrecision(3)}" title="Volts per division" />
+                <span class="text-neutral-400 text-[10px]">${ch.unit}/div</span>
+                <button class="ch-scale-up px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 font-bold" title="Increase V/div (Zoom Out)">+</button>
+              </div>
+            </div>
+
+            <!-- Offset (上下偏移) -->
+            <div class="flex items-center justify-between text-[11px] py-1 border-t border-neutral-700/40">
+              <span class="text-neutral-400 font-medium">Offset (偏移):</span>
+              <div class="flex items-center gap-1">
+                <button class="ch-offset-zero px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-amber-300 font-mono text-[10px] font-bold" title="Reset Offset to 0">0</button>
+                <button class="ch-offset-down px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 text-[10px]" title="Shift Down (▼)">▼</button>
+                <input type="number" step="any" class="ch-offset-input w-16 bg-neutral-900 border border-neutral-600 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vOffset.toFixed(3)}" title="Vertical offset in ${ch.unit}" />
+                <span class="text-neutral-400 text-[10px]">${ch.unit}</span>
+                <button class="ch-offset-up px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 text-[10px]" title="Shift Up (▲)">▲</button>
+              </div>
+            </div>
+
+            <!-- Bounds Readout -->
+            <div class="flex justify-between items-center text-[10px] text-neutral-400 pt-0.5 font-mono">
+              <span>Span: [${ch.vMin.toFixed(2)}, ${ch.vMax.toFixed(2)}] ${ch.unit}</span>
             </div>
           `;
 
@@ -1130,21 +1469,47 @@ export class OscilloscopeApp {
             this.draw();
           });
 
+          row.querySelector('.ch-select-name')?.addEventListener('click', () => {
+            tab.selectedMeasurementChannelId = id;
+            this.renderSidebar();
+            this.draw();
+          });
+
           row.querySelector('.ch-fit-btn')?.addEventListener('click', () => {
-            let min = Infinity, max = -Infinity;
-            for (let i = 0; i < ch.v.length; i++) {
-              const val = ch.v[i];
-              if (!isNaN(val)) {
-                if (val < min) min = val;
-                if (val > max) max = val;
-              }
+            this.autoScaleChannel(id);
+          });
+
+          row.querySelector('.ch-scale-down')?.addEventListener('click', () => {
+            this.stepChannelScale(id, 'down');
+          });
+
+          row.querySelector('.ch-scale-up')?.addEventListener('click', () => {
+            this.stepChannelScale(id, 'up');
+          });
+
+          row.querySelector('.ch-scale-input')?.addEventListener('change', (e: any) => {
+            const val = parseFloat(e.target.value);
+            if (!isNaN(val) && val > 0) {
+              this.setChannelScale(id, val);
             }
-            if (isFinite(min) && isFinite(max)) {
-              const margin = (max - min) * 0.1 || 1.0;
-              ch.vMin = min - margin;
-              ch.vMax = max + margin;
-              this.renderSidebar();
-              this.draw();
+          });
+
+          row.querySelector('.ch-offset-zero')?.addEventListener('click', () => {
+            this.zeroChannelOffset(id);
+          });
+
+          row.querySelector('.ch-offset-down')?.addEventListener('click', () => {
+            this.nudgeChannelOffset(id, 'down');
+          });
+
+          row.querySelector('.ch-offset-up')?.addEventListener('click', () => {
+            this.nudgeChannelOffset(id, 'up');
+          });
+
+          row.querySelector('.ch-offset-input')?.addEventListener('change', (e: any) => {
+            const val = parseFloat(e.target.value);
+            if (!isNaN(val)) {
+              this.setChannelOffset(id, val);
             }
           });
 
@@ -1163,26 +1528,56 @@ export class OscilloscopeApp {
           const ch = tab.channels[id];
           if (!ch) return;
 
+          const isActive = id === activeId;
+          const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
+          const vOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
+
           const row = document.createElement('div');
-          row.className = 'channel-item flex flex-col p-2 rounded bg-purple-950/40 border border-purple-800/40 hover:bg-purple-950/60 mb-1 text-xs border-l-4';
+          row.className = `channel-item flex flex-col p-2.5 rounded mb-2 text-xs border-l-4 transition ${
+            isActive ? 'bg-purple-950/70 border border-purple-600' : 'bg-purple-950/40 border border-purple-800/40 hover:bg-purple-950/60'
+          }`;
           row.style.borderLeftColor = ch.color;
 
           row.innerHTML = `
-            <div class="flex items-center justify-between">
+            <div class="flex items-center justify-between mb-1.5">
               <div class="flex items-center gap-1.5 overflow-hidden">
                 <input type="checkbox" class="ch-vis-chk cursor-pointer" ${ch.visible ? 'checked' : ''} />
-                <input type="color" class="ch-col-picker w-3.5 h-3.5 rounded cursor-pointer border-none bg-transparent" value="${ch.color}" />
-                <span class="font-medium text-purple-200 truncate max-w-[105px]" title="${ch.name}">${ch.name}</span>
+                <input type="color" class="ch-col-picker w-4 h-4 rounded cursor-pointer border-none bg-transparent" value="${ch.color}" />
+                <span class="font-bold text-purple-200 truncate max-w-[105px] cursor-pointer ch-select-name hover:text-white" title="Click to make Active Channel">${ch.name}</span>
               </div>
               <div class="flex items-center gap-1 font-mono text-[10px]">
-                <button class="ch-fit-btn px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded" title="Auto-scale this channel">Fit</button>
-                <button class="ch-fft-btn px-1.5 py-0.5 bg-purple-900/70 hover:bg-purple-800 text-purple-200 rounded font-semibold transition" title="Analyze this Math channel with FFT">FFT</button>
+                <button class="ch-fit-btn px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded font-medium transition" title="Auto-scale 1-2-5 & center">AutoFit</button>
+                <button class="ch-fft-btn px-1.5 py-0.5 bg-purple-900/70 hover:bg-purple-800 text-purple-200 rounded font-semibold transition" title="Analyze with FFT">FFT</button>
                 <button class="ch-del-btn text-red-400 hover:text-red-300 px-1 py-0.5" title="Delete math channel">✕</button>
               </div>
             </div>
+
+            <!-- Scale (步进 V/div) -->
+            <div class="flex items-center justify-between text-[11px] py-1 border-t border-purple-800/40">
+              <span class="text-neutral-400 font-medium">Scale (步进):</span>
+              <div class="flex items-center gap-1">
+                <button class="ch-scale-down px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 font-bold" title="Decrease V/div (Zoom In)">−</button>
+                <input type="number" step="any" class="ch-scale-input w-16 bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vPerDiv.toPrecision(3)}" title="Volts per division" />
+                <span class="text-neutral-400 text-[10px]">${ch.unit}/div</span>
+                <button class="ch-scale-up px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 font-bold" title="Increase V/div (Zoom Out)">+</button>
+              </div>
+            </div>
+
+            <!-- Offset (上下偏移) -->
+            <div class="flex items-center justify-between text-[11px] py-1 border-t border-purple-800/40">
+              <span class="text-neutral-400 font-medium">Offset (偏移):</span>
+              <div class="flex items-center gap-1">
+                <button class="ch-offset-zero px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-amber-300 font-mono text-[10px] font-bold" title="Reset Offset to 0">0</button>
+                <button class="ch-offset-down px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 text-[10px]" title="Shift Down (▼)">▼</button>
+                <input type="number" step="any" class="ch-offset-input w-16 bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vOffset.toFixed(3)}" title="Vertical offset in ${ch.unit}" />
+                <span class="text-neutral-400 text-[10px]">${ch.unit}</span>
+                <button class="ch-offset-up px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 text-[10px]" title="Shift Up (▲)">▲</button>
+              </div>
+            </div>
+
             <div class="flex justify-between items-center text-[10px] text-neutral-400 mt-1 font-mono">
-              <span class="truncate max-w-[150px] text-purple-300/90 font-mono" title="${ch.mathExpression || ''}">${ch.mathExpression || 'Math'}</span>
-              <span>[${ch.vMin.toFixed(1)}, ${ch.vMax.toFixed(1)}] ${ch.unit}</span>
+              <span class="truncate max-w-[140px] text-purple-300/90 font-mono" title="${ch.mathExpression || ''}">${ch.mathExpression || 'Math'}</span>
+              <span>[${ch.vMin.toFixed(2)}, ${ch.vMax.toFixed(2)}] ${ch.unit}</span>
             </div>
           `;
 
@@ -1197,25 +1592,51 @@ export class OscilloscopeApp {
             this.draw();
           });
 
+          row.querySelector('.ch-select-name')?.addEventListener('click', () => {
+            tab.selectedMeasurementChannelId = id;
+            this.renderSidebar();
+            this.draw();
+          });
+
           row.querySelector('.ch-fft-btn')?.addEventListener('click', () => {
             this.analyzeChannelWithFFT(id);
           });
 
           row.querySelector('.ch-fit-btn')?.addEventListener('click', () => {
-            let min = Infinity, max = -Infinity;
-            for (let i = 0; i < ch.v.length; i++) {
-              const val = ch.v[i];
-              if (!isNaN(val)) {
-                if (val < min) min = val;
-                if (val > max) max = val;
-              }
+            this.autoScaleChannel(id);
+          });
+
+          row.querySelector('.ch-scale-down')?.addEventListener('click', () => {
+            this.stepChannelScale(id, 'down');
+          });
+
+          row.querySelector('.ch-scale-up')?.addEventListener('click', () => {
+            this.stepChannelScale(id, 'up');
+          });
+
+          row.querySelector('.ch-scale-input')?.addEventListener('change', (e: any) => {
+            const val = parseFloat(e.target.value);
+            if (!isNaN(val) && val > 0) {
+              this.setChannelScale(id, val);
             }
-            if (isFinite(min) && isFinite(max)) {
-              const margin = (max - min) * 0.1 || 1.0;
-              ch.vMin = min - margin;
-              ch.vMax = max + margin;
-              this.renderSidebar();
-              this.draw();
+          });
+
+          row.querySelector('.ch-offset-zero')?.addEventListener('click', () => {
+            this.zeroChannelOffset(id);
+          });
+
+          row.querySelector('.ch-offset-down')?.addEventListener('click', () => {
+            this.nudgeChannelOffset(id, 'down');
+          });
+
+          row.querySelector('.ch-offset-up')?.addEventListener('click', () => {
+            this.nudgeChannelOffset(id, 'up');
+          });
+
+          row.querySelector('.ch-offset-input')?.addEventListener('change', (e: any) => {
+            const val = parseFloat(e.target.value);
+            if (!isNaN(val)) {
+              this.setChannelOffset(id, val);
             }
           });
 
@@ -1237,6 +1658,39 @@ export class OscilloscopeApp {
           mathChannelsListEl.appendChild(row);
         });
       }
+    }
+
+    // Sync Cursor Selectors in Toolbar
+    const cursorChannelSel = document.getElementById('cursorChannelSelect') as HTMLSelectElement;
+    if (cursorChannelSel) {
+      const selectedCurId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+      cursorChannelSel.innerHTML = '';
+      tab.drawOrder.forEach((id) => {
+        const ch = tab.channels[id];
+        if (ch) {
+          const opt = document.createElement('option');
+          opt.value = id;
+          opt.innerText = ch.name;
+          if (id === selectedCurId) opt.selected = true;
+          cursorChannelSel.appendChild(opt);
+        }
+      });
+      cursorChannelSel.onchange = (e: any) => {
+        tab.cursors.trackingChannel = e.target.value;
+        this.renderSidebar();
+        this.draw();
+      };
+      const cType = tab.cursors.type || 'x';
+      if (tab.cursors.enabled && (cType === 'y' || cType === 'xy')) {
+        cursorChannelSel.classList.remove('hidden');
+      } else {
+        cursorChannelSel.classList.add('hidden');
+      }
+    }
+
+    const cursorTypeSel = document.getElementById('cursorTypeSelect') as HTMLSelectElement;
+    if (cursorTypeSel) {
+      cursorTypeSel.value = tab.cursors.enabled ? (tab.cursors.type || 'x') : 'off';
     }
 
     // Populate Channel Selectors for Measurements and FFT
@@ -1372,10 +1826,28 @@ export class OscilloscopeApp {
     const mode = tab.plotMode.toUpperCase();
 
     let cursorText = '';
-    if (tab.cursors.enabled && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
-      const dt = Math.abs(tab.cursors.x2 - tab.cursors.x1);
-      const freq = dt > 0 ? formatEng(1 / dt, 'Hz', 2) : '∞';
-      cursorText = ` | ΔT: ${formatEng(dt, 's', 3)} (Freq: ${freq})`;
+    if (tab.cursors.enabled) {
+      const cType = tab.cursors.type || 'x';
+      const parts: string[] = [];
+
+      if ((cType === 'x' || cType === 'xy') && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+        const dt = Math.abs(tab.cursors.x2 - tab.cursors.x1);
+        const freq = dt > 0 ? formatEng(1 / dt, 'Hz', 2) : '∞';
+        parts.push(`ΔT: ${formatEng(dt, 's', 3)} (${freq})`);
+      }
+
+      if ((cType === 'y' || cType === 'xy') && tab.cursors.y1 !== null && tab.cursors.y2 !== null) {
+        const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+        const targetCh = tab.channels[trackingId] || primaryCh;
+        if (targetCh) {
+          const dv = Math.abs(tab.cursors.y2 - tab.cursors.y1);
+          parts.push(`ΔV [${targetCh.name}]: ${formatEng(dv, targetCh.unit, 3)}`);
+        }
+      }
+
+      if (parts.length > 0) {
+        cursorText = ' | ' + parts.join(' • ');
+      }
     }
 
     statusEl.innerHTML = `

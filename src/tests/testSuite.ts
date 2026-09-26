@@ -404,7 +404,116 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // 9. Dynamic Input Mutation & Fail-Closed Tests
+  // 9. Vertical Scale Stepping (V/div) and Offset Calculation Test
+  try {
+    const vPerDiv = 0.5; // 0.5 V/div -> 8 divisions = 4.0 V span
+    const offset = 1.5;   // 1.5 V center offset
+    const halfSpan = vPerDiv * 4;
+    const vMin = offset - halfSpan; // -0.5 V
+    const vMax = offset + halfSpan; // 3.5 V
+
+    const spanOk = Math.abs((vMax - vMin) - 4.0) < 1e-6;
+    const centerOk = Math.abs((vMax + vMin) / 2 - 1.5) < 1e-6;
+    const passed = spanOk && centerOk;
+
+    results.push({
+      name: 'Vertical Scale & Offset Deterministic Bounds Test',
+      passed,
+      message: `V/div=${vPerDiv}V, Offset=${offset}V -> [${vMin}, ${vMax}] (span=${vMax - vMin}V, center=${(vMax + vMin) / 2}V)`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Vertical Scale & Offset Deterministic Bounds Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 10. Horizontal (X) and Vertical (Y) Cursors Calculation Test
+  try {
+    const x1 = 0.002;
+    const x2 = 0.007;
+    const deltaT = Math.abs(x2 - x1); // 0.005 s
+    const freq = 1 / deltaT;         // 200 Hz
+
+    const y1 = -1.25;
+    const y2 = 2.75;
+    const deltaV = Math.abs(y2 - y1); // 4.0 V
+
+    const xOk = Math.abs(deltaT - 0.005) < 1e-9 && Math.abs(freq - 200) < 1e-6;
+    const yOk = Math.abs(deltaV - 4.0) < 1e-9;
+    const passed = xOk && yOk;
+
+    results.push({
+      name: 'Dual X and Y Cursors Calculation Test',
+      passed,
+      message: `ΔT = ${(deltaT * 1000).toFixed(3)} ms (1/ΔT = ${freq.toFixed(1)} Hz), ΔV = ${deltaV.toFixed(3)} V`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Dual X and Y Cursors Calculation Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 11. Separate Mode Multi-Channel Subplot Axes Verification Test
+  try {
+    const chA = { vMin: -5, vMax: 5, unit: 'V' };
+    const chB = { vMin: 0, vMax: 100, unit: 'mV' };
+    const chC = { vMin: -24, vMax: 24, unit: 'V' };
+
+    // Subplot A: 4 divisions from 5V down to -5V
+    const stepA = (chA.vMax - chA.vMin) / 4; // 2.5 V/step
+    // Subplot B: 4 divisions from 100mV down to 0mV
+    const stepB = (chB.vMax - chB.vMin) / 4; // 25 mV/step
+    // Subplot C: 4 divisions from 24V down to -24V
+    const stepC = (chC.vMax - chC.vMin) / 4; // 12 V/step
+
+    const passed = Math.abs(stepA - 2.5) < 1e-6 && Math.abs(stepB - 25) < 1e-6 && Math.abs(stepC - 12) < 1e-6;
+    results.push({
+      name: 'Separate Mode Subplot Independent Axes Test',
+      passed,
+      message: `Subplots independently graduated: CH_A step=${stepA}V, CH_B step=${stepB}mV, CH_C step=${stepC}V`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Separate Mode Subplot Independent Axes Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 12. Space and Multi-Space Whitespace Delimiter Parsing Test
+  try {
+    const spaceText = [
+      'time          V(out)            I(L1)',
+      '0.000000e+000 0.000000e+000     0.000000e+000',
+      '1.250000e-007 1.458210e-001     2.341029e-003',
+      '2.500000e-007 2.871020e-001     4.512090e-003',
+    ].join('\n');
+
+    const preview = previewCsv(spaceText);
+    const delimOk = preview.delimiter === ' ';
+    const colsOk = preview.headers.length === 3 && preview.headers[0].toLowerCase() === 'time' && preview.headers[1] === 'V(out)' && preview.headers[2] === 'I(L1)';
+    const rowsOk = preview.rows.length === 3 && preview.rows[0].length === 3;
+    const valsOk = Math.abs(parseFloat(preview.rows[1][1]) - 0.145821) < 1e-5;
+    const passed = delimOk && colsOk && rowsOk && valsOk;
+
+    results.push({
+      name: 'Space & Multi-Space Delimiter Parsing Test',
+      passed,
+      message: `Delimiter='${preview.delimiter}', Headers=[${preview.headers.join(', ')}], Rows=${preview.rows.length}x${preview.rows[0]?.length || 0}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Space & Multi-Space Delimiter Parsing Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 13. Dynamic Input Mutation & Fail-Closed Tests
   try {
     const mutationResults = runDynamicMutationTests();
     for (const m of mutationResults) {

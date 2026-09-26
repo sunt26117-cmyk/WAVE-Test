@@ -85,15 +85,26 @@ function bindToolbarActions() {
     const tab = app.getActiveTab();
     if (tab) {
       tab.cursors.enabled = !tab.cursors.enabled;
-      if (tab.cursors.enabled && tab.cursors.x1 === null) {
-        const primaryCh = tab.channels[tab.drawOrder[0]];
-        if (primaryCh) {
-          const dt = primaryCh.dt || 1e-4;
-          const span = (tab.view.endIndex - tab.view.startIndex) * dt;
-          const start = tab.view.startIndex * dt;
-          tab.cursors.x1 = start + span * 0.25;
-          tab.cursors.x2 = start + span * 0.75;
-        }
+      if (tab.cursors.enabled) {
+        if (!tab.cursors.type) tab.cursors.type = 'x';
+        app.ensureCursorPositions(tab);
+      }
+      app.renderSidebar();
+      app.draw();
+    }
+  });
+
+  const cursorTypeSelect = document.getElementById('cursorTypeSelect') as HTMLSelectElement;
+  cursorTypeSelect?.addEventListener('change', () => {
+    const tab = app.getActiveTab();
+    if (tab) {
+      const val = cursorTypeSelect.value;
+      if (val === 'off') {
+        tab.cursors.enabled = false;
+      } else {
+        tab.cursors.enabled = true;
+        tab.cursors.type = val as any;
+        app.ensureCursorPositions(tab);
       }
       app.renderSidebar();
       app.draw();

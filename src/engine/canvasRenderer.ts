@@ -9,6 +9,7 @@ import {
   WaveformChannel,
   SpectrumResult,
   HarmonicMarker,
+  ViewState,
 } from '../types/models';
 
 export interface PlotArea {
@@ -555,7 +556,7 @@ export function drawTriggerLine(
 }
 
 /**
- * Draws X and Y cursors and readout banner.
+ * Draws X (Time) and Y (Voltage) cursors and readout banner.
  */
 export function drawCursors(
   ctx: CanvasRenderingContext2D,
@@ -568,60 +569,286 @@ export function drawCursors(
   // In frequency spectrum mode, do not draw time-domain cursor lines
   if (tab.plotMode === 'frequency') return;
 
-  const ch = tab.channels[tab.drawOrder[0]];
-  if (!ch) return;
+  const cursorType = cursors.type || 'x';
+  const showX = cursorType === 'x' || cursorType === 'xy';
+  const showY = cursorType === 'y' || cursorType === 'xy';
 
-  const dt = ch.dt || 1e-4;
+  const primaryCh = tab.channels[tab.drawOrder[0]];
+  if (!primaryCh) return;
+
+  const dt = primaryCh.dt || 1e-4;
   const timeStart = tab.view.startIndex * dt;
   const timeSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
 
+  const trackingId = cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
+  const targetCh = tab.channels[trackingId] || primaryCh;
+
   ctx.save();
 
-  // X Cursors
-  if (cursors.x1 !== null && timeSpan > 0) {
-    const x1Frac = (cursors.x1 - timeStart) / timeSpan;
-    const x1Px = p.x + x1Frac * p.width;
-    if (x1Px >= p.x && x1Px <= p.x + p.width) {
-      ctx.strokeStyle = theme.cursor;
-      ctx.setLineDash([6, 3]);
-      ctx.beginPath();
-      ctx.moveTo(x1Px, p.y);
-      ctx.lineTo(x1Px, p.y + p.height);
-      ctx.stroke();
+  // X Cursors (Time domain)
+  if (showX && timeSpan > 0) {
+    let x1Px: number | null = null;
+    let x2Px: number | null = null;
 
-      ctx.fillStyle = theme.cursor;
-      ctx.font = '11px Consolas, monospace';
-      ctx.fillText('X1', x1Px + 4, p.y + 14);
+    if (cursors.x1 !== null) {
+      const x1Frac = (cursors.x1 - timeStart) / timeSpan;
+      x1Px = p.x + x1Frac * p.width;
+      if (x1Px >= p.x && x1Px <= p.x + p.width) {
+        ctx.strokeStyle = theme.cursor;
+        ctx.setLineDash([6, 3]);
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x1Px, p.y);
+        ctx.lineTo(x1Px, p.y + p.height);
+        ctx.stroke();
+
+        ctx.fillStyle = theme.cursor;
+        ctx.font = 'bold 11px Consolas, monospace';
+        ctx.fillText(`X1: ${formatEng(cursors.x1, 's', 3)}`, x1Px + 4, p.y + 14);
+      }
+    }
+
+    if (cursors.x2 !== null) {
+      const x2Frac = (cursors.x2 - timeStart) / timeSpan;
+      x2Px = p.x + x2Frac * p.width;
+      if (x2Px >= p.x && x2Px <= p.x + p.width) {
+        ctx.strokeStyle = theme.cursor;
+        ctx.setLineDash([6, 3]);
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x2Px, p.y);
+        ctx.lineTo(x2Px, p.y + p.height);
+        ctx.stroke();
+
+        ctx.fillStyle = theme.cursor;
+        ctx.font = 'bold 11px Consolas, monospace';
+        ctx.fillText(`X2: ${formatEng(cursors.x2, 's', 3)}`, x2Px + 4, p.y + 28);
+      }
+    }
+
+    // Shaded region between X1 and X2
+    if (x1Px !== null && x2Px !== null) {
+      const left = Math.max(p.x, Math.min(x1Px, x2Px));
+      const right = Math.min(p.x + p.width, Math.max(x1Px, x2Px));
+      if (right > left) {
+        ctx.fillStyle = theme.cursorFill;
+        ctx.fillRect(left, p.y, right - left, p.height);
+      }
     }
   }
 
-  if (cursors.x2 !== null && timeSpan > 0) {
-    const x2Frac = (cursors.x2 - timeStart) / timeSpan;
-    const x2Px = p.x + x2Frac * p.width;
-    if (x2Px >= p.x && x2Px <= p.x + p.width) {
-      ctx.strokeStyle = theme.cursor;
-      ctx.setLineDash([6, 3]);
-      ctx.beginPath();
-      ctx.moveTo(x2Px, p.y);
-      ctx.lineTo(x2Px, p.y + p.height);
-      ctx.stroke();
+  // Y Cursors (Voltage / Amplitude domain)
+  if (showY && targetCh) {
+    const vRange = targetCh.vMax - targetCh.vMin;
+    if (vRange > 0) {
+      let y1Px: number | null = null;
+      let y2Px: number | null = null;
 
-      ctx.fillStyle = theme.cursor;
-      ctx.font = '11px Consolas, monospace';
-      ctx.fillText('X2', x2Px + 4, p.y + 14);
+      if (cursors.y1 !== null) {
+        const y1Frac = (cursors.y1 - targetCh.vMin) / vRange;
+        y1Px = p.y + p.height - y1Frac * p.height;
+        if (y1Px >= p.y && y1Px <= p.y + p.height) {
+          ctx.strokeStyle = '#00e676';
+          ctx.setLineDash([6, 3]);
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(p.x, y1Px);
+          ctx.lineTo(p.x + p.width, y1Px);
+          ctx.stroke();
+
+          // Handle tag on right
+          ctx.font = 'bold 11px Consolas, monospace';
+          const label = `Y1: ${formatEng(cursors.y1, targetCh.unit, 3)}`;
+          const tw = ctx.measureText(label).width;
+          ctx.fillStyle = '#00e676';
+          ctx.fillRect(p.x + p.width - tw - 12, y1Px - 14, tw + 8, 14);
+          ctx.fillStyle = '#000000';
+          ctx.fillText(label, p.x + p.width - tw - 8, y1Px - 3);
+        }
+      }
+
+      if (cursors.y2 !== null) {
+        const y2Frac = (cursors.y2 - targetCh.vMin) / vRange;
+        y2Px = p.y + p.height - y2Frac * p.height;
+        if (y2Px >= p.y && y2Px <= p.y + p.height) {
+          ctx.strokeStyle = '#00e676';
+          ctx.setLineDash([6, 3]);
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(p.x, y2Px);
+          ctx.lineTo(p.x + p.width, y2Px);
+          ctx.stroke();
+
+          // Handle tag on right
+          ctx.font = 'bold 11px Consolas, monospace';
+          const label = `Y2: ${formatEng(cursors.y2, targetCh.unit, 3)}`;
+          const tw = ctx.measureText(label).width;
+          ctx.fillStyle = '#00e676';
+          ctx.fillRect(p.x + p.width - tw - 12, y2Px + 2, tw + 8, 14);
+          ctx.fillStyle = '#000000';
+          ctx.fillText(label, p.x + p.width - tw - 8, y2Px + 13);
+        }
+      }
+
+      // Shaded region between Y1 and Y2
+      if (y1Px !== null && y2Px !== null) {
+        const top = Math.max(p.y, Math.min(y1Px, y2Px));
+        const bottom = Math.min(p.y + p.height, Math.max(y1Px, y2Px));
+        if (bottom > top) {
+          ctx.fillStyle = 'rgba(0, 230, 118, 0.12)';
+          ctx.fillRect(p.x, top, p.width, bottom - top);
+        }
+      }
     }
   }
 
-  // Shaded region between X1 and X2
-  if (cursors.x1 !== null && cursors.x2 !== null && timeSpan > 0) {
-    const x1Px = p.x + ((cursors.x1 - timeStart) / timeSpan) * p.width;
-    const x2Px = p.x + ((cursors.x2 - timeStart) / timeSpan) * p.width;
-    const left = Math.max(p.x, Math.min(x1Px, x2Px));
-    const right = Math.min(p.x + p.width, Math.max(x1Px, x2Px));
-    if (right > left) {
-      ctx.fillStyle = theme.cursorFill;
-      ctx.fillRect(left, p.y, right - left, p.height);
-    }
+  // Floating On-Canvas Readout Badge
+  renderCursorReadoutOverlay(ctx, tab, p, targetCh, showX, showY);
+
+  ctx.restore();
+}
+
+function renderCursorReadoutOverlay(
+  ctx: CanvasRenderingContext2D,
+  tab: TabState,
+  p: PlotArea,
+  targetCh: WaveformChannel,
+  showX: boolean,
+  showY: boolean
+): void {
+  const { cursors } = tab;
+  const lines: string[] = [];
+
+  if (showX && cursors.x1 !== null && cursors.x2 !== null) {
+    const dt = Math.abs(cursors.x2 - cursors.x1);
+    const freq = dt > 0 ? formatEng(1 / dt, 'Hz', 2) : '∞';
+    lines.push(`X1: ${formatEng(cursors.x1, 's', 4)}  X2: ${formatEng(cursors.x2, 's', 4)}`);
+    lines.push(`ΔT: ${formatEng(dt, 's', 4)}  (1/ΔT: ${freq})`);
+  }
+
+  if (showY && cursors.y1 !== null && cursors.y2 !== null && targetCh) {
+    const dv = Math.abs(cursors.y2 - cursors.y1);
+    lines.push(`[${targetCh.name}] Y1: ${formatEng(cursors.y1, targetCh.unit, 3)}  Y2: ${formatEng(cursors.y2, targetCh.unit, 3)}`);
+    lines.push(`ΔY (ΔV): ${formatEng(dv, targetCh.unit, 3)}`);
+  }
+
+  if (lines.length === 0) return;
+
+  ctx.font = '11px Consolas, monospace';
+  const boxW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
+  const boxH = lines.length * 16 + 10;
+  const boxX = p.x + p.width - boxW - 8;
+  const boxY = p.y + p.height - boxH - 8;
+
+  ctx.fillStyle = 'rgba(15, 15, 15, 0.90)';
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeStyle = '#00e5ff';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+  lines.forEach((l, i) => {
+    ctx.fillStyle = i < 2 && showX ? '#00e5ff' : '#00e676';
+    ctx.fillText(l, boxX + 8, boxY + 16 + i * 16);
+  });
+}
+
+/**
+ * Draws Ground (0V) reference indicators on the left axis for each visible channel.
+ */
+export function drawGroundMarkers(
+  ctx: CanvasRenderingContext2D,
+  tab: TabState,
+  p: PlotArea
+): void {
+  if (tab.plotMode === 'frequency' || tab.separateView) return;
+  const visibleChs = tab.drawOrder
+    .map((id) => tab.channels[id])
+    .filter((c) => c && c.visible);
+
+  ctx.save();
+  visibleChs.forEach((ch, idx) => {
+    const vRange = ch.vMax - ch.vMin;
+    if (vRange <= 0) return;
+    const frac = (0 - ch.vMin) / vRange;
+    const clampedFrac = Math.max(0, Math.min(1, frac));
+    const y = p.y + p.height - clampedFrac * p.height;
+
+    // Draw Ground pointer: ▶ with channel index/name
+    ctx.fillStyle = ch.color;
+    ctx.beginPath();
+    ctx.moveTo(p.x - 2, y);
+    ctx.lineTo(p.x - 14, y - 6);
+    ctx.lineTo(p.x - 14, y + 6);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#000000';
+    ctx.font = 'bold 9px Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${idx + 1}`, p.x - 8, y + 3);
+  });
+  ctx.restore();
+}
+
+/**
+ * Draws Subplot-specific Vertical Axis labels and channel banner in Separate mode.
+ */
+export function drawSubplotAxisLabels(
+  ctx: CanvasRenderingContext2D,
+  subP: PlotArea,
+  ch: WaveformChannel,
+  theme: RenderTheme,
+  yDivs: number = 4
+): void {
+  ctx.save();
+  ctx.font = '10px Consolas, monospace';
+
+  const vMin = ch.vMin;
+  const vMax = ch.vMax;
+  const vSpan = vMax - vMin || 1.0;
+  const vPerDiv = (vMax - vMin) / 8; // 8 divisions standard
+  const vOffset = (vMax + vMin) / 2;
+
+  // Subplot voltage labels on left
+  for (let j = 0; j <= yDivs; j++) {
+    const v = vMax - (j / yDivs) * vSpan;
+    const y = subP.y + (j * subP.height) / yDivs;
+    ctx.textAlign = 'right';
+    ctx.fillStyle = ch.color;
+    ctx.fillText(formatEng(v, ch.unit, 2), subP.x - 8, y + 3);
+  }
+
+  // Subplot channel title & scale banner (inside top-left of subplot)
+  ctx.textAlign = 'left';
+  const bannerText = `${ch.name}: ${formatEng(vPerDiv, ch.unit + '/div', 2)} | Offset: ${formatEng(vOffset, ch.unit, 2)}`;
+  ctx.font = 'bold 11px Consolas, monospace';
+  const bannerW = ctx.measureText(bannerText).width + 12;
+
+  ctx.fillStyle = 'rgba(20, 20, 20, 0.85)';
+  ctx.fillRect(subP.x + 4, subP.y + 4, bannerW, 16);
+  ctx.strokeStyle = ch.color;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(subP.x + 4, subP.y + 4, bannerW, 16);
+
+  ctx.fillStyle = ch.color;
+  ctx.fillText(bannerText, subP.x + 8, subP.y + 16);
+
+  // Subplot ground pointer at 0V
+  const gndFrac = (0 - vMin) / vSpan;
+  if (gndFrac >= 0 && gndFrac <= 1) {
+    const gndY = subP.y + subP.height - gndFrac * subP.height;
+    ctx.fillStyle = ch.color;
+    ctx.beginPath();
+    ctx.moveTo(subP.x - 2, gndY);
+    ctx.lineTo(subP.x - 12, gndY - 5);
+    ctx.lineTo(subP.x - 12, gndY + 5);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#000000';
+    ctx.font = 'bold 8px Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('G', subP.x - 7, gndY + 3);
   }
 
   ctx.restore();
@@ -694,8 +921,9 @@ export function drawAxisLabels(
       ctx.fillText(label, x, p.y + p.height + 16);
     }
 
-    // Voltage labels on left for active selected channel
-    if (activeCh) {
+    // Voltage labels on left for active selected channel (ONLY in non-separate mode)
+    // In separate mode, each subplot draws its own aligned vertical axis labels via drawSubplotAxisLabels!
+    if (!tab.separateView && activeCh) {
       const vMin = activeCh.vMin;
       const vMax = activeCh.vMax;
       const vSpan = vMax - vMin;

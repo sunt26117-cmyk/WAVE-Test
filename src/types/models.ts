@@ -53,6 +53,8 @@ export interface WaveformChannel {
   // Vertical scaling limits
   vMin: number;
   vMax: number;
+  vPerDiv?: number; // Volts per division (e.g. 8 vertical divisions)
+  vOffset?: number; // Vertical offset in Volts
 }
 
 export type PlotMode = 'time' | 'frequency';
@@ -153,8 +155,11 @@ export interface ChannelMeasurements {
   statusMessage?: string;
 }
 
+export type CursorType = 'x' | 'y' | 'xy';
+
 export interface CursorsState {
   enabled: boolean;
+  type?: CursorType; // 'x' | 'y' | 'xy'
   x1: number | null;
   x2: number | null;
   y1: number | null;
