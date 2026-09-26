@@ -1,6 +1,7 @@
 /**
  * Waveform Viewer Pro - Unified Resampling Module
- * Performs robust linear resampling onto a uniform grid while handling and respecting gaps.
+ * Resamples non-uniform simulator/measurement time bases without treating
+ * ordinary adaptive solver steps as missing data.
  */
 
 export interface ResampleOptions {
@@ -16,102 +17,70 @@ export interface ResampledChannel {
   gapIndices: number[];
 }
 
-/**
- * Resamples non-uniform time-domain data onto a uniform grid.
- *
- * @param t Raw time array (Float64Array, monotonically non-decreasing, in seconds)
- * @param v Raw value array (Float32Array)
- * @param options Resampling options
- */
 export function resampleUniform(
   t: Float64Array,
   v: Float32Array,
   options: ResampleOptions = {}
 ): ResampledChannel {
   const N = t.length;
-  if (N === 0) {
-    return {
-      t: new Float64Array(0),
-      v: new Float32Array(0),
-      fs: 0,
-      dt: 0,
-      gapIndices: [],
-    };
-  }
+  if (N === 0) return { t: new Float64Array(0), v: new Float32Array(0), fs: 0, dt: 0, gapIndices: [] };
+  if (N === 1) return { t: new Float64Array([t[0]]), v: new Float32Array([v[0]]), fs: 1, dt: 1, gapIndices: [] };
+  if (v.length !== N) throw new Error('Time and value arrays must have identical lengths.');
 
-  if (N === 1) {
-    return {
-      t: new Float64Array([t[0]]),
-      v: new Float32Array([v[0]]),
-      fs: 1,
-      dt: 1,
-      gapIndices: [],
-    };
-  }
-
-  // Determine nominal dt
   let dt = options.nominalDt;
-  if (!dt || dt <= 0) {
-    const dtArray = new Float64Array(N - 1);
+  if (!dt || dt <= 0 || !isFinite(dt)) {
+    const dts: number[] = [];
     for (let i = 1; i < N; i++) {
-      dtArray[i - 1] = t[i] - t[i - 1];
+      const d = t[i] - t[i - 1];
+      if (d > 0 && isFinite(d)) dts.push(d);
     }
-    const sorted = dtArray.sort();
-    const mid = Math.floor(sorted.length / 2);
-    dt = sorted.length % 2 === 0
-      ? (sorted[mid - 1] + sorted[mid]) / 2
-      : sorted[mid];
-    if (dt <= 0) dt = (t[N - 1] - t[0]) / (N - 1);
+    if (!dts.length) throw new Error('Cannot determine a positive sampling interval.');
+    dts.sort((a, b) => a - b);
+    const mid = Math.floor(dts.length / 2);
+    dt = dts.length % 2 ? dts[mid] : (dts[mid - 1] + dts[mid]) / 2;
   }
 
   const tStart = t[0];
   const tEnd = t[N - 1];
   const totalDuration = tEnd - tStart;
-  const numUniformPoints = Math.max(2, Math.round(totalDuration / dt) + 1);
+  if (!(totalDuration > 0)) throw new Error('Time axis must be strictly increasing.');
 
+  // Never round up to a grid point beyond tEnd: clamping the last sample to
+  // tEnd would leave a short final interval and make a uniform grid look jittery.
+  const numUniformPoints = Math.max(2, Math.floor(totalDuration / dt) + 1);
   const resampledT = new Float64Array(numUniformPoints);
   const resampledV = new Float32Array(numUniformPoints);
   const gapIndices: number[] = [];
-  const gapThreshold = dt * 2.5;
 
   let rawIdx = 0;
-
   for (let k = 0; k < numUniformPoints; k++) {
-    const targetT = tStart + k * dt;
+    const targetT = Math.min(tEnd, tStart + k * dt);
     resampledT[k] = targetT;
 
-    // Advance rawIdx so that t[rawIdx] <= targetT <= t[rawIdx + 1]
-    while (rawIdx < N - 2 && t[rawIdx + 1] < targetT) {
-      rawIdx++;
-    }
+    while (rawIdx < N - 2 && t[rawIdx + 1] < targetT) rawIdx++;
 
     const t0 = t[rawIdx];
-    const t1 = t[rawIdx + 1];
+    const t1 = t[Math.min(N - 1, rawIdx + 1)];
     const v0 = v[rawIdx];
-    const v1 = v[rawIdx + 1];
+    const v1 = v[Math.min(N - 1, rawIdx + 1)];
 
-    const span = t1 - t0;
-
-    // Check if we are inside a large gap
-    if (span > gapThreshold && !options.allowGapInterpolation) {
-      // In a gap: do not linearly interpolate across huge missing window
+    if (!isFinite(v0) || !isFinite(v1)) {
+      // Real missing samples remain missing. No hidden zero-fill or
+      // interpolation across invalid endpoints.
       resampledV[k] = NaN;
       gapIndices.push(k);
-    } else if (span <= 1e-15) {
-      resampledV[k] = v0;
-    } else {
-      const frac = Math.max(0, Math.min(1, (targetT - t0) / span));
-      resampledV[k] = v0 + frac * (v1 - v0);
+      continue;
     }
+
+    const span = t1 - t0;
+    if (!(span > 0) || !isFinite(span)) {
+      resampledV[k] = v0;
+      continue;
+    }
+
+    const frac = Math.max(0, Math.min(1, (targetT - t0) / span));
+    resampledV[k] = v0 + frac * (v1 - v0);
   }
 
-  const fs = 1 / dt;
-
-  return {
-    t: resampledT,
-    v: resampledV,
-    fs,
-    dt,
-    gapIndices,
-  };
+  return { t: resampledT, v: resampledV, fs: 1 / dt, dt, gapIndices };
 }

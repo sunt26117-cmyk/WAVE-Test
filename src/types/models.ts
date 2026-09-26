@@ -217,6 +217,8 @@ export interface CsvColumnMapping {
 }
 
 export interface CsvPreviewInfo {
+  /** True when the source contained a textual header row. */
+  hasHeader: boolean;
   headers: string[];
   delimiter: string;
   rows: string[][];

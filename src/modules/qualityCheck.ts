@@ -44,70 +44,52 @@ export function analyzeSamplingQuality(
   let minDt = Infinity;
   let maxDt = -Infinity;
   let sumDt = 0;
+  let monotonic = true;
 
   for (let i = 1; i < N; i++) {
     const dt = timeArray[i] - timeArray[i - 1];
     dtArray[i - 1] = dt;
+    if (!isFinite(dt) || dt <= 0) monotonic = false;
     if (dt < minDt) minDt = dt;
     if (dt > maxDt) maxDt = dt;
     sumDt += dt;
   }
 
   const meanDt = sumDt / (N - 1);
-
-  // Compute robust median(dt) by sorting a copy
   const sortedDt = Float64Array.from(dtArray).sort();
   const mid = Math.floor(sortedDt.length / 2);
   const medianDt = sortedDt.length % 2 === 0
     ? (sortedDt[mid - 1] + sortedDt[mid]) / 2
     : sortedDt[mid];
 
-  // Avoid division by zero
-  const safeMedian = medianDt > 0 ? medianDt : (meanDt > 0 ? meanDt : 1e-6);
+  const safeMedian = medianDt > 0 && isFinite(medianDt)
+    ? medianDt
+    : (meanDt > 0 && isFinite(meanDt) ? meanDt : 1e-6);
 
-  // Calculate Jitter and Detect Gaps
+  // IMPORTANT: a large adaptive time step is not a data gap. SPICE/PSIM and
+  // many simulators intentionally vary dt. Missing samples are represented by
+  // NaN in the value array and are handled per channel by the parser/renderer.
   let sumSqJitter = 0;
   let maxJitter = 0;
-  let droppedSamples = 0;
-  const gapThreshold = safeMedian * 2.5; // Gap identified when dt > 2.5 * medianDt
-  const gapIndices: number[] = [];
-
   for (let i = 0; i < dtArray.length; i++) {
-    const dt = dtArray[i];
-    const diff = Math.abs(dt - safeMedian);
+    const diff = Math.abs(dtArray[i] - safeMedian);
     sumSqJitter += diff * diff;
-    if (diff > maxJitter) {
-      maxJitter = diff;
-    }
-
-    if (dt > gapThreshold) {
-      gapIndices.push(i + 1); // Index in timeArray where gap occurs
-      // Estimate dropped points in the gap interval
-      const estimatedLost = Math.max(0, Math.round(dt / safeMedian) - 1);
-      droppedSamples += estimatedLost;
-    }
+    if (diff > maxJitter) maxJitter = diff;
   }
 
   const rmsJitter = Math.sqrt(sumSqJitter / dtArray.length);
   const jitterRmsPercent = (rmsJitter / safeMedian) * 100;
   const jitterMaxPercent = (maxJitter / safeMedian) * 100;
 
-  // Classify Quality
   let qualityStatus: TimeQualityStatus = 'uniform';
-  let isUniform = true;
-
-  if (gapIndices.length > 0 || jitterMaxPercent >= 25 || invalidCount > 0) {
+  let isUniform = monotonic;
+  if (!monotonic || invalidCount > 0 || jitterMaxPercent >= 25) {
     qualityStatus = 'severe-jitter';
     isUniform = false;
   } else if (jitterMaxPercent >= 1.0) {
     qualityStatus = 'non-uniform';
     isUniform = false;
-  } else {
-    qualityStatus = 'uniform';
-    isUniform = true;
   }
-
-  const sampleRate = safeMedian > 0 ? 1 / safeMedian : null;
 
   return {
     originalSampleCount: N,
@@ -121,12 +103,13 @@ export function analyzeSamplingQuality(
     maxDt,
     jitterRms: jitterRmsPercent,
     jitterMax: jitterMaxPercent,
-    droppedSamples,
+    // Do not infer lost samples from an adaptive solver's dt.
+    droppedSamples: 0,
     invalidSamples: invalidCount,
-    sampleRate,
+    sampleRate: isUniform ? 1 / safeMedian : null,
     qualityStatus,
-    gapCount: gapIndices.length,
-    gapIndices,
+    gapCount: 0,
+    gapIndices: [],
   };
 }
 

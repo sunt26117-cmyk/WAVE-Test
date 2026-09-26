@@ -12,6 +12,8 @@ import { evaluateMathExpression } from '../modules/mathParser';
 import { computeClarke } from '../modules/transforms';
 import { computeMeasurements } from '../modules/measurements';
 import { WaveformChannel } from '../types/models';
+import { previewCsv, parseFullCsv } from '../parsers/csvParser';
+import { OVERLAP_COLORS } from '../engine/canvasRenderer';
 import { runDynamicMutationTests } from './dynamicMutationTest';
 
 export interface TestResult {
@@ -175,7 +177,8 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // 5. Gap Test: 1000 points, gap of 10*dt, 1000 points -> Gap detected at index 1000
+  // 5. Gap Semantics Test: an adaptive solver step is NOT a gap, real missing
+  //    samples (NaN / empty fields) ARE reported as gaps.
   try {
     const dt = 1e-4;
     const t = new Float64Array(2000);
@@ -184,23 +187,43 @@ export function runAllTests(): TestResult[] {
       t[i] = curTime;
       curTime += dt;
     }
-    curTime += dt * 10; // 10x gap
+    curTime += dt * 10; // 10x adaptive step
     for (let i = 1000; i < 2000; i++) {
       t[i] = curTime;
       curTime += dt;
     }
 
     const quality = analyzeSamplingQuality(t);
-    const passed = quality.gapCount >= 1 && quality.gapIndices.includes(1000);
+    const noFalseGap = quality.gapCount === 0 && quality.isUniformSampling === false;
+
+    // A truly missing sample must still be reported.
+    const missingText = ['time\tVa', '0.0\t1.0', '1e-4\t2.0', '2e-4\t', '3e-4\t4.0'].join('\n');
+    const missingPreview = previewCsv(missingText);
+    const missingParsed = parseFullCsv(missingText, {
+      delimiter: '\t',
+      hasHeader: missingPreview.hasHeader,
+      timeColIndex: 0,
+      timeUnit: 's',
+      columnMappings: missingPreview.columnMappings,
+      resample: false,
+      colors: OVERLAP_COLORS,
+    });
+    const missingCh = missingParsed.channels[missingParsed.drawOrder[0]];
+    const missingDetected = !!missingCh
+      && missingCh.metadata.gapCount === 1
+      && missingCh.metadata.gapIndices.includes(2)
+      && isNaN(missingCh.v[2]);
+
+    const passed = noFalseGap && missingDetected;
 
     results.push({
-      name: 'Gap Detection Test',
+      name: 'Gap Semantics Test (adaptive dt vs missing sample)',
       passed,
-      message: `Detected ${quality.gapCount} gap(s), Gap index: ${quality.gapIndices.join(', ')}`,
+      message: `adaptiveSteps=${quality.gapCount} falseGap, quality=${quality.qualityStatus}, missingSamples=${missingCh?.metadata.gapCount ?? -1} at [${missingCh?.metadata.gapIndices.join(', ') ?? ''}]`,
     });
   } catch (err: any) {
     results.push({
-      name: 'Gap Detection Test',
+      name: 'Gap Semantics Test (adaptive dt vs missing sample)',
       passed: false,
       message: `Exception: ${err.message}`,
     });
@@ -513,7 +536,47 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // 13. Dynamic Input Mutation & Fail-Closed Tests
+  // 13. PSIM-style adaptive time-base + metadata import regression test
+  try {
+    const psimLike = [
+      'time\t-I(R43)\t-I(RsA)\t-I(RsB)',
+      'Step Information: U=0  (Step: 1/1)',
+      '0.000000000000000e+00\t1.250797e-07\t-4.808243e-09\t-8.449385e-06',
+      '9.999999439624929e-11\t1.250795e-07\t-4.808243e-09\t-8.449383e-06',
+      '8.012369786017312e-09\t1.250795e-07\t-4.808243e-09\t-8.449322e-06',
+      '2.000000000000000e-05\t2.000872e-01\t-8.570964e-03\t-5.274751e-01',
+    ].join('\n');
+
+    const preview = previewCsv(psimLike);
+    const parsed = parseFullCsv(psimLike, {
+      delimiter: '\t',
+      hasHeader: preview.hasHeader,
+      timeColIndex: 0,
+      timeUnit: 's',
+      columnMappings: preview.columnMappings,
+      resample: false,
+      colors: OVERLAP_COLORS,
+    });
+
+    const first = parsed.channels[parsed.drawOrder[0]];
+    const hasSignal = !!first && first.v.length === 4 && first.v.every((x) => isFinite(x));
+    const noFalseGaps = parsed.quality.gapCount === 0 && parsed.quality.isUniformSampling === false;
+    const passed = preview.hasHeader && preview.timeColIndex === 0 && parsed.drawOrder.length === 3 && hasSignal && noFalseGaps;
+
+    results.push({
+      name: 'PSIM Adaptive Timebase Import Regression Test',
+      passed,
+      message: `Header=${preview.hasHeader}, channels=${parsed.drawOrder.length}, samples=${first?.v.length || 0}, quality=${parsed.quality.qualityStatus}, falseGaps=${parsed.quality.gapCount}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'PSIM Adaptive Timebase Import Regression Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 14. Dynamic Input Mutation & Fail-Closed Tests
   try {
     const mutationResults = runDynamicMutationTests();
     for (const m of mutationResults) {

@@ -163,36 +163,20 @@ export function splitCsvLine(line: string, delimiter: string): string[] {
 export function previewCsv(text: string, customDelimiter?: string): CsvPreviewInfo {
   const delimiter = customDelimiter || detectDelimiter(text);
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length === 0) {
-    throw new Error('CSV file is empty.');
-  }
+  if (lines.length === 0) throw new Error('CSV file is empty.');
 
-  const rawHeaderLine = splitCsvLine(lines[0], delimiter);
-  // Check if first line contains numeric values or headers
-  const isFirstLineNumeric = rawHeaderLine.every((field) => {
-    const num = parseFloat(field);
-    return !isNaN(num) && isFinite(num);
+  const rawFirst = splitCsvLine(lines[0], delimiter);
+  const firstNumeric = rawFirst.length > 0 && rawFirst.every((field) => {
+    const n = Number(field);
+    return field.trim() !== '' && isFinite(n);
   });
 
-  let headers: string[] = [];
-  let dataStartLine = 0;
+  const hasHeader = !firstNumeric;
+  const dataStartLine = hasHeader ? 1 : 0;
+  let headers = hasHeader
+    ? rawFirst.map((h, idx) => h ? h.replace(/^["']|["']$/g, '').trim() : `Col_${idx + 1}`)
+    : rawFirst.map((_, idx) => `Col_${idx + 1}`);
 
-  if (isFirstLineNumeric) {
-    headers = rawHeaderLine.map((_, idx) => `Col_${idx + 1}`);
-    dataStartLine = 0;
-  } else {
-    headers = rawHeaderLine.map((h, idx) => (h ? h.replace(/^["']|["']$/g, '').trim() : `Col_${idx + 1}`));
-    dataStartLine = 1;
-  }
-
-  // Sample first 20 rows
-  const previewRows: string[][] = [];
-  const maxPreview = Math.min(lines.length, dataStartLine + 25);
-  for (let i = dataStartLine; i < maxPreview; i++) {
-    previewRows.push(splitCsvLine(lines[i], delimiter));
-  }
-
-  // Detect time column index
   let timeColIndex = -1;
   for (let i = 0; i < headers.length; i++) {
     if (TIME_HEADER_REGEX.test(headers[i])) {
@@ -201,52 +185,47 @@ export function previewCsv(text: string, customDelimiter?: string): CsvPreviewIn
     }
   }
 
-  // Detect time unit from header e.g. "Time (ms)"
+  // Find numeric data rows while ignoring simulator metadata such as
+  // "Step Information: ..." between blocks.
+  const candidateRows: string[][] = [];
+  for (let i = dataStartLine; i < lines.length && candidateRows.length < 40; i++) {
+    const cols = splitCsvLine(lines[i], delimiter);
+    const timeNumeric = timeColIndex >= 0 && timeColIndex < cols.length && isFinite(Number(cols[timeColIndex]));
+    const anyNumeric = cols.some((c) => c.trim() !== '' && isFinite(Number(c)));
+    if ((timeColIndex >= 0 && timeNumeric) || (timeColIndex < 0 && anyNumeric)) candidateRows.push(cols);
+  }
+
+  if (timeColIndex === -1 && candidateRows.length > 2) {
+    let monotonic = true;
+    let prev = Number(candidateRows[0][0]);
+    if (!isFinite(prev)) monotonic = false;
+    for (let r = 1; monotonic && r < candidateRows.length; r++) {
+      const cur = Number(candidateRows[r][0]);
+      if (!isFinite(cur) || cur < prev) monotonic = false;
+      prev = cur;
+    }
+    if (monotonic) timeColIndex = 0;
+  }
+
   let timeUnit: 's' | 'ms' | 'us' | 'ns' = 's';
   if (timeColIndex >= 0) {
     const th = headers[timeColIndex].toLowerCase();
     if (th.includes('(ns)') || th.includes('[ns]')) timeUnit = 'ns';
     else if (th.includes('(us)') || th.includes('[us]') || th.includes('(µs)') || th.includes('[µs]')) timeUnit = 'us';
     else if (th.includes('(ms)') || th.includes('[ms]')) timeUnit = 'ms';
-    else if (th.includes('(s)') || th.includes('[s]')) timeUnit = 's';
   }
 
-  // If no explicit time column found, check first column monotonicity
-  if (timeColIndex === -1 && previewRows.length > 2) {
-    let isMonotonic = true;
-    let prev = parseFloat(previewRows[0][0]);
-    for (let r = 1; r < previewRows.length; r++) {
-      const cur = parseFloat(previewRows[r][0]);
-      if (isNaN(cur) || cur < prev) {
-        isMonotonic = false;
-        break;
-      }
-      prev = cur;
-    }
-    if (isMonotonic) {
-      timeColIndex = 0;
-    }
-  }
-
-  // Setup default column mappings
   const columnMappings: CsvColumnMapping[] = headers.map((header, idx) => {
     if (idx === timeColIndex) {
-      return {
-        index: idx,
-        header,
-        role: 'time',
-        channelName: 'Time',
-        unit: timeUnit,
-      };
+      return { index: idx, header, role: 'time', channelName: 'Time', unit: timeUnit };
     }
-    let detectedUnit = 'V';
-    if (/^(i\(|current|i_)/i.test(header)) {
-      detectedUnit = 'A';
-    } else if (/^(p\(|power|p_)/i.test(header)) {
-      detectedUnit = 'W';
-    } else if (/^(v\(|volt|v_)/i.test(header)) {
-      detectedUnit = 'V';
-    }
+
+    let detectedUnit = '';
+    if (/^(i(?:\(|_|$)|current|curr(?:ent)?)/i.test(header) || /I\(/i.test(header)) detectedUnit = 'A';
+    else if (/^(p(?:\(|_|$)|power)/i.test(header) || /P\(/i.test(header)) detectedUnit = 'W';
+    else if (/^(u|v)(?:\(|_|$)|volt(?:age)?/i.test(header) || /U\(/i.test(header) || /V\(/i.test(header)) detectedUnit = 'V';
+    else if (/temp|temperature|℃|degc/i.test(header)) detectedUnit = '°C';
+    else if (/rpm|speed/i.test(header)) detectedUnit = 'rpm';
 
     return {
       index: idx,
@@ -258,10 +237,11 @@ export function previewCsv(text: string, customDelimiter?: string): CsvPreviewIn
   });
 
   return {
+    hasHeader,
     headers,
     delimiter,
-    rows: previewRows,
-    totalRows: lines.length - dataStartLine,
+    rows: candidateRows.slice(0, 25),
+    totalRows: Math.max(0, lines.length - dataStartLine),
     timeColIndex,
     timeUnit,
     columnMappings,
@@ -284,7 +264,7 @@ export interface ParseCsvOptions {
  */
 export function parseFullCsv(
   text: string,
-  options: ParseCsvOptions
+  options: ParseCsvOptions & { sampleRate?: number }
 ): {
   channels: Record<string, WaveformChannel>;
   drawOrder: string[];
@@ -294,109 +274,111 @@ export function parseFullCsv(
   if (lines.length === 0) throw new Error('File has no content.');
 
   const startIndex = options.hasHeader ? 1 : 0;
-  const numDataRows = lines.length - startIndex;
-  if (numDataRows <= 0) throw new Error('No data rows found in CSV.');
-
   const timeMultiplier = getTimeUnitMultiplier(options.timeUnit);
-
-  // Parse time column
-  const rawTime = new Float64Array(numDataRows);
-  let hasExplicitTime = options.timeColIndex >= 0;
-  let invalidRows = 0;
-
-  // Active channel columns
   const activeChannels = options.columnMappings.filter((m) => m.role === 'channel');
-  if (activeChannels.length === 0) {
-    throw new Error('No data channels selected for import.');
+  if (activeChannels.length === 0) throw new Error('No data channels selected for import.');
+
+  if (options.timeColIndex < 0 && (!options.sampleRate || !isFinite(options.sampleRate) || options.sampleRate <= 0)) {
+    throw new Error('No time column was selected. Enter a valid sample rate before importing.');
   }
 
-  const rawValues: Float32Array[] = activeChannels.map(() => new Float32Array(numDataRows));
-
+  const rawTime = new Float64Array(lines.length - startIndex);
+  const rawValues = activeChannels.map(() => new Float32Array(lines.length - startIndex));
   let parsedRowIdx = 0;
+  let invalidRows = 0;
+
   for (let lineIdx = startIndex; lineIdx < lines.length; lineIdx++) {
     const cols = splitCsvLine(lines[lineIdx], options.delimiter);
+    if (!cols.length) continue;
 
-    let rowT = 0;
-    if (hasExplicitTime) {
-      const rawTVal = parseFloat(cols[options.timeColIndex]);
-      if (isNaN(rawTVal)) {
-        invalidRows++;
+    let rowT: number;
+    if (options.timeColIndex >= 0) {
+      const rawT = Number(cols[options.timeColIndex]);
+      if (!isFinite(rawT)) {
+        // Ignore non-data simulator metadata lines. Count malformed numeric rows
+        // only when at least one other numeric field is present.
+        const hasAnyNumeric = cols.some((c) => c.trim() !== '' && isFinite(Number(c)));
+        if (hasAnyNumeric) invalidRows++;
         continue;
       }
-      rowT = rawTVal * timeMultiplier;
+      rowT = rawT * timeMultiplier;
     } else {
-      rowT = parsedRowIdx * 1e-4; // 10 kS/s default time grid if no time column
+      rowT = parsedRowIdx / (options.sampleRate as number);
     }
 
     rawTime[parsedRowIdx] = rowT;
-
+    let rowHasInvalidValue = false;
     for (let c = 0; c < activeChannels.length; c++) {
       const colIdx = activeChannels[c].index;
-      const vVal = colIdx < cols.length ? parseFloat(cols[colIdx]) : 0;
-      rawValues[c][parsedRowIdx] = isNaN(vVal) ? 0 : vVal;
+      const raw = colIdx < cols.length ? cols[colIdx].trim() : '';
+      const value = raw === '' ? NaN : Number(raw);
+      if (!isFinite(value)) rowHasInvalidValue = true;
+      rawValues[c][parsedRowIdx] = isFinite(value) ? value : NaN;
     }
-
+    if (rowHasInvalidValue) invalidRows++;
     parsedRowIdx++;
   }
 
-  const validCount = parsedRowIdx;
-  const finalTime = rawTime.slice(0, validCount);
+  if (parsedRowIdx < 2) throw new Error('No usable numeric waveform rows found.');
 
-  // Quality check
+  const finalTime = rawTime.slice(0, parsedRowIdx);
   const quality = analyzeSamplingQuality(finalTime, invalidRows);
-
   const channels: Record<string, WaveformChannel> = {};
   const drawOrder: string[] = [];
 
   for (let c = 0; c < activeChannels.length; c++) {
     const chMap = activeChannels[c];
-    const chRawV = rawValues[c].slice(0, validCount);
+    const chRawV = rawValues[c].slice(0, parsedRowIdx);
 
-    let finalT: Float64Array = finalTime;
-    let finalV: Float32Array = chRawV;
+    let finalT = finalTime as Float64Array;
+    let finalV = chRawV as Float32Array;
     let fs = quality.sampleRate;
     let dt = quality.nominalDt;
 
-    // Resample if requested or non-uniform
-    if (options.resample && (!quality.isUniformSampling || quality.qualityStatus !== 'uniform')) {
-      const res = resampleUniform(finalTime, chRawV);
+    if (options.resample) {
+      if (!(quality.nominalDt && quality.nominalDt > 0)) throw new Error('Cannot resample: invalid source time base.');
+      const res = resampleUniform(finalTime, chRawV, { nominalDt: quality.nominalDt });
       finalT = res.t;
       finalV = res.v;
       fs = res.fs;
       dt = res.dt;
     }
 
-    // Min and Max
     let min = Infinity;
     let max = -Infinity;
+    const invalidIndices: number[] = [];
     for (let i = 0; i < finalV.length; i++) {
       const val = finalV[i];
-      if (!isNaN(val)) {
+      if (isFinite(val)) {
         if (val < min) min = val;
         if (val > max) max = val;
+      } else {
+        invalidIndices.push(i);
       }
     }
     if (!isFinite(min)) min = -1;
     if (!isFinite(max)) max = 1;
-    const margin = (max - min) * 0.1 || 1.0;
+    const margin = Math.max((max - min) * 0.1, 1e-12);
 
     const chId = `csv_ch_${chMap.index}_${c}`;
-    const chColor = options.colors[c % options.colors.length] || '#00e5ff';
-
+    const chColor = options.colors[c % Math.max(1, options.colors.length)] || '#00e5ff';
     channels[chId] = {
       id: chId,
       name: chMap.channelName || `CH ${c + 1}`,
-      unit: chMap.unit || 'V',
+      unit: chMap.unit || '',
       color: chColor,
       visible: true,
       t: finalT,
       v: finalV,
-      fs,
-      dt,
+      fs: fs,
+      dt: dt,
       isMath: false,
       sourceChannelIds: [],
       metadata: {
         ...quality,
+        invalidSamples: invalidIndices.length,
+        gapCount: invalidIndices.length,
+        gapIndices: invalidIndices,
         sampleRate: fs,
         nominalDt: dt,
       },
@@ -405,7 +387,6 @@ export function parseFullCsv(
       vMin: min - margin,
       vMax: max + margin,
     };
-
     drawOrder.push(chId);
   }
 

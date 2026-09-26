@@ -113,10 +113,12 @@ export function screenToData(
   plotArea: PlotArea
 ): { time: number; voltage: number } {
   const ch = tab.channels[channelId] || Object.values(tab.channels)[0];
-  if (!ch) return { time: 0, voltage: 0 };
+  if (!ch || !ch.t.length) return { time: 0, voltage: 0 };
 
-  const timeSpan = (tab.view.endIndex - tab.view.startIndex) * (ch.dt || 1e-4);
-  const timeStart = tab.view.startIndex * (ch.dt || 1e-4);
+  const startIdx = Math.max(0, Math.min(ch.t.length - 1, tab.view.startIndex));
+  const endIdx = Math.max(startIdx, Math.min(ch.t.length - 1, tab.view.endIndex - 1));
+  const timeStart = indexToTime(ch, startIdx);
+  const timeSpan = Math.max(0, indexToTime(ch, endIdx) - timeStart);
 
   const timeFrac = (screenPos.x - plotArea.x) / plotArea.width;
   const time = timeStart + timeFrac * timeSpan;
@@ -138,10 +140,12 @@ export function dataToScreen(
   plotArea: PlotArea
 ): { x: number; y: number } {
   const ch = tab.channels[channelId] || Object.values(tab.channels)[0];
-  if (!ch) return { x: 0, y: 0 };
+  if (!ch || !ch.t.length) return { x: 0, y: 0 };
 
-  const timeSpan = (tab.view.endIndex - tab.view.startIndex) * (ch.dt || 1e-4);
-  const timeStart = tab.view.startIndex * (ch.dt || 1e-4);
+  const startIdx = Math.max(0, Math.min(ch.t.length - 1, tab.view.startIndex));
+  const endIdx = Math.max(startIdx, Math.min(ch.t.length - 1, tab.view.endIndex - 1));
+  const timeStart = indexToTime(ch, startIdx);
+  const timeSpan = Math.max(0, indexToTime(ch, endIdx) - timeStart);
 
   const timeFrac = timeSpan > 0 ? (dataPos.time - timeStart) / timeSpan : 0;
   const x = plotArea.x + timeFrac * plotArea.width;
@@ -151,6 +155,35 @@ export function dataToScreen(
   const y = plotArea.y + plotArea.height - voltFrac * plotArea.height;
 
   return { x, y };
+}
+
+/**
+ * True time (seconds) of a sample index, taken from the channel's real t[] array.
+ *
+ * Adaptive-timebase sources (PSIM / LTspice / SPICE) do not have a constant dt,
+ * so time must never be reconstructed as index * dt.
+ */
+export function indexToTime(ch: WaveformChannel, index: number): number {
+  if (!ch.t.length) return 0;
+  const i = Math.max(0, Math.min(ch.t.length - 1, Math.round(index)));
+  return ch.t[i];
+}
+
+/** Binary search for the sample index closest to a given time (seconds). */
+export function timeToIndex(ch: WaveformChannel, time: number): number {
+  const t = ch.t;
+  if (!t.length) return 0;
+  if (time <= t[0]) return 0;
+  if (time >= t[t.length - 1]) return t.length - 1;
+  let lo = 0;
+  let hi = t.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] < time) lo = mid + 1;
+    else if (t[mid] > time) hi = mid - 1;
+    else return mid;
+  }
+  return Math.max(0, Math.min(t.length - 1, lo));
 }
 
 /**
@@ -211,7 +244,6 @@ export function drawChannelWaveform(
   const v = ch.v;
   const t = ch.t;
   const totalN = v.length;
-  const dt = ch.dt || (t.length > 1 ? t[1] - t[0] : 1e-4);
 
   const vMin = ch.vMin;
   const vMax = ch.vMax;
@@ -233,11 +265,10 @@ export function drawChannelWaveform(
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
 
-  const viewStartTime = startIdx * dt;
-  const viewEndTime = endIdx * dt;
+  // Real timestamps of the visible window (adaptive timebases have no constant dt).
+  const viewStartTime = indexToTime(ch, startIdx);
+  const viewEndTime = indexToTime(ch, Math.max(startIdx, endIdx - 1));
   const viewDuration = viewEndTime - viewStartTime || 1e-6;
-
-  const gapThreshold = dt * 2.5;
 
   if (pointsInView > area.width * 2) {
     // Pixel-level min/max decimation
@@ -258,11 +289,10 @@ export function drawChannelWaveform(
       for (let s = sStart; s < sEnd; s++) {
         const val = v[s];
         if (isNaN(val)) {
+          // Only real missing samples (NaN) break the trace. A large solver
+          // time step is NOT a gap.
           hasGap = true;
         } else {
-          if (s > 0 && t[s] - t[s - 1] > gapThreshold) {
-            hasGap = true;
-          }
           if (val < colMin) colMin = val;
           if (val > colMax) colMax = val;
           hasValid = true;
@@ -298,11 +328,6 @@ export function drawChannelWaveform(
       if (isNaN(val)) {
         isDrawing = false;
         continue;
-      }
-
-      // Check gap with previous sample
-      if (i > startIdx && t[i] - t[i - 1] > gapThreshold) {
-        isDrawing = false;
       }
 
       const fracX = (t[i] - viewStartTime) / viewDuration;
@@ -576,9 +601,8 @@ export function drawCursors(
   const primaryCh = tab.channels[tab.drawOrder[0]];
   if (!primaryCh) return;
 
-  const dt = primaryCh.dt || 1e-4;
-  const timeStart = tab.view.startIndex * dt;
-  const timeSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+  const timeStart = indexToTime(primaryCh, tab.view.startIndex);
+  const timeSpan = Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - timeStart);
 
   const trackingId = cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
   const targetCh = tab.channels[trackingId] || primaryCh;
@@ -908,10 +932,9 @@ export function drawAxisLabels(
     const targetId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
     const activeCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
     const primaryCh = tab.channels[tab.drawOrder[0]];
-    const dt = primaryCh?.dt || 1e-4;
-    const tStart = tab.view.startIndex * dt;
-    const tEnd = tab.view.endIndex * dt;
-    const tSpan = tEnd - tStart;
+    const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
+    const tEnd = primaryCh ? indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) : tStart;
+    const tSpan = Math.max(0, tEnd - tStart);
 
     for (let i = 0; i <= xDivs; i++) {
       const t = tStart + (i / xDivs) * tSpan;

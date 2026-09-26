@@ -28,6 +28,8 @@ import {
   drawSubplotAxisLabels,
   drawGroundMarkers,
   formatEng,
+  indexToTime,
+  timeToIndex,
 } from './canvasRenderer';
 import { computeFFT, computeBLDCHarmonics } from '../modules/fft';
 import { computeMeasurements } from '../modules/measurements';
@@ -383,8 +385,8 @@ export class OscilloscopeApp {
           if (tab.cursors.enabled && tab.cursors.x1 === null) {
             const ch = tab.channels[tab.drawOrder[0]];
             if (ch) {
-              const span = (tab.view.endIndex - tab.view.startIndex) * (ch.dt || 1e-4);
-              const start = tab.view.startIndex * (ch.dt || 1e-4);
+              const span = Math.max(0, indexToTime(ch, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - indexToTime(ch, tab.view.startIndex));
+              const start = indexToTime(ch, tab.view.startIndex);
               tab.cursors.x1 = start + span * 0.25;
               tab.cursors.x2 = start + span * 0.75;
             }
@@ -414,9 +416,8 @@ export class OscilloscopeApp {
   public ensureCursorPositions(tab: TabState): void {
     const primaryCh = tab.channels[tab.drawOrder[0]];
     if (!primaryCh) return;
-    const dt = primaryCh.dt || 1e-4;
-    const span = (tab.view.endIndex - tab.view.startIndex) * dt;
-    const start = tab.view.startIndex * dt;
+    const start = indexToTime(primaryCh, tab.view.startIndex);
+    const span = Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - start);
 
     if (tab.cursors.x1 === null || tab.cursors.x2 === null) {
       tab.cursors.x1 = start + span * 0.25;
@@ -563,9 +564,8 @@ export class OscilloscopeApp {
       // Check X Cursors (Time)
       if (showX) {
         const primaryCh = tab.channels[tab.drawOrder[0]];
-        const dt = primaryCh?.dt || 1e-4;
-        const tStart = tab.view.startIndex * dt;
-        const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+        const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
+        const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
 
         if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
           const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
@@ -644,9 +644,8 @@ export class OscilloscopeApp {
 
       if (this.draggingCursor === 'x1' || this.draggingCursor === 'x2') {
         const primaryCh = tab.channels[tab.drawOrder[0]];
-        const dt = primaryCh?.dt || 1e-4;
-        const tStart = tab.view.startIndex * dt;
-        const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+        const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
+        const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
         const tCur = tStart + ((x - p.x) / p.width) * tSpan;
 
         if (this.draggingCursor === 'x1') {
@@ -686,9 +685,8 @@ export class OscilloscopeApp {
         const cursorType = tab.cursors.type || 'x';
         if (cursorType === 'x' || cursorType === 'xy') {
           const primaryCh = tab.channels[tab.drawOrder[0]];
-          const dt = primaryCh?.dt || 1e-4;
-          const tStart = tab.view.startIndex * dt;
-          const tSpan = (tab.view.endIndex - tab.view.startIndex) * dt;
+          const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
+          const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
           if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
             const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
             const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
@@ -1010,10 +1008,16 @@ export class OscilloscopeApp {
           const colIdx = parseInt(e.target.dataset.col);
           const role = e.target.value;
           if (role === 'time') {
+            // Only one time column may exist at a time.
+            p.columnMappings.forEach((m) => {
+              m.role = m.index === colIdx ? 'time' : (m.role === 'time' ? 'channel' : m.role);
+            });
             p.timeColIndex = colIdx;
             this.renderCsvModalContent();
           } else {
             p.columnMappings[colIdx].role = role;
+            if (colIdx === p.timeColIndex) p.timeColIndex = -1;
+            this.renderCsvModalContent();
           }
         });
       });
@@ -1021,6 +1025,12 @@ export class OscilloscopeApp {
 
     const timeUnitSel = document.getElementById('csvTimeUnitSelect') as HTMLSelectElement;
     if (timeUnitSel) timeUnitSel.value = p.timeUnit;
+
+    // Sample rate is only required when no time column exists.
+    const sampleRateWrap = document.getElementById('csvSampleRateWrap');
+    const sampleRateInput = document.getElementById('csvSampleRateInput') as HTMLInputElement | null;
+    if (sampleRateWrap) sampleRateWrap.style.display = p.timeColIndex < 0 ? 'flex' : 'none';
+    if (sampleRateInput && p.timeColIndex >= 0) sampleRateInput.value = '';
 
     const rowCountEl = document.getElementById('csvTotalRows');
     if (rowCountEl) rowCountEl.innerText = `${p.totalRows.toLocaleString()} rows`;
@@ -1053,13 +1063,17 @@ export class OscilloscopeApp {
       const timeUnitSel = document.getElementById('csvTimeUnitSelect') as HTMLSelectElement;
       const timeUnit = (timeUnitSel?.value as 's' | 'ms' | 'us' | 'ns') || this.pendingCsvPreview.timeUnit;
 
+      const sampleRateInput = document.getElementById('csvSampleRateInput') as HTMLInputElement | null;
+      const sampleRate = sampleRateInput ? Number(sampleRateInput.value) : undefined;
+
       const parsed = parseFullCsv(this.pendingCsvText, {
         delimiter: this.pendingCsvPreview.delimiter,
-        hasHeader: true,
+        hasHeader: this.pendingCsvPreview.hasHeader,
         timeColIndex: this.pendingCsvPreview.timeColIndex,
         timeUnit,
         columnMappings: this.pendingCsvPreview.columnMappings,
         resample,
+        sampleRate,
         colors: OVERLAP_COLORS,
       });
 
