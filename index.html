@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en" class="h-full bg-neutral-950 text-neutral-100 antialiased select-none">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Waveform Viewer Pro - Web Oscilloscope</title>
+    <meta name="description" content="Professional web-based oscilloscope and waveform analysis tool for CSV and WFM data with FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
+    <meta property="og:title" content="Waveform Viewer Pro - Web Oscilloscope" />
+    <meta property="og:description" content="Professional web-based oscilloscope and waveform analysis tool for CSV and WFM data with FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <style>
+      /* Ensure proper canvas crispness and styling */
+      canvas {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
+      .modal-overlay {
+        background-color: rgba(0, 0, 0, 0.75);
+        backdrop-filter: blur(2px);
+      }
+    </style>
+  </head>
+  <body class="h-full flex flex-col overflow-hidden bg-[#1a1a1a] text-neutral-200">
+    <!-- Top Bar: File Tabs & Header -->
+    <header class="flex items-center justify-between bg-neutral-900 border-b border-neutral-800 px-3 h-10 shrink-0">
+      <div class="flex items-center gap-2 overflow-x-auto" id="tabsBar">
+        <div class="flex items-center gap-1.5 font-bold text-sm tracking-wide text-cyan-400 mr-2 shrink-0">
+          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+          </svg>
+          <span>Waveform Viewer Pro</span>
+        </div>
+        <div id="tabsContainer" class="flex items-center gap-1"></div>
+      </div>
+
+      <div class="flex items-center gap-2 shrink-0">
+        <button id="loadSampleSignalBtn" class="text-xs px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-cyan-300 rounded border border-cyan-800/60 transition" title="Load synthetic 3-phase BLDC signal for instant interactive demo">
+          Demo Signal
+        </button>
+        <button id="testSuiteBtn" class="text-xs px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-emerald-400 rounded border border-emerald-800/60 transition" title="Run mathematical verification test suite">
+          Diagnostics & Tests
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Toolbar -->
+    <nav class="flex items-center justify-between bg-neutral-800/90 border-b border-neutral-700 px-3 h-11 shrink-0 overflow-x-auto text-xs">
+      <div class="flex items-center gap-1.5">
+        <button id="loadBtn" class="flex items-center gap-1.5 px-3 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] text-white rounded font-medium transition shadow-sm">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+          Load File / CSV
+        </button>
+        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.graphx,.txt" multiple />
+
+        <div class="h-5 w-px bg-neutral-700 mx-1"></div>
+
+        <!-- View Mode: Time vs Frequency -->
+        <div class="flex rounded bg-neutral-900 p-0.5 border border-neutral-700">
+          <button id="timeModeBtn" class="px-2.5 py-1 rounded bg-[#0078d7] text-white font-medium transition">
+            Waveform
+          </button>
+          <button id="freqModeBtn" class="px-2.5 py-1 rounded bg-neutral-800 text-neutral-300 hover:text-white transition">
+            Spectrum (FFT)
+          </button>
+        </div>
+
+        <div class="h-5 w-px bg-neutral-700 mx-1"></div>
+
+        <!-- Oscilloscope Core Actions -->
+        <button id="autoSetBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition font-medium" title="Automatic 1-2-5 scale setup">
+          AutoSet
+        </button>
+        <button id="triggerBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition font-medium" title="Configure edge trigger">
+          Trigger
+        </button>
+        <button id="fitViewBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Fit View (Shortcut: F)">
+          Fit (F)
+        </button>
+        <button id="toggleCursorsBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Toggle Cursors (Shortcut: T)">
+          Cursors
+        </button>
+        <button id="toggleSeparateBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Toggle Separate / Overlapped Diagram">
+          Separate
+        </button>
+
+        <div class="h-5 w-px bg-neutral-700 mx-1"></div>
+
+        <!-- Math & Engineering Analysis -->
+        <button id="addMathBtn" class="px-2.5 py-1.5 bg-purple-900/60 hover:bg-purple-800/80 border border-purple-700/60 text-purple-200 rounded transition font-medium">
+          + Math Channel
+        </button>
+        <button id="transformBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition">
+          Clarke / Park
+        </button>
+        <button id="motorBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition">
+          BLDC Harmonics
+        </button>
+      </div>
+
+      <div class="flex items-center gap-1.5">
+        <!-- Export Actions -->
+        <div class="relative group">
+          <button class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 flex items-center gap-1 transition">
+            <span>Export</span>
+            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div class="absolute right-0 top-full mt-1 hidden group-hover:flex flex-col bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 min-w-[160px] z-50">
+            <button id="exportPngBtn" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs">PNG Screenshot</button>
+            <button id="exportCsvWaveformBtn" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs">Waveform CSV</button>
+            <button id="exportCsvSpectrumBtn" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs">Spectrum CSV</button>
+          </div>
+        </div>
+
+        <button id="saveSessionBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Save session to .graphx file">
+          Save Session
+        </button>
+      </div>
+    </nav>
+
+    <!-- Main Workspace Container -->
+    <main class="flex-1 flex overflow-hidden">
+      <!-- Left Sidebar (Channels, Math, Measurements, FFT Settings) -->
+      <aside class="w-80 bg-neutral-900 border-r border-neutral-800 flex flex-col shrink-0 overflow-y-auto h-full text-xs">
+        <!-- File Overview & Sampling Quality Panel -->
+        <section class="p-3 border-b border-neutral-800 shrink-0">
+          <div class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Sampling Quality & File</div>
+          <div id="fileSummaryPanel" class="space-y-1">
+            <div class="text-xs text-neutral-500">No file loaded</div>
+          </div>
+        </section>
+
+        <!-- Input Channels List -->
+        <section class="p-3 border-b border-neutral-800 shrink-0">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-bold uppercase tracking-wider text-neutral-400">Input Channels</span>
+            <span class="text-[11px] text-neutral-500">Scale / Bounds</span>
+          </div>
+          <div id="inputChannelsListPanel" class="space-y-1.5">
+            <div class="text-xs text-neutral-500">No channels available</div>
+          </div>
+        </section>
+
+        <!-- Math & Virtual Channels List -->
+        <section class="p-3 border-b border-neutral-800 shrink-0">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-bold uppercase tracking-wider text-purple-400 flex items-center gap-1.5">
+              <span>Math Channels</span>
+              <span id="mathCountBadge" class="bg-purple-900/60 text-purple-300 text-[10px] px-1.5 py-0.2 rounded-full font-mono">0</span>
+            </span>
+            <div class="flex items-center gap-1">
+              <button id="sidebarAddMathBtn" class="text-[10px] text-purple-300 hover:text-white bg-purple-900/50 hover:bg-purple-800 px-2 py-0.5 rounded border border-purple-700/60 transition">+ Math</button>
+              <button id="sidebarClarkeBtn" class="text-[10px] text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-1.5 py-0.5 rounded border border-neutral-700 transition">αβ</button>
+            </div>
+          </div>
+          <div id="mathChannelsListPanel" class="space-y-1.5">
+            <div class="text-xs text-neutral-500 italic">No math channels yet. Click "+ Math" or "Clarke / Park" to generate.</div>
+          </div>
+        </section>
+
+        <!-- Live Oscilloscope Measurements Panel (visible in Waveform mode) -->
+        <section id="measurementsSidebarSection" class="p-3 border-b border-neutral-800 bg-neutral-950/40 shrink-0">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-bold uppercase tracking-wider text-cyan-400">Live Measurements</span>
+            <select id="measChannelSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white max-w-[140px] truncate" title="Select channel to measure"></select>
+          </div>
+          <div id="measurementsPanel">
+            <div class="text-xs text-neutral-500">Waiting for data...</div>
+          </div>
+        </section>
+
+        <!-- FFT Controls Sub-panel (visible in Spectrum mode) -->
+        <section id="fftSidebarPanel" class="p-3 bg-neutral-950/60 shrink-0 hidden">
+          <div class="flex items-center justify-between mb-2 pb-1 border-b border-neutral-800">
+            <span class="text-[11px] font-bold uppercase tracking-wider text-amber-400">FFT Spectrum Analysis</span>
+            <select id="fftChannelSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white max-w-[140px] truncate" title="Select channel to analyze with FFT"></select>
+          </div>
+          <div class="space-y-2 text-xs">
+            <div>
+              <label class="block text-[11px] text-neutral-400 mb-1">Frequency Zoom / Span</label>
+              <select id="fftSpanSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
+                <option value="auto" selected>Auto Focus (Signal Band)</option>
+                <option value="1k">0 ~ 1.0 kHz (Low Freq)</option>
+                <option value="5k">0 ~ 5.0 kHz (Motor / Inverter)</option>
+                <option value="20k">0 ~ 20.0 kHz (Full Audio)</option>
+                <option value="full">Full Nyquist Span</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-neutral-400 mb-1">Analysis Range</label>
+              <select id="fftRangeSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
+                <option value="view" selected>Current View Window</option>
+                <option value="cursors">Between Cursors X1~X2</option>
+                <option value="entire">Entire Dataset</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-neutral-400 mb-1">Window Function</label>
+              <select id="fftWindowSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
+                <option value="hann" selected>Hann (Recommended)</option>
+                <option value="hamming">Hamming</option>
+                <option value="blackman-harris">Blackman-Harris</option>
+                <option value="rectangular">Rectangular (No window)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-neutral-400 mb-1">Scale Mode</label>
+              <select id="fftScaleSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
+                <option value="db" selected>dBV (Decibel, Ref: 1V)</option>
+                <option value="magnitude">Linear Magnitude (V)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-neutral-400 mb-1">Zero Padding</label>
+              <select id="fftPaddingSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
+                <option value="1" selected>None (1x)</option>
+                <option value="2">2x (Higher density)</option>
+                <option value="4">4x (Higher density)</option>
+                <option value="8">8x (Higher density)</option>
+              </select>
+              <div class="text-[10px] text-neutral-500 mt-0.5">Increases spectral sampling density; does not enhance physical frequency resolution.</div>
+            </div>
+            <div class="flex items-center gap-2 pt-1">
+              <input type="checkbox" id="fftRemoveDcChk" class="cursor-pointer" checked />
+              <label for="fftRemoveDcChk" class="text-neutral-300">Remove DC Offset</label>
+            </div>
+
+            <!-- Detected Spectral Peaks Summary -->
+            <div id="fftPeaksSummaryPanel" class="mt-3 pt-2 border-t border-neutral-800">
+              <div class="text-[11px] font-semibold text-neutral-400 mb-1">Detected Spectral Peaks</div>
+              <div id="fftPeaksList" class="space-y-1 font-mono text-[11px] text-neutral-300">
+                <div class="text-neutral-500 italic">No peaks detected</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <!-- Center Waveform Canvas Area -->
+      <section class="flex-1 flex flex-col min-w-0 bg-[#1e1e1e] relative">
+        <div class="flex-1 relative overflow-hidden">
+          <canvas id="waveformCanvas" class="absolute inset-0 w-full h-full cursor-crosshair"></canvas>
+        </div>
+
+        <!-- Hover info overlay strip -->
+        <div id="hoverInfoReadout" class="absolute top-2 right-4 text-xs font-mono bg-neutral-900/80 px-2 py-1 rounded border border-neutral-700 text-neutral-300 pointer-events-none">
+          T = 0.0000 s, V = 0.000 V
+        </div>
+      </section>
+    </main>
+
+    <!-- Bottom Status Bar -->
+    <footer class="h-7 bg-neutral-900 border-t border-neutral-800 px-3 flex items-center justify-between text-xs text-neutral-400 shrink-0">
+      <div id="statusBarContent" class="flex items-center gap-3">
+        <span>Ready</span>
+      </div>
+      <div class="flex items-center gap-4 text-[11px]">
+        <span>Drag: Pan</span>
+        <span>Wheel: Zoom</span>
+        <span>Z: Area Zoom</span>
+        <span>T: Cursors</span>
+        <span>F: Fit</span>
+      </div>
+    </footer>
+
+    <!-- CSV Quality Inspection & Mapping Modal -->
+    <div id="csvQualityModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-3xl w-full p-5 flex flex-col max-h-[90vh]">
+        <div class="flex justify-between items-center pb-3 border-b border-neutral-800 mb-4">
+          <h2 class="text-base font-bold text-neutral-100 flex items-center gap-2">
+            <span class="text-cyan-400">CSV Import & Sampling Quality Audit</span>
+          </h2>
+          <button id="csvCancelBtn" class="text-neutral-400 hover:text-white text-lg">✕</button>
+        </div>
+
+        <!-- Details Strip -->
+        <div class="grid grid-cols-3 gap-3 bg-neutral-950 p-3 rounded mb-4 text-xs">
+          <div><span class="text-neutral-500">Rows:</span> <span id="csvTotalRows" class="font-mono text-neutral-200">0</span></div>
+          <div><span class="text-neutral-500">Delimiter:</span> <span id="csvDelimiter" class="font-mono text-neutral-200">,</span></div>
+          <div class="flex items-center gap-2">
+            <span class="text-neutral-500">Time Unit:</span>
+            <select id="csvTimeUnitSelect" class="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-xs text-white">
+              <option value="s">s (Seconds)</option>
+              <option value="ms">ms (Milliseconds)</option>
+              <option value="us">us (Microseconds)</option>
+              <option value="ns">ns (Nanoseconds)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Preview Table -->
+        <div class="text-xs font-semibold text-neutral-300 mb-1.5">Column Roles & First Sample Rows:</div>
+        <div id="csvPreviewContainer" class="flex-1 overflow-auto border border-neutral-700 rounded bg-neutral-950 mb-4"></div>
+
+        <div class="flex items-center justify-between pt-3 border-t border-neutral-800">
+          <div class="text-xs text-neutral-400">
+            For non-uniform or jittered sampling, <strong class="text-cyan-400">Load + Resample</strong> generates a robust uniform time grid.
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="csvLoadOriginalBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded text-xs transition">
+              Load Original
+            </button>
+            <button id="csvLoadResampleBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] text-white font-medium rounded text-xs transition">
+              Load + Resample
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Math Channel Modal -->
+    <div id="mathModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-lg w-full p-5">
+        <div class="flex justify-between items-center pb-2 border-b border-neutral-800 mb-3">
+          <h2 class="text-base font-bold text-neutral-100 flex items-center gap-2">
+            <span class="text-purple-400">+ Add Virtual Math Channel</span>
+          </h2>
+          <button id="mathModalCloseBtn" class="text-neutral-400 hover:text-white text-lg">✕</button>
+        </div>
+
+        <div id="mathModalError" class="hidden p-2.5 rounded bg-red-950/80 border border-red-700/80 text-red-200 text-xs mb-3 font-mono"></div>
+
+        <div class="space-y-3 text-xs">
+          <div>
+            <label class="block text-neutral-400 mb-1">Channel Name</label>
+            <input id="mathNameInput" type="text" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white" value="Math 1" />
+          </div>
+
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <label class="text-neutral-400">Available Channels (click to insert)</label>
+              <span class="text-[10px] text-neutral-500">Aliases CH1, CH2... or names</span>
+            </div>
+            <div id="mathAvailableChannels" class="flex flex-wrap gap-1.5 p-2 bg-neutral-950/70 border border-neutral-800 rounded min-h-[34px] items-center"></div>
+          </div>
+
+          <div>
+            <label class="block text-neutral-400 mb-1">Expression</label>
+            <input id="mathExprInput" type="text" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-2 text-white font-mono text-sm tracking-wide" placeholder="e.g. CH1 - CH2, deriv(CH1), abs(CH1)" />
+            <div class="text-[11px] text-neutral-500 mt-1">Supports: +, -, *, /, ^, abs, sqrt, sin, cos, tan, mean, rms, min, max, diff, deriv</div>
+          </div>
+
+          <div>
+            <label class="block text-neutral-400 mb-1">Quick Keypad</label>
+            <div id="mathKeypad" class="flex flex-wrap gap-1 text-xs">
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" + ">+</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" - ">-</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" * ">*</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" / ">/</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" ^ ">^</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert="()">()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="deriv()">deriv()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="mean()">mean()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="rms()">rms()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="abs()">abs()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="sqrt()">sqrt()</button>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-neutral-400 mb-1.5">Quick Presets</label>
+            <div id="quickMathPresets"></div>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 mt-5 pt-3 border-t border-neutral-800">
+          <button id="mathCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
+          <button id="mathApplyBtn" class="px-4 py-1.5 bg-purple-700 hover:bg-purple-600 rounded text-white font-medium text-xs shadow-md">Create Math Channel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Trigger Modal -->
+    <div id="triggerModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-sm w-full p-5">
+        <h2 class="text-base font-bold text-neutral-100 mb-3">Oscilloscope Trigger Setup</h2>
+        <div class="space-y-3 text-xs">
+          <div>
+            <label class="block text-neutral-400 mb-1">Source Channel</label>
+            <select id="trigChannelSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Edge Slope</label>
+            <select id="trigSlopeSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
+              <option value="rising">Rising Edge (↑)</option>
+              <option value="falling">Falling Edge (↓)</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Threshold Level (V)</label>
+            <input id="trigLevelInput" type="number" step="0.1" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" value="0.0" />
+          </div>
+        </div>
+        <div class="flex justify-end gap-2 mt-5">
+          <button id="triggerCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
+          <button id="triggerApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Align View to Trigger</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Clarke / Park Transform Modal -->
+    <div id="transformModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-md w-full p-5">
+        <h2 class="text-base font-bold text-neutral-100 mb-3">Clarke Transform (3-Phase αβ)</h2>
+        <div class="space-y-3 text-xs">
+          <div>
+            <label class="block text-neutral-400 mb-1">Phase A Channel (Ua)</label>
+            <select id="clarkeUaSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Phase B Channel (Ub)</label>
+            <select id="clarkeUbSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Phase C Channel (Uc)</label>
+            <select id="clarkeUcSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+          </div>
+        </div>
+        <div class="flex justify-end gap-2 mt-5">
+          <button id="transformCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
+          <button id="clarkeApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Generate α & β Channels</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- BLDC Motor Analysis Modal -->
+    <div id="motorModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-sm w-full p-5">
+        <h2 class="text-base font-bold text-neutral-100 mb-3">BLDC Motor Harmonic Analysis</h2>
+        <div class="space-y-3 text-xs">
+          <div class="flex items-center gap-2">
+            <input type="checkbox" id="motorEnableChk" class="cursor-pointer" checked />
+            <label for="motorEnableChk" class="text-neutral-200 font-medium">Enable Harmonic Markers (1x, 2x, 3x, 6x, 12x)</label>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Mechanical Speed (RPM)</label>
+            <input id="motorRpmInput" type="number" step="1" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" placeholder="e.g. 3000" />
+            <span class="text-[10px] text-neutral-500">Required. No fake or assumed RPM is used.</span>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Rotor Pole Pairs (p)</label>
+            <input id="motorPolesInput" type="number" step="1" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" value="4" />
+          </div>
+        </div>
+        <div class="flex justify-end gap-2 mt-5">
+          <button id="motorCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
+          <button id="motorApplyBtn" class="px-4 py-1.5 bg-orange-600 hover:bg-orange-500 rounded text-white font-medium text-xs">Apply Markers</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Verification / Test Suite Modal -->
+    <div id="testSuiteModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-xl w-full p-5 max-h-[85vh] flex flex-col">
+        <div class="flex justify-between items-center pb-2 border-b border-neutral-800 mb-3">
+          <h2 class="text-base font-bold text-neutral-100 flex items-center gap-2">
+            <span class="text-emerald-400">Algorithmic Verification & Tests</span>
+          </h2>
+          <button onclick="document.getElementById('testSuiteModal').style.display='none'" class="text-neutral-400 hover:text-white">✕</button>
+        </div>
+        <div id="testResultsList" class="flex-1 overflow-y-auto pr-1"></div>
+        <div class="flex justify-end mt-4">
+          <button onclick="document.getElementById('testSuiteModal').style.display='none'" class="px-4 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-white text-xs">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Drag & Drop Visual Overlay -->
+    <div id="drag-overlay" class="fixed inset-0 bg-[#0078d7]/80 z-50 hidden items-center justify-center pointer-events-none">
+      <div class="text-center text-white">
+        <svg class="w-20 h-20 mx-auto animate-bounce" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" y1="15" x2="12" y2="3"></line>
+        </svg>
+        <span class="block text-2xl font-bold mt-4">Drop CSV or WFM file to open in Oscilloscope</span>
+      </div>
+    </div>
+
+    <!-- App Entry Point -->
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

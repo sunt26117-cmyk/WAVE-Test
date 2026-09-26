@@ -1,0 +1,6 @@
+{
+  "name": "Waveform Viewer Pro - Web Oscilloscope",
+  "description": "Professional web-based oscilloscope and waveform analysis tool for CSV and WFM data with FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
