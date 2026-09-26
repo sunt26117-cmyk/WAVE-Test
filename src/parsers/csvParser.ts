@@ -257,6 +257,8 @@ export interface ParseCsvOptions {
   columnMappings: CsvColumnMapping[];
   resample: boolean;
   colors: string[];
+  /** Minimum acceptable output sample rate in Hz when resampling. Defaults to 20e6 (20 MHz). */
+  minSampleRateHz?: number;
 }
 
 /**
@@ -335,13 +337,32 @@ export function parseFullCsv(
     let fs = quality.sampleRate;
     let dt = quality.nominalDt;
 
+    let belowTargetRate = false;
     if (options.resample) {
       if (!(quality.nominalDt && quality.nominalDt > 0)) throw new Error('Cannot resample: invalid source time base.');
-      const res = resampleUniform(finalTime, chRawV, { nominalDt: quality.nominalDt });
+      const res = resampleUniform(finalTime, chRawV, {
+        nominalDt: quality.nominalDt,
+        // 20 MHz floor: enough bandwidth for MOSFET gate-drive edges
+        // (rise times of a few ns to a few tens of ns). This never discards
+        // resolution the source has -- it only flags when the source itself
+        // can't support it, and skips needless interpolation when the
+        // capture is already a clean fixed-rate acquisition.
+        minSampleRate: options.minSampleRateHz ?? 20e6,
+      });
       finalT = res.t;
       finalV = res.v;
       fs = res.fs;
       dt = res.dt;
+      belowTargetRate = !!res.belowTargetRate;
+      if (belowTargetRate) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[csvParser] Channel "${chMap.channelName || c}": native sample rate ${(fs / 1e6).toFixed(2)}MHz ` +
+            `is below the ${(((options.minSampleRateHz ?? 20e6) / 1e6)).toFixed(0)}MHz target -- this data ` +
+            'was captured/exported without enough bandwidth to resolve fast edges; no amount of ' +
+            'downstream processing can add resolution back. Re-export from the scope at full rate/points.'
+        );
+      }
     }
 
     let min = Infinity;
@@ -381,6 +402,7 @@ export function parseFullCsv(
         gapIndices: invalidIndices,
         sampleRate: fs,
         nominalDt: dt,
+        belowTargetRate,
       },
       rawT: finalTime,
       rawV: chRawV,

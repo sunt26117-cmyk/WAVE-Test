@@ -7,6 +7,21 @@
 export interface ResampleOptions {
   nominalDt?: number;
   allowGapInterpolation?: boolean;
+  /**
+   * Minimum acceptable output sample rate in Hz (e.g. 20e6 for fast MOSFET
+   * gate-drive edges). Used only to flag `belowTargetRate` in the result --
+   * we never fabricate resolution the source data doesn't have.
+   */
+  minSampleRate?: number;
+  /**
+   * If the source timebase is already uniform to within this fractional
+   * jitter tolerance (default 0.1%), skip interpolation entirely and return
+   * the original samples untouched. Regridding via linear interpolation is
+   * only needed to correct real jitter/adaptive time steps; for already-clean
+   * high-rate scope captures (hundreds of MHz, fast edges) it should be
+   * avoided since it can subtly smooth transition edges for no benefit.
+   */
+  jitterPassthroughTolerance?: number;
 }
 
 export interface ResampledChannel {
@@ -15,6 +30,10 @@ export interface ResampledChannel {
   fs: number;
   dt: number;
   gapIndices: number[];
+  /** True if minSampleRate was requested but the source data can't support it. */
+  belowTargetRate?: boolean;
+  /** True if the original samples were returned as-is (no interpolation). */
+  passthrough?: boolean;
 }
 
 export function resampleUniform(
@@ -38,6 +57,41 @@ export function resampleUniform(
     dts.sort((a, b) => a - b);
     const mid = Math.floor(dts.length / 2);
     dt = dts.length % 2 ? dts[mid] : (dts[mid - 1] + dts[mid]) / 2;
+  }
+
+  // Check how uniform the source already is relative to `dt`, regardless of
+  // whether `dt` was supplied by the caller or just computed above. A native
+  // fixed-rate capture (typical scope binary/ASCII export) needs no
+  // regridding at all -- interpolating it would only risk smoothing fast
+  // edges (e.g. a MOSFET gate-drive transition sampled at hundreds of MHz)
+  // for zero benefit.
+  const tol = options.jitterPassthroughTolerance ?? 0.001;
+  let sourceIsUniform = true;
+  for (let i = 1; i < N; i++) {
+    const d = t[i] - t[i - 1];
+    if (!(d > 0) || !isFinite(d) || Math.abs(d - dt) > dt * tol) {
+      sourceIsUniform = false;
+      break;
+    }
+  }
+
+  const belowTargetRate =
+    options.minSampleRate && dt > 0 ? 1 / dt < options.minSampleRate : undefined;
+
+  if (sourceIsUniform) {
+    // Fast path: no jitter to correct, so don't touch the samples at all --
+    // interpolating a already-uniform high-rate signal (e.g. a MOSFET gate
+    // drive edge sampled at hundreds of MHz) only risks smoothing it for
+    // zero gain.
+    return {
+      t: t.slice(),
+      v: v.slice(),
+      fs: 1 / dt,
+      dt,
+      gapIndices: [],
+      belowTargetRate,
+      passthrough: true,
+    };
   }
 
   const tStart = t[0];
@@ -82,5 +136,5 @@ export function resampleUniform(
     resampledV[k] = v0 + frac * (v1 - v0);
   }
 
-  return { t: resampledT, v: resampledV, fs: 1 / dt, dt, gapIndices };
+  return { t: resampledT, v: resampledV, fs: 1 / dt, dt, gapIndices, belowTargetRate, passthrough: false };
 }

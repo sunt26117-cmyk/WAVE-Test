@@ -23,6 +23,8 @@ export interface SamplingMetadata {
   qualityStatus: TimeQualityStatus;
   gapCount: number;
   gapIndices: number[];
+  /** True if resampling detected the source can't meet the requested minimum bandwidth (e.g. 20MHz for fast edges). */
+  belowTargetRate?: boolean;
 }
 
 export interface WaveformChannel {

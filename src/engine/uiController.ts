@@ -1394,6 +1394,7 @@ export class OscilloscopeApp {
         <div class="flex justify-between text-xs py-0.5"><span>Quality:</span><span>${qualityBadge}</span></div>
         ${meta && meta.jitterRms !== null ? `<div class="flex justify-between text-xs py-0.5"><span>Jitter RMS:</span><span class="font-mono">${meta.jitterRms.toFixed(2)}%</span></div>` : ''}
         ${meta && meta.gapCount > 0 ? `<div class="flex justify-between text-xs py-0.5 text-amber-400"><span>Gaps Detected:</span><span class="font-mono font-bold">${meta.gapCount}</span></div>` : ''}
+        ${meta && meta.belowTargetRate ? `<div class="text-xs py-0.5 text-red-400 font-bold">⚠ Below 20MHz target -- source lacks bandwidth for fast edges (re-export at full rate)</div>` : ''}
       `;
     }
 
