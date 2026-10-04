@@ -27,6 +27,15 @@ export interface SamplingMetadata {
   belowTargetRate?: boolean;
 }
 
+/** Low-pass filter applied to a channel's displayed samples (-3 dB at cutoffHz). */
+export interface ChannelFilterSpec {
+  cutoffHz: number;
+  /** Number of cascaded first-order RC sections (poles): 1, 2 or 4. */
+  order: 1 | 2 | 4;
+  /** Forward-backward pass: no time delay between filtered and unfiltered traces. */
+  zeroPhase: boolean;
+}
+
 export interface WaveformChannel {
   id: string;
   name: string;
@@ -57,6 +66,11 @@ export interface WaveformChannel {
   vMax: number;
   vPerDiv?: number; // Volts per division (e.g. 8 vertical divisions)
   vOffset?: number; // Vertical offset in Volts
+
+  // Optional low-pass filter state. `vOriginal` keeps the unfiltered samples so the
+  // filter can be changed or removed without compounding.
+  vOriginal?: Float32Array;
+  filter?: ChannelFilterSpec;
 }
 
 export type PlotMode = 'time' | 'frequency';
@@ -206,6 +220,8 @@ export interface TabState {
   triggerConfig: TriggerConfig;
   measurementGate: MeasurementGate;
   separateView: boolean;
+  /** Draw 10%/90% levels, crossing points and rise/fall labels for the active channel. */
+  showEdgeMarks?: boolean;
   selectedMeasurementChannelId?: string;
   selectedFftChannelId?: string;
 }

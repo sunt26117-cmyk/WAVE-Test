@@ -127,3 +127,90 @@ export function computeMeasurements(channel:WaveformChannel,gate:MeasurementGate
   }
   return {channelId:channel.id,channelName:channel.name,unit:channel.unit,gate,sampleCount,timeStart,timeEnd,max,min,average:averageValue,rms,vpp,peak,period,frequency,dutyCycle,riseTime,fallTime,overshoot,undershoot,statusMessage};
 }
+
+// ---------------------------------------------------------------------------
+// Edge marks: where the 10%-90% rise / fall edges are, for drawing on the plot.
+// ---------------------------------------------------------------------------
+
+export interface EdgeMark {
+  type: 'rise' | 'fall';
+  /** Time the edge passes the first level (10% for rise, 90% for fall). */
+  tStart: number;
+  /** Time the edge passes the second level (90% for rise, 10% for fall). */
+  tEnd: number;
+  duration: number;
+}
+
+export interface EdgeMarks {
+  low: number;
+  high: number;
+  v10: number;
+  v90: number;
+  edges: EdgeMark[];
+  riseCount: number;
+  fallCount: number;
+}
+
+/**
+ * For each end crossing take the latest start crossing before it, so a noisy edge that
+ * wobbles around the first level is reported once, from its last pass.
+ */
+function pairEdges(starts: number[], ends: number[]): Array<{ start: number; end: number }> {
+  const pairs: Array<{ start: number; end: number }> = [];
+  let si = 0;
+  for (const end of ends) {
+    let cand = -1;
+    while (si < starts.length && starts[si] < end) {
+      cand = si;
+      si++;
+    }
+    if (cand < 0) continue;
+    const start = starts[cand];
+    if (end > start && (!pairs.length || start > pairs[pairs.length - 1].end)) pairs.push({ start, end });
+  }
+  return pairs;
+}
+
+/** Locates 10%-90% rise and 90%-10% fall edges in samples [startIdx, endIdx). */
+export function computeEdgeMarks(channel: WaveformChannel, startIdx: number, endIdx: number): EdgeMarks | null {
+  const { t, v } = channel;
+  const n = v.length;
+  const s = Math.max(0, Math.min(n - 1, startIdx));
+  const e = Math.max(s, Math.min(n - 1, endIdx - 1));
+  if (e - s < 2) return null;
+
+  let min = Infinity, max = -Infinity;
+  for (let i = s; i <= e; i++) {
+    const x = v[i];
+    if (!Number.isFinite(x)) continue;
+    if (x < min) min = x;
+    if (x > max) max = x;
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max - min < 1e-9) return null;
+
+  const { low, high } = estimateRobustEdgeLevels(v, s, e, min, max);
+  const span = high - low;
+  if (!(span > 1e-12)) return null;
+  const v10 = low + 0.1 * span;
+  const v90 = low + 0.9 * span;
+
+  const rise10 = collectThresholdCrossings(t, v, s, e, v10, 'rising');
+  const rise90 = collectThresholdCrossings(t, v, s, e, v90, 'rising');
+  const fall90 = collectThresholdCrossings(t, v, s, e, v90, 'falling');
+  const fall10 = collectThresholdCrossings(t, v, s, e, v10, 'falling');
+
+  const edges: EdgeMark[] = [];
+  for (const p of pairEdges(rise10, rise90)) edges.push({ type: 'rise', tStart: p.start, tEnd: p.end, duration: p.end - p.start });
+  for (const p of pairEdges(fall90, fall10)) edges.push({ type: 'fall', tStart: p.start, tEnd: p.end, duration: p.end - p.start });
+  edges.sort((a, b) => a.tStart - b.tStart);
+
+  return {
+    low,
+    high,
+    v10,
+    v90,
+    edges,
+    riseCount: edges.filter((x) => x.type === 'rise').length,
+    fallCount: edges.filter((x) => x.type === 'fall').length,
+  };
+}

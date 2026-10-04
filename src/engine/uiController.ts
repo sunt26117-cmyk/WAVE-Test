@@ -11,6 +11,7 @@ import {
   PlotMode,
   MeasurementGate,
   CsvPreviewInfo,
+  ChannelFilterSpec,
 } from '../types/models';
 import {
   PlotArea,
@@ -24,6 +25,13 @@ import {
   drawSpectrum,
   drawTriggerLine,
   drawCursors,
+  drawEdgeMarkers,
+  getActiveChannel,
+  getTimeBaseChannel,
+  getCursorChannel,
+  getChannelArea,
+  computeSubplotAreas,
+  getVisibleChannels,
   drawAxisLabels,
   drawSubplotAxisLabels,
   drawGroundMarkers,
@@ -32,7 +40,8 @@ import {
   timeToIndex,
 } from './canvasRenderer';
 import { computeFFT, computeBLDCHarmonics } from '../modules/fft';
-import { computeMeasurements } from '../modules/measurements';
+import { computeMeasurements, computeEdgeMarks, EdgeMarks } from '../modules/measurements';
+import { lowPassFilter, validateFilterSpec, describeFilter } from '../modules/filter';
 import { performAutoSet } from '../modules/autoSet';
 import { findTriggerPoint, alignViewToTrigger } from '../modules/trigger';
 import { evaluateMathExpression } from '../modules/mathParser';
@@ -70,6 +79,8 @@ function getNextScale(current: number, direction: 'up' | 'down'): number {
   }
 }
 
+export type FilterScope = 'active' | 'visible' | 'all';
+
 export class OscilloscopeApp {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
@@ -98,6 +109,19 @@ export class OscilloscopeApp {
   // Cached FFT result for current tab
   private cachedSpectrum: SpectrumResult | null = null;
   private cachedSpectrumKey: string = '';
+
+  // Canvas size in CSS pixels (kept in sync with the backing store in handleResize)
+  private cssW: number = 0;
+  private cssH: number = 0;
+
+  // Bumped whenever sample data changes (filter on/off) so caches can be invalidated
+  private filterRev: number = 0;
+  private edgeCache: { key: string; marks: EdgeMarks | null } | null = null;
+  private trigCache: { key: string; time: number | null } | null = null;
+  private statusFlash: string = '';
+  private statusFlashTimer: number | undefined;
+  /** Last filter used, so the toolbar toggle can re-apply it with one click. */
+  private lastFilter: { spec: ChannelFilterSpec; scope: FilterScope } | null = null;
 
   // CSV import modal state
   private pendingCsvText: string = '';
@@ -151,9 +175,8 @@ export class OscilloscopeApp {
 
   // --- Rendering Pipeline ---
   public draw(): void {
-    const dpr = window.devicePixelRatio || 1;
-    const width = this.canvas.width / dpr;
-    const height = this.canvas.height / dpr;
+    const width = this.cssW || this.canvas.clientWidth;
+    const height = this.cssH || this.canvas.clientHeight;
 
     this.ctx.clearRect(0, 0, width, height);
 
@@ -210,23 +233,13 @@ export class OscilloscopeApp {
   }
 
   private renderTimeDomain(tab: TabState, p: PlotArea): void {
-    const visibleChs = tab.drawOrder
-      .map((id) => tab.channels[id])
-      .filter((c) => c && c.visible);
+    const visibleChs = getVisibleChannels(tab);
+    const subAreas = computeSubplotAreas(tab, p);
 
-    if (tab.separateView && visibleChs.length > 1) {
+    if (subAreas) {
       // Separate diagram subplots
-      const totalH = p.height;
-      const gap = 12;
-      const subH = (totalH - (visibleChs.length - 1) * gap) / visibleChs.length;
-
-      visibleChs.forEach((ch, idx) => {
-        const subP: PlotArea = {
-          x: p.x,
-          y: p.y + idx * (subH + gap),
-          width: p.width,
-          height: subH,
-        };
+      visibleChs.forEach((ch) => {
+        const subP = subAreas.get(ch.id)!;
         drawGrid(this.ctx, subP, this.theme, 10, 4);
         drawChannelWaveform(this.ctx, tab, ch, p, subP);
         drawSubplotAxisLabels(this.ctx, subP, ch, this.theme, 4);
@@ -242,8 +255,39 @@ export class OscilloscopeApp {
       drawGroundMarkers(this.ctx, tab, p);
     }
 
-    // Trigger Line
-    drawTriggerLine(this.ctx, tab, p, this.theme);
+    // 10% / 90% edge annotations for the active channel
+    if (tab.showEdgeMarks) {
+      const ch = getActiveChannel(tab);
+      if (ch && ch.visible) {
+        drawEdgeMarkers(this.ctx, tab, ch, p, this.getEdgeMarks(tab, ch));
+      }
+    }
+
+    // Trigger level line + trigger event marker
+    drawTriggerLine(this.ctx, tab, p, this.theme, this.getTriggerTime(tab));
+  }
+
+  /** Edge detection for the visible window, cached so panning stays smooth. */
+  private getEdgeMarks(tab: TabState, ch: WaveformChannel): EdgeMarks | null {
+    const key = `${tab.id}|${ch.id}|${ch.v.length}|${tab.view.startIndex}|${tab.view.endIndex}|${this.filterRev}`;
+    if (this.edgeCache && this.edgeCache.key === key) return this.edgeCache.marks;
+    const marks = computeEdgeMarks(ch, tab.view.startIndex, tab.view.endIndex);
+    this.edgeCache = { key, marks };
+    return marks;
+  }
+
+  /** Time of the first trigger event in the trigger channel (cached). */
+  private getTriggerTime(tab: TabState): number | null {
+    const cfg = tab.triggerConfig;
+    if (!cfg.enabled) return null;
+    const ch = tab.channels[cfg.channelId];
+    if (!ch) return null;
+    const key = `${tab.id}|${ch.id}|${ch.v.length}|${cfg.type}|${cfg.level}|${this.filterRev}`;
+    if (this.trigCache && this.trigCache.key === key) return this.trigCache.time;
+    const pt = findTriggerPoint(ch, cfg);
+    const time = pt ? pt.triggerTime : null;
+    this.trigCache = { key, time };
+    return time;
   }
 
   private renderFrequencyDomain(tab: TabState, p: PlotArea): void {
@@ -252,7 +296,7 @@ export class OscilloscopeApp {
     if (!primaryCh || primaryCh.v.length === 0) return;
 
     // Cache key to avoid redundant FFT calculation
-    const key = `${primaryCh.id}_${tab.view.startIndex}_${tab.view.endIndex}_${tab.fftOptions.window}_${tab.fftOptions.scale}_${tab.fftOptions.zeroPadding}_${tab.fftOptions.removeDC}_${tab.fftOptions.range}`;
+    const key = `${primaryCh.id}_${tab.view.startIndex}_${tab.view.endIndex}_${tab.fftOptions.window}_${tab.fftOptions.scale}_${tab.fftOptions.zeroPadding}_${tab.fftOptions.removeDC}_${tab.fftOptions.range}_${this.filterRev}`;
 
     if (this.cachedSpectrumKey !== key || !this.cachedSpectrum) {
       try {
@@ -383,7 +427,7 @@ export class OscilloscopeApp {
         if (tab) {
           tab.cursors.enabled = !tab.cursors.enabled;
           if (tab.cursors.enabled && tab.cursors.x1 === null) {
-            const ch = tab.channels[tab.drawOrder[0]];
+            const ch = getTimeBaseChannel(tab);
             if (ch) {
               const span = Math.max(0, indexToTime(ch, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - indexToTime(ch, tab.view.startIndex));
               const start = indexToTime(ch, tab.view.startIndex);
@@ -403,18 +447,25 @@ export class OscilloscopeApp {
     const rect = this.canvas.parentElement?.getBoundingClientRect();
     if (!rect) return;
 
-    this.canvas.width = rect.width * dpr;
-    this.canvas.height = rect.height * dpr;
+    // Round the backing store to whole device pixels and scale by the *actual* ratio.
+    // A fractional size (125% / 150% Windows scaling) makes the browser resample the canvas,
+    // which is what made lines and text look soft or jagged.
+    const pxW = Math.max(1, Math.round(rect.width * dpr));
+    const pxH = Math.max(1, Math.round(rect.height * dpr));
+    this.cssW = rect.width;
+    this.cssH = rect.height;
+
+    this.canvas.width = pxW;
+    this.canvas.height = pxH;
     this.canvas.style.width = `${rect.width}px`;
     this.canvas.style.height = `${rect.height}px`;
 
-    this.ctx.resetTransform();
-    this.ctx.scale(dpr, dpr);
+    this.ctx.setTransform(pxW / rect.width, 0, 0, pxH / rect.height, 0, 0);
     this.draw();
   }
 
   public ensureCursorPositions(tab: TabState): void {
-    const primaryCh = tab.channels[tab.drawOrder[0]];
+    const primaryCh = getTimeBaseChannel(tab);
     if (!primaryCh) return;
     const start = indexToTime(primaryCh, tab.view.startIndex);
     const span = Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - start);
@@ -424,13 +475,64 @@ export class OscilloscopeApp {
       tab.cursors.x2 = start + span * 0.75;
     }
 
-    const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-    const targetCh = tab.channels[trackingId] || primaryCh;
+    const targetCh = getCursorChannel(tab) || primaryCh;
     if (targetCh && (tab.cursors.y1 === null || tab.cursors.y2 === null)) {
+      // Place them inside what is currently on screen for that channel
+      const lo = targetCh.vMin;
       const vSpan = targetCh.vMax - targetCh.vMin;
-      tab.cursors.y1 = targetCh.vMin + vSpan * 0.3;
-      tab.cursors.y2 = targetCh.vMin + vSpan * 0.7;
+      tab.cursors.y1 = lo + vSpan * 0.3;
+      tab.cursors.y2 = lo + vSpan * 0.7;
     }
+  }
+
+  /**
+   * Keeps the Y cursors at the same *screen* position when the channel they measure changes,
+   * instead of leaving them at the old channel's volts (which is usually off-screen on the
+   * new channel's scale and made the cursor look stuck on channel 1).
+   */
+  private remapYCursors(tab: TabState, from: WaveformChannel | undefined, to: WaveformChannel | undefined): void {
+    if (!from || !to || from.id === to.id) return;
+    const fr = from.vMax - from.vMin;
+    const tr = to.vMax - to.vMin;
+    if (!(fr > 0) || !(tr > 0)) return;
+    for (const key of ['y1', 'y2'] as const) {
+      const val = tab.cursors[key];
+      if (val === null) continue;
+      tab.cursors[key] = to.vMin + ((val - from.vMin) / fr) * tr;
+    }
+  }
+
+  /** Change which channel the vertical axis / measurements / auto cursor follow. */
+  public setActiveChannel(tab: TabState, id: string): void {
+    const before = getCursorChannel(tab);
+    tab.selectedMeasurementChannelId = id;
+    this.remapYCursors(tab, before, getCursorChannel(tab));
+    this.renderSidebar();
+    this.draw();
+  }
+
+  /** Select the channel the Y cursors measure; '' means Auto (follow active channel). */
+  public setCursorChannel(tab: TabState, id: string): void {
+    const before = getCursorChannel(tab);
+    tab.cursors.trackingChannel = id || null;
+    this.remapYCursors(tab, before, getCursorChannel(tab));
+    this.renderSidebar();
+    this.draw();
+  }
+
+  /**
+   * Called after a channel is shown or hidden. If the active channel just disappeared the
+   * axis and measurements move to the first visible channel automatically.
+   */
+  private onVisibilityChanged(tab: TabState, before: WaveformChannel | undefined): void {
+    const selected = tab.channels[tab.selectedMeasurementChannelId || ''];
+    if (!selected || !selected.visible) {
+      const active = getActiveChannel(tab);
+      if (active) tab.selectedMeasurementChannelId = active.id;
+    }
+    this.remapYCursors(tab, before, getCursorChannel(tab));
+    this.renderSidebar();
+    this.draw();
   }
 
   public setChannelScale(channelId: string, newVPerDiv: number): void {
@@ -563,7 +665,7 @@ export class OscilloscopeApp {
 
       // Check X Cursors (Time)
       if (showX) {
-        const primaryCh = tab.channels[tab.drawOrder[0]];
+        const primaryCh = getTimeBaseChannel(tab);
         const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
         const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
 
@@ -581,22 +683,22 @@ export class OscilloscopeApp {
         }
       }
 
-      // Check Y Cursors (Voltage)
+      // Check Y Cursors (Voltage) - measured on the tracked channel, inside its own subplot
       if (showY) {
-        const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-        const targetCh = tab.channels[trackingId];
+        const targetCh = getCursorChannel(tab);
         if (targetCh) {
+          const area = getChannelArea(tab, p, targetCh);
           const vRange = targetCh.vMax - targetCh.vMin;
           if (vRange > 0) {
             if (tab.cursors.y1 !== null) {
-              const y1Px = p.y + p.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * p.height;
+              const y1Px = area.y + area.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * area.height;
               if (Math.abs(y - y1Px) < 10) {
                 this.draggingCursor = 'y1';
                 return;
               }
             }
             if (tab.cursors.y2 !== null) {
-              const y2Px = p.y + p.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * p.height;
+              const y2Px = area.y + area.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * area.height;
               if (Math.abs(y - y2Px) < 10) {
                 this.draggingCursor = 'y2';
                 return;
@@ -643,7 +745,7 @@ export class OscilloscopeApp {
       }
 
       if (this.draggingCursor === 'x1' || this.draggingCursor === 'x2') {
-        const primaryCh = tab.channels[tab.drawOrder[0]];
+        const primaryCh = getTimeBaseChannel(tab);
         const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
         const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
         const tCur = tStart + ((x - p.x) / p.width) * tSpan;
@@ -659,11 +761,11 @@ export class OscilloscopeApp {
       }
 
       if (this.draggingCursor === 'y1' || this.draggingCursor === 'y2') {
-        const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-        const targetCh = tab.channels[trackingId];
+        const targetCh = getCursorChannel(tab);
         if (targetCh) {
+          const area = getChannelArea(tab, p, targetCh);
           const vRange = targetCh.vMax - targetCh.vMin;
-          const voltFrac = (p.y + p.height - y) / p.height;
+          const voltFrac = (area.y + area.height - y) / area.height;
           const vCur = targetCh.vMin + voltFrac * vRange;
 
           if (this.draggingCursor === 'y1') {
@@ -684,7 +786,7 @@ export class OscilloscopeApp {
       if (tab.cursors.enabled) {
         const cursorType = tab.cursors.type || 'x';
         if (cursorType === 'x' || cursorType === 'xy') {
-          const primaryCh = tab.channels[tab.drawOrder[0]];
+          const primaryCh = getTimeBaseChannel(tab);
           const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
           const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
           if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
@@ -697,20 +799,20 @@ export class OscilloscopeApp {
           }
         }
         if (!isNearCursor && (cursorType === 'y' || cursorType === 'xy')) {
-          const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-          const targetCh = tab.channels[trackingId];
+          const targetCh = getCursorChannel(tab);
           if (targetCh) {
+            const area = getChannelArea(tab, p, targetCh);
             const vRange = targetCh.vMax - targetCh.vMin;
             if (vRange > 0) {
               if (tab.cursors.y1 !== null) {
-                const y1Px = p.y + p.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * p.height;
+                const y1Px = area.y + area.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * area.height;
                 if (Math.abs(y - y1Px) < 10) {
                   this.canvas.style.cursor = 'ns-resize';
                   isNearCursor = true;
                 }
               }
               if (!isNearCursor && tab.cursors.y2 !== null) {
-                const y2Px = p.y + p.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * p.height;
+                const y2Px = area.y + area.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * area.height;
                 if (Math.abs(y - y2Px) < 10) {
                   this.canvas.style.cursor = 'ns-resize';
                   isNearCursor = true;
@@ -742,7 +844,7 @@ export class OscilloscopeApp {
       const viewSpan = this.initialViewEnd - this.initialViewStart;
       const shiftPoints = Math.round((dx / p.width) * viewSpan);
 
-      const primaryCh = tab.channels[tab.drawOrder[0]];
+      const primaryCh = getTimeBaseChannel(tab);
       const totalN = primaryCh?.v.length || 1000;
 
       let newStart = this.initialViewStart - shiftPoints;
@@ -765,10 +867,22 @@ export class OscilloscopeApp {
 
     // Hover readout
     if (x >= p.x && x <= p.x + p.width && y >= p.y && y <= p.y + p.height) {
-      const primaryCh = tab.channels[tab.drawOrder[0]];
-      if (primaryCh) {
-        const dataPt = screenToData({ x, y }, tab, primaryCh.id, p);
-        this.updateHoverInfo(dataPt.time, dataPt.voltage);
+      // Voltage follows the channel whose axis is shown (in Separate mode: the subplot under the mouse)
+      let hoverCh = getActiveChannel(tab);
+      const areas = computeSubplotAreas(tab, p);
+      let area = p;
+      if (areas) {
+        for (const [id, a] of areas) {
+          if (y >= a.y && y <= a.y + a.height) {
+            hoverCh = tab.channels[id];
+            area = a;
+            break;
+          }
+        }
+      }
+      if (hoverCh) {
+        const dataPt = screenToData({ x, y }, tab, hoverCh.id, area);
+        this.updateHoverInfo(dataPt.time, dataPt.voltage, hoverCh);
       }
     }
   }
@@ -780,7 +894,7 @@ export class OscilloscopeApp {
     }
 
     if (this.isAreaZooming && this.areaZoomStart && this.areaZoomEnd && tab) {
-      const p = getPlotArea(this.canvas.width / (window.devicePixelRatio || 1), this.canvas.height / (window.devicePixelRatio || 1));
+      const p = getPlotArea(this.cssW || this.canvas.clientWidth, this.cssH || this.canvas.clientHeight);
       const x1 = Math.min(this.areaZoomStart.x, this.areaZoomEnd.x);
       const x2 = Math.max(this.areaZoomStart.x, this.areaZoomEnd.x);
 
@@ -819,10 +933,9 @@ export class OscilloscopeApp {
 
     // If mouse is on left voltage axis: Zoom vertical scale (V/div) with wheel!
     if (x < p.x && x >= p.x - 70) {
-      const activeId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
-      const ch = tab.channels[activeId];
+      const ch = getActiveChannel(tab);
       if (ch) {
-        this.stepChannelScale(activeId, e.deltaY < 0 ? 'down' : 'up');
+        this.stepChannelScale(ch.id, e.deltaY < 0 ? 'down' : 'up');
       }
       return;
     }
@@ -835,7 +948,7 @@ export class OscilloscopeApp {
     const mouseIdx = tab.view.startIndex + mouseFrac * viewSpan;
 
     const newSpan = Math.max(10, Math.round(viewSpan * zoomFactor));
-    const primaryCh = tab.channels[tab.drawOrder[0]];
+    const primaryCh = getTimeBaseChannel(tab);
     const totalN = primaryCh?.v.length || 1000;
 
     let newStart = Math.round(mouseIdx - mouseFrac * newSpan);
@@ -860,7 +973,7 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     if (!tab) return;
 
-    const primaryCh = tab.channels[tab.drawOrder[0]];
+    const primaryCh = getTimeBaseChannel(tab);
     if (!primaryCh) return;
 
     tab.view.startIndex = 0;
@@ -1137,7 +1250,8 @@ export class OscilloscopeApp {
     this.draw();
   }
 
-  public applyTrigger(): void {
+  /** Moves the view so the first trigger event sits at the configured screen position. */
+  public applyTrigger(silent: boolean = false): void {
     const tab = this.getActiveTab();
     if (!tab || !tab.triggerConfig.enabled) return;
 
@@ -1147,10 +1261,165 @@ export class OscilloscopeApp {
     const pt = findTriggerPoint(ch, tab.triggerConfig);
     if (pt) {
       tab.view = alignViewToTrigger(tab.view, ch, pt.triggerIndex, tab.triggerConfig.positionPercent);
+      this.renderSidebar();
       this.draw();
     } else {
-      alert(`Trigger condition not found in channel "${ch.name}".`);
+      const msg = `Trigger condition not found in channel "${ch.name}".`;
+      if (silent) {
+        this.flashStatus(msg);
+        this.draw();
+      } else {
+        alert(msg);
+      }
     }
+  }
+
+  /** Trigger ON/OFF button. Turning it on aligns the view to the first event. */
+  public toggleTrigger(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    const cfg = tab.triggerConfig;
+    cfg.enabled = !cfg.enabled;
+    if (cfg.enabled) {
+      if (!cfg.channelId || !tab.channels[cfg.channelId]) {
+        cfg.channelId = getActiveChannel(tab)?.id || tab.drawOrder[0] || '';
+      }
+      this.applyTrigger(true);
+    }
+    this.renderSidebar();
+    this.draw();
+  }
+
+  /** Rising <-> falling edge trigger. */
+  public toggleTriggerSlope(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.triggerConfig.type = tab.triggerConfig.type === 'rising' ? 'falling' : 'rising';
+    if (tab.triggerConfig.enabled) this.applyTrigger(true);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  /** Edge annotation (10% / 90% levels, tr / tf) ON/OFF. */
+  public toggleEdgeMarks(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.showEdgeMarks = !tab.showEdgeMarks;
+    this.updateToolbarState();
+    this.draw();
+  }
+
+  // --- Low-pass filter ---
+  private filterTargets(tab: TabState, scope: FilterScope): WaveformChannel[] {
+    if (scope === 'active') {
+      const a = getActiveChannel(tab);
+      return a ? [a] : [];
+    }
+    if (scope === 'visible') return getVisibleChannels(tab).filter((c) => !c.isMath);
+    return tab.drawOrder.map((id) => tab.channels[id]).filter((c): c is WaveformChannel => !!c && !c.isMath);
+  }
+
+  /**
+   * Re-evaluates Math / Clarke channels from their (possibly just filtered) sources, keeping
+   * their colour, scale and visibility.
+   */
+  private recomputeDerivedChannels(tab: TabState): void {
+    for (const id of tab.drawOrder) {
+      const ch = tab.channels[id];
+      if (!ch || !ch.isMath) continue;
+      try {
+        if (id.startsWith('clarke_alpha_') || id.startsWith('clarke_beta_')) {
+          const [ua, ub, uc] = ch.sourceChannelIds.map((sid) => tab.channels[sid]?.v);
+          if (ua && ub && uc) {
+            const { alpha, beta } = computeClarke(ua, ub, uc);
+            tab.channels[id] = { ...ch, v: id.startsWith('clarke_alpha_') ? alpha : beta };
+          }
+        } else if (ch.mathExpression) {
+          const fresh = evaluateMathExpression(ch.mathExpression, tab.channels, tab.drawOrder, id, ch.name);
+          tab.channels[id] = { ...ch, t: fresh.t, v: fresh.v, fs: fresh.fs, dt: fresh.dt, metadata: fresh.metadata };
+        }
+      } catch (err) {
+        console.warn(`Could not refresh derived channel ${id}:`, err);
+      }
+    }
+  }
+
+  private afterSampleDataChanged(tab: TabState): void {
+    this.filterRev++;
+    this.edgeCache = null;
+    this.trigCache = null;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.recomputeDerivedChannels(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  /** Applies a -3 dB low-pass filter. Always filters from the original samples (no compounding). */
+  public applyFilter(spec: ChannelFilterSpec, scope: FilterScope): { ok: boolean; message?: string; warning?: string } {
+    const tab = this.getActiveTab();
+    if (!tab) return { ok: false, message: 'No data loaded.' };
+
+    const targets = this.filterTargets(tab, scope);
+    if (targets.length === 0) return { ok: false, message: 'No channel to filter.' };
+    if (targets.some((c) => c.isMath)) {
+      return {
+        ok: false,
+        message: 'Math channels follow their source channels. Select an input channel, or choose "All input channels".',
+      };
+    }
+
+    let warning: string | undefined;
+    for (const ch of targets) {
+      const check = validateFilterSpec(spec, ch.t);
+      if (!check.ok) return { ok: false, message: `${ch.name}: ${check.message}` };
+      if (check.warning) warning = check.warning;
+    }
+
+    for (const ch of targets) {
+      if (!ch.vOriginal) ch.vOriginal = ch.v;
+      ch.v = lowPassFilter(ch.t, ch.vOriginal, spec);
+      ch.filter = { ...spec };
+    }
+    this.lastFilter = { spec: { ...spec }, scope };
+    this.afterSampleDataChanged(tab);
+    return { ok: true, warning };
+  }
+
+  public removeFilter(scope: FilterScope): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    let changed = false;
+    for (const ch of this.filterTargets(tab, scope)) {
+      if (ch.vOriginal) {
+        ch.v = ch.vOriginal;
+        ch.vOriginal = undefined;
+        changed = true;
+      }
+      ch.filter = undefined;
+    }
+    if (changed) this.afterSampleDataChanged(tab);
+    else this.updateToolbarState();
+  }
+
+  public getLastFilter(): { spec: ChannelFilterSpec; scope: FilterScope } | null {
+    return this.lastFilter;
+  }
+
+  /** Toolbar LPF ON/OFF. Returns false when there is nothing to re-apply (caller opens the dialog). */
+  public toggleFilter(): boolean {
+    const tab = this.getActiveTab();
+    if (!tab) return true;
+    const active = getActiveChannel(tab);
+    if (!active) return true;
+    if (active.filter) {
+      this.removeFilter(this.lastFilter?.scope === 'active' || !this.lastFilter ? 'active' : this.lastFilter.scope);
+      return true;
+    }
+    if (!this.lastFilter) return false;
+    const res = this.applyFilter(this.lastFilter.spec, this.lastFilter.scope);
+    if (!res.ok) this.flashStatus(res.message || 'Filter failed.');
+    return true;
   }
 
   public addMathChannel(expr: string, name: string): { success: boolean; error?: string } {
@@ -1289,6 +1558,8 @@ export class OscilloscopeApp {
         color: '#ff007f',
         visible: true,
         v: alpha,
+        vOriginal: undefined,
+        filter: undefined,
         isMath: true,
         mathExpression: `Clarke α(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
         sourceChannelIds: [uaId, ubId, ucId],
@@ -1304,6 +1575,8 @@ export class OscilloscopeApp {
         color: '#00e676',
         visible: true,
         v: beta,
+        vOriginal: undefined,
+        filter: undefined,
         isMath: true,
         mathExpression: `Clarke β(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
         sourceChannelIds: [uaId, ubId, ucId],
@@ -1410,7 +1683,7 @@ export class OscilloscopeApp {
       mathCountBadge.innerText = mathChannelIds.length.toString();
     }
 
-    const activeId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
+    const activeId = getActiveChannel(tab)?.id;
 
     if (inputChannelsListEl) {
       inputChannelsListEl.innerHTML = '';
@@ -1474,8 +1747,9 @@ export class OscilloscopeApp {
           `;
 
           row.querySelector('.ch-vis-chk')?.addEventListener('change', (e: any) => {
+            const before = getCursorChannel(tab);
             ch.visible = e.target.checked;
-            this.draw();
+            this.onVisibilityChanged(tab, before);
           });
 
           row.querySelector('.ch-col-picker')?.addEventListener('input', (e: any) => {
@@ -1485,9 +1759,7 @@ export class OscilloscopeApp {
           });
 
           row.querySelector('.ch-select-name')?.addEventListener('click', () => {
-            tab.selectedMeasurementChannelId = id;
-            this.renderSidebar();
-            this.draw();
+            this.setActiveChannel(tab, id);
           });
 
           row.querySelector('.ch-fit-btn')?.addEventListener('click', () => {
@@ -1597,8 +1869,9 @@ export class OscilloscopeApp {
           `;
 
           row.querySelector('.ch-vis-chk')?.addEventListener('change', (e: any) => {
+            const before = getCursorChannel(tab);
             ch.visible = e.target.checked;
-            this.draw();
+            this.onVisibilityChanged(tab, before);
           });
 
           row.querySelector('.ch-col-picker')?.addEventListener('input', (e: any) => {
@@ -1608,9 +1881,7 @@ export class OscilloscopeApp {
           });
 
           row.querySelector('.ch-select-name')?.addEventListener('click', () => {
-            tab.selectedMeasurementChannelId = id;
-            this.renderSidebar();
-            this.draw();
+            this.setActiveChannel(tab, id);
           });
 
           row.querySelector('.ch-fft-btn')?.addEventListener('click', () => {
@@ -1661,6 +1932,8 @@ export class OscilloscopeApp {
             if (tab.selectedMeasurementChannelId === id) {
               tab.selectedMeasurementChannelId = tab.drawOrder[0];
             }
+            if (tab.cursors.trackingChannel === id) tab.cursors.trackingChannel = null;
+            if (tab.triggerConfig.channelId === id) tab.triggerConfig.channelId = tab.drawOrder[0] || '';
             if (tab.selectedFftChannelId === id) {
               tab.selectedFftChannelId = tab.drawOrder[0];
               this.cachedSpectrum = null;
@@ -1678,26 +1951,20 @@ export class OscilloscopeApp {
     // Sync Cursor Selectors in Toolbar
     const cursorChannelSel = document.getElementById('cursorChannelSelect') as HTMLSelectElement;
     if (cursorChannelSel) {
-      const selectedCurId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-      cursorChannelSel.innerHTML = '';
+      const items: Array<{ value: string; label: string }> = [{ value: '', label: 'Auto (active)' }];
       tab.drawOrder.forEach((id) => {
         const ch = tab.channels[id];
-        if (ch) {
-          const opt = document.createElement('option');
-          opt.value = id;
-          opt.innerText = ch.name;
-          if (id === selectedCurId) opt.selected = true;
-          cursorChannelSel.appendChild(opt);
-        }
+        if (ch) items.push({ value: id, label: ch.visible ? ch.name : `${ch.name} (hidden)` });
       });
+      this.syncSelect(cursorChannelSel, items, tab.cursors.trackingChannel || '');
       cursorChannelSel.onchange = (e: any) => {
-        tab.cursors.trackingChannel = e.target.value;
-        this.renderSidebar();
-        this.draw();
+        this.setCursorChannel(tab, e.target.value);
       };
       const cType = tab.cursors.type || 'x';
       if (tab.cursors.enabled && (cType === 'y' || cType === 'xy')) {
         cursorChannelSel.classList.remove('hidden');
+        const eff = getCursorChannel(tab);
+        cursorChannelSel.title = eff ? `Y cursors measure: ${eff.name}` : 'Select Y-cursor channel';
       } else {
         cursorChannelSel.classList.add('hidden');
       }
@@ -1711,39 +1978,24 @@ export class OscilloscopeApp {
     // Populate Channel Selectors for Measurements and FFT
     const measChannelSel = document.getElementById('measChannelSelect') as HTMLSelectElement;
     if (measChannelSel) {
-      const selectedMeasId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
-      measChannelSel.innerHTML = '';
-      tab.drawOrder.forEach((id) => {
-        const ch = tab.channels[id];
-        if (ch) {
-          const opt = document.createElement('option');
-          opt.value = id;
-          opt.innerText = ch.isMath ? `[Math] ${ch.name}` : ch.name;
-          if (id === selectedMeasId) opt.selected = true;
-          measChannelSel.appendChild(opt);
-        }
-      });
+      const items = tab.drawOrder
+        .filter((id) => tab.channels[id])
+        .map((id) => ({ value: id, label: tab.channels[id].isMath ? `[Math] ${tab.channels[id].name}` : tab.channels[id].name }));
+      this.syncSelect(measChannelSel, items, getActiveChannel(tab)?.id || '');
       measChannelSel.onchange = (e: any) => {
-        tab.selectedMeasurementChannelId = e.target.value;
-        this.renderLiveMeasurements(tab);
-        this.draw();
+        this.setActiveChannel(tab, e.target.value);
       };
     }
 
     const fftChannelSel = document.getElementById('fftChannelSelect') as HTMLSelectElement;
     if (fftChannelSel) {
-      const selectedFftId = tab.selectedFftChannelId || tab.drawOrder[0];
-      fftChannelSel.innerHTML = '';
-      tab.drawOrder.forEach((id) => {
-        const ch = tab.channels[id];
-        if (ch) {
-          const opt = document.createElement('option');
-          opt.value = id;
-          opt.innerText = ch.isMath ? `[Math] ${ch.name} (${ch.mathExpression || ''})` : ch.name;
-          if (id === selectedFftId) opt.selected = true;
-          fftChannelSel.appendChild(opt);
-        }
-      });
+      const items = tab.drawOrder
+        .filter((id) => tab.channels[id])
+        .map((id) => {
+          const ch = tab.channels[id];
+          return { value: id, label: ch.isMath ? `[Math] ${ch.name} (${ch.mathExpression || ''})` : ch.name };
+        });
+      this.syncSelect(fftChannelSel, items, tab.selectedFftChannelId || tab.drawOrder[0] || '');
       fftChannelSel.onchange = (e: any) => {
         tab.selectedFftChannelId = e.target.value;
         this.cachedSpectrum = null;
@@ -1777,14 +2029,86 @@ export class OscilloscopeApp {
 
     // Live Measurements
     this.renderLiveMeasurements(tab);
+    this.updateToolbarState();
+  }
+
+  /**
+   * Updates a <select> without tearing it down when nothing changed. Rebuilding the options of
+   * a select while its popup is open makes the browser repaint the popup with its default
+   * (white) palette, so only touch the DOM when the option list really differs.
+   */
+  private syncSelect(sel: HTMLSelectElement, items: Array<{ value: string; label: string }>, value: string): void {
+    const sig = items.map((i) => `${i.value}\u0000${i.label}`).join('\u0001');
+    if (sel.dataset.sig !== sig) {
+      sel.innerHTML = '';
+      for (const it of items) {
+        const opt = document.createElement('option');
+        opt.value = it.value;
+        opt.textContent = it.label;
+        sel.appendChild(opt);
+      }
+      sel.dataset.sig = sig;
+    }
+    if (sel.value !== value) sel.value = value;
+  }
+
+  /** Reflects trigger / filter / edge-mark state on the toolbar buttons. */
+  public updateToolbarState(): void {
+    const tab = this.getActiveTab();
+    const setCls = (el: HTMLElement | null, on: string[], off: string[], active: boolean) => {
+      if (!el) return;
+      el.classList.remove(...(active ? off : on));
+      el.classList.add(...(active ? on : off));
+    };
+
+    const trigToggle = document.getElementById('triggerToggleBtn');
+    const trigSlope = document.getElementById('triggerSlopeBtn');
+    const trigOn = !!tab && tab.triggerConfig.enabled;
+    if (trigToggle) {
+      trigToggle.textContent = trigOn ? 'Trig ON' : 'Trig OFF';
+      setCls(trigToggle, ['bg-amber-600', 'text-black', 'border-amber-400'], ['bg-neutral-800', 'text-neutral-400', 'border-neutral-600'], trigOn);
+    }
+    if (trigSlope && tab) {
+      trigSlope.textContent = tab.triggerConfig.type === 'rising' ? '↑ Rising' : '↓ Falling';
+      trigSlope.title = 'Click to switch trigger slope (rising / falling)';
+      setCls(trigSlope, ['text-amber-300'], ['text-neutral-400'], trigOn);
+    }
+
+    const edgeBtn = document.getElementById('edgeMarksBtn');
+    if (edgeBtn) {
+      const on = !!tab && !!tab.showEdgeMarks;
+      setCls(edgeBtn, ['bg-emerald-700', 'text-white', 'border-emerald-400'], ['bg-neutral-700', 'text-neutral-200', 'border-transparent'], on);
+    }
+
+    const filterBtn = document.getElementById('filterBtn');
+    const filterToggle = document.getElementById('filterToggleBtn');
+    const act = tab ? getActiveChannel(tab) : undefined;
+    const fOn = !!act && !!act.filter;
+    if (filterBtn) {
+      filterBtn.textContent = fOn ? `Filter · ${describeFilter(act!.filter!).replace(/ \(.*$/, '')}` : 'Filter';
+      filterBtn.title = fOn ? describeFilter(act!.filter!) : 'Low-pass filter (-3 dB cutoff)';
+    }
+    if (filterToggle) {
+      filterToggle.textContent = fOn ? 'LPF ON' : 'LPF OFF';
+      setCls(filterToggle, ['bg-cyan-700', 'text-white', 'border-cyan-400'], ['bg-neutral-800', 'text-neutral-400', 'border-neutral-600'], fOn);
+    }
+  }
+
+  private flashStatus(msg: string): void {
+    this.statusFlash = msg;
+    if (this.statusFlashTimer) window.clearTimeout(this.statusFlashTimer);
+    this.statusFlashTimer = window.setTimeout(() => {
+      this.statusFlash = '';
+      this.updateStatusBar();
+    }, 4000);
+    this.updateStatusBar();
   }
 
   private renderLiveMeasurements(tab: TabState): void {
     const measContainer = document.getElementById('measurementsPanel');
     if (!measContainer) return;
 
-    const targetId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
-    const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
+    const targetCh = getActiveChannel(tab);
     if (!targetCh) {
       measContainer.innerHTML = '<div class="text-xs text-neutral-400">No active channel for measurement</div>';
       return;
@@ -1798,11 +2122,7 @@ export class OscilloscopeApp {
     measContainer.innerHTML = `
       <div class="flex justify-between items-center mb-2 pb-1 border-b border-neutral-700">
         <span class="text-xs font-semibold ${targetCh.isMath ? 'text-purple-300' : 'text-neutral-200'} truncate max-w-[150px]">${targetCh.name} (${targetCh.unit})</span>
-        <select id="measGateSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1 text-white">
-          <option value="view" ${tab.measurementGate === 'view' ? 'selected' : ''}>View Window</option>
-          <option value="cursors" ${tab.measurementGate === 'cursors' ? 'selected' : ''}>Cursors X1~X2</option>
-          <option value="entire" ${tab.measurementGate === 'entire' ? 'selected' : ''}>Entire Data</option>
-        </select>
+        ${targetCh.filter ? `<span class="text-[10px] text-cyan-300 font-mono" title="${describeFilter(targetCh.filter)}">LPF</span>` : ''}
       </div>
       <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] font-mono">
         <div class="flex justify-between"><span>Vpp:</span><span class="font-bold text-neutral-100">${fmtVal(m.vpp, targetCh.unit)}</span></div>
@@ -1819,10 +2139,15 @@ export class OscilloscopeApp {
       ${m.statusMessage ? `<div class="text-[10px] text-amber-400 mt-2">${m.statusMessage}</div>` : ''}
     `;
 
-    document.getElementById('measGateSelect')?.addEventListener('change', (e: any) => {
-      tab.measurementGate = e.target.value as MeasurementGate;
-      this.renderSidebar();
-    });
+    // The gate selector is static markup (rebuilding it while open repaints its popup white)
+    const gateSel = document.getElementById('measGateSelect') as HTMLSelectElement | null;
+    if (gateSel) {
+      if (gateSel.value !== tab.measurementGate) gateSel.value = tab.measurementGate;
+      gateSel.onchange = (e: any) => {
+        tab.measurementGate = e.target.value as MeasurementGate;
+        this.renderSidebar();
+      };
+    }
   }
 
   private updateStatusBar(): void {
@@ -1835,7 +2160,7 @@ export class OscilloscopeApp {
       return;
     }
 
-    const primaryCh = tab.channels[tab.drawOrder[0]];
+    const primaryCh = getTimeBaseChannel(tab);
     const fsStr = primaryCh?.fs ? formatEng(primaryCh.fs, 'S/s', 2) : 'N/A';
     const pts = primaryCh?.v.length || 0;
     const mode = tab.plotMode.toUpperCase();
@@ -1852,8 +2177,7 @@ export class OscilloscopeApp {
       }
 
       if ((cType === 'y' || cType === 'xy') && tab.cursors.y1 !== null && tab.cursors.y2 !== null) {
-        const trackingId = tab.cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-        const targetCh = tab.channels[trackingId] || primaryCh;
+        const targetCh = getCursorChannel(tab) || primaryCh;
         if (targetCh) {
           const dv = Math.abs(tab.cursors.y2 - tab.cursors.y1);
           parts.push(`ΔV [${targetCh.name}]: ${formatEng(dv, targetCh.unit, 3)}`);
@@ -1865,19 +2189,26 @@ export class OscilloscopeApp {
       }
     }
 
+    const filtered = getVisibleChannels(tab).filter((c) => c.filter);
+    const filterText = filtered.length
+      ? `<span class="text-cyan-300">• ${filtered.length === 1 ? filtered[0].name + ': ' + describeFilter(filtered[0].filter!) : filtered.length + ' channels low-pass filtered'}</span>`
+      : '';
     statusEl.innerHTML = `
       <span>[${mode}]</span>
       <span>${tab.fileName}</span>
       <span>• ${pts.toLocaleString()} pts</span>
       <span>• Fs: ${fsStr}</span>
+      ${filterText}
       <span class="text-cyan-300 font-mono">${cursorText}</span>
+      ${this.statusFlash ? `<span class="text-amber-300">• ${this.statusFlash}</span>` : ''}
     `;
   }
 
-  private updateHoverInfo(time: number, voltage: number): void {
+  private updateHoverInfo(time: number, voltage: number, ch?: WaveformChannel): void {
     const el = document.getElementById('hoverInfoReadout');
     if (el) {
-      el.innerText = `T = ${formatEng(time, 's', 4)}, V = ${formatEng(voltage, 'V', 3)}`;
+      const name = ch && getVisibleChannels(this.getActiveTab() as TabState).length > 1 ? `${ch.name}: ` : '';
+      el.innerText = `T = ${formatEng(time, 's', 4)}, ${name}V = ${formatEng(voltage, ch?.unit || 'V', 3)}`;
     }
   }
 

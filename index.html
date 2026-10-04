@@ -10,11 +10,19 @@
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
     <style>
-      /* Ensure proper canvas crispness and styling */
-      canvas {
-        image-rendering: pixelated;
-        image-rendering: crisp-edges;
+      /* Dark native controls: without this the <select> popup (and date/number spinners) are
+         drawn with the OS light palette, giving white option lists with light, unreadable text. */
+      :root { color-scheme: dark; }
+      select, input, textarea { color-scheme: dark; }
+      select option, select optgroup {
+        background-color: #262626;
+        color: #e5e5e5;
       }
+      select option:disabled { color: #737373; }
+      /* Toolbar buttons never wrap their label or collapse to "F..." - the bar wraps instead */
+      nav button, nav select, nav a { white-space: nowrap; flex-shrink: 0; }
+      /* NOTE: no image-rendering: pixelated on the canvas. On 125% / 150% display scaling it
+         made lines and text look soft and uneven. The canvas is sized in whole device pixels. */
       .modal-overlay {
         background-color: rgba(0, 0, 0, 0.75);
         backdrop-filter: blur(2px);
@@ -49,8 +57,8 @@
     </header>
 
     <!-- Main Toolbar -->
-    <nav class="flex items-center justify-between bg-neutral-800/90 border-b border-neutral-700 px-3 h-11 shrink-0 overflow-x-auto text-xs">
-      <div class="flex items-center gap-1.5">
+    <nav class="flex items-center justify-between gap-x-3 gap-y-1 flex-wrap bg-neutral-800/90 border-b border-neutral-700 px-3 py-1 min-h-[2.75rem] shrink-0 text-xs">
+      <div class="flex items-center gap-1.5 flex-wrap">
         <button id="loadBtn" class="flex items-center gap-1.5 px-3 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] text-white rounded font-medium transition shadow-sm">
           <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
           Load File / CSV
@@ -75,8 +83,23 @@
         <button id="autoSetBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition font-medium" title="Automatic 1-2-5 scale setup">
           AutoSet
         </button>
-        <button id="triggerBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition font-medium" title="Configure edge trigger">
-          Trigger
+        <!-- Trigger: setup dialog + ON/OFF + slope -->
+        <div class="flex items-center gap-1 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-700">
+          <button id="triggerBtn" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 transition font-medium" title="Configure edge trigger (channel, slope, level)">
+            Trigger
+          </button>
+          <button id="triggerToggleBtn" class="px-2 py-1 rounded border bg-neutral-800 text-neutral-400 border-neutral-600 font-semibold transition" title="Trigger ON / OFF">Trig OFF</button>
+          <button id="triggerSlopeBtn" class="px-2 py-1 rounded border border-neutral-600 bg-neutral-800 text-neutral-400 hover:bg-neutral-700 transition" title="Click to switch trigger slope (rising / falling)">↑ Rising</button>
+        </div>
+
+        <!-- Low-pass filter: dialog + ON/OFF -->
+        <div class="flex items-center gap-1 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-700">
+          <button id="filterBtn" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 transition font-medium max-w-[150px] truncate" title="Low-pass filter (-3 dB cutoff)">Filter</button>
+          <button id="filterToggleBtn" class="px-2 py-1 rounded border bg-neutral-800 text-neutral-400 border-neutral-600 font-semibold transition" title="Filter ON / OFF for the active channel">LPF OFF</button>
+        </div>
+
+        <button id="edgeMarksBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 border border-transparent rounded text-neutral-200 transition font-medium" title="Mark 10% / 90% levels and rise / fall edges (tr / tf) on the active channel">
+          Edge Marks
         </button>
         <button id="fitViewBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Fit View (Shortcut: F)">
           Fit (F)
@@ -114,7 +137,7 @@
         </button>
       </div>
 
-      <div class="flex items-center gap-1.5">
+      <div class="flex items-center gap-1.5 shrink-0">
         <!-- Export Actions -->
         <div class="relative group">
           <button class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 flex items-center gap-1 transition">
@@ -195,6 +218,14 @@
           <div class="flex items-center justify-between mb-2">
             <span class="text-[11px] font-bold uppercase tracking-wider text-cyan-400">Live Measurements</span>
             <select id="measChannelSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white max-w-[140px] truncate" title="Select channel to measure"></select>
+          </div>
+          <div class="flex items-center justify-between mb-2 text-[11px]">
+            <span class="text-neutral-400">Gate</span>
+            <select id="measGateSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white">
+              <option value="view">View Window</option>
+              <option value="cursors">Cursors X1~X2</option>
+              <option value="entire">Entire Data</option>
+            </select>
           </div>
           <div id="measurementsPanel">
             <div class="text-xs text-neutral-500">Waiting for data...</div>
@@ -421,6 +452,10 @@
       <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-sm w-full p-5">
         <h2 class="text-base font-bold text-neutral-100 mb-3">Oscilloscope Trigger Setup</h2>
         <div class="space-y-3 text-xs">
+          <div class="flex items-center gap-2">
+            <input type="checkbox" id="trigEnableChk" class="cursor-pointer" checked />
+            <label for="trigEnableChk" class="text-neutral-200 font-medium">Trigger enabled</label>
+          </div>
           <div>
             <label class="block text-neutral-400 mb-1">Source Channel</label>
             <select id="trigChannelSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
@@ -440,6 +475,70 @@
         <div class="flex justify-end gap-2 mt-5">
           <button id="triggerCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
           <button id="triggerApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Align View to Trigger</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Low-pass Filter Modal -->
+    <div id="filterModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-md w-full p-5">
+        <h2 class="text-base font-bold text-neutral-100 mb-1">Low-pass Filter <span class="text-cyan-400 font-mono text-sm">(-3 dB)</span></h2>
+        <p class="text-[11px] text-neutral-500 mb-3">Attenuates content above the cutoff; the response is -3 dB (70.7 %) exactly at the cutoff frequency.</p>
+        <div class="space-y-3 text-xs">
+          <div>
+            <label class="block text-neutral-400 mb-1">Apply to</label>
+            <select id="filterScopeSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
+              <option value="active">Active channel</option>
+              <option value="visible">All visible input channels</option>
+              <option value="all">All input channels</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Cutoff frequency (-3 dB)</label>
+            <div class="flex gap-2">
+              <input id="filterCutoffInput" type="number" min="0" step="any" class="flex-1 bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" value="10" />
+              <select id="filterUnitSelect" class="w-24 bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
+                <option value="1">Hz</option>
+                <option value="1000" selected>kHz</option>
+                <option value="1000000">MHz</option>
+              </select>
+            </div>
+            <div id="filterPresets" class="flex flex-wrap gap-1 mt-1.5">
+              <button type="button" data-hz="100" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">100 Hz</button>
+              <button type="button" data-hz="1000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">1 kHz</button>
+              <button type="button" data-hz="10000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">10 kHz</button>
+              <button type="button" data-hz="100000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">100 kHz</button>
+              <button type="button" data-hz="1000000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">1 MHz</button>
+              <button type="button" data-hz="20000000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">20 MHz</button>
+            </div>
+            <div id="filterNyquistHint" class="text-[10px] text-neutral-500 mt-1"></div>
+          </div>
+          <div>
+            <label class="block text-neutral-400 mb-1">Poles (steepness)</label>
+            <select id="filterOrderSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
+              <option value="1">1 pole (gentle)</option>
+              <option value="2" selected>2 poles</option>
+              <option value="4">4 poles (steep)</option>
+            </select>
+            <div id="filterRolloffHint" class="text-[10px] text-neutral-500 mt-1"></div>
+          </div>
+          <div class="flex items-start gap-2">
+            <input type="checkbox" id="filterZeroPhaseChk" class="cursor-pointer mt-0.5" checked />
+            <label for="filterZeroPhaseChk" class="text-neutral-300">Zero-phase (no time delay)
+              <span class="block text-[10px] text-neutral-500">Filters forward and backward so edges and cursors stay aligned with the unfiltered channels. Turn off to see the real causal delay.</span>
+            </label>
+          </div>
+          <div class="text-[10px] text-neutral-500 border-t border-neutral-800 pt-2">
+            Measurements, FFT, Math channels and CSV export use the filtered samples. The original data is kept and restored by <b>Remove filter</b>.
+          </div>
+          <div id="filterError" class="hidden p-2 rounded bg-red-950/80 border border-red-700/80 text-red-200 text-xs font-mono"></div>
+        </div>
+        <div class="flex justify-between gap-2 mt-5">
+          <button id="filterRemoveBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-red-300 text-xs">Remove filter</button>
+          <div class="flex gap-2">
+            <button id="filterCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
+            <button id="filterApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Apply</button>
+          </div>
         </div>
       </div>
     </div>

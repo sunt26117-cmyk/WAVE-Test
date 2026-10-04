@@ -4,7 +4,8 @@
  * math definitions, and FFT/Motor configuration.
  */
 
-import { TabState, WaveformChannel, AnnotationItem } from '../types/models';
+import { TabState, WaveformChannel, AnnotationItem, ChannelFilterSpec } from '../types/models';
+import { lowPassFilter } from '../modules/filter';
 import { evaluateMathExpression } from '../modules/mathParser';
 
 export interface SerializedChannel {
@@ -21,6 +22,8 @@ export interface SerializedChannel {
   fs: number | null;
   dt: number | null;
   metadata: any;
+  /** Low-pass filter applied to this channel. `v` then holds the ORIGINAL samples. */
+  filter?: ChannelFilterSpec;
   // Encoded Float arrays
   t: number[];
   v: number[];
@@ -42,6 +45,7 @@ export interface SerializedSession {
     motorConfig: any;
     triggerConfig: any;
     separateView: boolean;
+    showEdgeMarks?: boolean;
   }[];
   activeTabIndex: number;
 }
@@ -56,7 +60,8 @@ export function serializeSession(tabs: TabState[], activeTabIndex: number): stri
     for (const [id, ch] of Object.entries(tab.channels)) {
       // Convert Float32Array and Float64Array to standard arrays (or downsample if huge)
       const tArr = Array.from(ch.t);
-      const vArr = Array.from(ch.v);
+      // Always store the unfiltered samples; the filter is re-applied on load.
+      const vArr = Array.from(ch.vOriginal ?? ch.v);
 
       serializedChannels[id] = {
         id: ch.id,
@@ -72,6 +77,7 @@ export function serializeSession(tabs: TabState[], activeTabIndex: number): stri
         fs: ch.fs,
         dt: ch.dt,
         metadata: ch.metadata,
+        filter: ch.filter,
         t: tArr,
         v: vArr,
       };
@@ -90,6 +96,7 @@ export function serializeSession(tabs: TabState[], activeTabIndex: number): stri
       motorConfig: tab.motorConfig,
       triggerConfig: tab.triggerConfig,
       separateView: tab.separateView,
+      showEdgeMarks: tab.showEdgeMarks,
     };
   });
 
@@ -130,6 +137,17 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
         t: new Float64Array(sCh.t),
         v: new Float32Array(sCh.v),
       };
+      if (sCh.filter && !sCh.isMath) {
+        const ch = channels[id];
+        try {
+          ch.vOriginal = ch.v;
+          ch.v = lowPassFilter(ch.t, ch.vOriginal, sCh.filter);
+          ch.filter = { ...sCh.filter };
+        } catch (e) {
+          console.warn(`Could not re-apply filter on ${id}:`, e);
+          ch.vOriginal = undefined;
+        }
+      }
     }
 
     // Deterministically recompute Math channels if expression is present
@@ -179,6 +197,7 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
       },
       measurementGate: 'view',
       separateView: !!tab.separateView,
+      showEdgeMarks: !!tab.showEdgeMarks,
     };
   });
 

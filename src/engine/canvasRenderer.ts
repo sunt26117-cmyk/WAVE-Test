@@ -11,6 +11,7 @@ import {
   HarmonicMarker,
   ViewState,
 } from '../types/models';
+import type { EdgeMarks } from '../modules/measurements';
 
 export interface PlotArea {
   x: number;
@@ -101,6 +102,74 @@ export function getPlotArea(width: number, height: number): PlotArea {
     width: Math.max(10, width - left - right),
     height: Math.max(10, height - top - bottom),
   };
+}
+
+/** Channels that are currently drawn, in draw order. */
+export function getVisibleChannels(tab: TabState): WaveformChannel[] {
+  return tab.drawOrder.map((id) => tab.channels[id]).filter((c): c is WaveformChannel => !!c && c.visible);
+}
+
+/**
+ * The channel the vertical axis, hover readout and measurements refer to.
+ * The selected channel wins only while it is visible; otherwise the first visible one
+ * is used, so hiding CH1 never leaves CH2 plotted against CH1's axis.
+ */
+export function getActiveChannel(tab: TabState): WaveformChannel | undefined {
+  const sel = tab.selectedMeasurementChannelId ? tab.channels[tab.selectedMeasurementChannelId] : undefined;
+  if (sel && sel.visible) return sel;
+  const vis = getVisibleChannels(tab);
+  if (vis.length) return vis[0];
+  return sel || tab.channels[tab.drawOrder[0]];
+}
+
+/** Channel that provides the time axis: first visible channel, else the first channel. */
+export function getTimeBaseChannel(tab: TabState): WaveformChannel | undefined {
+  const vis = getVisibleChannels(tab);
+  return vis[0] || tab.channels[tab.drawOrder[0]];
+}
+
+/**
+ * Channel the Y cursors measure. An explicit choice is honoured while that channel is
+ * visible; "Auto" (trackingChannel null / '') follows the active channel.
+ */
+export function getCursorChannel(tab: TabState): WaveformChannel | undefined {
+  const id = tab.cursors.trackingChannel;
+  const explicit = id ? tab.channels[id] : undefined;
+  if (explicit && explicit.visible) return explicit;
+  return getActiveChannel(tab);
+}
+
+/** Subplot rectangles when "Separate" mode is active, otherwise null. */
+export function computeSubplotAreas(tab: TabState, p: PlotArea): Map<string, PlotArea> | null {
+  const vis = getVisibleChannels(tab);
+  if (!tab.separateView || vis.length <= 1) return null;
+  const gap = 12;
+  const subH = (p.height - (vis.length - 1) * gap) / vis.length;
+  const map = new Map<string, PlotArea>();
+  vis.forEach((ch, idx) => {
+    map.set(ch.id, { x: p.x, y: p.y + idx * (subH + gap), width: p.width, height: subH });
+  });
+  return map;
+}
+
+/** Plot rectangle in which a channel's own vertical scale applies. */
+export function getChannelArea(tab: TabState, p: PlotArea, ch: WaveformChannel): PlotArea {
+  const areas = computeSubplotAreas(tab, p);
+  return (areas && areas.get(ch.id)) || p;
+}
+
+/** Linear interpolation of a channel at a given time. Null when outside the record. */
+export function sampleAt(ch: WaveformChannel, time: number): number | null {
+  const n = ch.t.length;
+  if (n === 0 || time < ch.t[0] || time > ch.t[n - 1]) return null;
+  const i = timeToIndex(ch, time);
+  const j = ch.t[i] > time ? i - 1 : i + 1;
+  if (j < 0 || j >= n) return Number.isFinite(ch.v[i]) ? ch.v[i] : null;
+  const t0 = ch.t[i], t1 = ch.t[j];
+  const v0 = ch.v[i], v1 = ch.v[j];
+  if (!Number.isFinite(v0)) return null;
+  if (!Number.isFinite(v1) || t1 === t0) return v0;
+  return v0 + ((v1 - v0) * (time - t0)) / (t1 - t0);
 }
 
 /**
@@ -534,19 +603,22 @@ export function drawSpectrum(
 }
 
 /**
- * Draws horizontal trigger line indicator.
+ * Draws the horizontal trigger level line and, when the trigger event was located,
+ * a vertical marker at the trigger time with a dot on the crossing.
  */
 export function drawTriggerLine(
   ctx: CanvasRenderingContext2D,
   tab: TabState,
   p: PlotArea,
-  theme: RenderTheme
+  theme: RenderTheme,
+  trigTime: number | null = null
 ): void {
   const trig = tab.triggerConfig;
   if (!trig.enabled || !trig.channelId) return;
 
   const ch = tab.channels[trig.channelId];
-  if (!ch) return;
+  if (!ch || !ch.visible) return;
+  const area = getChannelArea(tab, p, ch);
 
   const vRange = ch.vMax - ch.vMin;
   if (vRange <= 0) return;
@@ -554,34 +626,81 @@ export function drawTriggerLine(
   const yFrac = (trig.level - ch.vMin) / vRange;
   if (yFrac < 0 || yFrac > 1) return;
 
-  const y = p.y + p.height - yFrac * p.height;
+  const y = area.y + area.height - yFrac * area.height;
+  const rising = trig.type === 'rising';
 
   ctx.save();
   ctx.strokeStyle = theme.trigger;
   ctx.setLineDash([5, 5]);
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(p.x, y);
-  ctx.lineTo(p.x + p.width, y);
+  ctx.moveTo(area.x, y);
+  ctx.lineTo(area.x + area.width, y);
   ctx.stroke();
 
   // Trigger Arrow on left axis
+  ctx.setLineDash([]);
   ctx.fillStyle = theme.trigger;
   ctx.beginPath();
-  ctx.moveTo(p.x - 2, y);
-  ctx.lineTo(p.x - 10, y - 6);
-  ctx.lineTo(p.x - 10, y + 6);
+  ctx.moveTo(area.x - 2, y);
+  ctx.lineTo(area.x - 10, y - 6);
+  ctx.lineTo(area.x - 10, y + 6);
   ctx.closePath();
   ctx.fill();
 
   ctx.font = '10px Consolas, monospace';
   ctx.fillStyle = theme.trigger;
-  ctx.fillText(`T: ${trig.level.toFixed(2)}V`, p.x + 8, y - 4);
+  ctx.textAlign = 'left';
+  ctx.fillText(`T${rising ? '↑' : '↓'} ${formatEng(trig.level, ch.unit, 3)} [${ch.name}]`, area.x + 8, y - 4);
+
+  // Trigger event marker
+  if (trigTime !== null && ch.t.length > 1) {
+    const startIdx = Math.max(0, Math.min(ch.t.length - 1, tab.view.startIndex));
+    const endIdx = Math.max(startIdx, Math.min(ch.t.length - 1, tab.view.endIndex - 1));
+    const t0 = indexToTime(ch, startIdx);
+    const dur = indexToTime(ch, endIdx) - t0;
+    if (dur > 0 && trigTime >= t0 && trigTime <= t0 + dur) {
+      const x = area.x + ((trigTime - t0) / dur) * area.width;
+      ctx.beginPath();
+      ctx.rect(area.x, area.y, area.width, area.height);
+      ctx.clip();
+      ctx.setLineDash([2, 4]);
+      ctx.strokeStyle = theme.trigger;
+      ctx.beginPath();
+      ctx.moveTo(x, area.y);
+      ctx.lineTo(x, area.y + area.height);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // flag at the top
+      ctx.beginPath();
+      ctx.moveTo(x - 6, area.y);
+      ctx.lineTo(x + 6, area.y);
+      ctx.lineTo(x, area.y + 9);
+      ctx.closePath();
+      ctx.fill();
+      // dot on the crossing
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      const label = `Trig ${formatEng(trigTime, 's', 4)}`;
+      ctx.font = 'bold 10px Consolas, monospace';
+      const tw = ctx.measureText(label).width;
+      const lx = Math.min(x + 8, area.x + area.width - tw - 6);
+      ctx.fillStyle = 'rgba(20,20,20,0.85)';
+      ctx.fillRect(lx - 3, area.y + 12, tw + 6, 13);
+      ctx.fillStyle = theme.trigger;
+      ctx.fillText(label, lx, area.y + 22);
+    }
+  }
   ctx.restore();
 }
 
 /**
  * Draws X (Time) and Y (Voltage) cursors and readout banner.
+ * X cursors read every visible channel; Y cursors belong to one channel (see getCursorChannel).
  */
 export function drawCursors(
   ctx: CanvasRenderingContext2D,
@@ -598,14 +717,14 @@ export function drawCursors(
   const showX = cursorType === 'x' || cursorType === 'xy';
   const showY = cursorType === 'y' || cursorType === 'xy';
 
-  const primaryCh = tab.channels[tab.drawOrder[0]];
-  if (!primaryCh) return;
+  const timeBase = getTimeBaseChannel(tab);
+  if (!timeBase) return;
 
-  const timeStart = indexToTime(primaryCh, tab.view.startIndex);
-  const timeSpan = Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - timeStart);
+  const timeStart = indexToTime(timeBase, tab.view.startIndex);
+  const timeSpan = Math.max(0, indexToTime(timeBase, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - timeStart);
 
-  const trackingId = cursors.trackingChannel || tab.selectedMeasurementChannelId || tab.drawOrder[0];
-  const targetCh = tab.channels[trackingId] || primaryCh;
+  const targetCh = getCursorChannel(tab);
+  const yArea = targetCh ? getChannelArea(tab, p, targetCh) : p;
 
   ctx.save();
 
@@ -614,41 +733,27 @@ export function drawCursors(
     let x1Px: number | null = null;
     let x2Px: number | null = null;
 
-    if (cursors.x1 !== null) {
-      const x1Frac = (cursors.x1 - timeStart) / timeSpan;
-      x1Px = p.x + x1Frac * p.width;
-      if (x1Px >= p.x && x1Px <= p.x + p.width) {
+    const drawX = (value: number, label: string, labelY: number): number => {
+      const px = p.x + ((value - timeStart) / timeSpan) * p.width;
+      if (px >= p.x && px <= p.x + p.width) {
         ctx.strokeStyle = theme.cursor;
         ctx.setLineDash([6, 3]);
         ctx.lineWidth = 1.2;
         ctx.beginPath();
-        ctx.moveTo(x1Px, p.y);
-        ctx.lineTo(x1Px, p.y + p.height);
+        ctx.moveTo(px, p.y);
+        ctx.lineTo(px, p.y + p.height);
         ctx.stroke();
+        ctx.setLineDash([]);
 
         ctx.fillStyle = theme.cursor;
         ctx.font = 'bold 11px Consolas, monospace';
-        ctx.fillText(`X1: ${formatEng(cursors.x1, 's', 3)}`, x1Px + 4, p.y + 14);
+        ctx.fillText(`${label}: ${formatEng(value, 's', 3)}`, px + 4, labelY);
       }
-    }
+      return px;
+    };
 
-    if (cursors.x2 !== null) {
-      const x2Frac = (cursors.x2 - timeStart) / timeSpan;
-      x2Px = p.x + x2Frac * p.width;
-      if (x2Px >= p.x && x2Px <= p.x + p.width) {
-        ctx.strokeStyle = theme.cursor;
-        ctx.setLineDash([6, 3]);
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        ctx.moveTo(x2Px, p.y);
-        ctx.lineTo(x2Px, p.y + p.height);
-        ctx.stroke();
-
-        ctx.fillStyle = theme.cursor;
-        ctx.font = 'bold 11px Consolas, monospace';
-        ctx.fillText(`X2: ${formatEng(cursors.x2, 's', 3)}`, x2Px + 4, p.y + 28);
-      }
-    }
+    if (cursors.x1 !== null) x1Px = drawX(cursors.x1, 'X1', p.y + 14);
+    if (cursors.x2 !== null) x2Px = drawX(cursors.x2, 'X2', p.y + 28);
 
     // Shaded region between X1 and X2
     if (x1Px !== null && x2Px !== null) {
@@ -659,68 +764,71 @@ export function drawCursors(
         ctx.fillRect(left, p.y, right - left, p.height);
       }
     }
+
+    // Intersection dots: every visible channel at X1 / X2
+    for (const ch of getVisibleChannels(tab)) {
+      const area = getChannelArea(tab, p, ch);
+      const vRange = ch.vMax - ch.vMin;
+      if (vRange <= 0) continue;
+      for (const cx of [cursors.x1, cursors.x2]) {
+        if (cx === null) continue;
+        const val = sampleAt(ch, cx);
+        if (val === null) continue;
+        const px = p.x + ((cx - timeStart) / timeSpan) * p.width;
+        const py = area.y + area.height - ((val - ch.vMin) / vRange) * area.height;
+        if (px < p.x || px > p.x + p.width || py < area.y || py > area.y + area.height) continue;
+        ctx.fillStyle = ch.color;
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(px, py, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
   }
 
-  // Y Cursors (Voltage / Amplitude domain)
+  // Y Cursors (Voltage / Amplitude domain) on the tracked channel
   if (showY && targetCh) {
     const vRange = targetCh.vMax - targetCh.vMin;
     if (vRange > 0) {
       let y1Px: number | null = null;
       let y2Px: number | null = null;
 
-      if (cursors.y1 !== null) {
-        const y1Frac = (cursors.y1 - targetCh.vMin) / vRange;
-        y1Px = p.y + p.height - y1Frac * p.height;
-        if (y1Px >= p.y && y1Px <= p.y + p.height) {
+      const drawY = (value: number, label: string, tagBelow: boolean): number => {
+        const py = yArea.y + yArea.height - ((value - targetCh.vMin) / vRange) * yArea.height;
+        if (py >= yArea.y && py <= yArea.y + yArea.height) {
           ctx.strokeStyle = '#00e676';
           ctx.setLineDash([6, 3]);
           ctx.lineWidth = 1.2;
           ctx.beginPath();
-          ctx.moveTo(p.x, y1Px);
-          ctx.lineTo(p.x + p.width, y1Px);
+          ctx.moveTo(yArea.x, py);
+          ctx.lineTo(yArea.x + yArea.width, py);
           ctx.stroke();
+          ctx.setLineDash([]);
 
-          // Handle tag on right
           ctx.font = 'bold 11px Consolas, monospace';
-          const label = `Y1: ${formatEng(cursors.y1, targetCh.unit, 3)}`;
-          const tw = ctx.measureText(label).width;
+          const text = `${label}: ${formatEng(value, targetCh.unit, 3)}`;
+          const tw = ctx.measureText(text).width;
+          const ty = tagBelow ? py + 2 : py - 14;
           ctx.fillStyle = '#00e676';
-          ctx.fillRect(p.x + p.width - tw - 12, y1Px - 14, tw + 8, 14);
+          ctx.fillRect(yArea.x + yArea.width - tw - 12, ty, tw + 8, 14);
           ctx.fillStyle = '#000000';
-          ctx.fillText(label, p.x + p.width - tw - 8, y1Px - 3);
+          ctx.fillText(text, yArea.x + yArea.width - tw - 8, ty + 11);
         }
-      }
+        return py;
+      };
 
-      if (cursors.y2 !== null) {
-        const y2Frac = (cursors.y2 - targetCh.vMin) / vRange;
-        y2Px = p.y + p.height - y2Frac * p.height;
-        if (y2Px >= p.y && y2Px <= p.y + p.height) {
-          ctx.strokeStyle = '#00e676';
-          ctx.setLineDash([6, 3]);
-          ctx.lineWidth = 1.2;
-          ctx.beginPath();
-          ctx.moveTo(p.x, y2Px);
-          ctx.lineTo(p.x + p.width, y2Px);
-          ctx.stroke();
-
-          // Handle tag on right
-          ctx.font = 'bold 11px Consolas, monospace';
-          const label = `Y2: ${formatEng(cursors.y2, targetCh.unit, 3)}`;
-          const tw = ctx.measureText(label).width;
-          ctx.fillStyle = '#00e676';
-          ctx.fillRect(p.x + p.width - tw - 12, y2Px + 2, tw + 8, 14);
-          ctx.fillStyle = '#000000';
-          ctx.fillText(label, p.x + p.width - tw - 8, y2Px + 13);
-        }
-      }
+      if (cursors.y1 !== null) y1Px = drawY(cursors.y1, 'Y1', false);
+      if (cursors.y2 !== null) y2Px = drawY(cursors.y2, 'Y2', true);
 
       // Shaded region between Y1 and Y2
       if (y1Px !== null && y2Px !== null) {
-        const top = Math.max(p.y, Math.min(y1Px, y2Px));
-        const bottom = Math.min(p.y + p.height, Math.max(y1Px, y2Px));
+        const top = Math.max(yArea.y, Math.min(y1Px, y2Px));
+        const bottom = Math.min(yArea.y + yArea.height, Math.max(y1Px, y2Px));
         if (bottom > top) {
           ctx.fillStyle = 'rgba(0, 230, 118, 0.12)';
-          ctx.fillRect(p.x, top, p.width, bottom - top);
+          ctx.fillRect(yArea.x, top, yArea.width, bottom - top);
         }
       }
     }
@@ -736,30 +844,44 @@ function renderCursorReadoutOverlay(
   ctx: CanvasRenderingContext2D,
   tab: TabState,
   p: PlotArea,
-  targetCh: WaveformChannel,
+  targetCh: WaveformChannel | undefined,
   showX: boolean,
   showY: boolean
 ): void {
   const { cursors } = tab;
-  const lines: string[] = [];
+  const lines: Array<{ text: string; color: string }> = [];
 
   if (showX && cursors.x1 !== null && cursors.x2 !== null) {
     const dt = Math.abs(cursors.x2 - cursors.x1);
     const freq = dt > 0 ? formatEng(1 / dt, 'Hz', 2) : '∞';
-    lines.push(`X1: ${formatEng(cursors.x1, 's', 4)}  X2: ${formatEng(cursors.x2, 's', 4)}`);
-    lines.push(`ΔT: ${formatEng(dt, 's', 4)}  (1/ΔT: ${freq})`);
+    lines.push({ text: `X1: ${formatEng(cursors.x1, 's', 4)}  X2: ${formatEng(cursors.x2, 's', 4)}`, color: '#00e5ff' });
+    lines.push({ text: `ΔT: ${formatEng(dt, 's', 4)}  (1/ΔT: ${freq})`, color: '#00e5ff' });
+
+    // Value of every visible channel at X1 / X2
+    for (const ch of getVisibleChannels(tab).slice(0, 8)) {
+      const a = sampleAt(ch, cursors.x1);
+      const b = sampleAt(ch, cursors.x2);
+      if (a === null || b === null) continue;
+      lines.push({
+        text: `${ch.name}: ${formatEng(a, ch.unit, 3)} → ${formatEng(b, ch.unit, 3)}  Δ${formatEng(b - a, ch.unit, 3)}`,
+        color: ch.color,
+      });
+    }
   }
 
   if (showY && cursors.y1 !== null && cursors.y2 !== null && targetCh) {
     const dv = Math.abs(cursors.y2 - cursors.y1);
-    lines.push(`[${targetCh.name}] Y1: ${formatEng(cursors.y1, targetCh.unit, 3)}  Y2: ${formatEng(cursors.y2, targetCh.unit, 3)}`);
-    lines.push(`ΔY (ΔV): ${formatEng(dv, targetCh.unit, 3)}`);
+    lines.push({
+      text: `[${targetCh.name}] Y1: ${formatEng(cursors.y1, targetCh.unit, 3)}  Y2: ${formatEng(cursors.y2, targetCh.unit, 3)}`,
+      color: '#00e676',
+    });
+    lines.push({ text: `ΔY (ΔV): ${formatEng(dv, targetCh.unit, 3)}`, color: '#00e676' });
   }
 
   if (lines.length === 0) return;
 
   ctx.font = '11px Consolas, monospace';
-  const boxW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
+  const boxW = Math.max(...lines.map((l) => ctx.measureText(l.text).width)) + 16;
   const boxH = lines.length * 16 + 10;
   const boxX = p.x + p.width - boxW - 8;
   const boxY = p.y + p.height - boxH - 8;
@@ -771,9 +893,186 @@ function renderCursorReadoutOverlay(
   ctx.strokeRect(boxX, boxY, boxW, boxH);
 
   lines.forEach((l, i) => {
-    ctx.fillStyle = i < 2 && showX ? '#00e5ff' : '#00e676';
-    ctx.fillText(l, boxX + 8, boxY + 16 + i * 16);
+    ctx.fillStyle = l.color;
+    ctx.textAlign = 'left';
+    ctx.fillText(l.text, boxX + 8, boxY + 16 + i * 16);
   });
+}
+
+/**
+ * Oscilloscope-style edge annotation for one channel: dashed 10% / 90% levels, a dot at every
+ * level crossing with a dashed drop line to the time axis, and a tr / tf bracket with its value.
+ */
+export function drawEdgeMarkers(
+  ctx: CanvasRenderingContext2D,
+  tab: TabState,
+  ch: WaveformChannel,
+  p: PlotArea,
+  marks: EdgeMarks | null
+): void {
+  if (!ch.visible || ch.t.length < 2) return;
+  const area = getChannelArea(tab, p, ch);
+  const vRange = ch.vMax - ch.vMin;
+  if (vRange <= 0) return;
+
+  const startIdx = Math.max(0, Math.min(ch.t.length - 1, tab.view.startIndex));
+  const endIdx = Math.max(startIdx + 1, Math.min(ch.t.length, tab.view.endIndex));
+  const viewStart = indexToTime(ch, startIdx);
+  const viewDur = indexToTime(ch, Math.max(startIdx, endIdx - 1)) - viewStart;
+  if (!(viewDur > 0)) return;
+
+  const X = (t: number) => area.x + ((t - viewStart) / viewDur) * area.width;
+  const Y = (v: number) => area.y + area.height - ((v - ch.vMin) / vRange) * area.height;
+  const RISE = '#69f0ae';
+  const FALL = '#ff80ab';
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(area.x, area.y, area.width, area.height);
+  ctx.clip();
+  ctx.font = 'bold 10px Consolas, monospace';
+  ctx.textAlign = 'left';
+
+  const tagY = area.y + 36;
+  const drawTag = (text: string) => {
+    ctx.font = 'bold 10px Consolas, monospace';
+    const tw = ctx.measureText(text).width;
+    ctx.fillStyle = 'rgba(20,20,20,0.85)';
+    ctx.fillRect(area.x + 4, tagY - 11, tw + 8, 14);
+    ctx.strokeStyle = ch.color;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(area.x + 4, tagY - 11, tw + 8, 14);
+    ctx.fillStyle = ch.color;
+    ctx.fillText(text, area.x + 8, tagY);
+  };
+
+  const inView = marks ? marks.edges.filter((e) => e.tEnd >= viewStart && e.tStart <= viewStart + viewDur) : [];
+  if (!marks || inView.length === 0) {
+    drawTag(`Edges [${ch.name}]: no complete 10%-90% edge in view`);
+    ctx.restore();
+    return;
+  }
+
+  // 10% / 90% levels
+  const levelLine = (value: number, label: string) => {
+    const y = Y(value);
+    if (y < area.y || y > area.y + area.height) return;
+    ctx.setLineDash([3, 4]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.40)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(area.x, y);
+    ctx.lineTo(area.x + area.width, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const text = `${label} ${formatEng(value, ch.unit, 3)}`;
+    ctx.font = '10px Consolas, monospace';
+    const tw = ctx.measureText(text).width;
+    ctx.fillStyle = 'rgba(20,20,20,0.8)';
+    ctx.fillRect(area.x + area.width - tw - 10, y - 12, tw + 6, 12);
+    ctx.fillStyle = '#d0d0d0';
+    ctx.fillText(text, area.x + area.width - tw - 7, y - 3);
+  };
+  levelLine(marks.v90, '90%');
+  levelLine(marks.v10, '10%');
+
+  // Which edges to mark: all when few, otherwise only the first of each kind
+  const firstRise = inView.find((e) => e.type === 'rise');
+  const firstFall = inView.find((e) => e.type === 'fall');
+  const list = inView.length <= 12 ? inView : ([firstRise, firstFall].filter(Boolean) as typeof inView);
+
+  for (const e of list) {
+    const c = e.type === 'rise' ? RISE : FALL;
+    const lvl1 = e.type === 'rise' ? marks.v10 : marks.v90;
+    const lvl2 = e.type === 'rise' ? marks.v90 : marks.v10;
+    const pts: Array<[number, number]> = [
+      [X(e.tStart), Y(lvl1)],
+      [X(e.tEnd), Y(lvl2)],
+    ];
+    ctx.strokeStyle = c;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 3]);
+    for (const [px, py] of pts) {
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(px, area.y + area.height);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    for (const [px, py] of pts) {
+      ctx.fillStyle = c;
+      ctx.beginPath();
+      ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#000';
+      ctx.stroke();
+    }
+  }
+
+  // tr / tf brackets (first of each kind), stacked above the time axis
+  const bracket = (e: typeof inView[number] | undefined, row: number) => {
+    if (!e) return;
+    const c = e.type === 'rise' ? RISE : FALL;
+    const x1 = X(e.tStart);
+    const x2 = X(e.tEnd);
+    const y = area.y + area.height - 12 - row * 18;
+    if (y < area.y + 40) return;
+    ctx.strokeStyle = c;
+    ctx.fillStyle = c;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(x1, y);
+    ctx.lineTo(x2, y);
+    ctx.stroke();
+    // arrow heads pointing inward (or ticks when the edge is only a few pixels wide)
+    const head = Math.min(5, Math.max(0, (x2 - x1) / 3));
+    ctx.beginPath();
+    ctx.moveTo(x1, y);
+    ctx.lineTo(x1 + head, y - 3);
+    ctx.lineTo(x1 + head, y + 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x2, y);
+    ctx.lineTo(x2 - head, y - 3);
+    ctx.lineTo(x2 - head, y + 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x1, y - 4);
+    ctx.lineTo(x1, y + 4);
+    ctx.moveTo(x2, y - 4);
+    ctx.lineTo(x2, y + 4);
+    ctx.stroke();
+
+    const text = `${e.type === 'rise' ? 'tr' : 'tf'} ${formatEng(e.duration, 's', 3)}`;
+    ctx.font = 'bold 11px Consolas, monospace';
+    const tw = ctx.measureText(text).width;
+    let tx = (x1 + x2) / 2 - tw / 2;
+    tx = Math.max(area.x + 4, Math.min(area.x + area.width - tw - 8, tx));
+    ctx.fillStyle = 'rgba(20,20,20,0.88)';
+    ctx.fillRect(tx - 3, y - 20, tw + 6, 14);
+    ctx.strokeStyle = c;
+    ctx.strokeRect(tx - 3, y - 20, tw + 6, 14);
+    ctx.fillStyle = c;
+    ctx.fillText(text, tx, y - 9);
+  };
+  bracket(firstRise, 1);
+  bracket(firstFall, 0);
+
+  const avg = (type: 'rise' | 'fall') => {
+    const xs = inView.filter((e) => e.type === type);
+    return xs.length ? xs.reduce((a, b) => a + b.duration, 0) / xs.length : null;
+  };
+  const ar = avg('rise');
+  const af = avg('fall');
+  const parts = [`Edges [${ch.name}]`, `${marks.riseCount}↑ ${marks.fallCount}↓`];
+  if (ar !== null) parts.push(`avg tr ${formatEng(ar, 's', 3)}`);
+  if (af !== null) parts.push(`avg tf ${formatEng(af, 's', 3)}`);
+  if (inView.length > list.length) parts.push(`(first of each marked)`);
+  drawTag(parts.join('  '));
+
+  ctx.restore();
 }
 
 /**
@@ -929,9 +1228,8 @@ export function drawAxisLabels(
     }
   } else {
     // Time labels on bottom
-    const targetId = tab.selectedMeasurementChannelId || tab.drawOrder[0];
-    const activeCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
-    const primaryCh = tab.channels[tab.drawOrder[0]];
+    const activeCh = getActiveChannel(tab);
+    const primaryCh = getTimeBaseChannel(tab);
     const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
     const tEnd = primaryCh ? indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) : tStart;
     const tSpan = Math.max(0, tEnd - tStart);
@@ -958,6 +1256,12 @@ export function drawAxisLabels(
         ctx.fillStyle = activeCh.color;
         ctx.fillText(formatEng(v, activeCh.unit, 2), p.x - 8, y + 4);
       }
+
+      // Say whose axis this is (only matters when several channels are drawn)
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 11px Consolas, monospace';
+      ctx.fillStyle = activeCh.color;
+      ctx.fillText(activeCh.name, p.x - 60, p.y - 6);
     }
   }
 

@@ -7,7 +7,7 @@ import './index.css';
 import { OscilloscopeApp } from './engine/uiController';
 import { runAllTests } from './tests/testSuite';
 import { TabState, WaveformChannel } from './types/models';
-import { OVERLAP_COLORS } from './engine/canvasRenderer';
+import { OVERLAP_COLORS, getActiveChannel } from './engine/canvasRenderer';
 
 let app: OscilloscopeApp;
 
@@ -20,6 +20,7 @@ window.addEventListener('DOMContentLoaded', () => {
   // Bind Main Toolbars
   bindToolbarActions();
   bindModals();
+  bindFilterModal();
 
   // Run automated test suite in background to verify algorithm correctness
   const testResults = runAllTests();
@@ -125,6 +126,25 @@ function bindToolbarActions() {
     const tab = app.getActiveTab();
     if (!tab) return;
     openTriggerModal(tab);
+  });
+
+  // Trigger ON/OFF and slope quick buttons
+  document.getElementById('triggerToggleBtn')?.addEventListener('click', () => app.toggleTrigger());
+  document.getElementById('triggerSlopeBtn')?.addEventListener('click', () => app.toggleTriggerSlope());
+
+  // Edge marks (10% / 90% levels, tr / tf)
+  document.getElementById('edgeMarksBtn')?.addEventListener('click', () => app.toggleEdgeMarks());
+
+  // Low-pass filter
+  document.getElementById('filterBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    openFilterModal(tab);
+  });
+  document.getElementById('filterToggleBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    if (!app.toggleFilter()) openFilterModal(tab);
   });
 
   // Math Channel Modal
@@ -286,13 +306,17 @@ function bindModals() {
     const typeSel = document.getElementById('trigSlopeSelect') as HTMLSelectElement;
     const levelInput = document.getElementById('trigLevelInput') as HTMLInputElement;
 
-    tab.triggerConfig.enabled = true;
+    const enableChk = document.getElementById('trigEnableChk') as HTMLInputElement;
+
+    tab.triggerConfig.enabled = enableChk ? enableChk.checked : true;
     tab.triggerConfig.channelId = chSel.value;
     tab.triggerConfig.type = typeSel.value as 'rising' | 'falling';
     tab.triggerConfig.level = parseFloat(levelInput.value) || 0;
 
-    app.applyTrigger();
     document.getElementById('triggerModal')!.style.display = 'none';
+    if (tab.triggerConfig.enabled) app.applyTrigger();
+    app.renderSidebar();
+    app.draw();
   });
   document.getElementById('triggerCancelBtn')?.addEventListener('click', () => {
     document.getElementById('triggerModal')!.style.display = 'none';
@@ -365,7 +389,106 @@ function openTriggerModal(tab: TabState) {
   const slopeSel = document.getElementById('trigSlopeSelect') as HTMLSelectElement;
   slopeSel.value = tab.triggerConfig.type;
 
+  const enableChk = document.getElementById('trigEnableChk') as HTMLInputElement;
+  if (enableChk) enableChk.checked = true; // opening the dialog and applying means "use it"
+
   modal.style.display = 'flex';
+}
+
+// --- Low-pass filter dialog ---
+function openFilterModal(tab: TabState) {
+  const modal = document.getElementById('filterModal');
+  if (!modal) return;
+
+  const last = app.getLastFilter();
+  const active = getActiveChannel(tab);
+  const spec = active?.filter || last?.spec;
+
+  const cutoff = document.getElementById('filterCutoffInput') as HTMLInputElement;
+  const unit = document.getElementById('filterUnitSelect') as HTMLSelectElement;
+  const order = document.getElementById('filterOrderSelect') as HTMLSelectElement;
+  const zero = document.getElementById('filterZeroPhaseChk') as HTMLInputElement;
+  const scope = document.getElementById('filterScopeSelect') as HTMLSelectElement;
+  const err = document.getElementById('filterError');
+  const hint = document.getElementById('filterNyquistHint');
+
+  if (spec) {
+    const f = spec.cutoffHz;
+    const u = f >= 1e6 ? 1e6 : f >= 1e3 ? 1e3 : 1;
+    unit.value = String(u);
+    cutoff.value = String(+(f / u).toPrecision(6));
+    order.value = String(spec.order);
+    zero.checked = spec.zeroPhase;
+  } else if (active && active.t.length > 2) {
+    // Sensible first guess: a decade-ish below Nyquist
+    const dt = (active.t[active.t.length - 1] - active.t[0]) / (active.t.length - 1);
+    const guess = dt > 0 ? 1 / (2 * dt) / 20 : 1000;
+    const u = guess >= 1e6 ? 1e6 : guess >= 1e3 ? 1e3 : 1;
+    unit.value = String(u);
+    cutoff.value = String(+(guess / u).toPrecision(3));
+  }
+  if (last) scope.value = last.scope;
+  if (err) err.classList.add('hidden');
+  if (hint && active && active.t.length > 2) {
+    const dt = (active.t[active.t.length - 1] - active.t[0]) / (active.t.length - 1);
+    const nyq = dt > 0 ? 1 / (2 * dt) : 0;
+    hint.textContent = nyq > 0 ? `${active.name}: Nyquist ≈ ${nyq >= 1e6 ? (nyq / 1e6).toPrecision(4) + ' MHz' : nyq >= 1e3 ? (nyq / 1e3).toPrecision(4) + ' kHz' : nyq.toPrecision(4) + ' Hz'} - choose a cutoff well below it.` : '';
+  }
+
+  modal.style.display = 'flex';
+  modal.dispatchEvent(new Event('filter-open'));
+}
+
+function bindFilterModal() {
+  const modal = document.getElementById('filterModal');
+  const err = document.getElementById('filterError');
+  const readSpec = () => {
+    const cutoff = parseFloat((document.getElementById('filterCutoffInput') as HTMLInputElement).value);
+    const unit = parseFloat((document.getElementById('filterUnitSelect') as HTMLSelectElement).value);
+    const order = parseInt((document.getElementById('filterOrderSelect') as HTMLSelectElement).value, 10) as 1 | 2 | 4;
+    const zeroPhase = (document.getElementById('filterZeroPhaseChk') as HTMLInputElement).checked;
+    return { cutoffHz: cutoff * unit, order, zeroPhase };
+  };
+  const scope = () => (document.getElementById('filterScopeSelect') as HTMLSelectElement).value as 'active' | 'visible' | 'all';
+
+  const updateRolloff = () => {
+    const hint = document.getElementById('filterRolloffHint');
+    if (!hint) return;
+    const order = parseInt((document.getElementById('filterOrderSelect') as HTMLSelectElement).value, 10);
+    const zp = (document.getElementById('filterZeroPhaseChk') as HTMLInputElement).checked;
+    hint.textContent = `Roll-off above the cutoff: ${20 * order * (zp ? 2 : 1)} dB/decade${zp ? ' (zero-phase doubles the steepness)' : ''}`;
+  };
+  document.getElementById('filterOrderSelect')?.addEventListener('change', updateRolloff);
+  document.getElementById('filterZeroPhaseChk')?.addEventListener('change', updateRolloff);
+  document.getElementById('filterModal')?.addEventListener('filter-open', updateRolloff);
+
+  document.querySelectorAll<HTMLButtonElement>('.filter-preset').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const hz = parseFloat(btn.dataset.hz || '0');
+      const u = hz >= 1e6 ? 1e6 : hz >= 1e3 ? 1e3 : 1;
+      (document.getElementById('filterUnitSelect') as HTMLSelectElement).value = String(u);
+      (document.getElementById('filterCutoffInput') as HTMLInputElement).value = String(hz / u);
+    });
+  });
+
+  document.getElementById('filterApplyBtn')?.addEventListener('click', () => {
+    const res = app.applyFilter(readSpec(), scope());
+    if (!res.ok) {
+      if (err) {
+        err.textContent = res.message || 'Filter failed.';
+        err.classList.remove('hidden');
+      }
+      return;
+    }
+    if (modal) modal.style.display = 'none';
+  });
+  document.getElementById('filterRemoveBtn')?.addEventListener('click', () => {
+    app.removeFilter(scope());
+    if (modal) modal.style.display = 'none';
+  });
+  document.getElementById('filterCancelBtn')?.addEventListener('click', () => {
+    if (modal) modal.style.display = 'none';
+  });
 }
 
 function openMathModal(tab: TabState) {
