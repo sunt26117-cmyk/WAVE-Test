@@ -171,7 +171,7 @@ export function performAutoSet(
   return {
     updatedChannels,
     view: updatedView,
-    triggerConfig,
-    statusMessage: `AutoSet applied: Trigger level ${midLevel.toFixed(3)} V, scale fitted to 1-2-5 steps.`,
+    triggerConfig: { ...triggerConfig, enabled: false },
+    statusMessage: `AutoSet applied: timebase & 1-2-5 vertical scales fitted.`,
   };
 }

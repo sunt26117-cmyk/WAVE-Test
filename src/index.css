@@ -172,9 +172,15 @@ html[data-theme="daylight"] {
 
 /* Side-by-Side Non-Overlapping Tool Drawer */
 .tool-drawer {
+  display: flex;
+  flex-direction: column;
   background-color: var(--bg-elevated);
   border-left: 1px solid var(--border-strong);
   color: var(--text-primary);
+}
+
+.tool-drawer.hidden {
+  display: none;
 }
 
 .tool-drawer-resize-handle {
@@ -284,6 +290,20 @@ html[data-theme="daylight"] {
   pointer-events: auto !important;
   background-color: transparent !important;
   border-bottom: 1px solid var(--border-strong);
+}
+
+#toolDrawerBody .modal-overlay.tool-dockable:only-child {
+  flex: 1 1 0%;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  border-bottom: none;
+}
+
+#toolDrawerBody .modal-overlay.tool-dockable:only-child > div {
+  height: 100% !important;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 #toolDrawerBody .modal-overlay.tool-dockable[style*="display: none"] {

@@ -1848,17 +1848,6 @@ export class OscilloscopeApp {
       }
     }
 
-    // 2. Check Right Trigger Handle (interactive trigger level drag)
-    const trigHandle = getTriggerHandlePosition(p, tab);
-    if (trigHandle && x >= trigHandle.x - 4 && x <= trigHandle.x + 22 && Math.abs(y - trigHandle.y) <= 9) {
-      this.dragState = {
-        type: 'trigger',
-        channelId: tab.triggerConfig.channelId,
-        area: trigHandle.area,
-      };
-      return;
-    }
-
     // 2b. Check Left Y-Axis Gutter for direct Vertical Offset dragging
     if (e.button === 0 && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
       const hit = this.findSubplotAtPoint(tab, p, y);
@@ -2065,19 +2054,6 @@ export class OscilloscopeApp {
         return;
       }
 
-      if (this.dragState.type === 'trigger') {
-        const ch = tab.channels[this.dragState.channelId];
-        if (ch) {
-          const { area } = this.dragState;
-          const fracFromBottom = Math.max(0, Math.min(1, (area.y + area.height - y) / area.height));
-          tab.triggerConfig.level = ch.vMin + fracFromBottom * (ch.vMax - ch.vMin);
-          const trigInput = document.getElementById('trigQuickLevelInput') as HTMLInputElement;
-          if (trigInput) trigInput.value = tab.triggerConfig.level.toFixed(3);
-          this.draw();
-        }
-        return;
-      }
-
       if (this.dragState.type === 'cursorX') {
         const primaryCh = tab.channels[tab.drawOrder[0]];
         const { tStart, tSpan } = getTimeBoundsForView(tab, primaryCh);
@@ -2188,11 +2164,6 @@ export class OscilloscopeApp {
           nextCursor = 'ns-resize';
           break;
         }
-      }
-
-      const trigHandle = getTriggerHandlePosition(p, tab);
-      if (trigHandle && x >= trigHandle.x - 4 && x <= trigHandle.x + 22 && Math.abs(y - trigHandle.y) <= 9) {
-        nextCursor = 'ns-resize';
       }
 
       if (nextCursor === 'crosshair' && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
@@ -3018,7 +2989,7 @@ export class OscilloscopeApp {
       }
     }
     tab.view = res.view;
-    tab.triggerConfig = res.triggerConfig;
+    tab.triggerConfig = { ...res.triggerConfig, enabled: false };
     clampCursorsToViewport(tab);
 
     this.renderSidebar();
@@ -3574,7 +3545,6 @@ export class OscilloscopeApp {
     const tbEl = document.getElementById('timebaseReadout');
     const srEl = document.getElementById('acqSampleRateReadout');
     const depthEl = document.getElementById('acqDepthReadout');
-    const trigBtn = document.getElementById('triggerQuickBtn');
     const timeBtn = document.getElementById('timeModeBtn');
     const freqBtn = document.getElementById('freqModeBtn');
     const xyBtn = document.getElementById('xyModeBtn');
@@ -3590,7 +3560,6 @@ export class OscilloscopeApp {
       if (tbEl) tbEl.innerText = '-- /div';
       if (srEl) srEl.innerText = '-- Sa/s';
       if (depthEl) depthEl.innerText = '0 pts';
-      if (trigBtn) trigBtn.innerText = 'TRIG: OFF';
       return;
     }
 
@@ -3598,19 +3567,6 @@ export class OscilloscopeApp {
     if (tbEl) tbEl.innerText = `${formatEng(tb.secPerDiv, 's', 2)}/div`;
     if (srEl) srEl.innerText = tb.sampleRate ? formatEng(tb.sampleRate, 'Sa/s', 2) : 'Non-uniform';
     if (depthEl) depthEl.innerText = `${tb.visiblePoints.toLocaleString()} / ${tb.totalPoints.toLocaleString()} pts`;
-
-    if (trigBtn) {
-      const trig = tab.triggerConfig;
-      const trigCh = tab.channels[trig.channelId];
-      if (trig.enabled && trigCh) {
-        const arrow = trig.type === 'rising' ? '↑' : '↓';
-        trigBtn.innerText = `TRIG ${trigCh.name} ${arrow} ${formatEng(trig.level, trigCh.unit, 2)}`;
-        trigBtn.className = 'px-2 py-1 bg-[#1e1610] border border-orange-500/60 rounded-sm font-mono text-[11px] text-orange-300 tabular-nums cursor-pointer';
-      } else {
-        trigBtn.innerText = 'TRIG: OFF';
-        trigBtn.className = 'px-2 py-1 bg-[#0c0f13] hover:bg-[#161b22] border border-[#222933] rounded-sm font-mono text-[11px] text-slate-400 tabular-nums cursor-pointer';
-      }
-    }
 
     // Mode toggles (Time | FFT | XY)
     const activeModeCls = 'px-2 py-0.5 rounded-sm bg-cyan-600 text-slate-950 font-semibold transition cursor-pointer whitespace-nowrap';
@@ -3664,8 +3620,6 @@ export class OscilloscopeApp {
     const measCount = `${(tab.selectedMeasurements || []).length}`;
     const measCountEl = document.getElementById('measureCountLabel');
     if (measCountEl) measCountEl.innerText = measCount;
-    const sidebarMeasCountEl = document.getElementById('sidebarMeasureCountLabel');
-    if (sidebarMeasCountEl) sidebarMeasCountEl.innerText = measCount;
 
     // Active Tool button highlights
     const tool = tab.activeTool || 'pan';
@@ -4004,42 +3958,7 @@ export class OscilloscopeApp {
       this.syncVerticalPanelOnly(activeCh);
     }
 
-    // 2. Trigger Control Panel
-    const trigEnBtn = document.getElementById('trigEnableBtn');
-    if (trigEnBtn) {
-      trigEnBtn.innerText = tab.triggerConfig.enabled ? 'ON' : 'OFF';
-      trigEnBtn.className = `px-2 py-0.5 rounded-sm border text-[10px] font-mono cursor-pointer ${
-        tab.triggerConfig.enabled
-          ? 'bg-orange-950/60 border-orange-500/70 text-orange-300 font-semibold'
-          : 'bg-[#0c0f13] border-[#222933] text-slate-400'
-      }`;
-    }
-
-    const trigChSel = document.getElementById('trigQuickChannelSelect') as HTMLSelectElement;
-    if (trigChSel) {
-      trigChSel.innerHTML = '';
-      tab.drawOrder.forEach((id, idx) => {
-        const ch = tab.channels[id];
-        if (!ch) return;
-        const opt = document.createElement('option');
-        opt.value = id;
-        opt.text = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
-        if (id === tab.triggerConfig.channelId) opt.selected = true;
-        trigChSel.appendChild(opt);
-      });
-    }
-
-    const trigSlopeBtn = document.getElementById('trigQuickSlopeBtn');
-    if (trigSlopeBtn) {
-      trigSlopeBtn.innerText = tab.triggerConfig.type === 'rising' ? '↑ Rise' : '↓ Fall';
-    }
-
-    const trigLvlInp = document.getElementById('trigQuickLevelInput') as HTMLInputElement;
-    if (trigLvlInp && document.activeElement !== trigLvlInp) {
-      trigLvlInp.value = tab.triggerConfig.level.toFixed(3);
-    }
-
-    // 3. Cursors Panel
+    // 2. Cursors Panel
     const curChSel = document.getElementById('cursorChannelSelect') as HTMLSelectElement;
     if (curChSel) {
       const targetCurId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
@@ -4190,7 +4109,8 @@ export class OscilloscopeApp {
       }
     }
 
-    // 5. Math Channels List (exclude Compare Reference overlays which are managed above)
+    // 5. Math Channels List (exclude Compare Reference overlays which are managed above; hide section when empty)
+    const mathSectionEl = document.getElementById('mathChannelsSidebarSection');
     const mathChannelsListEl = document.getElementById('mathChannelsListPanel');
     const mathCountBadge = document.getElementById('mathCountBadge');
     const mathChannelIds = tab.drawOrder.filter((id) => {
@@ -4200,11 +4120,12 @@ export class OscilloscopeApp {
 
     if (mathCountBadge) mathCountBadge.innerText = mathChannelIds.length.toString();
 
-    if (mathChannelsListEl) {
+    if (mathSectionEl && mathChannelsListEl) {
       mathChannelsListEl.innerHTML = '';
       if (mathChannelIds.length === 0) {
-        mathChannelsListEl.innerHTML = '<div class="text-[11px] text-slate-500">No math channels defined.</div>';
+        mathSectionEl.classList.add('hidden');
       } else {
+        mathSectionEl.classList.remove('hidden');
         mathChannelIds.forEach((id) => {
           const ch = tab.channels[id];
           if (!ch) return;

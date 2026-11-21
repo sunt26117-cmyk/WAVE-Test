@@ -170,8 +170,8 @@ export class ThermalWorkbenchController {
       if (btn) {
         btn.className =
           key === next
-            ? 'px-3 py-1.5 rounded-sm bg-cyan-600 text-slate-950 font-semibold text-xs cursor-pointer whitespace-nowrap'
-            : 'px-3 py-1.5 rounded-sm bg-[#0c0f13] hover:bg-[#1e2530] border border-[#222933] text-slate-300 text-xs cursor-pointer whitespace-nowrap';
+            ? 'py-1.5 px-2 rounded-sm bg-cyan-600 text-slate-950 font-semibold text-xs cursor-pointer truncate'
+            : 'py-1.5 px-2 rounded-sm text-slate-300 hover:text-white text-xs cursor-pointer truncate';
       }
       if (panel) panel.classList.toggle('hidden', key !== next);
     }
@@ -182,6 +182,8 @@ export class ThermalWorkbenchController {
     if (this.activeTab === 'deconv') {
       this.drawDeconvMainCanvas();
       this.drawDeconvSubCanvas();
+    } else if (this.activeTab === 'loss') {
+      this.drawLossPreviewCanvas();
     } else if (this.activeTab === 'soa') {
       this.drawSoaCanvas();
     } else if (this.activeTab === 'foc') {
@@ -554,12 +556,28 @@ export class ThermalWorkbenchController {
       this.app.showToast('Downloaded INV_6MOS_THERM.lib for LTspice.', 'info');
     });
 
-    window.addEventListener('resize', () => {
+    const scheduleRedrawIfVisible = () => {
       const modal = document.getElementById('thermalModal');
       if (modal && getComputedStyle(modal).display !== 'none') {
-        this.redrawActivePlots();
+        requestAnimationFrame(() => this.redrawActivePlots());
+      }
+    };
+
+    window.addEventListener('wvp-drawer-panel-shown', (ev: Event) => {
+      const detail = (ev as CustomEvent<{ id?: string }>).detail;
+      if (detail?.id === 'thermalModal') {
+        requestAnimationFrame(() => this.redrawActivePlots());
       }
     });
+
+    window.addEventListener('wvp-drawer-resized', (ev: Event) => {
+      const detail = (ev as CustomEvent<{ id?: string }>).detail;
+      if (!detail?.id || detail.id === 'thermalModal') {
+        scheduleRedrawIfVisible();
+      }
+    });
+
+    window.addEventListener('resize', scheduleRedrawIfVisible);
   }
 
   private syncPlotButtons(): void {
@@ -1104,6 +1122,8 @@ export class ThermalWorkbenchController {
       setText('thermLossDeltaTj', `${(res.tjMaxC - (isFinite(tAmbC) ? tAmbC : 25)).toFixed(2)} °C`);
       setText('thermLossSwCount', `${res.switchingEvents}`);
 
+      this.drawLossPreviewCanvas();
+
       this.app.injectThermalTraces(
         [
           {
@@ -1141,6 +1161,187 @@ export class ThermalWorkbenchController {
     } catch (err: any) {
       this.app.showToast(`Loss & Tj(t) simulation failed: ${err?.message || err}`, 'error');
     }
+  }
+
+  private drawLossPreviewCanvas(): void {
+    const canvas = document.getElementById('thermLossCanvas') as HTMLCanvasElement | null;
+    if (!canvas) return;
+    const prep = prepareHiDpiCanvas(canvas);
+    if (!prep) return;
+    const { ctx, w, h } = prep;
+
+    ctx.fillStyle = '#07090e';
+    ctx.fillRect(0, 0, w, h);
+
+    const res = this.lastLossResult;
+    if (!res || res.time.length < 2) {
+      ctx.fillStyle = '#64748b';
+      ctx.font = '11px "IBM Plex Sans", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Run Loss & Tj(t) to preview stripped P_loss(t) & closed-loop Tj(t).', w / 2, h / 2);
+      return;
+    }
+
+    const pad = { l: 56, r: 54, t: 22, b: 28 };
+    const pw = Math.max(20, w - pad.l - pad.r);
+    const ph = Math.max(20, h - pad.t - pad.b);
+
+    ctx.strokeStyle = '#1b2330';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.t + (ph * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(pad.l, y);
+      ctx.lineTo(pad.l + pw, y);
+      ctx.stroke();
+    }
+    for (let i = 0; i <= 5; i++) {
+      const x = pad.l + (pw * i) / 5;
+      ctx.beginPath();
+      ctx.moveTo(x, pad.t);
+      ctx.lineTo(x, pad.t + ph);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = '#334155';
+    ctx.strokeRect(pad.l, pad.t, pw, ph);
+
+    const n = res.time.length;
+    const tMin = res.time[0];
+    const tMax = res.time[n - 1];
+    const tSpan = Math.max(1e-12, tMax - tMin);
+
+    let pMin = Infinity;
+    let pMax = -Infinity;
+    let tjMin = Infinity;
+    let tjMax = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const p = res.pLossW[i];
+      const tj = res.tjC[i];
+      if (isFinite(p)) {
+        if (p < pMin) pMin = p;
+        if (p > pMax) pMax = p;
+      }
+      if (isFinite(tj)) {
+        if (tj < tjMin) tjMin = tj;
+        if (tj > tjMax) tjMax = tj;
+      }
+    }
+    if (!isFinite(pMin) || !isFinite(pMax)) {
+      pMin = 0;
+      pMax = 1;
+    }
+    if (!isFinite(tjMin) || !isFinite(tjMax)) {
+      tjMin = 20;
+      tjMax = 30;
+    }
+
+    const pPad = Math.max(0.5, (pMax - pMin) * 0.08);
+    pMin = Math.min(0, pMin - pPad * 0.25);
+    pMax += pPad;
+    const pSpan = Math.max(1e-6, pMax - pMin);
+
+    const tjPad = Math.max(0.25, (tjMax - tjMin) * 0.12);
+    tjMin -= tjPad;
+    tjMax += tjPad;
+    const tjSpan = Math.max(1e-6, tjMax - tjMin);
+
+    const xOf = (t: number) => pad.l + ((t - tMin) / tSpan) * pw;
+    const yOfP = (p: number) => pad.t + ph - ((p - pMin) / pSpan) * ph;
+    const yOfTj = (tj: number) => pad.t + ph - ((tj - tjMin) / tjSpan) * ph;
+
+    // Decimate min/max buckets when dense so transients remain sharp at any drawer width
+    const stride = Math.max(1, Math.floor(n / Math.max(200, Math.round(pw * 1.5))));
+
+    // P_loss(t) trace (amber-orange, left Y-axis)
+    ctx.strokeStyle = 'rgba(251, 146, 60, 0.85)';
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    let startedP = false;
+    for (let i = 0; i < n; i += stride) {
+      let lo = Infinity;
+      let hi = -Infinity;
+      let loIdx = i;
+      let hiIdx = i;
+      const end = Math.min(n, i + stride);
+      for (let j = i; j < end; j++) {
+        const v = res.pLossW[j];
+        if (!isFinite(v)) continue;
+        if (v < lo) {
+          lo = v;
+          loIdx = j;
+        }
+        if (v > hi) {
+          hi = v;
+          hiIdx = j;
+        }
+      }
+      if (!isFinite(lo)) continue;
+      const ordered = loIdx <= hiIdx ? [loIdx, hiIdx] : [hiIdx, loIdx];
+      for (const idx of ordered) {
+        const px = xOf(res.time[idx]);
+        const py = yOfP(res.pLossW[idx]);
+        if (!startedP) {
+          ctx.moveTo(px, py);
+          startedP = true;
+        } else {
+          ctx.lineTo(px, py);
+        }
+      }
+    }
+    ctx.stroke();
+
+    // Closed-loop Tj(t) trace (pink, right Y-axis)
+    ctx.strokeStyle = '#f472b6';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let startedTj = false;
+    for (let i = 0; i < n; i += stride) {
+      const tj = res.tjC[i];
+      if (!isFinite(tj)) continue;
+      const px = xOf(res.time[i]);
+      const py = yOfTj(tj);
+      if (!startedTj) {
+        ctx.moveTo(px, py);
+        startedTj = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    if (n > 0 && isFinite(res.tjC[n - 1])) {
+      ctx.lineTo(xOf(res.time[n - 1]), yOfTj(res.tjC[n - 1]));
+    }
+    ctx.stroke();
+
+    // Axis tick labels
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#fb923c';
+    for (let i = 0; i <= 4; i++) {
+      const pVal = pMax - (pSpan * i) / 4;
+      ctx.fillText(`${pVal.toFixed(Math.abs(pVal) >= 100 ? 0 : 1)}W`, pad.l - 6, pad.t + (ph * i) / 4 + 3);
+    }
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#f472b6';
+    for (let i = 0; i <= 4; i++) {
+      const tjVal = tjMax - (tjSpan * i) / 4;
+      ctx.fillText(`${tjVal.toFixed(1)}°C`, pad.l + pw + 6, pad.t + (ph * i) / 4 + 3);
+    }
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#94a3b8';
+    for (let i = 0; i <= 5; i++) {
+      const tVal = tMin + (tSpan * i) / 5;
+      ctx.fillText(formatEng(tVal, 's', 2), pad.l + (pw * i) / 5, pad.t + ph + 16);
+    }
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillText(
+      `Pmean=${res.pLossMeanW.toFixed(2)} W · Tj_max=${res.tjMaxC.toFixed(2)} °C · SW Events=${res.switchingEvents}`,
+      pad.l + 6,
+      pad.t - 6
+    );
   }
 
   private populateSoaPresets(): void {
@@ -2127,7 +2328,6 @@ export class ThermalWorkbenchController {
 export function initThermalWorkbench(app: OscilloscopeApp): ThermalWorkbenchController {
   const ctrl = new ThermalWorkbenchController(app);
   document.getElementById('openThermalModalBtn')?.addEventListener('click', () => ctrl.openModal());
-  document.getElementById('openThermalAnalyzeBtn')?.addEventListener('click', () => ctrl.openModal());
   return ctrl;
 }
 

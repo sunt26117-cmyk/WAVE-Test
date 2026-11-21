@@ -8,19 +8,25 @@
 const TOOL_TAB_LABELS: Record<string, string> = {
   measureModal: 'Measure',
   compareModal: 'Compare',
+  thermalModal: 'MOS Thermal',
   mathModal: 'Math fx',
   bldcModal: 'BLDC Diag',
   phaseModal: 'ΔΦ Phase',
   anomalyModal: 'Scan',
   waveformEditModal: 'Edit / Ref',
   cropExportModal: 'Crop',
-  triggerModal: 'Trigger',
   transformModal: '3-Ph / Power',
   motorModal: 'Motor / RPM',
   batchModal: 'Batch',
   presetModal: 'Presets',
   testSuiteModal: 'Self-Test',
   shortcutsModal: 'Shortcuts',
+};
+
+const DEFAULT_DRAWER_WIDTH = 440;
+const PREFERRED_TOOL_WIDTHS: Record<string, number> = {
+  compareModal: 480,
+  thermalModal: 720,
 };
 
 class ToolDrawerController {
@@ -36,9 +42,18 @@ class ToolDrawerController {
   private activeId: string | null = null;
   private secondaryId: string | null = null;
   private splitMode: boolean = false;
-  private drawerWidthPx: number = 440;
+  private drawerWidthPx: number = DEFAULT_DRAWER_WIDTH;
+  private panelWidthsPx: Record<string, number> = {};
   private isSyncing: boolean = false;
   private onLayoutChange?: () => void;
+
+  private getTargetWidthForPanel(id: string | null): number {
+    const minW = 360;
+    const maxW = Math.min(980, Math.max(480, window.innerWidth - 340));
+    if (!id) return Math.min(maxW, Math.max(minW, DEFAULT_DRAWER_WIDTH));
+    const preferred = this.panelWidthsPx[id] ?? PREFERRED_TOOL_WIDTHS[id] ?? DEFAULT_DRAWER_WIDTH;
+    return Math.min(maxW, Math.max(minW, preferred));
+  }
 
   public init(onLayoutChange?: () => void): void {
     this.onLayoutChange = onLayoutChange;
@@ -78,17 +93,20 @@ class ToolDrawerController {
       const onMove = (me: MouseEvent) => {
         if (!this.container) return;
         const delta = startX - me.clientX; // dragging left increases drawer width
-        const maxAllowed = Math.min(720, Math.max(360, window.innerWidth - 420));
+        const maxAllowed = Math.min(980, Math.max(460, window.innerWidth - 340));
         const nextW = Math.max(340, Math.min(maxAllowed, Math.round(startW + delta)));
         this.drawerWidthPx = nextW;
+        if (this.activeId) this.panelWidthsPx[this.activeId] = nextW;
         this.container.style.width = `${nextW}px`;
         this.onLayoutChange?.();
+        window.dispatchEvent(new CustomEvent('wvp-drawer-resized', { detail: { id: this.activeId, width: nextW } }));
       };
 
       const onUp = () => {
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
         this.onLayoutChange?.();
+        window.dispatchEvent(new CustomEvent('wvp-drawer-resized', { detail: { id: this.activeId, width: this.drawerWidthPx } }));
       };
 
       window.addEventListener('mousemove', onMove);
@@ -233,6 +251,7 @@ class ToolDrawerController {
         this.stageEl!.appendChild(child);
       });
       this.container.classList.add('hidden');
+      this.container.classList.remove('flex');
       this.tabsEl.innerHTML = '';
       this.isSyncing = false;
       this.onLayoutChange?.();
@@ -240,6 +259,7 @@ class ToolDrawerController {
     }
 
     this.container.classList.remove('hidden');
+    this.container.classList.add('flex');
 
     if (!this.activeId || !this.openIds.includes(this.activeId)) {
       this.activeId = this.openIds[this.openIds.length - 1];
@@ -248,6 +268,10 @@ class ToolDrawerController {
     if (this.openIds.length < 2) {
       this.splitMode = false;
     }
+
+    const nextW = this.getTargetWidthForPanel(this.activeId);
+    this.drawerWidthPx = nextW;
+    this.container.style.width = `${nextW}px`;
 
     const visibleIds: string[] = [this.activeId];
     if (this.splitMode && this.openIds.length >= 2) {

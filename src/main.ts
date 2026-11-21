@@ -276,17 +276,9 @@ function bindToolbarActions() {
     const tab = app.getActiveTab();
     if (tab) openMeasureModal(tab);
   });
-  document.getElementById('sidebarOpenMeasureBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openMeasureModal(tab);
-  });
   document.getElementById('openEditModalBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (tab) openWaveformEditModal(tab);
-  });
-  document.getElementById('openCropExportBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openCropExportModal(tab);
   });
   document.getElementById('openCropExportMenuBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
@@ -309,7 +301,6 @@ function bindToolbarActions() {
 
   // AutoSet, Fit, Sync Same-Unit, Undo/Redo, Zoom Box, Annotations
   document.getElementById('syncUnitScaleBtn')?.addEventListener('click', () => app.syncSameUnitScales());
-  document.getElementById('sidebarSyncUnitBtn')?.addEventListener('click', () => app.syncSameUnitScales());
   document.getElementById('undoBtn')?.addEventListener('click', () => app.undo());
   document.getElementById('redoBtn')?.addEventListener('click', () => app.redo());
   document.getElementById('autoSetBtn')?.addEventListener('click', () => app.executeAutoSet());
@@ -322,10 +313,6 @@ function bindToolbarActions() {
 
   // New Analysis & Workflow Modals
   document.getElementById('openCompareModalBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openCompareModal(tab);
-  });
-  document.getElementById('sidebarOpenCompareBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (tab) openCompareModal(tab);
   });
@@ -345,26 +332,12 @@ function bindToolbarActions() {
   document.getElementById('openPresetModalBtn')?.addEventListener('click', () => openPresetModal());
   document.getElementById('openShortcutsModalBtn')?.addEventListener('click', () => openShortcutsModal());
 
-  // Trigger quick pill opens trigger modal
-  document.getElementById('triggerQuickBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openTriggerModal(tab);
-  });
-
   // Math & Transform & Motor buttons
   document.getElementById('addMathBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (tab) openMathModal(tab);
   });
-  document.getElementById('sidebarAddMathBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openMathModal(tab);
-  });
   document.getElementById('transformBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openTransformModal(tab);
-  });
-  document.getElementById('sidebarClarkeBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (tab) openTransformModal(tab);
   });
@@ -515,99 +488,7 @@ function bindFrontPanelControls() {
     }
   });
 
-  // --- 2. Quick Trigger Controls ---
-  document.getElementById('trigEnableBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (!tab) return;
-    tab.triggerConfig.enabled = !tab.triggerConfig.enabled;
-    app.renderSidebar();
-    app.draw();
-  });
-
-  document.getElementById('trigModalOpenBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (tab) openTriggerModal(tab);
-  });
-
-  const trigChSel = document.getElementById('trigQuickChannelSelect') as HTMLSelectElement;
-  trigChSel?.addEventListener('change', () => {
-    const tab = app.getActiveTab();
-    if (!tab) return;
-    tab.triggerConfig.channelId = trigChSel.value;
-    app.renderSidebar();
-    app.draw();
-  });
-
-  document.getElementById('trigQuickSlopeBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (!tab) return;
-    tab.triggerConfig.type = tab.triggerConfig.type === 'rising' ? 'falling' : 'rising';
-    app.renderSidebar();
-    app.draw();
-  });
-
-  document.getElementById('trigAlignBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (!tab) return;
-    tab.triggerConfig.enabled = true;
-    app.applyTrigger();
-  });
-
-  const trigLvlInput = document.getElementById('trigQuickLevelInput') as HTMLInputElement;
-  trigLvlInput?.addEventListener('change', () => {
-    const tab = app.getActiveTab();
-    const val = parseFloat(trigLvlInput.value);
-    if (tab && isFinite(val)) {
-      tab.triggerConfig.level = val;
-      app.draw();
-    }
-  });
-
-  document.getElementById('trigLevelDecBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    const ch = tab && tab.channels[tab.triggerConfig.channelId];
-    if (tab && ch) {
-      const step = (ch.voltsPerDiv || (ch.vMax - ch.vMin) / 8) * 0.25;
-      tab.triggerConfig.level -= step;
-      app.renderSidebar();
-      app.draw();
-    }
-  });
-
-  document.getElementById('trigLevelIncBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    const ch = tab && tab.channels[tab.triggerConfig.channelId];
-    if (tab && ch) {
-      const step = (ch.voltsPerDiv || (ch.vMax - ch.vMin) / 8) * 0.25;
-      tab.triggerConfig.level += step;
-      app.renderSidebar();
-      app.draw();
-    }
-  });
-
-  document.getElementById('trigAuto50Btn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    const ch = tab && tab.channels[tab.triggerConfig.channelId];
-    if (!tab || !ch || ch.v.length === 0) return;
-    let min = Infinity;
-    let max = -Infinity;
-    for (let i = 0; i < ch.v.length; i++) {
-      const val = ch.v[i];
-      if (isFinite(val)) {
-        if (val < min) min = val;
-        if (val > max) max = val;
-      }
-    }
-    if (isFinite(min) && isFinite(max)) {
-      tab.triggerConfig.level = (min + max) / 2;
-      tab.triggerConfig.enabled = true;
-      app.applyTrigger();
-      app.renderSidebar();
-      app.draw();
-    }
-  });
-
-  // --- 3. Cursor Mode, Center Recall & Target Channel ---
+  // --- 2. Cursor Mode, Center Recall & Target Channel ---
   document.querySelectorAll('.cur-mode-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const mode = btn.getAttribute('data-curmode') as CursorMode;
@@ -749,30 +630,6 @@ function bindModals() {
   });
   document.getElementById('mathModalCloseBtn')?.addEventListener('click', () => {
     document.getElementById('mathModal')!.style.display = 'none';
-  });
-
-  // Trigger Modal
-  document.getElementById('triggerApplyBtn')?.addEventListener('click', () => {
-    const tab = app.getActiveTab();
-    if (!tab) return;
-
-    const chSel = document.getElementById('trigChannelSelect') as HTMLSelectElement;
-    const typeSel = document.getElementById('trigSlopeSelect') as HTMLSelectElement;
-    const levelInput = document.getElementById('trigLevelInput') as HTMLInputElement;
-    const posInput = document.getElementById('trigPosInput') as HTMLInputElement;
-
-    tab.triggerConfig.enabled = true;
-    tab.triggerConfig.channelId = chSel.value;
-    tab.triggerConfig.type = typeSel.value as 'rising' | 'falling';
-    tab.triggerConfig.level = parseFloat(levelInput.value) || 0;
-    const pos = parseFloat(posInput?.value || '50');
-    tab.triggerConfig.positionPercent = isFinite(pos) ? Math.max(5, Math.min(95, pos)) : 50;
-
-    app.applyTrigger();
-    document.getElementById('triggerModal')!.style.display = 'none';
-  });
-  document.getElementById('triggerCancelBtn')?.addEventListener('click', () => {
-    document.getElementById('triggerModal')!.style.display = 'none';
   });
 
   // Transform Modal (Clarke αβ | Park dq0 | Power P(t))
@@ -1706,35 +1563,6 @@ function bindModals() {
       }
     });
   });
-}
-
-function openTriggerModal(tab: TabState) {
-  const modal = document.getElementById('triggerModal');
-  if (!modal) return;
-
-  const chSel = document.getElementById('trigChannelSelect') as HTMLSelectElement;
-  chSel.innerHTML = '';
-  tab.drawOrder.forEach((id) => {
-    const ch = tab.channels[id];
-    if (ch) {
-      const opt = document.createElement('option');
-      opt.value = id;
-      opt.innerText = ch.name;
-      if (id === tab.triggerConfig.channelId) opt.selected = true;
-      chSel.appendChild(opt);
-    }
-  });
-
-  const levelInput = document.getElementById('trigLevelInput') as HTMLInputElement;
-  levelInput.value = tab.triggerConfig.level.toString();
-
-  const slopeSel = document.getElementById('trigSlopeSelect') as HTMLSelectElement;
-  slopeSel.value = tab.triggerConfig.type;
-
-  const posInput = document.getElementById('trigPosInput') as HTMLInputElement;
-  if (posInput) posInput.value = (tab.triggerConfig.positionPercent ?? 50).toString();
-
-  modal.style.display = 'flex';
 }
 
 function openMathModal(tab: TabState) {
