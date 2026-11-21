@@ -1,17 +1,26 @@
 /**
- * Waveform Viewer Pro - UI Controller & Oscilloscope Workspace
- * Manages tabs, toolbars, sidebar panels, modals, event handlers,
- * canvas interactions, and state orchestration.
+ * Waveform Viewer Pro - Oscilloscope UI Controller & Workspace Orchestrator
+ * Manages multi-tab datasets, hardware-style vertical/horizontal/trigger/cursor controls,
+ * interactive canvas dragging (pan, box zoom, X/Y cursors, GND handles, Trigger level),
+ * CSV quality audit, clipboard paste, FFT spectrum, Math & Clarke channels, annotations, and exports.
  */
 
 import {
   TabState,
   WaveformChannel,
   SpectrumResult,
-  PlotMode,
   MeasurementGate,
+  MeasurementMetricKey,
   CsvPreviewInfo,
-  ChannelFilterSpec,
+  CursorMode,
+  ActiveTool,
+  RenderMode,
+  DecimationMode,
+  ChannelMeasurements,
+  PlotMode,
+  AnomalyEvent,
+  ChannelCoupling,
+  AnnotationItem,
 } from '../types/models';
 import {
   PlotArea,
@@ -19,67 +28,83 @@ import {
   DEFAULT_THEME,
   OVERLAP_COLORS,
   getPlotArea,
+  getTimeBoundsForView,
+  resolveCursorMode,
+  getChannelPlotArea,
   screenToData,
+  sampleChannelValueAtTime,
   drawGrid,
   drawChannelWaveform,
   drawSpectrum,
   drawTriggerLine,
   drawCursors,
-  drawEdgeMarkers,
-  getActiveChannel,
-  getTimeBaseChannel,
-  getCursorChannel,
-  getChannelArea,
-  computeSubplotAreas,
-  getVisibleChannels,
+  drawGndMarkers,
+  drawAnnotations,
   drawAxisLabels,
-  drawSubplotAxisLabels,
-  drawGroundMarkers,
+  drawCompareGroupLegend,
+  drawXYPlot,
+  drawGoldenToleranceBand,
+  drawActiveAnomalyMarkers,
+  getGndHandlePositions,
+  getTriggerHandlePosition,
+  generateWaveformSVG,
   formatEng,
-  indexToTime,
-  timeToIndex,
+  formatMeasurementMetricValue,
 } from './canvasRenderer';
+import {
+  STANDARD_125_VALUES,
+  stepScale125,
+  ensureChannelScaleOffset,
+  syncChannelBoundsFromScaleOffset,
+  fitChannelTo125,
+  getTimebaseInfo,
+  stepTimebase125,
+  panHorizontalDivs,
+  getSubplotRects,
+  syncSameUnitChannelsScale,
+} from '../modules/oscilloscopeScale';
 import { computeFFT, computeBLDCHarmonics } from '../modules/fft';
-import { computeMeasurements, computeEdgeMarks, EdgeMarks } from '../modules/measurements';
-import { lowPassFilter, validateFilterSpec, describeFilter } from '../modules/filter';
+import { computeMeasurements, MEASUREMENT_DEFINITIONS } from '../modules/measurements';
+import { clampCursorsToViewport, centerCursorsInViewport } from '../modules/cursorEngine';
+import {
+  applyGlobalEdit,
+  applyLocalEdit,
+  revertChannelToReference,
+  GlobalEditOp,
+  LocalEditOp,
+} from '../modules/waveformEditor';
+import {
+  captureCompositeScopePNG,
+  exportCroppedWaveformCSV,
+  exportCroppedWaveformJSON,
+} from '../modules/exporter';
+import { buildEngineeringReportHTML, downloadEngineeringReportHTML } from '../modules/reportExporter';
 import { performAutoSet } from '../modules/autoSet';
 import { findTriggerPoint, alignViewToTrigger } from '../modules/trigger';
 import { evaluateMathExpression } from '../modules/mathParser';
-import { computeClarke, computePark } from '../modules/transforms';
+import { computeClarke, computePark, computeInstantaneousPower } from '../modules/transforms';
+import { estimateElectricalAngleFromAlphaBeta, computePowerSummary } from '../modules/motorAnalysis';
+import {
+  scanChannelAnomalies,
+  evaluateGoldenTolerance,
+  AnomalyScanOptions,
+  GoldenEvaluationResult,
+} from '../modules/anomalyScanner';
+import { computeXYMetrics } from '../modules/xyAnalysis';
 import { serializeSession, deserializeSession } from './session';
-import { previewCsv, parseFullCsv } from '../parsers/csvParser';
+import { previewCsv, parseFullCsv, computeCsvPreviewQuality } from '../parsers/csvParser';
 import { parseWfmBuffer } from '../parsers/wfmParser';
-import { runAllTests } from '../tests/testSuite';
+import { computeBufferFingerprint, computeTextFingerprint } from '../modules/waveformCompare';
 
-// Standard 1-2-5 scale step sequence for oscilloscope vertical steps
-const SCALE_STEPS = [
-  1e-6, 2e-6, 5e-6,
-  1e-5, 2e-5, 5e-5,
-  1e-4, 2e-4, 5e-4,
-  1e-3, 2e-3, 5e-3,
-  1e-2, 2e-2, 5e-2,
-  0.1, 0.2, 0.5,
-  1, 2, 5,
-  10, 20, 50,
-  100, 200, 500,
-  1000, 2000, 5000,
-];
-
-function getNextScale(current: number, direction: 'up' | 'down'): number {
-  if (direction === 'up') {
-    for (const step of SCALE_STEPS) {
-      if (step > current * 1.05) return step;
-    }
-    return current * 2;
-  } else {
-    for (let i = SCALE_STEPS.length - 1; i >= 0; i--) {
-      if (SCALE_STEPS[i] < current * 0.95) return SCALE_STEPS[i];
-    }
-    return current / 2;
-  }
-}
-
-export type FilterScope = 'active' | 'visible' | 'all';
+type DragMode =
+  | null
+  | { type: 'pan'; startX: number; initialStartIdx: number; initialEndIdx: number; initialFMin: number; initialFMax: number }
+  | { type: 'cursorX'; which: 'x1' | 'x2' }
+  | { type: 'cursorY'; which: 'y1' | 'y2'; channelId: string; area: PlotArea }
+  | { type: 'gnd'; channelId: string; area: PlotArea }
+  | { type: 'trigger'; channelId: string; area: PlotArea }
+  | { type: 'areaZoom'; start: { x: number; y: number }; end: { x: number; y: number } }
+  | { type: 'areaAnnotate'; channelId: string; area: PlotArea; start: { x: number; y: number }; end: { x: number; y: number } };
 
 export class OscilloscopeApp {
   private canvas: HTMLCanvasElement;
@@ -89,44 +114,58 @@ export class OscilloscopeApp {
   private tabs: TabState[] = [];
   private activeTabIndex: number = -1;
 
-  // Interaction state
-  private isDragging: boolean = false;
-  private dragStartX: number = 0;
-  private dragStartY: number = 0;
-  private initialViewStart: number = 0;
-  private initialViewEnd: number = 0;
-  private isAreaZooming: boolean = false;
-  private areaZoomStart: { x: number; y: number } | null = null;
-  private areaZoomEnd: { x: number; y: number } | null = null;
-  private draggingCursor:
-    | 'x1'
-    | 'x2'
-    | 'y1'
-    | 'y2'
-    | { groundChId: string; startY: number; initialOffset: number }
-    | null = null;
+  private dragState: DragMode = null;
 
-  // Cached FFT result for current tab
+  // Cached FFT result
   private cachedSpectrum: SpectrumResult | null = null;
   private cachedSpectrumKey: string = '';
 
-  // Canvas size in CSS pixels (kept in sync with the backing store in handleResize)
-  private cssW: number = 0;
-  private cssH: number = 0;
-
-  // Bumped whenever sample data changes (filter on/off) so caches can be invalidated
-  private filterRev: number = 0;
-  private edgeCache: { key: string; marks: EdgeMarks | null } | null = null;
-  private trigCache: { key: string; time: number | null } | null = null;
-  private statusFlash: string = '';
-  private statusFlashTimer: number | undefined;
-  /** Last filter used, so the toolbar toggle can re-apply it with one click. */
-  private lastFilter: { spec: ChannelFilterSpec; scope: FilterScope } | null = null;
+  // Cached measurements by channel key for fast 60fps strip updates
+  private measCache: Record<string, { key: string; value: ChannelMeasurements }> = {};
+  private editVersion: number = 0;
 
   // CSV import modal state
   private pendingCsvText: string = '';
   private pendingCsvPreview: CsvPreviewInfo | null = null;
   private pendingFileName: string = '';
+
+  // Pending text annotation coordinate
+  private pendingAnnotationCoord: { time: number; voltage: number; channelId: string } | null = null;
+  private toastTimer: number | null = null;
+
+  // Hook for opening/editing a Compare Group from softkey pill or sidebar
+  public onEditCompareGroup?: (groupId: string) => void;
+
+  // Undo / Redo History
+  private undoStack: Array<{
+    tabId: string;
+    label: string;
+    view: { startIndex: number; endIndex: number; fMin?: number; fMax?: number };
+    separateView: boolean;
+    plotMode: PlotMode;
+    activeChannelId?: string;
+    drawOrder: string[];
+    annotations: AnnotationItem[];
+    channelStates: Record<
+      string,
+      {
+        visible: boolean;
+        color: string;
+        voltsPerDiv?: number;
+        vOffset?: number;
+        vMin: number;
+        vMax: number;
+        inverted?: boolean;
+        coupling?: ChannelCoupling;
+        hasEdits?: boolean;
+        showRef?: boolean;
+        showDiff?: boolean;
+        v?: Float32Array;
+        refV?: Float32Array;
+      }
+    >;
+  }> = [];
+  private redoStack: typeof this.undoStack = [];
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -134,8 +173,39 @@ export class OscilloscopeApp {
     if (!ctx) throw new Error('Could not get 2D canvas context.');
     this.ctx = ctx;
 
+    this.populateScaleDropdown();
     this.initEvents();
     this.handleResize();
+  }
+
+  public showToast(message: string, level: 'info' | 'warn' | 'error' = 'info'): void {
+    const el = document.getElementById('scopeToast');
+    if (!el) return;
+    el.innerText = message;
+    el.classList.remove('hidden', 'border-amber-500/60', 'text-amber-200', 'border-red-500/70', 'text-red-200', 'border-cyan-500/60', 'text-cyan-200');
+    if (level === 'error') {
+      el.classList.add('border-red-500/70', 'text-red-200');
+    } else if (level === 'warn') {
+      el.classList.add('border-amber-500/60', 'text-amber-200');
+    } else {
+      el.classList.add('border-cyan-500/60', 'text-cyan-200');
+    }
+    if (this.toastTimer !== null) window.clearTimeout(this.toastTimer);
+    this.toastTimer = window.setTimeout(() => {
+      el.classList.add('hidden');
+    }, 3600);
+  }
+
+  private populateScaleDropdown(): void {
+    const sel = document.getElementById('vDivSelect') as HTMLSelectElement;
+    if (!sel) return;
+    sel.innerHTML = '';
+    STANDARD_125_VALUES.forEach((val) => {
+      const opt = document.createElement('option');
+      opt.value = val.toString();
+      opt.text = `${formatEng(val, '', 0)}/div`;
+      sel.appendChild(opt);
+    });
   }
 
   public getActiveTab(): TabState | null {
@@ -145,9 +215,189 @@ export class OscilloscopeApp {
     return null;
   }
 
+  private ensureTabDefaults(tab: TabState): void {
+    for (const id of tab.drawOrder) {
+      const ch = tab.channels[id];
+      if (ch) {
+        if (!ch.coupling) ch.coupling = 'DC';
+        if (ch.inverted === undefined) ch.inverted = false;
+        if (ch.showRef === undefined) ch.showRef = true;
+        ensureChannelScaleOffset(ch);
+        syncChannelBoundsFromScaleOffset(ch);
+      }
+    }
+    if (!tab.activeChannelId || !tab.channels[tab.activeChannelId]) {
+      tab.activeChannelId = tab.drawOrder[0];
+    }
+    if (!tab.selectedMeasurementChannelId || !tab.channels[tab.selectedMeasurementChannelId]) {
+      tab.selectedMeasurementChannelId = tab.activeChannelId;
+    }
+    if (!tab.selectedFftChannelId || !tab.channels[tab.selectedFftChannelId]) {
+      tab.selectedFftChannelId = tab.activeChannelId;
+    }
+    if (!tab.cursors.trackingChannel || !tab.channels[tab.cursors.trackingChannel]) {
+      tab.cursors.trackingChannel = tab.activeChannelId || null;
+    }
+    if (!tab.cursors.mode) {
+      tab.cursors.mode = tab.cursors.enabled ? 'x' : 'off';
+    }
+    if (!tab.activeTool) {
+      tab.activeTool = 'pan';
+    }
+    if (!tab.renderMode) {
+      tab.renderMode = 'vector';
+    }
+    if (!tab.decimationMode) {
+      tab.decimationMode = 'minmax';
+    }
+    if (!tab.selectedMeasurements) {
+      tab.selectedMeasurements = [];
+    }
+    if (!tab.xyConfig) {
+      tab.xyConfig = {
+        xChannelId: tab.drawOrder[0] || '',
+        yChannelId: tab.drawOrder[1] || tab.drawOrder[0] || '',
+        range: 'view',
+      };
+    } else {
+      if (!tab.channels[tab.xyConfig.xChannelId]) tab.xyConfig.xChannelId = tab.drawOrder[0] || '';
+      if (!tab.channels[tab.xyConfig.yChannelId]) {
+        tab.xyConfig.yChannelId = tab.drawOrder[1] || tab.drawOrder[0] || '';
+      }
+    }
+    if (!tab.goldenBand) {
+      tab.goldenBand = {
+        enabled: false,
+        channelId: tab.drawOrder[0] || '',
+        mode: 'percent',
+        tolerance: 5,
+      };
+    }
+  }
+
+  private captureTabSnapshot(tab: TabState, label: string, includeData: boolean) {
+    const channelStates: (typeof this.undoStack)[number]['channelStates'] = {};
+    for (const id of tab.drawOrder) {
+      const ch = tab.channels[id];
+      if (!ch) continue;
+      channelStates[id] = {
+        visible: ch.visible,
+        color: ch.color,
+        voltsPerDiv: ch.voltsPerDiv,
+        vOffset: ch.vOffset,
+        vMin: ch.vMin,
+        vMax: ch.vMax,
+        inverted: ch.inverted,
+        coupling: ch.coupling,
+        hasEdits: ch.hasEdits,
+        showRef: ch.showRef,
+        showDiff: ch.showDiff,
+        v: includeData ? new Float32Array(ch.v) : undefined,
+        refV: includeData && ch.refV ? new Float32Array(ch.refV) : undefined,
+      };
+    }
+    return {
+      tabId: tab.id,
+      label,
+      view: { ...tab.view },
+      separateView: tab.separateView,
+      plotMode: tab.plotMode,
+      activeChannelId: tab.activeChannelId,
+      drawOrder: [...tab.drawOrder],
+      annotations: tab.annotations.map((a) => ({ ...a })),
+      channelStates,
+    };
+  }
+
+  private restoreSnapshot(snap: (typeof this.undoStack)[number]): void {
+    const tab = this.tabs.find((t) => t.id === snap.tabId);
+    if (!tab) return;
+    tab.view = { ...snap.view };
+    tab.separateView = snap.separateView;
+    tab.plotMode = snap.plotMode;
+    tab.activeChannelId = snap.activeChannelId;
+    tab.annotations = snap.annotations.map((a) => ({ ...a }));
+
+    for (const [id, st] of Object.entries(snap.channelStates)) {
+      const ch = tab.channels[id];
+      if (!ch) continue;
+      ch.visible = st.visible;
+      ch.color = st.color;
+      ch.voltsPerDiv = st.voltsPerDiv;
+      ch.vOffset = st.vOffset;
+      ch.vMin = st.vMin;
+      ch.vMax = st.vMax;
+      ch.inverted = st.inverted;
+      ch.coupling = st.coupling;
+      ch.hasEdits = st.hasEdits;
+      ch.showRef = st.showRef;
+      ch.showDiff = st.showDiff;
+      if (st.v) ch.v = new Float32Array(st.v);
+      if (st.refV) ch.refV = new Float32Array(st.refV);
+    }
+
+    this.editVersion++;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public pushUndoSnapshot(label: string, includeData: boolean = false): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    this.undoStack.push(this.captureTabSnapshot(tab, label, includeData));
+    if (this.undoStack.length > 30) this.undoStack.shift();
+    this.redoStack = [];
+    this.updateUndoRedoButtons();
+  }
+
+  public undo(): void {
+    const snap = this.undoStack.pop();
+    if (!snap) {
+      this.showToast('Nothing to undo.', 'warn');
+      return;
+    }
+    const tab = this.tabs.find((t) => t.id === snap.tabId);
+    if (tab) {
+      const hasData = Object.values(snap.channelStates).some((s) => !!s.v);
+      this.redoStack.push(this.captureTabSnapshot(tab, snap.label, hasData));
+    }
+    this.restoreSnapshot(snap);
+    this.updateUndoRedoButtons();
+    this.showToast(`Undo: ${snap.label}`, 'info');
+  }
+
+  public redo(): void {
+    const snap = this.redoStack.pop();
+    if (!snap) {
+      this.showToast('Nothing to redo.', 'warn');
+      return;
+    }
+    const tab = this.tabs.find((t) => t.id === snap.tabId);
+    if (tab) {
+      const hasData = Object.values(snap.channelStates).some((s) => !!s.v);
+      this.undoStack.push(this.captureTabSnapshot(tab, snap.label, hasData));
+    }
+    this.restoreSnapshot(snap);
+    this.updateUndoRedoButtons();
+    this.showToast(`Redo: ${snap.label}`, 'info');
+  }
+
+  private updateUndoRedoButtons(): void {
+    const uBtn = document.getElementById('undoBtn') as HTMLButtonElement | null;
+    const rBtn = document.getElementById('redoBtn') as HTMLButtonElement | null;
+    if (uBtn) uBtn.disabled = this.undoStack.length === 0;
+    if (rBtn) rBtn.disabled = this.redoStack.length === 0;
+  }
+
   public addTab(tab: TabState): void {
+    this.ensureTabDefaults(tab);
     this.tabs.push(tab);
     this.activeTabIndex = this.tabs.length - 1;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
     this.renderTabsBar();
     this.renderSidebar();
     this.draw();
@@ -159,6 +409,8 @@ export class OscilloscopeApp {
     if (this.activeTabIndex >= this.tabs.length) {
       this.activeTabIndex = this.tabs.length - 1;
     }
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
     this.renderTabsBar();
     this.renderSidebar();
     this.draw();
@@ -167,136 +419,1005 @@ export class OscilloscopeApp {
   public setActiveTab(index: number): void {
     if (index >= 0 && index < this.tabs.length) {
       this.activeTabIndex = index;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
       this.renderTabsBar();
       this.renderSidebar();
       this.draw();
     }
   }
 
+  // --- Oscilloscope Channel & Horizontal Controls ---
+  public selectActiveChannel(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    tab.activeChannelId = chId;
+    tab.selectedMeasurementChannelId = chId;
+    tab.cursors.trackingChannel = chId;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public stepChannelScale(chId: string, direction: 1 | -1): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    this.pushUndoSnapshot('Scale V/div');
+    const ch = tab.channels[chId];
+    const { voltsPerDiv } = ensureChannelScaleOffset(ch);
+    ch.voltsPerDiv = stepScale125(voltsPerDiv, direction);
+    syncChannelBoundsFromScaleOffset(ch);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public setChannelScale(chId: string, vPerDiv: number): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId] || !isFinite(vPerDiv) || vPerDiv <= 0) return;
+    this.pushUndoSnapshot('Set V/div');
+    const ch = tab.channels[chId];
+    ch.voltsPerDiv = vPerDiv;
+    syncChannelBoundsFromScaleOffset(ch);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public setChannelOffset(chId: string, offset: number): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId] || !isFinite(offset)) return;
+    const ch = tab.channels[chId];
+    ensureChannelScaleOffset(ch);
+    ch.vOffset = offset;
+    syncChannelBoundsFromScaleOffset(ch);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public nudgeChannelOffsetDivs(chId: string, divs: number): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    this.pushUndoSnapshot('Vertical Offset');
+    const ch = tab.channels[chId];
+    const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(ch);
+    ch.vOffset = vOffset + divs * voltsPerDiv;
+    syncChannelBoundsFromScaleOffset(ch);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public zeroChannelOffset(chId: string): void {
+    this.pushUndoSnapshot('Zero Offset');
+    this.setChannelOffset(chId, 0);
+  }
+
+  public fitSingleChannel(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    this.pushUndoSnapshot('Fit Channel');
+    fitChannelTo125(tab.channels[chId]);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public syncSameUnitScales(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    this.pushUndoSnapshot('Sync Same-Unit Scale');
+    const res = syncSameUnitChannelsScale(tab, tab.activeChannelId);
+    if (!res) {
+      this.showToast('No visible channels found to synchronize.', 'warn');
+      return;
+    }
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+    this.showToast(
+      `Synced ${res.syncedCount} [${res.unit}] channel(s) to ${formatEng(res.targetVoltsPerDiv, res.unit, 1)}/div (driver: ${res.driverChannelName})`,
+      'info'
+    );
+  }
+
+  public toggleChannelVisible(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    this.pushUndoSnapshot('Toggle Channel Visibility');
+    tab.channels[chId].visible = !tab.channels[chId].visible;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public toggleChannelCoupling(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    this.pushUndoSnapshot('Toggle AC/DC Coupling');
+    const ch = tab.channels[chId];
+    ch.coupling = ch.coupling === 'AC' ? 'DC' : 'AC';
+    fitChannelTo125(ch);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public toggleChannelInvert(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    this.pushUndoSnapshot('Toggle Invert');
+    const ch = tab.channels[chId];
+    ch.inverted = !ch.inverted;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public stepTimebase(direction: 1 | -1): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.view = stepTimebase125(tab, direction);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public panTimebase(divs: number): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.view = panHorizontalDivs(tab, divs);
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public setPlotMode(mode: PlotMode): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.plotMode = mode;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public setSeparateView(separate: boolean): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    this.pushUndoSnapshot('Layout Mode');
+    tab.separateView = separate;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public setRenderMode(mode: RenderMode): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.renderMode = mode;
+    this.updateScreenTelemetry();
+    this.draw();
+  }
+
+  public setDecimationMode(mode: DecimationMode): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.decimationMode = mode;
+    this.updateScreenTelemetry();
+    this.draw();
+  }
+
+  public toggleRightPanel(): void {
+    const panel = document.getElementById('rightControlPanel');
+    const btn = document.getElementById('togglePanelBtn');
+    if (!panel) return;
+    const isNowHidden = panel.classList.toggle('hidden');
+    if (btn) btn.innerText = isNowHidden ? 'Show Panel' : 'Hide Panel';
+    this.handleResize();
+  }
+
+  public setActiveTool(tool: ActiveTool): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.activeTool = tab.activeTool === tool && tool !== 'pan' ? 'pan' : tool;
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public clearAnnotations(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.annotations = [];
+    this.draw();
+    this.showToast('Cleared waveform annotations.', 'info');
+  }
+
+  public setCursorMode(mode: CursorMode): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.cursors.mode = mode;
+    tab.cursors.enabled = mode !== 'off';
+
+    const targetId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
+    const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
+    if (targetCh && tab.cursors.enabled) {
+      tab.cursors.trackingChannel = targetCh.id;
+      const { tStart, tSpan } = getTimeBoundsForView(tab, targetCh);
+      if (tab.cursors.x1 === null || tab.cursors.x2 === null) {
+        tab.cursors.x1 = tStart + tSpan * 0.25;
+        tab.cursors.x2 = tStart + tSpan * 0.75;
+      }
+      if (tab.cursors.y1 === null || tab.cursors.y2 === null) {
+        ensureChannelScaleOffset(targetCh);
+        syncChannelBoundsFromScaleOffset(targetCh);
+        const vSpan = targetCh.vMax - targetCh.vMin;
+        tab.cursors.y1 = targetCh.vMin + vSpan * 0.72;
+        tab.cursors.y2 = targetCh.vMin + vSpan * 0.28;
+      }
+      clampCursorsToViewport(tab);
+    }
+
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public centerCursors(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    centerCursorsInViewport(tab);
+    this.renderSidebar();
+    this.draw();
+    this.showToast('Cursors centered at 25% & 75% of viewport.', 'info');
+  }
+
+  public setCursorTargetChannel(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    tab.cursors.trackingChannel = chId;
+    const ch = tab.channels[chId];
+    ensureChannelScaleOffset(ch);
+    syncChannelBoundsFromScaleOffset(ch);
+    const vSpan = ch.vMax - ch.vMin;
+    tab.cursors.y1 = ch.vMin + vSpan * 0.72;
+    tab.cursors.y2 = ch.vMin + vSpan * 0.28;
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  // --- On-Demand Measurements Management ---
+  public toggleMeasurementSelection(channelId: string, metric: MeasurementMetricKey, enabled?: boolean): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    if (!tab.selectedMeasurements) tab.selectedMeasurements = [];
+    const itemId = `${channelId}::${metric}`;
+    const existsIdx = tab.selectedMeasurements.findIndex((m) => m.id === itemId);
+    const shouldAdd = enabled !== undefined ? enabled : existsIdx === -1;
+
+    if (shouldAdd && existsIdx === -1) {
+      tab.selectedMeasurements.push({ id: itemId, channelId, metric });
+    } else if (!shouldAdd && existsIdx !== -1) {
+      tab.selectedMeasurements.splice(existsIdx, 1);
+    }
+    this.renderMeasurementStrip(tab);
+    this.updateScreenTelemetry();
+    this.handleResize();
+  }
+
+  public removeMeasurementSelection(itemId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.selectedMeasurements) return;
+    tab.selectedMeasurements = tab.selectedMeasurements.filter((m) => m.id !== itemId);
+    this.renderMeasurementStrip(tab);
+    this.updateScreenTelemetry();
+    this.handleResize();
+  }
+
+  public selectAllMeasurementsForChannel(channelId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    if (!tab.selectedMeasurements) tab.selectedMeasurements = [];
+    for (const def of MEASUREMENT_DEFINITIONS) {
+      const id = `${channelId}::${def.key}`;
+      if (!tab.selectedMeasurements.some((m) => m.id === id)) {
+        tab.selectedMeasurements.push({ id, channelId, metric: def.key });
+      }
+    }
+    this.renderMeasurementStrip(tab);
+    this.updateScreenTelemetry();
+    this.handleResize();
+  }
+
+  public clearAllMeasurements(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.selectedMeasurements = [];
+    this.renderMeasurementStrip(tab);
+    this.updateScreenTelemetry();
+    this.handleResize();
+  }
+
+  // --- Waveform Editing & Same-Screen Reference (Ref / Diff) ---
+  public applyChannelGlobalEdit(channelId: string, op: GlobalEditOp): void {
+    const tab = this.getActiveTab();
+    const ch = tab?.channels[channelId];
+    if (!tab || !ch) return;
+
+    this.pushUndoSnapshot(`Global Edit (${op.type})`, true);
+    applyGlobalEdit(ch, op);
+    this.editVersion++;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+    this.showToast(`Applied ${op.type} to ${ch.name} (Ref locked).`, 'info');
+  }
+
+  public applyChannelLocalEdit(channelId: string, op: LocalEditOp): number {
+    const tab = this.getActiveTab();
+    const ch = tab?.channels[channelId];
+    if (!tab || !ch) return 0;
+
+    let tStart: number;
+    let tEnd: number;
+    if (tab.cursors.enabled && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+      tStart = Math.min(tab.cursors.x1, tab.cursors.x2);
+      tEnd = Math.max(tab.cursors.x1, tab.cursors.x2);
+    } else {
+      const bounds = getTimeBoundsForView(tab, ch);
+      tStart = bounds.tStart;
+      tEnd = bounds.tEnd;
+    }
+
+    this.pushUndoSnapshot(`Local Edit (${op.type})`, true);
+    const modified = applyLocalEdit(ch, tStart, tEnd, op);
+    if (modified > 0) {
+      this.editVersion++;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
+      this.showToast(`Edited ${modified.toLocaleString()} samples on ${ch.name} (Ref locked).`, 'info');
+    } else {
+      this.undoStack.pop();
+      this.updateUndoRedoButtons();
+      this.showToast('No samples in selected [X1, X2] range.', 'warn');
+    }
+    return modified;
+  }
+
+  public revertChannelEdits(channelId: string): void {
+    const tab = this.getActiveTab();
+    const ch = tab?.channels[channelId];
+    if (!tab || !ch) return;
+    this.pushUndoSnapshot('Revert Edits', true);
+    if (revertChannelToReference(ch)) {
+      this.editVersion++;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
+      this.showToast(`Reverted ${ch.name} to original Reference trace.`, 'info');
+    } else {
+      this.undoStack.pop();
+      this.updateUndoRedoButtons();
+      this.showToast(`${ch.name} has no pending edits to revert.`, 'warn');
+    }
+  }
+
+  public getGoldenEvaluation(tab: TabState): GoldenEvaluationResult | null {
+    const gb = tab.goldenBand;
+    if (!gb || !gb.enabled) return null;
+    const ch = tab.channels[gb.channelId];
+    if (!ch) return null;
+    return evaluateGoldenTolerance(ch, gb);
+  }
+
+  public scanAnomalies(chId: string, opts: AnomalyScanOptions): AnomalyEvent[] {
+    const tab = this.getActiveTab();
+    const ch = tab?.channels[chId];
+    if (!tab || !ch) return [];
+    const events = scanChannelAnomalies(ch, opts);
+    tab.activeChannelId = chId;
+    tab.activeAnomalies = events;
+    tab.selectedAnomalyIndex = events.length > 0 ? 0 : null;
+    this.draw();
+    this.showToast(
+      events.length > 0
+        ? `Found ${events.length} anomaly event(s) on ${ch.name}.`
+        : `No anomalies matched criteria on ${ch.name}.`,
+      events.length > 0 ? 'warn' : 'info'
+    );
+    return events;
+  }
+
+  public clearAnomalies(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    tab.activeAnomalies = [];
+    tab.selectedAnomalyIndex = null;
+    this.draw();
+  }
+
+  public jumpToAnomaly(idx: number): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.activeAnomalies || !tab.activeAnomalies[idx]) return;
+    const ev = tab.activeAnomalies[idx];
+    const ch = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
+    if (!ch || ch.v.length < 2) return;
+
+    tab.plotMode = 'time';
+    tab.selectedAnomalyIndex = idx;
+    const halfSpan = Math.max(40, Math.min(Math.floor(ch.v.length * 0.05), 1000));
+    let newStart = ev.index - halfSpan;
+    let newEnd = ev.index + halfSpan;
+    if (newStart < 0) {
+      newStart = 0;
+      newEnd = Math.min(ch.v.length, halfSpan * 2);
+    }
+    if (newEnd > ch.v.length) {
+      newEnd = ch.v.length;
+      newStart = Math.max(0, ch.v.length - halfSpan * 2);
+    }
+    tab.view.startIndex = newStart;
+    tab.view.endIndex = newEnd;
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public jumpToSampleIndex(channelId: string, index: number): void {
+    const tab = this.getActiveTab();
+    const ch = tab?.channels[channelId];
+    if (!tab || !ch || ch.v.length < 2) return;
+
+    tab.plotMode = 'time';
+    tab.activeChannelId = channelId;
+    const clampedIdx = Math.max(0, Math.min(ch.v.length - 1, index));
+    const halfSpan = Math.max(40, Math.min(Math.floor(ch.v.length * 0.05), 1000));
+    let newStart = clampedIdx - halfSpan;
+    let newEnd = clampedIdx + halfSpan;
+    if (newStart < 0) {
+      newStart = 0;
+      newEnd = Math.min(ch.v.length, halfSpan * 2);
+    }
+    if (newEnd > ch.v.length) {
+      newEnd = ch.v.length;
+      newStart = Math.max(0, ch.v.length - halfSpan * 2);
+    }
+    tab.view.startIndex = newStart;
+    tab.view.endIndex = newEnd;
+    clampCursorsToViewport(tab);
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public getAllTabChannelOptions(): Array<{
+    tabId: string;
+    tabName: string;
+    channelId: string;
+    channelName: string;
+    unit: string;
+    isCurrentTab: boolean;
+    channel: WaveformChannel;
+  }> {
+    const activeTab = this.getActiveTab();
+    const out: Array<{
+      tabId: string;
+      tabName: string;
+      channelId: string;
+      channelName: string;
+      unit: string;
+      isCurrentTab: boolean;
+      channel: WaveformChannel;
+    }> = [];
+
+    const orderedTabs = activeTab
+      ? [activeTab, ...this.tabs.filter((t) => t.id !== activeTab.id)]
+      : this.tabs;
+
+    for (const t of orderedTabs) {
+      for (const chId of t.drawOrder) {
+        const ch = t.channels[chId];
+        if (!ch) continue;
+        out.push({
+          tabId: t.id,
+          tabName: t.fileName,
+          channelId: ch.id,
+          channelName: ch.name,
+          unit: ch.unit || 'V',
+          isCurrentTab: activeTab ? t.id === activeTab.id : false,
+          channel: ch,
+        });
+      }
+    }
+    return out;
+  }
+
+  public applyCompareOverlay(
+    targetChannelId: string,
+    refLabel: string,
+    alignedRefV: Float32Array,
+    diffV: Float32Array,
+    options: {
+      overlayRefTrace: boolean;
+      enableGoldenBand: boolean;
+      goldenMode: 'percent' | 'absolute';
+      goldenTolerance: number;
+      addDiffChannel: boolean;
+    }
+  ): void {
+    const tab = this.getActiveTab();
+    const targetCh = tab?.channels[targetChannelId];
+    if (!tab || !targetCh) return;
+
+    this.pushUndoSnapshot('Waveform Compare', true);
+    tab.plotMode = 'time';
+    tab.activeChannelId = targetChannelId;
+
+    if (options.overlayRefTrace) {
+      const refChId = `cmp_ref_${targetChannelId}`;
+      const existing = tab.channels[refChId];
+      const refTrace: WaveformChannel = {
+        ...targetCh,
+        id: refChId,
+        name: `REF: ${refLabel}`,
+        unit: targetCh.unit || 'V',
+        color: '#94a3b8',
+        visible: true,
+        t: targetCh.t,
+        v: new Float32Array(alignedRefV),
+        isMath: true,
+        mathExpression: `Compare Reference (${refLabel})`,
+        sourceChannelIds: [targetChannelId],
+        coupling: 'DC',
+        inverted: false,
+        hasEdits: false,
+        refV: undefined,
+        voltsPerDiv: targetCh.voltsPerDiv,
+        vOffset: targetCh.vOffset,
+        vMin: targetCh.vMin,
+        vMax: targetCh.vMax,
+      };
+      tab.channels[refChId] = refTrace;
+      if (!existing && !tab.drawOrder.includes(refChId)) {
+        tab.drawOrder.push(refChId);
+      }
+      // Align same-unit scale so Target and Reference sit identically on grid
+      syncSameUnitChannelsScale(tab, targetChannelId);
+    }
+
+    if (options.enableGoldenBand) {
+      tab.goldenBand = {
+        enabled: true,
+        channelId: targetChannelId,
+        mode: options.goldenMode,
+        tolerance: Math.max(0.01, options.goldenTolerance || 5),
+        refV: new Float32Array(alignedRefV),
+        refLabel,
+      };
+    }
+
+    if (options.addDiffChannel) {
+      const diffChId = `cmp_diff_${targetChannelId}`;
+      const existingDiff = tab.channels[diffChId];
+      const diffTrace: WaveformChannel = {
+        ...targetCh,
+        id: diffChId,
+        name: `Δ(${targetCh.name} − ${refLabel})`,
+        unit: targetCh.unit || 'V',
+        color: '#fb7185',
+        visible: true,
+        t: targetCh.t,
+        v: new Float32Array(diffV),
+        isMath: true,
+        mathExpression: `${targetCh.name} - ${refLabel}`,
+        sourceChannelIds: [targetChannelId],
+        coupling: 'DC',
+        inverted: false,
+        hasEdits: false,
+        refV: undefined,
+        voltsPerDiv: undefined,
+        vOffset: undefined,
+        vMin: -1,
+        vMax: 1,
+      };
+      fitChannelTo125(diffTrace);
+      tab.channels[diffChId] = diffTrace;
+      if (!existingDiff && !tab.drawOrder.includes(diffChId)) {
+        tab.drawOrder.push(diffChId);
+      }
+    }
+
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public findTabByFingerprint(fingerprint: string): { tab: TabState; index: number } | null {
+    if (!fingerprint) return null;
+    for (let i = 0; i < this.tabs.length; i++) {
+      if (this.tabs[i].fileFingerprint === fingerprint) {
+        return { tab: this.tabs[i], index: i };
+      }
+    }
+    return null;
+  }
+
+  public applyMultiCompareGroup(
+    targetChannelId: string,
+    groupConfig: {
+      groupId: string;
+      replaceGroupId?: string;
+      groupName: string;
+      groupColor: string;
+      targetColor?: string;
+      tagTargetChannel: boolean;
+      overlayRefTraces: boolean;
+      enableGoldenBand: boolean;
+      goldenMode: 'percent' | 'absolute';
+      goldenTolerance: number;
+      addDiffChannels: boolean;
+    },
+    items: Array<{
+      id: string;
+      refLabel: string;
+      color: string;
+      alignedRefV: Float32Array;
+      diffV: Float32Array;
+    }>
+  ): void {
+    const tab = this.getActiveTab();
+    const targetCh = tab?.channels[targetChannelId];
+    if (!tab || !targetCh || items.length === 0) return;
+
+    this.pushUndoSnapshot(`Compare Group [${groupConfig.groupName}]`, true);
+    tab.plotMode = 'time';
+    tab.activeChannelId = targetChannelId;
+
+    // If replacing an existing group (or re-applying same groupId), clean up old synthetic ref/diff traces first
+    const oldGroupId = groupConfig.replaceGroupId || groupConfig.groupId;
+    if (oldGroupId) {
+      const staleIds = new Set<string>();
+      for (const id of tab.drawOrder) {
+        const ch = tab.channels[id];
+        if (!ch || ch.compareGroupId !== oldGroupId) continue;
+        if (ch.compareRole === 'target' || !id.startsWith('cmp_')) {
+          if (id !== targetChannelId || !groupConfig.tagTargetChannel) {
+            delete ch.compareGroupId;
+            delete ch.compareGroupName;
+            delete ch.compareGroupColor;
+            delete ch.compareRole;
+          }
+        } else {
+          const isOldRef = groupConfig.overlayRefTraces && ch.compareRole === 'ref';
+          const isOldDiff = groupConfig.addDiffChannels && ch.compareRole === 'diff';
+          if (isOldRef || isOldDiff) {
+            staleIds.add(id);
+            delete tab.channels[id];
+          } else {
+            ch.compareGroupId = groupConfig.groupId;
+            ch.compareGroupName = groupConfig.groupName;
+            ch.compareGroupColor = groupConfig.groupColor;
+          }
+        }
+      }
+      if (staleIds.size > 0) {
+        tab.drawOrder = tab.drawOrder.filter((id) => !staleIds.has(id));
+      }
+    }
+
+    if (groupConfig.tagTargetChannel) {
+      targetCh.compareGroupId = groupConfig.groupId;
+      targetCh.compareGroupName = groupConfig.groupName;
+      targetCh.compareGroupColor = groupConfig.groupColor;
+      targetCh.compareRole = 'target';
+      if (groupConfig.targetColor) {
+        targetCh.color = groupConfig.targetColor;
+      }
+    }
+
+    if (groupConfig.overlayRefTraces) {
+      items.forEach((item, idx) => {
+        const refChId = `cmp_ref_${groupConfig.groupId}_${idx}_${item.id}`;
+        const existing = tab.channels[refChId];
+        const refTrace: WaveformChannel = {
+          ...targetCh,
+          id: refChId,
+          name: `[${groupConfig.groupName}] ${item.refLabel}`,
+          unit: targetCh.unit || 'V',
+          color: item.color,
+          visible: true,
+          t: targetCh.t,
+          v: new Float32Array(item.alignedRefV),
+          isMath: true,
+          mathExpression: `Compare [${groupConfig.groupName}]: ${item.refLabel}`,
+          sourceChannelIds: [targetChannelId],
+          coupling: 'DC',
+          inverted: false,
+          hasEdits: false,
+          refV: undefined,
+          voltsPerDiv: targetCh.voltsPerDiv,
+          vOffset: targetCh.vOffset,
+          vMin: targetCh.vMin,
+          vMax: targetCh.vMax,
+          compareGroupId: groupConfig.groupId,
+          compareGroupName: groupConfig.groupName,
+          compareGroupColor: groupConfig.groupColor,
+          compareRole: 'ref',
+        };
+        tab.channels[refChId] = refTrace;
+        if (!existing && !tab.drawOrder.includes(refChId)) {
+          tab.drawOrder.push(refChId);
+        }
+      });
+      syncSameUnitChannelsScale(tab, targetChannelId);
+    }
+
+    if (groupConfig.enableGoldenBand && items[0]) {
+      tab.goldenBand = {
+        enabled: true,
+        channelId: targetChannelId,
+        mode: groupConfig.goldenMode,
+        tolerance: Math.max(0.01, groupConfig.goldenTolerance || 5),
+        refV: new Float32Array(items[0].alignedRefV),
+        refLabel: `[${groupConfig.groupName}] ${items[0].refLabel}`,
+      };
+    }
+
+    if (groupConfig.addDiffChannels) {
+      items.forEach((item, idx) => {
+        const diffChId = `cmp_diff_${groupConfig.groupId}_${idx}_${item.id}`;
+        const existingDiff = tab.channels[diffChId];
+        const diffTrace: WaveformChannel = {
+          ...targetCh,
+          id: diffChId,
+          name: `[${groupConfig.groupName}] Δ(${targetCh.name} − ${item.refLabel})`,
+          unit: targetCh.unit || 'V',
+          color: item.color,
+          visible: true,
+          t: targetCh.t,
+          v: new Float32Array(item.diffV),
+          isMath: true,
+          mathExpression: `${targetCh.name} - ${item.refLabel}`,
+          sourceChannelIds: [targetChannelId],
+          coupling: 'DC',
+          inverted: false,
+          hasEdits: false,
+          refV: undefined,
+          voltsPerDiv: undefined,
+          vOffset: undefined,
+          vMin: -1,
+          vMax: 1,
+          compareGroupId: groupConfig.groupId,
+          compareGroupName: groupConfig.groupName,
+          compareGroupColor: groupConfig.groupColor,
+          compareRole: 'diff',
+        };
+        fitChannelTo125(diffTrace);
+        tab.channels[diffChId] = diffTrace;
+        if (!existingDiff && !tab.drawOrder.includes(diffChId)) {
+          tab.drawOrder.push(diffChId);
+        }
+      });
+    }
+
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public toggleCompareGroupVisibility(groupId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    const members = tab.drawOrder
+      .map((id) => tab.channels[id])
+      .filter((c) => c && c.compareGroupId === groupId && c.compareRole !== 'target');
+    const pool =
+      members.length > 0
+        ? members
+        : tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.compareGroupId === groupId);
+    if (pool.length === 0) return;
+    const anyHidden = pool.some((c) => !c.visible);
+    const targetVis = anyHidden ? true : false;
+    pool.forEach((c) => {
+      c.visible = targetVis;
+    });
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public removeCompareGroup(groupId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    this.pushUndoSnapshot('Remove Compare Group', true);
+    const toDelete = new Set<string>();
+    let grpName = '';
+    for (const id of tab.drawOrder) {
+      const ch = tab.channels[id];
+      if (!ch || ch.compareGroupId !== groupId) continue;
+      grpName = ch.compareGroupName || grpName;
+      if (ch.compareRole === 'target' || !id.startsWith('cmp_')) {
+        delete ch.compareGroupId;
+        delete ch.compareGroupName;
+        delete ch.compareGroupColor;
+        delete ch.compareRole;
+      } else {
+        toDelete.add(id);
+        delete tab.channels[id];
+      }
+    }
+    tab.drawOrder = tab.drawOrder.filter((id) => !toDelete.has(id));
+    if (tab.activeChannelId && toDelete.has(tab.activeChannelId)) {
+      tab.activeChannelId = tab.drawOrder[0];
+    }
+    if (tab.goldenBand && tab.goldenBand.refLabel?.startsWith(`[${grpName}]`)) {
+      tab.goldenBand.enabled = false;
+    }
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+    this.showToast(`Removed compare group${grpName ? ` [${grpName}]` : ''}.`, 'info');
+  }
+
+  public exportCroppedSlice(format: 'csv' | 'json', rangeMode: 'view' | 'cursors', channelIds: string[]): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+
+    const baseCh = tab.channels[channelIds[0] || tab.drawOrder[0]];
+    if (!baseCh) return;
+
+    let tStart: number;
+    let tEnd: number;
+    if (rangeMode === 'cursors' && tab.cursors.enabled && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+      tStart = Math.min(tab.cursors.x1, tab.cursors.x2);
+      tEnd = Math.max(tab.cursors.x1, tab.cursors.x2);
+    } else {
+      const b = getTimeBoundsForView(tab, baseCh);
+      tStart = b.tStart;
+      tEnd = b.tEnd;
+    }
+
+    try {
+      const res =
+        format === 'json'
+          ? exportCroppedWaveformJSON(tab, tStart, tEnd, channelIds)
+          : exportCroppedWaveformCSV(tab, tStart, tEnd, channelIds);
+      this.showToast(`Exported ${res.rowCount.toLocaleString()} cropped samples (${format.toUpperCase()}).`, 'info');
+    } catch (err: any) {
+      this.showToast(`Crop export failed: ${err.message}`, 'error');
+    }
+  }
+
+  public submitPendingTextAnnotation(text: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !this.pendingAnnotationCoord) return;
+    const trimmed = text.trim();
+    if (trimmed) {
+      tab.annotations.push({
+        id: `ann_${Date.now()}`,
+        type: 'text',
+        x: this.pendingAnnotationCoord.time,
+        y: this.pendingAnnotationCoord.voltage,
+        channelId: this.pendingAnnotationCoord.channelId,
+        text: trimmed,
+      });
+      tab.annotationsVisible = true;
+    }
+    this.pendingAnnotationCoord = null;
+    tab.activeTool = 'pan';
+    this.renderSidebar();
+    this.draw();
+  }
+
   // --- Rendering Pipeline ---
   public draw(): void {
-    const width = this.cssW || this.canvas.clientWidth;
-    const height = this.cssH || this.canvas.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    const width = this.canvas.width / dpr;
+    const height = this.canvas.height / dpr;
 
     this.ctx.clearRect(0, 0, width, height);
 
     const tab = this.getActiveTab();
     const p = getPlotArea(width, height);
-
-    // Always draw professional oscilloscope background grid
-    drawGrid(this.ctx, p, this.theme);
+    const emptyOverlay = document.getElementById('emptyScopeOverlay');
 
     if (!tab || tab.drawOrder.length === 0) {
-      // Empty state prompt
-      this.ctx.save();
-      this.ctx.fillStyle = '#888888';
-      this.ctx.font = '16px "Segoe UI", sans-serif';
-      this.ctx.textAlign = 'center';
-      this.ctx.fillText(
-        'Drop a CSV or WFM file here, or click "Load File" to start waveform analysis',
-        width / 2,
-        height / 2
-      );
-      this.ctx.restore();
+      drawGrid(this.ctx, p, this.theme);
+      if (emptyOverlay) emptyOverlay.style.display = 'flex';
       this.updateStatusBar();
+      this.updateScreenTelemetry();
       return;
     }
 
+    if (emptyOverlay) emptyOverlay.style.display = 'none';
+    this.ensureTabDefaults(tab);
+
     if (tab.plotMode === 'frequency') {
+      drawGrid(this.ctx, p, this.theme, 10, 8, false);
       this.renderFrequencyDomain(tab, p);
+    } else if (tab.plotMode === 'xy') {
+      drawGrid(this.ctx, p, this.theme, 10, 8, true);
+      drawXYPlot(this.ctx, tab, p, this.theme);
     } else {
+      const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
+      if (!tab.separateView || visibleChs.length <= 1) {
+        drawGrid(this.ctx, p, this.theme, 10, 8, true);
+      }
       this.renderTimeDomain(tab, p);
+      drawGndMarkers(this.ctx, p, tab);
+      drawCursors(this.ctx, tab, p, this.theme);
+      drawActiveAnomalyMarkers(this.ctx, tab, p);
+      drawAnnotations(this.ctx, tab, p);
     }
 
-    // Draw Cursors
-    drawCursors(this.ctx, tab, p, this.theme);
-
-    // Draw Axis Labels
     drawAxisLabels(this.ctx, p, tab, this.theme, 10, 8, this.cachedSpectrum);
+    if (tab.plotMode === 'time') {
+      drawCompareGroupLegend(this.ctx, tab, p);
+    }
 
-    // Area Zoom rect if active
-    if (this.isAreaZooming && this.areaZoomStart && this.areaZoomEnd) {
+    // Interactive box drag overlay (Area Zoom or Area Annotation)
+    if (this.dragState && (this.dragState.type === 'areaZoom' || this.dragState.type === 'areaAnnotate')) {
+      const { start, end, type } = this.dragState;
       this.ctx.save();
-      this.ctx.fillStyle = 'rgba(0, 120, 215, 0.3)';
-      this.ctx.strokeStyle = '#0078d7';
-      this.ctx.lineWidth = 1;
-      const rx = Math.min(this.areaZoomStart.x, this.areaZoomEnd.x);
-      const ry = Math.min(this.areaZoomStart.y, this.areaZoomEnd.y);
-      const rw = Math.abs(this.areaZoomEnd.x - this.areaZoomStart.x);
-      const rh = Math.abs(this.areaZoomEnd.y - this.areaZoomStart.y);
+      this.ctx.fillStyle = type === 'areaZoom' ? 'rgba(56, 189, 248, 0.18)' : 'rgba(52, 211, 153, 0.18)';
+      this.ctx.strokeStyle = type === 'areaZoom' ? '#38bdf8' : '#34d399';
+      this.ctx.lineWidth = 1.2;
+      const rx = Math.min(start.x, end.x);
+      const ry = Math.min(start.y, end.y);
+      const rw = Math.abs(end.x - start.x);
+      const rh = Math.abs(end.y - start.y);
       this.ctx.fillRect(rx, ry, rw, rh);
       this.ctx.strokeRect(rx, ry, rw, rh);
       this.ctx.restore();
     }
 
     this.updateStatusBar();
+    this.updateScreenTelemetry();
+    this.renderMeasurementStrip(tab);
   }
 
   private renderTimeDomain(tab: TabState, p: PlotArea): void {
-    const visibleChs = getVisibleChannels(tab);
-    const subAreas = computeSubplotAreas(tab, p);
+    const visibleChs = tab.drawOrder
+      .map((id) => tab.channels[id])
+      .filter((c) => c && c.visible);
 
-    if (subAreas) {
-      // Separate diagram subplots
-      visibleChs.forEach((ch) => {
-        const subP = subAreas.get(ch.id)!;
-        drawGrid(this.ctx, subP, this.theme, 10, 4);
-        drawChannelWaveform(this.ctx, tab, ch, p, subP);
-        drawSubplotAxisLabels(this.ctx, subP, ch, this.theme, 4);
+    const goldenEval = this.getGoldenEvaluation(tab);
+
+    if (tab.separateView && visibleChs.length > 1) {
+      const rects = getSubplotRects(p, visibleChs, true);
+      rects.forEach((rect) => {
+        drawGrid(this.ctx, rect.area, this.theme, 10, 4, true);
+        drawChannelWaveform(this.ctx, tab, rect.channel, p, rect.area);
+        if (goldenEval && tab.goldenBand?.channelId === rect.channel.id) {
+          drawGoldenToleranceBand(this.ctx, tab, rect.channel, p, goldenEval, rect.area);
+        }
       });
     } else {
-      // Overlapped diagram
-      for (const id of tab.drawOrder) {
-        const ch = tab.channels[id];
-        if (ch && ch.visible) {
-          drawChannelWaveform(this.ctx, tab, ch, p);
+      for (const ch of visibleChs) {
+        drawChannelWaveform(this.ctx, tab, ch, p);
+        if (goldenEval && tab.goldenBand?.channelId === ch.id) {
+          drawGoldenToleranceBand(this.ctx, tab, ch, p, goldenEval);
         }
       }
-      drawGroundMarkers(this.ctx, tab, p);
     }
 
-    // 10% / 90% edge annotations for the active channel
-    if (tab.showEdgeMarks) {
-      const ch = getActiveChannel(tab);
-      if (ch && ch.visible) {
-        drawEdgeMarkers(this.ctx, tab, ch, p, this.getEdgeMarks(tab, ch));
-      }
-    }
-
-    // Trigger level line + trigger event marker
-    drawTriggerLine(this.ctx, tab, p, this.theme, this.getTriggerTime(tab));
+    drawTriggerLine(this.ctx, tab, p, this.theme);
   }
 
-  /** Edge detection for the visible window, cached so panning stays smooth. */
-  private getEdgeMarks(tab: TabState, ch: WaveformChannel): EdgeMarks | null {
-    const key = `${tab.id}|${ch.id}|${ch.v.length}|${tab.view.startIndex}|${tab.view.endIndex}|${this.filterRev}`;
-    if (this.edgeCache && this.edgeCache.key === key) return this.edgeCache.marks;
-    const marks = computeEdgeMarks(ch, tab.view.startIndex, tab.view.endIndex);
-    this.edgeCache = { key, marks };
-    return marks;
-  }
-
-  /** Time of the first trigger event in the trigger channel (cached). */
-  private getTriggerTime(tab: TabState): number | null {
-    const cfg = tab.triggerConfig;
-    if (!cfg.enabled) return null;
-    const ch = tab.channels[cfg.channelId];
-    if (!ch) return null;
-    const key = `${tab.id}|${ch.id}|${ch.v.length}|${cfg.type}|${cfg.level}|${this.filterRev}`;
-    if (this.trigCache && this.trigCache.key === key) return this.trigCache.time;
-    const pt = findTriggerPoint(ch, cfg);
-    const time = pt ? pt.triggerTime : null;
-    this.trigCache = { key, time };
-    return time;
-  }
+  private lastRenderedPeaksKey: string = '';
 
   private renderFrequencyDomain(tab: TabState, p: PlotArea): void {
     const targetId = tab.selectedFftChannelId || tab.drawOrder[0];
     const primaryCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
     if (!primaryCh || primaryCh.v.length === 0) return;
 
-    // Cache key to avoid redundant FFT calculation
-    const key = `${primaryCh.id}_${tab.view.startIndex}_${tab.view.endIndex}_${tab.fftOptions.window}_${tab.fftOptions.scale}_${tab.fftOptions.zeroPadding}_${tab.fftOptions.removeDC}_${tab.fftOptions.range}_${this.filterRev}`;
+    const rangeSuffix =
+      tab.fftOptions.range === 'view'
+        ? `${tab.view.startIndex}_${tab.view.endIndex}`
+        : tab.fftOptions.range === 'cursors'
+        ? `${tab.cursors.x1}_${tab.cursors.x2}`
+        : 'entire';
+    const key = `${primaryCh.id}_${rangeSuffix}_${tab.fftOptions.window}_${tab.fftOptions.zeroPadding}_${tab.fftOptions.removeDC}_${tab.fftOptions.range}_${this.editVersion}`;
 
     if (this.cachedSpectrumKey !== key || !this.cachedSpectrum) {
       try {
@@ -341,7 +1462,6 @@ export class OscilloscopeApp {
     }
 
     if (this.cachedSpectrum) {
-      // Harmonic markers
       const harmonicRes = computeBLDCHarmonics(tab.motorConfig);
       drawSpectrum(
         this.ctx,
@@ -353,40 +1473,60 @@ export class OscilloscopeApp {
         tab.view
       );
 
-      // Render Detected Peaks in the sidebar
-      const peaksEl = document.getElementById('fftPeaksList');
-      if (peaksEl) {
-        if (this.cachedSpectrum.peaks.length === 0) {
-          peaksEl.innerHTML = '<div class="text-neutral-500 italic">No peaks detected above threshold</div>';
-        } else {
-          let html = '';
-          this.cachedSpectrum.peaks.forEach((peak, i) => {
-            const isFund = peak.isFundamental;
-            const magStr = tab.fftOptions.scale === 'db' ? `${peak.db.toFixed(1)} dB` : formatEng(peak.magnitude, primaryCh.unit, 2);
-            html += `
-              <div class="flex justify-between items-center py-0.5 ${isFund ? 'text-amber-300 font-bold' : 'text-neutral-300'}">
-                <span>${isFund ? '★ ' : ''}P${i + 1}: ${formatEng(peak.frequency, 'Hz', 2)}</span>
-                <span>${magStr}</span>
-              </div>
-            `;
-          });
-          peaksEl.innerHTML = html;
+      const peaksRenderKey = `${this.cachedSpectrumKey}_${tab.fftOptions.scale}`;
+      if (this.lastRenderedPeaksKey !== peaksRenderKey) {
+        this.lastRenderedPeaksKey = peaksRenderKey;
+        const peaksEl = document.getElementById('fftPeaksList');
+        if (peaksEl) {
+          if (this.cachedSpectrum.peaks.length === 0) {
+            peaksEl.innerHTML = '<div class="text-slate-500">No peaks detected above threshold</div>';
+          } else {
+            let html = '';
+            this.cachedSpectrum.peaks.forEach((peak, i) => {
+              const isFund = peak.isFundamental;
+              const magStr =
+                tab.fftOptions.scale === 'db'
+                  ? `${peak.db.toFixed(1)} dB`
+                  : formatEng(peak.magnitude, primaryCh.unit, 2);
+              html += `
+                <div class="flex justify-between items-center py-0.5 ${isFund ? 'text-amber-300 font-semibold' : 'text-slate-300'}">
+                  <span>${isFund ? '* ' : ''}P${i + 1}: ${formatEng(peak.frequency, 'Hz', 2)}</span>
+                  <span>${magStr}</span>
+                </div>
+              `;
+            });
+            peaksEl.innerHTML = html;
+          }
         }
       }
     }
   }
 
-  // --- Interaction & Controls ---
+  // --- Interaction & Events ---
   private initEvents(): void {
     window.addEventListener('resize', () => this.handleResize());
 
-    // Canvas Mouse Events
     this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-    this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-    this.canvas.addEventListener('mouseup', () => this.handleMouseUp());
+    this.canvas.addEventListener('dblclick', () => this.fitView());
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    window.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+    window.addEventListener('mouseup', () => this.handleMouseUp());
     this.canvas.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
 
-    // Drag and drop files onto whole window
+    // Clipboard CSV Paste
+    window.addEventListener('paste', (e: ClipboardEvent) => {
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT')) {
+        return;
+      }
+      const text = e.clipboardData?.getData('text/plain');
+      if (text && text.trim().length > 0 && (text.includes(',') || text.includes('\t') || text.includes(';'))) {
+        e.preventDefault();
+        this.showCsvImportModal(text, `clipboard_${new Date().toTimeString().slice(0, 8).replace(/:/g, '')}.csv`);
+      }
+    });
+
+    // Drag and Drop files
     window.addEventListener('dragover', (e) => {
       e.preventDefault();
       const overlay = document.getElementById('drag-overlay');
@@ -411,32 +1551,95 @@ export class OscilloscopeApp {
 
     // Keyboard Shortcuts
     window.addEventListener('keydown', (e) => {
-      const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'SELECT')) {
+      const key = e.key.toUpperCase();
+
+      // Screenshot hotkey (Ctrl+S / Cmd+S / F12)
+      if (((e.ctrlKey || e.metaKey) && key === 'S') || e.key === 'F12') {
+        e.preventDefault();
+        this.exportPNG();
         return;
       }
 
-      const key = e.key.toUpperCase();
-      if (key === 'F') {
+      // Undo / Redo hotkeys
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === 'Z') {
+        e.preventDefault();
+        this.undo();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && (key === 'Y' || (e.shiftKey && key === 'Z'))) {
+        e.preventDefault();
+        this.redo();
+        return;
+      }
+
+      // Close open modal on Escape even if focus is inside an input
+      if (key === 'ESCAPE') {
+        let closedModal = false;
+        document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+          const el = overlay as HTMLElement;
+          if (el.style.display === 'flex') {
+            el.style.display = 'none';
+            closedModal = true;
+          }
+        });
+        if (closedModal) return;
+      }
+
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'SELECT' || activeEl.tagName === 'TEXTAREA')) {
+        return;
+      }
+
+      const tab = this.getActiveTab();
+      if (!tab) return;
+
+      // 1-8 numeric quick channel switch
+      if (/^[1-8]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const chIdx = parseInt(e.key, 10) - 1;
+        if (tab.drawOrder[chIdx]) {
+          this.selectActiveChannel(tab.drawOrder[chIdx]);
+        }
+        return;
+      }
+
+      if (key === 'U') {
+        this.syncSameUnitScales();
+      } else if (key === 'A') {
+        this.executeAutoSet();
+      } else if (key === 'F') {
         this.fitView();
       } else if (key === 'Z') {
-        this.isAreaZooming = !this.isAreaZooming;
-        this.draw();
+        this.setActiveTool('areaZoom');
       } else if (key === 'T') {
-        const tab = this.getActiveTab();
-        if (tab) {
-          tab.cursors.enabled = !tab.cursors.enabled;
-          if (tab.cursors.enabled && tab.cursors.x1 === null) {
-            const ch = getTimeBaseChannel(tab);
-            if (ch) {
-              const span = Math.max(0, indexToTime(ch, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - indexToTime(ch, tab.view.startIndex));
-              const start = indexToTime(ch, tab.view.startIndex);
-              tab.cursors.x1 = start + span * 0.25;
-              tab.cursors.x2 = start + span * 0.75;
-            }
-          }
-          this.renderSidebar();
-          this.draw();
+        const cur = resolveCursorMode(tab);
+        this.setCursorMode(cur === 'off' ? 'xy' : 'off');
+      } else if (key === 'O') {
+        this.setSeparateView(false);
+      } else if (key === 'S' && !e.ctrlKey && !e.metaKey) {
+        this.setSeparateView(true);
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        this.panTimebase(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        this.panTimebase(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const chId = tab.activeChannelId || tab.drawOrder[0];
+        if (chId) this.stepChannelScale(chId, -1);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const chId = tab.activeChannelId || tab.drawOrder[0];
+        if (chId) this.stepChannelScale(chId, 1);
+      } else if (e.key === '+' || e.key === '=') {
+        this.stepTimebase(-1);
+      } else if (e.key === '-' || e.key === '_') {
+        this.stepTimebase(1);
+      } else if (key === 'ESCAPE') {
+        if (tab.activeTool && tab.activeTool !== 'pan') {
+          this.setActiveTool('pan');
+        } else {
+          this.fitView();
         }
       }
     });
@@ -445,181 +1648,32 @@ export class OscilloscopeApp {
   private handleResize(): void {
     const dpr = window.devicePixelRatio || 1;
     const rect = this.canvas.parentElement?.getBoundingClientRect();
-    if (!rect) return;
+    if (!rect || rect.width === 0 || rect.height === 0) return;
 
-    // Round the backing store to whole device pixels and scale by the *actual* ratio.
-    // A fractional size (125% / 150% Windows scaling) makes the browser resample the canvas,
-    // which is what made lines and text look soft or jagged.
-    const pxW = Math.max(1, Math.round(rect.width * dpr));
-    const pxH = Math.max(1, Math.round(rect.height * dpr));
-    this.cssW = rect.width;
-    this.cssH = rect.height;
-
-    this.canvas.width = pxW;
-    this.canvas.height = pxH;
+    this.canvas.width = rect.width * dpr;
+    this.canvas.height = rect.height * dpr;
     this.canvas.style.width = `${rect.width}px`;
     this.canvas.style.height = `${rect.height}px`;
 
-    this.ctx.setTransform(pxW / rect.width, 0, 0, pxH / rect.height, 0, 0);
+    this.ctx.resetTransform();
+    this.ctx.scale(dpr, dpr);
     this.draw();
   }
 
-  public ensureCursorPositions(tab: TabState): void {
-    const primaryCh = getTimeBaseChannel(tab);
-    if (!primaryCh) return;
-    const start = indexToTime(primaryCh, tab.view.startIndex);
-    const span = Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - start);
-
-    if (tab.cursors.x1 === null || tab.cursors.x2 === null) {
-      tab.cursors.x1 = start + span * 0.25;
-      tab.cursors.x2 = start + span * 0.75;
+  private findSubplotAtPoint(tab: TabState, p: PlotArea, y: number): { channel: WaveformChannel; area: PlotArea } | null {
+    const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
+    if (visibleChs.length === 0) return null;
+    if (!tab.separateView || visibleChs.length === 1) {
+      const activeCh = tab.channels[tab.activeChannelId || ''] || visibleChs[0];
+      return { channel: activeCh, area: p };
     }
-
-    const targetCh = getCursorChannel(tab) || primaryCh;
-    if (targetCh && (tab.cursors.y1 === null || tab.cursors.y2 === null)) {
-      // Place them inside what is currently on screen for that channel
-      const lo = targetCh.vMin;
-      const vSpan = targetCh.vMax - targetCh.vMin;
-      tab.cursors.y1 = lo + vSpan * 0.3;
-      tab.cursors.y2 = lo + vSpan * 0.7;
-    }
-  }
-
-  /**
-   * Keeps the Y cursors at the same *screen* position when the channel they measure changes,
-   * instead of leaving them at the old channel's volts (which is usually off-screen on the
-   * new channel's scale and made the cursor look stuck on channel 1).
-   */
-  private remapYCursors(tab: TabState, from: WaveformChannel | undefined, to: WaveformChannel | undefined): void {
-    if (!from || !to || from.id === to.id) return;
-    const fr = from.vMax - from.vMin;
-    const tr = to.vMax - to.vMin;
-    if (!(fr > 0) || !(tr > 0)) return;
-    for (const key of ['y1', 'y2'] as const) {
-      const val = tab.cursors[key];
-      if (val === null) continue;
-      tab.cursors[key] = to.vMin + ((val - from.vMin) / fr) * tr;
-    }
-  }
-
-  /** Change which channel the vertical axis / measurements / auto cursor follow. */
-  public setActiveChannel(tab: TabState, id: string): void {
-    const before = getCursorChannel(tab);
-    tab.selectedMeasurementChannelId = id;
-    this.remapYCursors(tab, before, getCursorChannel(tab));
-    this.renderSidebar();
-    this.draw();
-  }
-
-  /** Select the channel the Y cursors measure; '' means Auto (follow active channel). */
-  public setCursorChannel(tab: TabState, id: string): void {
-    const before = getCursorChannel(tab);
-    tab.cursors.trackingChannel = id || null;
-    this.remapYCursors(tab, before, getCursorChannel(tab));
-    this.renderSidebar();
-    this.draw();
-  }
-
-  /**
-   * Called after a channel is shown or hidden. If the active channel just disappeared the
-   * axis and measurements move to the first visible channel automatically.
-   */
-  private onVisibilityChanged(tab: TabState, before: WaveformChannel | undefined): void {
-    const selected = tab.channels[tab.selectedMeasurementChannelId || ''];
-    if (!selected || !selected.visible) {
-      const active = getActiveChannel(tab);
-      if (active) tab.selectedMeasurementChannelId = active.id;
-    }
-    this.remapYCursors(tab, before, getCursorChannel(tab));
-    this.renderSidebar();
-    this.draw();
-  }
-
-  public setChannelScale(channelId: string, newVPerDiv: number): void {
-    const tab = this.getActiveTab();
-    if (!tab || !tab.channels[channelId]) return;
-    const ch = tab.channels[channelId];
-    if (newVPerDiv <= 0 || !isFinite(newVPerDiv)) return;
-
-    const currentOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
-    const halfSpan = newVPerDiv * 4; // 8 divisions
-    ch.vPerDiv = newVPerDiv;
-    ch.vOffset = currentOffset;
-    ch.vMin = currentOffset - halfSpan;
-    ch.vMax = currentOffset + halfSpan;
-    this.renderSidebar();
-    this.draw();
-  }
-
-  public setChannelOffset(channelId: string, newOffset: number): void {
-    const tab = this.getActiveTab();
-    if (!tab || !tab.channels[channelId]) return;
-    const ch = tab.channels[channelId];
-    if (!isFinite(newOffset)) return;
-
-    const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
-    const halfSpan = vPerDiv * 4;
-    ch.vOffset = newOffset;
-    ch.vPerDiv = vPerDiv;
-    ch.vMin = newOffset - halfSpan;
-    ch.vMax = newOffset + halfSpan;
-    this.renderSidebar();
-    this.draw();
-  }
-
-  public nudgeChannelOffset(channelId: string, direction: 'up' | 'down'): void {
-    const tab = this.getActiveTab();
-    if (!tab || !tab.channels[channelId]) return;
-    const ch = tab.channels[channelId];
-    const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
-    const currentOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
-    const delta = direction === 'up' ? vPerDiv : -vPerDiv;
-    this.setChannelOffset(channelId, currentOffset + delta);
-  }
-
-  public zeroChannelOffset(channelId: string): void {
-    this.setChannelOffset(channelId, 0);
-  }
-
-  public stepChannelScale(channelId: string, direction: 'up' | 'down'): void {
-    const tab = this.getActiveTab();
-    if (!tab || !tab.channels[channelId]) return;
-    const ch = tab.channels[channelId];
-    const currentScale = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
-    const newScale = getNextScale(currentScale, direction);
-    this.setChannelScale(channelId, newScale);
-  }
-
-  public autoScaleChannel(channelId: string): void {
-    const tab = this.getActiveTab();
-    if (!tab || !tab.channels[channelId]) return;
-    const ch = tab.channels[channelId];
-    let min = Infinity;
-    let max = -Infinity;
-    for (let i = 0; i < ch.v.length; i++) {
-      const val = ch.v[i];
-      if (!isNaN(val)) {
-        if (val < min) min = val;
-        if (val > max) max = val;
+    const rects = getSubplotRects(p, visibleChs, true);
+    for (const r of rects) {
+      if (y >= r.area.y && y <= r.area.y + r.area.height) {
+        return { channel: r.channel, area: r.area };
       }
     }
-    if (!isFinite(min) || !isFinite(max)) return;
-    const span = max - min || 1.0;
-    const center = (max + min) / 2;
-    const vPerDivRaw = span / 6; // Leave 1 division headroom
-    let snapped = 1.0;
-    for (const step of SCALE_STEPS) {
-      if (step >= vPerDivRaw) {
-        snapped = step;
-        break;
-      }
-    }
-    ch.vPerDiv = snapped;
-    ch.vOffset = center;
-    ch.vMin = center - snapped * 4;
-    ch.vMax = center + snapped * 4;
-    this.renderSidebar();
-    this.draw();
+    return { channel: rects[0].channel, area: rects[0].area };
   }
 
   private handleMouseDown(e: MouseEvent): void {
@@ -631,94 +1685,155 @@ export class OscilloscopeApp {
     const y = e.clientY - rect.top;
     const p = getPlotArea(rect.width, rect.height);
 
-    // Check Ground Reference markers on left margin (x in [p.x - 22, p.x])
-    if (!tab.separateView && x >= p.x - 22 && x <= p.x && y >= p.y && y <= p.y + p.height) {
-      const visibleChs = tab.drawOrder
-        .map((id) => tab.channels[id])
-        .filter((c) => c && c.visible);
-
-      for (const ch of visibleChs) {
-        const vRange = ch.vMax - ch.vMin;
-        if (vRange > 0) {
-          const frac = (0 - ch.vMin) / vRange;
-          const clampedFrac = Math.max(0, Math.min(1, frac));
-          const gndY = p.y + p.height - clampedFrac * p.height;
-          if (Math.abs(y - gndY) < 12) {
-            this.draggingCursor = {
-              groundChId: ch.id,
-              startY: y,
-              initialOffset: ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2,
-            };
-            return;
-          }
-        }
+    // 1. Check Left GND Handles (interactive vertical offset drag)
+    const gndHandles = getGndHandlePositions(p, tab);
+    for (let i = gndHandles.length - 1; i >= 0; i--) {
+      const h = gndHandles[i];
+      if (x >= h.x - 20 && x <= h.x + 6 && Math.abs(y - h.y) <= 9) {
+        this.pushUndoSnapshot('Drag GND Offset');
+        this.selectActiveChannel(h.channelId);
+        this.dragState = { type: 'gnd', channelId: h.channelId, area: h.area };
+        return;
       }
+    }
+
+    // 2. Check Right Trigger Handle (interactive trigger level drag)
+    const trigHandle = getTriggerHandlePosition(p, tab);
+    if (trigHandle && x >= trigHandle.x - 4 && x <= trigHandle.x + 22 && Math.abs(y - trigHandle.y) <= 9) {
+      this.dragState = {
+        type: 'trigger',
+        channelId: tab.triggerConfig.channelId,
+        area: trigHandle.area,
+      };
+      return;
     }
 
     if (x < p.x || x > p.x + p.width || y < p.y || y > p.y + p.height) return;
 
-    // Check Cursors (X and Y)
-    if (tab.cursors.enabled) {
-      const cursorType = tab.cursors.type || 'x';
-      const showX = cursorType === 'x' || cursorType === 'xy';
-      const showY = cursorType === 'y' || cursorType === 'xy';
+    // Right-drag inside graticule always triggers Box Zoom
+    if (e.button === 2) {
+      this.dragState = {
+        type: 'areaZoom',
+        start: { x, y },
+        end: { x, y },
+      };
+      return;
+    }
 
-      // Check X Cursors (Time)
-      if (showX) {
-        const primaryCh = getTimeBaseChannel(tab);
-        const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
-        const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
+    if (e.button !== 0) return;
 
+    // 3. Check Cursors X & Y
+    const curMode = resolveCursorMode(tab);
+    if (curMode !== 'off' && tab.plotMode === 'time') {
+      const targetId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
+      const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
+      const targetArea = targetCh ? getChannelPlotArea(tab, targetCh.id, p) : p;
+
+      if ((curMode === 'x' || curMode === 'xy' || curMode === 'track') && targetCh) {
+        const { tStart, tSpan } = getTimeBoundsForView(tab, targetCh);
         if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
           const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
           const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
-
-          if (Math.abs(x - x1Px) < 10) {
-            this.draggingCursor = 'x1';
+          if (Math.abs(x - x1Px) < 9) {
+            this.dragState = { type: 'cursorX', which: 'x1' };
             return;
-          } else if (Math.abs(x - x2Px) < 10) {
-            this.draggingCursor = 'x2';
+          }
+          if (Math.abs(x - x2Px) < 9) {
+            this.dragState = { type: 'cursorX', which: 'x2' };
             return;
           }
         }
       }
 
-      // Check Y Cursors (Voltage) - measured on the tracked channel, inside its own subplot
-      if (showY) {
-        const targetCh = getCursorChannel(tab);
-        if (targetCh) {
-          const area = getChannelArea(tab, p, targetCh);
-          const vRange = targetCh.vMax - targetCh.vMin;
-          if (vRange > 0) {
-            if (tab.cursors.y1 !== null) {
-              const y1Px = area.y + area.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * area.height;
-              if (Math.abs(y - y1Px) < 10) {
-                this.draggingCursor = 'y1';
-                return;
-              }
-            }
-            if (tab.cursors.y2 !== null) {
-              const y2Px = area.y + area.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * area.height;
-              if (Math.abs(y - y2Px) < 10) {
-                this.draggingCursor = 'y2';
-                return;
-              }
-            }
+      if ((curMode === 'y' || curMode === 'xy') && targetCh) {
+        const vSpan = targetCh.vMax - targetCh.vMin;
+        if (vSpan > 0 && tab.cursors.y1 !== null && tab.cursors.y2 !== null && y >= targetArea.y && y <= targetArea.y + targetArea.height) {
+          const y1Px = targetArea.y + targetArea.height - ((tab.cursors.y1 - targetCh.vMin) / vSpan) * targetArea.height;
+          const y2Px = targetArea.y + targetArea.height - ((tab.cursors.y2 - targetCh.vMin) / vSpan) * targetArea.height;
+          if (Math.abs(y - y1Px) < 9) {
+            this.dragState = { type: 'cursorY', which: 'y1', channelId: targetCh.id, area: targetArea };
+            return;
+          }
+          if (Math.abs(y - y2Px) < 9) {
+            this.dragState = { type: 'cursorY', which: 'y2', channelId: targetCh.id, area: targetArea };
+            return;
           }
         }
       }
     }
 
-    if (e.shiftKey || this.isAreaZooming) {
-      this.isAreaZooming = true;
-      this.areaZoomStart = { x, y };
-      this.areaZoomEnd = { x, y };
+    // 4. Annotation Tools
+    const subHit = this.findSubplotAtPoint(tab, p, y);
+    if (tab.plotMode === 'time' && subHit) {
+      if (tab.activeTool === 'pointAnnotate') {
+        const dataPt = screenToData({ x, y }, tab, subHit.channel.id, subHit.area);
+        const sampledV = sampleChannelValueAtTime(subHit.channel, dataPt.time);
+        tab.annotations.push({
+          id: `ann_${Date.now()}`,
+          type: 'point',
+          x: dataPt.time,
+          y: sampledV !== null ? sampledV : dataPt.voltage,
+          channelId: subHit.channel.id,
+          color: subHit.channel.color,
+        });
+        tab.annotationsVisible = true;
+        this.draw();
+        return;
+      }
+
+      if (tab.activeTool === 'textAnnotate') {
+        const dataPt = screenToData({ x, y }, tab, subHit.channel.id, subHit.area);
+        const sampledV = sampleChannelValueAtTime(subHit.channel, dataPt.time);
+        this.pendingAnnotationCoord = {
+          time: dataPt.time,
+          voltage: sampledV !== null ? sampledV : dataPt.voltage,
+          channelId: subHit.channel.id,
+        };
+        const modal = document.getElementById('textAnnotationModal');
+        const input = document.getElementById('textAnnInput') as HTMLInputElement;
+        if (modal && input) {
+          input.value = '';
+          modal.style.display = 'flex';
+          setTimeout(() => input.focus(), 30);
+        }
+        return;
+      }
+
+      if (tab.activeTool === 'areaAnnotate') {
+        this.dragState = {
+          type: 'areaAnnotate',
+          channelId: subHit.channel.id,
+          area: subHit.area,
+          start: { x, y },
+          end: { x, y },
+        };
+        return;
+      }
+    }
+
+    // 5. In Separate Mode, clicking inside a subplot activates that channel
+    if (tab.separateView && subHit && subHit.channel.id !== tab.activeChannelId) {
+      this.selectActiveChannel(subHit.channel.id);
+    }
+
+    // 6. Area Zoom or Pan
+    if (e.shiftKey || tab.activeTool === 'areaZoom') {
+      this.dragState = {
+        type: 'areaZoom',
+        start: { x, y },
+        end: { x, y },
+      };
     } else {
-      this.isDragging = true;
-      this.dragStartX = x;
-      this.dragStartY = y;
-      this.initialViewStart = tab.view.startIndex;
-      this.initialViewEnd = tab.view.endIndex;
+      const targetFftCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
+      const nyquist = (targetFftCh?.fs || 1e5) / 2;
+      this.dragState = {
+        type: 'pan',
+        startX: x,
+        initialStartIdx: tab.view.startIndex,
+        initialEndIdx: tab.view.endIndex,
+        initialFMin: tab.view.fMin ?? 0,
+        initialFMax: tab.view.fMax ?? nyquist,
+      };
     }
   }
 
@@ -731,195 +1846,269 @@ export class OscilloscopeApp {
     const y = e.clientY - rect.top;
     const p = getPlotArea(rect.width, rect.height);
 
-    // Dragging Cursors or Ground Marker
-    if (this.draggingCursor) {
-      if (typeof this.draggingCursor === 'object' && 'groundChId' in this.draggingCursor) {
-        const ch = tab.channels[this.draggingCursor.groundChId];
+    if (this.dragState) {
+      if (this.dragState.type === 'gnd') {
+        const ch = tab.channels[this.dragState.channelId];
         if (ch) {
-          const dy = this.draggingCursor.startY - y; // dragging up increases offset
-          const vPerPixel = (ch.vMax - ch.vMin) / p.height;
-          const newOffset = this.draggingCursor.initialOffset + dy * vPerPixel;
-          this.setChannelOffset(ch.id, newOffset);
-        }
-        return;
-      }
-
-      if (this.draggingCursor === 'x1' || this.draggingCursor === 'x2') {
-        const primaryCh = getTimeBaseChannel(tab);
-        const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
-        const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
-        const tCur = tStart + ((x - p.x) / p.width) * tSpan;
-
-        if (this.draggingCursor === 'x1') {
-          tab.cursors.x1 = tCur;
-        } else {
-          tab.cursors.x2 = tCur;
-        }
-        this.draw();
-        this.renderSidebar();
-        return;
-      }
-
-      if (this.draggingCursor === 'y1' || this.draggingCursor === 'y2') {
-        const targetCh = getCursorChannel(tab);
-        if (targetCh) {
-          const area = getChannelArea(tab, p, targetCh);
-          const vRange = targetCh.vMax - targetCh.vMin;
-          const voltFrac = (area.y + area.height - y) / area.height;
-          const vCur = targetCh.vMin + voltFrac * vRange;
-
-          if (this.draggingCursor === 'y1') {
-            tab.cursors.y1 = vCur;
-          } else {
-            tab.cursors.y2 = vCur;
-          }
+          const { voltsPerDiv } = ensureChannelScaleOffset(ch);
+          const { area } = this.dragState;
+          const fracFromBottom = Math.max(-0.25, Math.min(1.25, (area.y + area.height - y) / area.height));
+          ch.vOffset = (fracFromBottom - 0.5) * (8 * voltsPerDiv);
+          syncChannelBoundsFromScaleOffset(ch);
+          clampCursorsToViewport(tab);
+          this.syncVerticalPanelOnly(ch);
+          this.renderSoftkeysOnly(tab);
+          this.renderCursorReadoutOnly(tab);
           this.draw();
-          this.renderSidebar();
         }
+        return;
+      }
+
+      if (this.dragState.type === 'trigger') {
+        const ch = tab.channels[this.dragState.channelId];
+        if (ch) {
+          const { area } = this.dragState;
+          const fracFromBottom = Math.max(0, Math.min(1, (area.y + area.height - y) / area.height));
+          tab.triggerConfig.level = ch.vMin + fracFromBottom * (ch.vMax - ch.vMin);
+          const trigInput = document.getElementById('trigQuickLevelInput') as HTMLInputElement;
+          if (trigInput) trigInput.value = tab.triggerConfig.level.toFixed(3);
+          this.draw();
+        }
+        return;
+      }
+
+      if (this.dragState.type === 'cursorX') {
+        const primaryCh = tab.channels[tab.drawOrder[0]];
+        const { tStart, tSpan } = getTimeBoundsForView(tab, primaryCh);
+        const clampedX = Math.max(p.x, Math.min(p.x + p.width, x));
+        const tCur = tStart + ((clampedX - p.x) / p.width) * tSpan;
+        if (this.dragState.which === 'x1') tab.cursors.x1 = tCur;
+        else tab.cursors.x2 = tCur;
+        clampCursorsToViewport(tab);
+        this.renderCursorReadoutOnly(tab);
+        this.draw();
+        return;
+      }
+
+      if (this.dragState.type === 'cursorY') {
+        const ch = tab.channels[this.dragState.channelId];
+        if (ch) {
+          const { area, which } = this.dragState;
+          const clampedY = Math.max(area.y, Math.min(area.y + area.height, y));
+          const frac = (area.y + area.height - clampedY) / area.height;
+          const val = ch.vMin + frac * (ch.vMax - ch.vMin);
+          if (which === 'y1') tab.cursors.y1 = val;
+          else tab.cursors.y2 = val;
+          clampCursorsToViewport(tab);
+          this.renderCursorReadoutOnly(tab);
+          this.draw();
+        }
+        return;
+      }
+
+      if (this.dragState.type === 'areaZoom' || this.dragState.type === 'areaAnnotate') {
+        this.dragState.end = { x, y };
+        this.draw();
+        return;
+      }
+
+      if (this.dragState.type === 'pan') {
+        const dx = x - this.dragState.startX;
+        if (tab.plotMode === 'frequency') {
+          const targetCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
+          const nyquist = (targetCh?.fs || 1e5) / 2;
+          const fSpan = this.dragState.initialFMax - this.dragState.initialFMin;
+          const df = -(dx / p.width) * fSpan;
+          let newFMin = this.dragState.initialFMin + df;
+          let newFMax = this.dragState.initialFMax + df;
+          if (newFMin < 0) {
+            newFMin = 0;
+            newFMax = fSpan;
+          } else if (newFMax > nyquist) {
+            newFMax = nyquist;
+            newFMin = Math.max(0, nyquist - fSpan);
+          }
+          tab.view.fMin = newFMin;
+          tab.view.fMax = newFMax;
+          this.draw();
+          return;
+        }
+
+        const viewSpan = this.dragState.initialEndIdx - this.dragState.initialStartIdx;
+        const shiftPoints = Math.round((dx / p.width) * viewSpan);
+        const primaryCh = tab.channels[tab.drawOrder[0]];
+        const totalN = primaryCh?.v.length || 1000;
+
+        let newStart = this.dragState.initialStartIdx - shiftPoints;
+        let newEnd = this.dragState.initialEndIdx - shiftPoints;
+
+        if (newStart < 0) {
+          newStart = 0;
+          newEnd = viewSpan;
+        } else if (newEnd > totalN) {
+          newEnd = totalN;
+          newStart = Math.max(0, totalN - viewSpan);
+        }
+
+        tab.view.startIndex = Math.max(0, newStart);
+        tab.view.endIndex = Math.min(totalN, newEnd);
+        clampCursorsToViewport(tab);
+        this.renderCursorReadoutOnly(tab);
+        this.draw();
         return;
       }
     }
 
-    // Dynamic mouse cursor pointer style
-    if (!this.isDragging && !this.isAreaZooming) {
-      let isNearCursor = false;
-      if (tab.cursors.enabled) {
-        const cursorType = tab.cursors.type || 'x';
-        if (cursorType === 'x' || cursorType === 'xy') {
-          const primaryCh = getTimeBaseChannel(tab);
-          const tStart = primaryCh ? indexToTime(primaryCh, tab.view.startIndex) : 0;
-          const tSpan = primaryCh ? Math.max(0, indexToTime(primaryCh, Math.max(tab.view.startIndex, tab.view.endIndex - 1)) - tStart) : 0;
-          if (tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
-            const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
-            const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
-            if (Math.abs(x - x1Px) < 10 || Math.abs(x - x2Px) < 10) {
-              this.canvas.style.cursor = 'ew-resize';
-              isNearCursor = true;
-            }
-          }
+    // Dynamic hover cursor icon & readout (when mouse is inside canvas)
+    if (x >= 0 && x <= rect.width && y >= 0 && y <= rect.height) {
+      let nextCursor = 'crosshair';
+
+      const gndHandles = getGndHandlePositions(p, tab);
+      for (const h of gndHandles) {
+        if (x >= h.x - 20 && x <= h.x + 6 && Math.abs(y - h.y) <= 9) {
+          nextCursor = 'ns-resize';
+          break;
         }
-        if (!isNearCursor && (cursorType === 'y' || cursorType === 'xy')) {
-          const targetCh = getCursorChannel(tab);
+      }
+
+      const trigHandle = getTriggerHandlePosition(p, tab);
+      if (trigHandle && x >= trigHandle.x - 4 && x <= trigHandle.x + 22 && Math.abs(y - trigHandle.y) <= 9) {
+        nextCursor = 'ns-resize';
+      }
+
+      if (nextCursor === 'crosshair' && tab.plotMode === 'time') {
+        const curMode = resolveCursorMode(tab);
+        if (curMode !== 'off') {
+          const targetId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
+          const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
           if (targetCh) {
-            const area = getChannelArea(tab, p, targetCh);
-            const vRange = targetCh.vMax - targetCh.vMin;
-            if (vRange > 0) {
-              if (tab.cursors.y1 !== null) {
-                const y1Px = area.y + area.height - ((tab.cursors.y1 - targetCh.vMin) / vRange) * area.height;
-                if (Math.abs(y - y1Px) < 10) {
-                  this.canvas.style.cursor = 'ns-resize';
-                  isNearCursor = true;
-                }
-              }
-              if (!isNearCursor && tab.cursors.y2 !== null) {
-                const y2Px = area.y + area.height - ((tab.cursors.y2 - targetCh.vMin) / vRange) * area.height;
-                if (Math.abs(y - y2Px) < 10) {
-                  this.canvas.style.cursor = 'ns-resize';
-                  isNearCursor = true;
-                }
+            const { tStart, tSpan } = getTimeBoundsForView(tab, targetCh);
+            if ((curMode === 'x' || curMode === 'xy' || curMode === 'track') && tSpan > 0 && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+              const x1Px = p.x + ((tab.cursors.x1 - tStart) / tSpan) * p.width;
+              const x2Px = p.x + ((tab.cursors.x2 - tStart) / tSpan) * p.width;
+              if (Math.abs(x - x1Px) < 9 || Math.abs(x - x2Px) < 9) nextCursor = 'ew-resize';
+            }
+            if (nextCursor === 'crosshair' && (curMode === 'y' || curMode === 'xy')) {
+              const targetArea = getChannelPlotArea(tab, targetCh.id, p);
+              const vSpan = targetCh.vMax - targetCh.vMin;
+              if (vSpan > 0 && tab.cursors.y1 !== null && tab.cursors.y2 !== null && y >= targetArea.y && y <= targetArea.y + targetArea.height) {
+                const y1Px = targetArea.y + targetArea.height - ((tab.cursors.y1 - targetCh.vMin) / vSpan) * targetArea.height;
+                const y2Px = targetArea.y + targetArea.height - ((tab.cursors.y2 - targetCh.vMin) / vSpan) * targetArea.height;
+                if (Math.abs(y - y1Px) < 9 || Math.abs(y - y2Px) < 9) nextCursor = 'ns-resize';
               }
             }
           }
         }
       }
-      if (!isNearCursor && !tab.separateView && x >= p.x - 22 && x <= p.x) {
-        this.canvas.style.cursor = 'ns-resize';
-        isNearCursor = true;
-      }
-      if (!isNearCursor) {
-        this.canvas.style.cursor = 'crosshair';
-      }
-    }
 
-    // Area Zoom drag
-    if (this.isAreaZooming && this.areaZoomStart) {
-      this.areaZoomEnd = { x, y };
-      this.draw();
-      return;
-    }
+      this.canvas.style.cursor = nextCursor;
 
-    // Panning View
-    if (this.isDragging) {
-      const dx = x - this.dragStartX;
-      const viewSpan = this.initialViewEnd - this.initialViewStart;
-      const shiftPoints = Math.round((dx / p.width) * viewSpan);
-
-      const primaryCh = getTimeBaseChannel(tab);
-      const totalN = primaryCh?.v.length || 1000;
-
-      let newStart = this.initialViewStart - shiftPoints;
-      let newEnd = this.initialViewEnd - shiftPoints;
-
-      if (newStart < 0) {
-        newStart = 0;
-        newEnd = viewSpan;
-      } else if (newEnd > totalN) {
-        newEnd = totalN;
-        newStart = totalN - viewSpan;
-      }
-
-      tab.view.startIndex = Math.max(0, newStart);
-      tab.view.endIndex = Math.min(totalN, newEnd);
-      this.draw();
-      this.renderSidebar();
-      return;
-    }
-
-    // Hover readout
-    if (x >= p.x && x <= p.x + p.width && y >= p.y && y <= p.y + p.height) {
-      // Voltage follows the channel whose axis is shown (in Separate mode: the subplot under the mouse)
-      let hoverCh = getActiveChannel(tab);
-      const areas = computeSubplotAreas(tab, p);
-      let area = p;
-      if (areas) {
-        for (const [id, a] of areas) {
-          if (y >= a.y && y <= a.y + a.height) {
-            hoverCh = tab.channels[id];
-            area = a;
-            break;
+      // Update Hover Readout (matching hovered subplot in Separate mode, or frequency in FFT mode)
+      if (x >= p.x && x <= p.x + p.width && y >= p.y && y <= p.y + p.height) {
+        if (tab.plotMode === 'frequency') {
+          const targetCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
+          const nyquist = (targetCh?.fs || 1e5) / 2;
+          const minF = Math.max(0, tab.view.fMin ?? 0);
+          const maxF = Math.min(nyquist, tab.view.fMax ?? nyquist);
+          const f = minF + ((x - p.x) / p.width) * (maxF - minF);
+          const yMin =
+            tab.fftOptions.scale === 'magnitude'
+              ? this.cachedSpectrum?.magYMin ?? 0
+              : this.cachedSpectrum?.dbYMin ?? this.cachedSpectrum?.yMin ?? -120;
+          const yMax =
+            tab.fftOptions.scale === 'magnitude'
+              ? this.cachedSpectrum?.magYMax ?? 1
+              : this.cachedSpectrum?.dbYMax ?? this.cachedSpectrum?.yMax ?? 20;
+          const amp = yMin + ((p.y + p.height - y) / p.height) * (yMax - yMin);
+          const el = document.getElementById('hoverInfoReadout');
+          if (el) {
+            el.innerText =
+              tab.fftOptions.scale === 'db'
+                ? `f = ${formatEng(f, 'Hz', 2)}   Amp = ${amp.toFixed(1)} dB`
+                : `f = ${formatEng(f, 'Hz', 2)}   Mag = ${formatEng(amp, targetCh?.unit || 'V', 3)}`;
+          }
+        } else {
+          const hit = this.findSubplotAtPoint(tab, p, y);
+          if (hit) {
+            const dataPt = screenToData({ x, y }, tab, hit.channel.id, hit.area);
+            const el = document.getElementById('hoverInfoReadout');
+            if (el) {
+              el.innerText = `${hit.channel.name}: T = ${formatEng(dataPt.time, 's', 4)}   V = ${formatEng(dataPt.voltage, hit.channel.unit, 3)}`;
+            }
           }
         }
-      }
-      if (hoverCh) {
-        const dataPt = screenToData({ x, y }, tab, hoverCh.id, area);
-        this.updateHoverInfo(dataPt.time, dataPt.voltage, hoverCh);
       }
     }
   }
 
   private handleMouseUp(): void {
     const tab = this.getActiveTab();
-    if (this.draggingCursor) {
-      this.draggingCursor = null;
-    }
+    if (!this.dragState) return;
 
-    if (this.isAreaZooming && this.areaZoomStart && this.areaZoomEnd && tab) {
-      const p = getPlotArea(this.cssW || this.canvas.clientWidth, this.cssH || this.canvas.clientHeight);
-      const x1 = Math.min(this.areaZoomStart.x, this.areaZoomEnd.x);
-      const x2 = Math.max(this.areaZoomStart.x, this.areaZoomEnd.x);
+    const currentDrag = this.dragState;
+    this.dragState = null;
 
-      if (x2 - x1 > 5) {
-        const viewSpan = tab.view.endIndex - tab.view.startIndex;
-        const fracStart = Math.max(0, (x1 - p.x) / p.width);
-        const fracEnd = Math.min(1, (x2 - p.x) / p.width);
+    if (!tab) return;
 
-        const newStart = Math.floor(tab.view.startIndex + fracStart * viewSpan);
-        const newEnd = Math.ceil(tab.view.startIndex + fracEnd * viewSpan);
+    const dpr = window.devicePixelRatio || 1;
+    const p = getPlotArea(this.canvas.width / dpr, this.canvas.height / dpr);
 
-        if (newEnd - newStart >= 10) {
-          tab.view.startIndex = newStart;
-          tab.view.endIndex = newEnd;
+    if (currentDrag.type === 'areaZoom') {
+      const x1 = Math.min(currentDrag.start.x, currentDrag.end.x);
+      const x2 = Math.max(currentDrag.start.x, currentDrag.end.x);
+      if (x2 - x1 > 6) {
+        if (tab.plotMode === 'frequency') {
+          const targetCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
+          const nyquist = (targetCh?.fs || 1e5) / 2;
+          const minF = Math.max(0, tab.view.fMin ?? 0);
+          const maxF = Math.min(nyquist, tab.view.fMax ?? nyquist);
+          const span = maxF - minF;
+          const frac1 = Math.max(0, (x1 - p.x) / p.width);
+          const frac2 = Math.min(1, (x2 - p.x) / p.width);
+          tab.view.fMin = minF + frac1 * span;
+          tab.view.fMax = minF + frac2 * span;
+        } else {
+          const viewSpan = tab.view.endIndex - tab.view.startIndex;
+          const fracStart = Math.max(0, (x1 - p.x) / p.width);
+          const fracEnd = Math.min(1, (x2 - p.x) / p.width);
+          const newStart = Math.floor(tab.view.startIndex + fracStart * viewSpan);
+          const newEnd = Math.ceil(tab.view.startIndex + fracEnd * viewSpan);
+          if (newEnd - newStart >= 2) {
+            tab.view.startIndex = newStart;
+            tab.view.endIndex = newEnd;
+            clampCursorsToViewport(tab);
+          }
         }
       }
-      this.isAreaZooming = false;
-      this.areaZoomStart = null;
-      this.areaZoomEnd = null;
-      this.draw();
+      tab.activeTool = 'pan';
       this.renderSidebar();
+      this.draw();
       return;
     }
 
-    this.isDragging = false;
+    if (currentDrag.type === 'areaAnnotate') {
+      const { start, end, channelId, area } = currentDrag;
+      if (Math.abs(end.x - start.x) > 8 && Math.abs(end.y - start.y) > 8) {
+        const d1 = screenToData(start, tab, channelId, area);
+        const d2 = screenToData(end, tab, channelId, area);
+        tab.annotations.push({
+          id: `ann_${Date.now()}`,
+          type: 'area',
+          x: d1.time,
+          y: d1.voltage,
+          x2: d2.time,
+          y2: d2.voltage,
+          channelId,
+        });
+        tab.annotationsVisible = true;
+      }
+      tab.activeTool = 'pan';
+      this.renderSidebar();
+      this.draw();
+      return;
+    }
+
+    this.renderSidebar();
   }
 
   private handleWheel(e: WheelEvent): void {
@@ -929,27 +2118,59 @@ export class OscilloscopeApp {
 
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
     const p = getPlotArea(rect.width, rect.height);
 
-    // If mouse is on left voltage axis: Zoom vertical scale (V/div) with wheel!
-    if (x < p.x && x >= p.x - 70) {
-      const ch = getActiveChannel(tab);
-      if (ch) {
-        this.stepChannelScale(ch.id, e.deltaY < 0 ? 'down' : 'up');
+    // Wheel on Left Y-Axis gutter OR Shift+Wheel OR Alt+Wheel -> 1-2-5 Vertical V/div step
+    if (tab.plotMode === 'time' && (x < p.x || e.shiftKey || e.altKey)) {
+      const hit = this.findSubplotAtPoint(tab, p, y);
+      const targetId = tab.separateView && hit ? hit.channel.id : tab.activeChannelId || tab.drawOrder[0];
+      if (targetId && tab.channels[targetId]) {
+        const dir: 1 | -1 = e.deltaY < 0 ? -1 : 1; // Scroll up = finer V/div (zoom in vertically)
+        this.stepChannelScale(targetId, dir);
       }
       return;
     }
 
     if (x < p.x || x > p.x + p.width) return;
 
+    // Frequency domain horizontal zoom
+    if (tab.plotMode === 'frequency') {
+      const targetCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
+      const nyquist = (targetCh?.fs || 1e5) / 2;
+      const minF = Math.max(0, tab.view.fMin ?? 0);
+      const maxF = Math.min(nyquist, tab.view.fMax ?? nyquist);
+      const fSpan = Math.max(10, maxF - minF);
+      const mouseFrac = (x - p.x) / p.width;
+      const mouseFreq = minF + mouseFrac * fSpan;
+      const factor = e.deltaY < 0 ? 0.78 : 1.28;
+      const nextSpan = Math.min(nyquist, Math.max(20, fSpan * factor));
+      let nMin = mouseFreq - mouseFrac * nextSpan;
+      let nMax = nMin + nextSpan;
+      if (nMin < 0) {
+        nMin = 0;
+        nMax = Math.min(nyquist, nextSpan);
+      }
+      if (nMax > nyquist) {
+        nMax = nyquist;
+        nMin = Math.max(0, nyquist - nextSpan);
+      }
+      tab.view.fMin = nMin;
+      tab.view.fMax = nMax;
+      this.draw();
+      return;
+    }
+
+    // Time domain horizontal zoom anchored at mouse
     const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
     const viewSpan = tab.view.endIndex - tab.view.startIndex;
     const mouseFrac = (x - p.x) / p.width;
     const mouseIdx = tab.view.startIndex + mouseFrac * viewSpan;
 
-    const newSpan = Math.max(10, Math.round(viewSpan * zoomFactor));
-    const primaryCh = getTimeBaseChannel(tab);
+    const primaryCh = tab.channels[tab.drawOrder[0]];
     const totalN = primaryCh?.v.length || 1000;
+    const minSpan = Math.min(totalN, 2);
+    const newSpan = Math.max(minSpan, Math.round(viewSpan * zoomFactor));
 
     let newStart = Math.round(mouseIdx - mouseFrac * newSpan);
     let newEnd = newStart + newSpan;
@@ -965,6 +2186,7 @@ export class OscilloscopeApp {
 
     tab.view.startIndex = newStart;
     tab.view.endIndex = newEnd;
+    clampCursorsToViewport(tab);
     this.draw();
     this.renderSidebar();
   }
@@ -973,22 +2195,104 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     if (!tab) return;
 
-    const primaryCh = getTimeBaseChannel(tab);
+    if (tab.plotMode === 'frequency') {
+      const targetCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
+      const nyquist = (targetCh?.fs || 1e5) / 2;
+      tab.view.fMin = 0;
+      tab.view.fMax = nyquist;
+      this.draw();
+      return;
+    }
+
+    const primaryCh = tab.channels[tab.drawOrder[0]];
     if (!primaryCh) return;
 
+    this.pushUndoSnapshot('Fit View');
     tab.view.startIndex = 0;
     tab.view.endIndex = primaryCh.v.length;
 
-    // Auto-fit 1-2-5 vertical scale and center offset for all visible channels
     for (const id of tab.drawOrder) {
       const ch = tab.channels[id];
       if (ch && ch.visible) {
-        this.autoScaleChannel(id);
+        fitChannelTo125(ch);
       }
     }
 
-    this.draw();
+    clampCursorsToViewport(tab);
     this.renderSidebar();
+    this.draw();
+  }
+
+  public async openFileDirectInTab(file: File): Promise<void> {
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    if (ext === 'wfm') {
+      const buf = await file.arrayBuffer();
+      const fileFingerprint = computeBufferFingerprint(file.name, buf);
+      const parsed = parseWfmBuffer(buf, file.name, OVERLAP_COLORS);
+      for (const ch of Object.values(parsed.channels)) fitChannelTo125(ch);
+      const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+      this.addTab({
+        id: `tab_${Date.now()}_${Math.random()}`,
+        fileName: file.name,
+        fileFingerprint,
+        channels: parsed.channels,
+        drawOrder: parsed.drawOrder,
+        view: { startIndex: 0, endIndex: totalPoints },
+        cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
+        annotations: [],
+        annotationMode: false,
+        annotationsVisible: true,
+        isOverlap: false,
+        plotMode: 'time',
+        fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+        motorConfig: { rpm: null, polePairs: null, enabled: false },
+        triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
+        measurementGate: 'view',
+        separateView: false,
+        activeChannelId: parsed.drawOrder[0],
+        activeTool: 'pan',
+      });
+      return;
+    }
+
+    const text = await file.text();
+    const fileFingerprint = computeTextFingerprint(file.name, text);
+    const p = previewCsv(text);
+    const shouldResample = !!(p.quality && !p.quality.isUniformSampling);
+    const parsed = parseFullCsv(text, {
+      delimiter: p.delimiter,
+      hasHeader: p.hasHeader,
+      skipLines: p.skipLines,
+      timeColIndex: p.timeColIndex,
+      timeUnit: p.timeUnit,
+      sampleRateOverrideHz: p.sampleRateOverrideHz ?? null,
+      columnMappings: p.columnMappings,
+      resample: shouldResample,
+      colors: OVERLAP_COLORS,
+    });
+    for (const ch of Object.values(parsed.channels)) fitChannelTo125(ch);
+    const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+    this.addTab({
+      id: `tab_${Date.now()}_${Math.random()}`,
+      fileName: file.name,
+      fileFingerprint,
+      channels: parsed.channels,
+      drawOrder: parsed.drawOrder,
+      view: { startIndex: 0, endIndex: totalPoints },
+      cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
+      annotations: [],
+      annotationMode: false,
+      annotationsVisible: true,
+      isOverlap: false,
+      plotMode: 'time',
+      fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+      motorConfig: { rpm: null, polePairs: null, enabled: false },
+      triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
+      measurementGate: 'view',
+      separateView: false,
+      activeChannelId: parsed.drawOrder[0],
+      activeTool: 'pan',
+    });
   }
 
   // --- File Handling (CSV, WFM, .graphx Session) ---
@@ -1003,11 +2307,12 @@ export class OscilloscopeApp {
             const restored = deserializeSession(json);
             this.tabs = restored.tabs;
             this.activeTabIndex = restored.activeTabIndex;
+            this.tabs.forEach((t) => this.ensureTabDefaults(t));
             this.renderTabsBar();
             this.renderSidebar();
             this.draw();
           } catch (err: any) {
-            alert(`Failed to load session: ${err.message}`);
+            this.showToast(`Failed to load session: ${err.message}`, 'error');
           }
         };
         reader.readAsText(file);
@@ -1016,53 +2321,47 @@ export class OscilloscopeApp {
         reader.onload = (e) => {
           try {
             const buf = e.target?.result as ArrayBuffer;
+            const fileFingerprint = computeBufferFingerprint(file.name, buf);
             const parsed = parseWfmBuffer(buf, file.name, OVERLAP_COLORS);
+            for (const ch of Object.values(parsed.channels)) {
+              fitChannelTo125(ch);
+            }
             const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
             const tab: TabState = {
               id: `tab_${Date.now()}_${Math.random()}`,
               fileName: file.name,
+              fileFingerprint,
               channels: parsed.channels,
               drawOrder: parsed.drawOrder,
               view: { startIndex: 0, endIndex: totalPoints },
-              cursors: { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null },
+              cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
               annotations: [],
               annotationMode: false,
               annotationsVisible: true,
               isOverlap: false,
               plotMode: 'time',
-              fftOptions: {
-                range: 'view',
-                window: 'hann',
-                scale: 'db',
-                zeroPadding: 1,
-                removeDC: true,
-              },
+              fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
               motorConfig: { rpm: null, polePairs: null, enabled: false },
-              triggerConfig: {
-                enabled: false,
-                channelId: parsed.drawOrder[0],
-                type: 'rising',
-                level: 0,
-                positionPercent: 50,
-              },
+              triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
               measurementGate: 'view',
               separateView: false,
+              activeChannelId: parsed.drawOrder[0],
+              activeTool: 'pan',
             };
             this.addTab(tab);
           } catch (err: any) {
-            alert(`Failed to parse WFM: ${err.message}`);
+            this.showToast(`Failed to parse WFM: ${err.message}`, 'error');
           }
         };
         reader.readAsArrayBuffer(file);
       } else {
-        // CSV or text file -> open CSV Quality & Mapping Modal
         const reader = new FileReader();
         reader.onload = (e) => {
           try {
             const text = e.target?.result as string;
             this.showCsvImportModal(text, file.name);
           } catch (err: any) {
-            alert(`Failed to inspect CSV: ${err.message}`);
+            this.showToast(`Failed to inspect CSV: ${err.message}`, 'error');
           }
         };
         reader.readAsText(file);
@@ -1089,16 +2388,17 @@ export class OscilloscopeApp {
     const previewContainer = document.getElementById('csvPreviewContainer');
     if (previewContainer) {
       let tableHtml = '<table class="min-w-full text-xs font-mono border-collapse">';
-      tableHtml += '<thead class="bg-neutral-800 text-neutral-300"><tr>';
+      tableHtml += '<thead class="bg-[#161b22] text-slate-300"><tr>';
       p.headers.forEach((h: string, idx: number) => {
         const isTime = idx === p.timeColIndex;
-        tableHtml += `<th class="p-2 border border-neutral-700 text-left ${isTime ? 'text-amber-400 font-bold' : ''}">
+        const role = p.columnMappings[idx]?.role || (isTime ? 'time' : 'channel');
+        tableHtml += `<th class="p-2 border border-[#222933] text-left ${isTime ? 'text-amber-300 font-semibold' : ''}">
           <div class="flex flex-col gap-1">
             <span>${h}</span>
-            <select class="col-role-select text-xs bg-neutral-900 border border-neutral-600 rounded px-1 text-white" data-col="${idx}">
-              <option value="time" ${isTime ? 'selected' : ''}>Time</option>
-              <option value="channel" ${!isTime ? 'selected' : ''}>Channel</option>
-              <option value="ignore">Ignore</option>
+            <select class="col-role-select text-xs bg-[#0c0f13] border border-[#2c3543] rounded-sm px-1 text-white" data-col="${idx}">
+              <option value="time" ${role === 'time' ? 'selected' : ''}>Time</option>
+              <option value="channel" ${role === 'channel' ? 'selected' : ''}>Channel</option>
+              <option value="ignore" ${role === 'ignore' ? 'selected' : ''}>Ignore</option>
             </select>
           </div>
         </th>`;
@@ -1106,66 +2406,122 @@ export class OscilloscopeApp {
       tableHtml += '</tr></thead><tbody>';
 
       p.rows.slice(0, 8).forEach((r: string[]) => {
-        tableHtml += '<tr class="border-b border-neutral-700 hover:bg-neutral-800">';
+        tableHtml += '<tr class="border-b border-[#222933] hover:bg-[#161b22]">';
         r.forEach((c: string) => {
-          tableHtml += `<td class="p-2 border-r border-neutral-700 whitespace-nowrap">${c}</td>`;
+          tableHtml += `<td class="p-2 border-r border-[#222933] whitespace-nowrap">${c}</td>`;
         });
         tableHtml += '</tr>';
       });
       tableHtml += '</tbody></table>';
       previewContainer.innerHTML = tableHtml;
 
-      // Bind select changes
       previewContainer.querySelectorAll('.col-role-select').forEach((sel) => {
         sel.addEventListener('change', (e: any) => {
-          const colIdx = parseInt(e.target.dataset.col);
+          const colIdx = parseInt(e.target.dataset.col, 10);
           const role = e.target.value;
           if (role === 'time') {
-            // Only one time column may exist at a time.
-            p.columnMappings.forEach((m) => {
-              m.role = m.index === colIdx ? 'time' : (m.role === 'time' ? 'channel' : m.role);
-            });
             p.timeColIndex = colIdx;
-            this.renderCsvModalContent();
+            p.columnMappings.forEach((m, i) => {
+              if (i === colIdx) m.role = 'time';
+              else if (m.role === 'time') m.role = 'channel';
+            });
           } else {
             p.columnMappings[colIdx].role = role;
             if (colIdx === p.timeColIndex) p.timeColIndex = -1;
-            this.renderCsvModalContent();
           }
+          p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+          this.renderCsvModalContent();
         });
       });
     }
 
     const timeUnitSel = document.getElementById('csvTimeUnitSelect') as HTMLSelectElement;
-    if (timeUnitSel) timeUnitSel.value = p.timeUnit;
+    if (timeUnitSel) {
+      timeUnitSel.value = p.timeUnit;
+      timeUnitSel.onchange = () => {
+        p.timeUnit = (timeUnitSel.value as 's' | 'ms' | 'us' | 'ns' | 'ps') || 's';
+        p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+        this.renderCsvModalContent();
+      };
+    }
 
-    // Sample rate is only required when no time column exists.
-    const sampleRateWrap = document.getElementById('csvSampleRateWrap');
-    const sampleRateInput = document.getElementById('csvSampleRateInput') as HTMLInputElement | null;
-    if (sampleRateWrap) sampleRateWrap.style.display = p.timeColIndex < 0 ? 'flex' : 'none';
-    if (sampleRateInput && p.timeColIndex >= 0) sampleRateInput.value = '';
+    const ratePresetSel = document.getElementById('csvSampleRatePresetSelect') as HTMLSelectElement;
+    const customRateInput = document.getElementById('csvCustomRateInput') as HTMLInputElement;
+    if (ratePresetSel && customRateInput) {
+      if (!p.sampleRateOverrideHz) {
+        ratePresetSel.value = 'auto';
+        customRateInput.classList.add('hidden');
+      } else {
+        const presetMatch = Array.from(ratePresetSel.options).find(
+          (opt) => opt.value !== 'auto' && opt.value !== 'custom' && Math.abs(Number(opt.value) - p.sampleRateOverrideHz!) < 1e-3
+        );
+        if (presetMatch) {
+          ratePresetSel.value = presetMatch.value;
+          customRateInput.classList.add('hidden');
+        } else {
+          ratePresetSel.value = 'custom';
+          customRateInput.classList.remove('hidden');
+          if (document.activeElement !== customRateInput) {
+            customRateInput.value = String(p.sampleRateOverrideHz);
+          }
+        }
+      }
+
+      ratePresetSel.onchange = () => {
+        const val = ratePresetSel.value;
+        if (val === 'auto') {
+          p.sampleRateOverrideHz = null;
+          customRateInput.classList.add('hidden');
+        } else if (val === 'custom') {
+          customRateInput.classList.remove('hidden');
+          const cur = parseFloat(customRateInput.value);
+          p.sampleRateOverrideHz = isFinite(cur) && cur > 0 ? cur : 1e9;
+          customRateInput.value = String(p.sampleRateOverrideHz);
+          customRateInput.focus();
+        } else {
+          p.sampleRateOverrideHz = Number(val);
+          customRateInput.classList.add('hidden');
+        }
+        p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+        this.renderCsvModalContent();
+      };
+
+      customRateInput.onchange = () => {
+        const parsedVal = parseFloat(customRateInput.value);
+        p.sampleRateOverrideHz = isFinite(parsedVal) && parsedVal > 0 ? parsedVal : null;
+        p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+        this.renderCsvModalContent();
+      };
+    }
 
     const rowCountEl = document.getElementById('csvTotalRows');
     if (rowCountEl) rowCountEl.innerText = `${p.totalRows.toLocaleString()} rows`;
 
-    const delimSel = document.getElementById('csvDelimiterSelect') as HTMLSelectElement;
-    if (delimSel) {
-      if (p.delimiter === ' ') delimSel.value = ' ';
-      else if (p.delimiter === '\t') delimSel.value = '\t';
-      else if (p.delimiter === ',') delimSel.value = ',';
-      else if (p.delimiter === ';') delimSel.value = ';';
-      else delimSel.value = 'auto';
+    const delimEl = document.getElementById('csvDelimiter');
+    if (delimEl) delimEl.innerText = p.delimiter === '\t' ? 'Tab (\\t)' : `"${p.delimiter}"`;
 
-      delimSel.onchange = (e: any) => {
-        const selected = e.target.value;
-        const chosenDelim = selected === 'auto' ? undefined : selected;
-        try {
-          this.pendingCsvPreview = previewCsv(this.pendingCsvText, chosenDelim);
-          this.renderCsvModalContent();
-        } catch (err: any) {
-          console.error('Error re-parsing CSV preview with selected delimiter:', err);
-        }
-      };
+    const auditEl = document.getElementById('csvAuditSummaryRow');
+    if (auditEl && p.quality) {
+      const q = p.quality;
+      const dur = q.originalTimeEnd - q.originalTimeStart;
+      const statusCls =
+        q.qualityStatus === 'uniform'
+          ? 'text-emerald-400'
+          : q.qualityStatus === 'non-uniform'
+          ? 'text-amber-300'
+          : 'text-red-400';
+      const overrideBadge = p.sampleRateOverrideHz
+        ? `<span class="text-cyan-300 font-semibold">[FORCED ${formatEng(p.sampleRateOverrideHz, 'Sa/s', 2)}]</span>`
+        : '';
+      auditEl.innerHTML = `
+        <span>Sampling: <strong class="${statusCls}">${q.qualityStatus.toUpperCase()}</strong> ${overrideBadge}</span>
+        <span>Rate: <strong class="text-slate-100">${q.sampleRate ? formatEng(q.sampleRate, 'Sa/s', 2) : 'N/A'}</strong></span>
+        <span>Duration: <strong class="text-slate-100">${formatEng(dur, 's', 3)}</strong></span>
+        <span>Jitter RMS: <strong class="text-slate-100">${q.jitterRms !== null ? q.jitterRms.toFixed(2) + '%' : 'N/A'}</strong></span>
+        <span>Gaps: <strong class="${q.gapCount > 0 ? 'text-amber-300' : 'text-slate-100'}">${q.gapCount}</strong></span>
+      `;
+    } else if (auditEl) {
+      auditEl.innerHTML = '<span class="text-slate-400">No explicit Time column selected (defaults to 10 kSa/s, or choose up to 1 GSa/s in Rate above).</span>';
     }
   }
 
@@ -1174,42 +2530,47 @@ export class OscilloscopeApp {
 
     try {
       const timeUnitSel = document.getElementById('csvTimeUnitSelect') as HTMLSelectElement;
-      const timeUnit = (timeUnitSel?.value as 's' | 'ms' | 'us' | 'ns') || this.pendingCsvPreview.timeUnit;
-
-      const sampleRateInput = document.getElementById('csvSampleRateInput') as HTMLInputElement | null;
-      const sampleRate = sampleRateInput ? Number(sampleRateInput.value) : undefined;
+      const timeUnit = (timeUnitSel?.value as 's' | 'ms' | 'us' | 'ns' | 'ps') || this.pendingCsvPreview.timeUnit;
 
       const parsed = parseFullCsv(this.pendingCsvText, {
         delimiter: this.pendingCsvPreview.delimiter,
         hasHeader: this.pendingCsvPreview.hasHeader,
+        skipLines: this.pendingCsvPreview.skipLines,
         timeColIndex: this.pendingCsvPreview.timeColIndex,
         timeUnit,
+        sampleRateOverrideHz: this.pendingCsvPreview.sampleRateOverrideHz ?? null,
         columnMappings: this.pendingCsvPreview.columnMappings,
         resample,
-        sampleRate,
         colors: OVERLAP_COLORS,
       });
+
+      for (const ch of Object.values(parsed.channels)) {
+        fitChannelTo125(ch);
+      }
 
       const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
       const tab: TabState = {
         id: `tab_${Date.now()}_${Math.random()}`,
         fileName: this.pendingFileName,
+        fileFingerprint: computeTextFingerprint(this.pendingFileName, this.pendingCsvText),
         channels: parsed.channels,
         drawOrder: parsed.drawOrder,
         view: { startIndex: 0, endIndex: totalPoints },
-        cursors: { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null },
+        cursors: {
+          enabled: false,
+          mode: 'off',
+          x1: null,
+          x2: null,
+          y1: null,
+          y2: null,
+          trackingChannel: parsed.drawOrder[0] || null,
+        },
         annotations: [],
         annotationMode: false,
         annotationsVisible: true,
         isOverlap: false,
         plotMode: 'time',
-        fftOptions: {
-          range: 'view',
-          window: 'hann',
-          scale: 'db',
-          zeroPadding: 1,
-          removeDC: true,
-        },
+        fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
         motorConfig: { rpm: null, polePairs: null, enabled: false },
         triggerConfig: {
           enabled: false,
@@ -1220,6 +2581,8 @@ export class OscilloscopeApp {
         },
         measurementGate: 'view',
         separateView: false,
+        activeChannelId: parsed.drawOrder[0],
+        activeTool: 'pan',
       };
 
       this.addTab(tab);
@@ -1227,31 +2590,36 @@ export class OscilloscopeApp {
       const modal = document.getElementById('csvQualityModal');
       if (modal) modal.style.display = 'none';
     } catch (err: any) {
-      alert(`CSV Import Failed: ${err.message}`);
+      this.showToast(`CSV Import Failed: ${err.message}`, 'error');
     }
   }
 
-  // --- AutoSet & Trigger & Math UI Triggers ---
+  // --- AutoSet, Trigger, Math, Clarke, Park, Power ---
   public executeAutoSet(): void {
     const tab = this.getActiveTab();
     if (!tab) return;
 
+    this.pushUndoSnapshot('AutoSet');
     const res = performAutoSet(tab.channels, tab.drawOrder, tab.view);
     for (const [id, bounds] of Object.entries(res.updatedChannels)) {
-      if (tab.channels[id]) {
-        tab.channels[id].vMin = bounds.vMin;
-        tab.channels[id].vMax = bounds.vMax;
+      const ch = tab.channels[id];
+      if (ch) {
+        ch.voltsPerDiv = bounds.voltsPerDiv;
+        ch.vOffset = bounds.vOffset;
+        ch.vMin = bounds.vMin;
+        ch.vMax = bounds.vMax;
       }
     }
     tab.view = res.view;
     tab.triggerConfig = res.triggerConfig;
+    clampCursorsToViewport(tab);
 
     this.renderSidebar();
     this.draw();
+    this.showToast(res.statusMessage, 'info');
   }
 
-  /** Moves the view so the first trigger event sits at the configured screen position. */
-  public applyTrigger(silent: boolean = false): void {
+  public applyTrigger(): void {
     const tab = this.getActiveTab();
     if (!tab || !tab.triggerConfig.enabled) return;
 
@@ -1261,165 +2629,12 @@ export class OscilloscopeApp {
     const pt = findTriggerPoint(ch, tab.triggerConfig);
     if (pt) {
       tab.view = alignViewToTrigger(tab.view, ch, pt.triggerIndex, tab.triggerConfig.positionPercent);
+      clampCursorsToViewport(tab);
       this.renderSidebar();
       this.draw();
     } else {
-      const msg = `Trigger condition not found in channel "${ch.name}".`;
-      if (silent) {
-        this.flashStatus(msg);
-        this.draw();
-      } else {
-        alert(msg);
-      }
+      this.showToast(`Trigger level not crossed on "${ch.name}".`, 'warn');
     }
-  }
-
-  /** Trigger ON/OFF button. Turning it on aligns the view to the first event. */
-  public toggleTrigger(): void {
-    const tab = this.getActiveTab();
-    if (!tab) return;
-    const cfg = tab.triggerConfig;
-    cfg.enabled = !cfg.enabled;
-    if (cfg.enabled) {
-      if (!cfg.channelId || !tab.channels[cfg.channelId]) {
-        cfg.channelId = getActiveChannel(tab)?.id || tab.drawOrder[0] || '';
-      }
-      this.applyTrigger(true);
-    }
-    this.renderSidebar();
-    this.draw();
-  }
-
-  /** Rising <-> falling edge trigger. */
-  public toggleTriggerSlope(): void {
-    const tab = this.getActiveTab();
-    if (!tab) return;
-    tab.triggerConfig.type = tab.triggerConfig.type === 'rising' ? 'falling' : 'rising';
-    if (tab.triggerConfig.enabled) this.applyTrigger(true);
-    this.renderSidebar();
-    this.draw();
-  }
-
-  /** Edge annotation (10% / 90% levels, tr / tf) ON/OFF. */
-  public toggleEdgeMarks(): void {
-    const tab = this.getActiveTab();
-    if (!tab) return;
-    tab.showEdgeMarks = !tab.showEdgeMarks;
-    this.updateToolbarState();
-    this.draw();
-  }
-
-  // --- Low-pass filter ---
-  private filterTargets(tab: TabState, scope: FilterScope): WaveformChannel[] {
-    if (scope === 'active') {
-      const a = getActiveChannel(tab);
-      return a ? [a] : [];
-    }
-    if (scope === 'visible') return getVisibleChannels(tab).filter((c) => !c.isMath);
-    return tab.drawOrder.map((id) => tab.channels[id]).filter((c): c is WaveformChannel => !!c && !c.isMath);
-  }
-
-  /**
-   * Re-evaluates Math / Clarke channels from their (possibly just filtered) sources, keeping
-   * their colour, scale and visibility.
-   */
-  private recomputeDerivedChannels(tab: TabState): void {
-    for (const id of tab.drawOrder) {
-      const ch = tab.channels[id];
-      if (!ch || !ch.isMath) continue;
-      try {
-        if (id.startsWith('clarke_alpha_') || id.startsWith('clarke_beta_')) {
-          const [ua, ub, uc] = ch.sourceChannelIds.map((sid) => tab.channels[sid]?.v);
-          if (ua && ub && uc) {
-            const { alpha, beta } = computeClarke(ua, ub, uc);
-            tab.channels[id] = { ...ch, v: id.startsWith('clarke_alpha_') ? alpha : beta };
-          }
-        } else if (ch.mathExpression) {
-          const fresh = evaluateMathExpression(ch.mathExpression, tab.channels, tab.drawOrder, id, ch.name);
-          tab.channels[id] = { ...ch, t: fresh.t, v: fresh.v, fs: fresh.fs, dt: fresh.dt, metadata: fresh.metadata };
-        }
-      } catch (err) {
-        console.warn(`Could not refresh derived channel ${id}:`, err);
-      }
-    }
-  }
-
-  private afterSampleDataChanged(tab: TabState): void {
-    this.filterRev++;
-    this.edgeCache = null;
-    this.trigCache = null;
-    this.cachedSpectrum = null;
-    this.cachedSpectrumKey = '';
-    this.recomputeDerivedChannels(tab);
-    this.renderSidebar();
-    this.draw();
-  }
-
-  /** Applies a -3 dB low-pass filter. Always filters from the original samples (no compounding). */
-  public applyFilter(spec: ChannelFilterSpec, scope: FilterScope): { ok: boolean; message?: string; warning?: string } {
-    const tab = this.getActiveTab();
-    if (!tab) return { ok: false, message: 'No data loaded.' };
-
-    const targets = this.filterTargets(tab, scope);
-    if (targets.length === 0) return { ok: false, message: 'No channel to filter.' };
-    if (targets.some((c) => c.isMath)) {
-      return {
-        ok: false,
-        message: 'Math channels follow their source channels. Select an input channel, or choose "All input channels".',
-      };
-    }
-
-    let warning: string | undefined;
-    for (const ch of targets) {
-      const check = validateFilterSpec(spec, ch.t);
-      if (!check.ok) return { ok: false, message: `${ch.name}: ${check.message}` };
-      if (check.warning) warning = check.warning;
-    }
-
-    for (const ch of targets) {
-      if (!ch.vOriginal) ch.vOriginal = ch.v;
-      ch.v = lowPassFilter(ch.t, ch.vOriginal, spec);
-      ch.filter = { ...spec };
-    }
-    this.lastFilter = { spec: { ...spec }, scope };
-    this.afterSampleDataChanged(tab);
-    return { ok: true, warning };
-  }
-
-  public removeFilter(scope: FilterScope): void {
-    const tab = this.getActiveTab();
-    if (!tab) return;
-    let changed = false;
-    for (const ch of this.filterTargets(tab, scope)) {
-      if (ch.vOriginal) {
-        ch.v = ch.vOriginal;
-        ch.vOriginal = undefined;
-        changed = true;
-      }
-      ch.filter = undefined;
-    }
-    if (changed) this.afterSampleDataChanged(tab);
-    else this.updateToolbarState();
-  }
-
-  public getLastFilter(): { spec: ChannelFilterSpec; scope: FilterScope } | null {
-    return this.lastFilter;
-  }
-
-  /** Toolbar LPF ON/OFF. Returns false when there is nothing to re-apply (caller opens the dialog). */
-  public toggleFilter(): boolean {
-    const tab = this.getActiveTab();
-    if (!tab) return true;
-    const active = getActiveChannel(tab);
-    if (!active) return true;
-    if (active.filter) {
-      this.removeFilter(this.lastFilter?.scope === 'active' || !this.lastFilter ? 'active' : this.lastFilter.scope);
-      return true;
-    }
-    if (!this.lastFilter) return false;
-    const res = this.applyFilter(this.lastFilter.spec, this.lastFilter.scope);
-    if (!res.ok) this.flashStatus(res.message || 'Filter failed.');
-    return true;
   }
 
   public addMathChannel(expr: string, name: string): { success: boolean; error?: string } {
@@ -1429,28 +2644,83 @@ export class OscilloscopeApp {
     try {
       const mathId = `math_${Date.now()}`;
       const mathCh = evaluateMathExpression(expr, tab.channels, tab.drawOrder, mathId, name);
+      mathCh.coupling = 'DC';
+      mathCh.inverted = false;
+      fitChannelTo125(mathCh);
+
       tab.channels[mathId] = mathCh;
       tab.drawOrder.push(mathId);
-
-      // Auto-select newly created math channel for measurements & FFT
+      tab.activeChannelId = mathId;
       tab.selectedMeasurementChannelId = mathId;
       tab.selectedFftChannelId = mathId;
+      tab.cursors.trackingChannel = mathId;
       this.cachedSpectrum = null;
       this.cachedSpectrumKey = '';
 
       this.renderSidebar();
       this.draw();
-
-      // Smoothly scroll to the math channels section so the user sees it immediately
-      setTimeout(() => {
-        const mathEl = document.getElementById('mathChannelsListPanel');
-        mathEl?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }, 50);
-
+      this.showToast(`Created Math channel: ${name}`, 'info');
       return { success: true };
     } catch (err: any) {
       console.error('Math evaluation error:', err);
       return { success: false, error: err.message };
+    }
+  }
+
+  public createDerivedMathTraces(
+    specs: Array<{
+      name: string;
+      unit?: string;
+      baseChannelId: string;
+      values: Float32Array;
+      expr: string;
+      color: string;
+      sourceIds: string[];
+    }>
+  ): void {
+    const tab = this.getActiveTab();
+    if (!tab || specs.length === 0) return;
+
+    this.pushUndoSnapshot('Add BLDC Derived Trace(s)', true);
+    let lastId = '';
+    specs.forEach((sp, idx) => {
+      const baseCh = tab.channels[sp.baseChannelId] || tab.channels[tab.drawOrder[0]];
+      if (!baseCh) return;
+      const traceId = `bldc_${Date.now()}_${idx}`;
+      const ch: WaveformChannel = {
+        ...baseCh,
+        id: traceId,
+        name: sp.name,
+        unit: sp.unit || baseCh.unit || 'V',
+        color: sp.color,
+        visible: true,
+        t: baseCh.t,
+        v: new Float32Array(sp.values),
+        isMath: true,
+        mathExpression: sp.expr,
+        sourceChannelIds: sp.sourceIds,
+        coupling: 'DC',
+        inverted: false,
+        hasEdits: false,
+        refV: undefined,
+        voltsPerDiv: undefined,
+        vOffset: undefined,
+        vMin: -1,
+        vMax: 1,
+      };
+      fitChannelTo125(ch);
+      tab.channels[traceId] = ch;
+      tab.drawOrder.push(traceId);
+      lastId = traceId;
+    });
+
+    if (lastId) {
+      tab.plotMode = 'time';
+      tab.activeChannelId = lastId;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
     }
   }
 
@@ -1461,13 +2731,6 @@ export class OscilloscopeApp {
     tab.selectedFftChannelId = channelId;
     this.cachedSpectrum = null;
     this.cachedSpectrumKey = '';
-
-    const timeBtn = document.getElementById('timeModeBtn');
-    const freqBtn = document.getElementById('freqModeBtn');
-    freqBtn?.classList.add('bg-[#0078d7]', 'text-white');
-    freqBtn?.classList.remove('bg-neutral-800', 'text-neutral-300');
-    timeBtn?.classList.remove('bg-[#0078d7]', 'text-white');
-    timeBtn?.classList.add('bg-neutral-800', 'text-neutral-300');
 
     this.renderSidebar();
     this.draw();
@@ -1513,7 +2776,7 @@ export class OscilloscopeApp {
     const uc = tab.channels[ucId]?.v;
 
     if (!ua || !ub || !uc) {
-      alert('Selected phase channels are invalid.');
+      this.showToast('Selected phase channels are invalid.', 'error');
       return;
     }
 
@@ -1524,82 +2787,226 @@ export class OscilloscopeApp {
       const alphaId = `clarke_alpha_${Date.now()}`;
       const betaId = `clarke_beta_${Date.now()}`;
 
-      // Calculate exact min/max bounds for Alpha
-      let minA = Infinity, maxA = -Infinity;
-      for (let i = 0; i < alpha.length; i++) {
-        const val = alpha[i];
-        if (!isNaN(val)) {
-          if (val < minA) minA = val;
-          if (val > maxA) maxA = val;
-        }
-      }
-      if (!isFinite(minA)) minA = -1;
-      if (!isFinite(maxA)) maxA = 1;
-      const marginA = (maxA - minA) * 0.1 || 1.0;
-
-      // Calculate exact min/max bounds for Beta
-      let minB = Infinity, maxB = -Infinity;
-      for (let i = 0; i < beta.length; i++) {
-        const val = beta[i];
-        if (!isNaN(val)) {
-          if (val < minB) minB = val;
-          if (val > maxB) maxB = val;
-        }
-      }
-      if (!isFinite(minB)) minB = -1;
-      if (!isFinite(maxB)) maxB = 1;
-      const marginB = (maxB - minB) * 0.1 || 1.0;
-
-      tab.channels[alphaId] = {
+      const alphaCh: WaveformChannel = {
         ...baseCh,
         id: alphaId,
-        name: 'Clarke Alpha (α)',
+        name: 'Clarke α',
         unit: baseCh.unit || 'V',
-        color: '#ff007f',
+        color: '#f472b6',
         visible: true,
         v: alpha,
-        vOriginal: undefined,
-        filter: undefined,
         isMath: true,
+        coupling: 'DC',
+        inverted: false,
         mathExpression: `Clarke α(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
         sourceChannelIds: [uaId, ubId, ucId],
-        vMin: minA - marginA,
-        vMax: maxA + marginA,
+        vMin: -1,
+        vMax: 1,
+        voltsPerDiv: undefined,
+        vOffset: undefined,
       };
+      fitChannelTo125(alphaCh);
 
-      tab.channels[betaId] = {
+      const betaCh: WaveformChannel = {
         ...baseCh,
         id: betaId,
-        name: 'Clarke Beta (β)',
+        name: 'Clarke β',
         unit: baseCh.unit || 'V',
-        color: '#00e676',
+        color: '#4ade80',
         visible: true,
         v: beta,
-        vOriginal: undefined,
-        filter: undefined,
         isMath: true,
+        coupling: 'DC',
+        inverted: false,
         mathExpression: `Clarke β(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
         sourceChannelIds: [uaId, ubId, ucId],
-        vMin: minB - marginB,
-        vMax: maxB + marginB,
+        vMin: -1,
+        vMax: 1,
+        voltsPerDiv: undefined,
+        vOffset: undefined,
       };
+      fitChannelTo125(betaCh);
 
+      tab.channels[alphaId] = alphaCh;
+      tab.channels[betaId] = betaCh;
       tab.drawOrder.push(alphaId, betaId);
 
-      // Auto-select Clarke Alpha for measurements and FFT
+      tab.activeChannelId = alphaId;
       tab.selectedMeasurementChannelId = alphaId;
       tab.selectedFftChannelId = alphaId;
+      tab.cursors.trackingChannel = alphaId;
       this.cachedSpectrum = null;
       this.cachedSpectrumKey = '';
 
       this.renderSidebar();
       this.draw();
+      this.showToast('Generated Clarke α and β channels.', 'info');
     } catch (err: any) {
-      alert(`Clarke Transform Failed: ${err.message}`);
+      this.showToast(`Clarke Transform Failed: ${err.message}`, 'error');
     }
   }
 
-  // --- DOM Rendering Helpers ---
+  public executeParkTransform(
+    alphaId: string,
+    betaId: string,
+    angleMode: 'auto' | 'channel',
+    angleChannelId: string,
+    offsetDeg: number
+  ): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    const alphaCh = tab.channels[alphaId];
+    const betaCh = tab.channels[betaId];
+    if (!alphaCh || !betaCh) {
+      this.showToast('Select valid α and β channels.', 'error');
+      return;
+    }
+
+    try {
+      const offsetRad = ((isFinite(offsetDeg) ? offsetDeg : 0) * Math.PI) / 180;
+      let theta: Float32Array;
+      if (angleMode === 'channel' && tab.channels[angleChannelId]) {
+        const rawAng = tab.channels[angleChannelId].v;
+        theta = new Float32Array(rawAng.length);
+        for (let i = 0; i < rawAng.length; i++) theta[i] = rawAng[i] + offsetRad;
+      } else {
+        theta = estimateElectricalAngleFromAlphaBeta(alphaCh.v, betaCh.v, offsetRad);
+      }
+
+      const { d, q } = computePark(alphaCh.v, betaCh.v, theta);
+      const dId = `park_d_${Date.now()}`;
+      const qId = `park_q_${Date.now() + 1}`;
+
+      const dCh: WaveformChannel = {
+        ...alphaCh,
+        id: dId,
+        name: 'Park Id/Ud',
+        unit: alphaCh.unit || 'V',
+        color: '#38bdf8',
+        visible: true,
+        v: d,
+        isMath: true,
+        coupling: 'DC',
+        inverted: false,
+        mathExpression: `Park_d(${alphaCh.name}, ${betaCh.name})`,
+        sourceChannelIds: [alphaId, betaId],
+        voltsPerDiv: undefined,
+        vOffset: undefined,
+      };
+      fitChannelTo125(dCh);
+
+      const qCh: WaveformChannel = {
+        ...alphaCh,
+        id: qId,
+        name: 'Park Iq/Uq',
+        unit: alphaCh.unit || 'V',
+        color: '#fb923c',
+        visible: true,
+        v: q,
+        isMath: true,
+        coupling: 'DC',
+        inverted: false,
+        mathExpression: `Park_q(${alphaCh.name}, ${betaCh.name})`,
+        sourceChannelIds: [alphaId, betaId],
+        voltsPerDiv: undefined,
+        vOffset: undefined,
+      };
+      fitChannelTo125(qCh);
+
+      tab.channels[dId] = dCh;
+      tab.channels[qId] = qCh;
+      tab.drawOrder.push(dId, qId);
+      tab.activeChannelId = dId;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
+      this.showToast('Generated Park d and q channels.', 'info');
+    } catch (err: any) {
+      this.showToast(`Park Transform Failed: ${err.message}`, 'error');
+    }
+  }
+
+  public executePowerCalculation(
+    mode: '3ph' | '1ph',
+    uaId: string,
+    ubId: string,
+    ucId: string,
+    iaId: string,
+    ibId: string,
+    icId: string
+  ): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    const uaCh = tab.channels[uaId];
+    const iaCh = tab.channels[iaId];
+    if (!uaCh || !iaCh) {
+      this.showToast('Select valid Voltage and Current channels.', 'error');
+      return;
+    }
+
+    try {
+      let power: Float32Array;
+      let expr: string;
+      let srcIds: string[];
+
+      if (mode === '1ph') {
+        const n = Math.min(uaCh.v.length, iaCh.v.length);
+        power = new Float32Array(n);
+        for (let i = 0; i < n; i++) power[i] = uaCh.v[i] * iaCh.v[i];
+        expr = `${uaCh.name}*${iaCh.name}`;
+        srcIds = [uaId, iaId];
+      } else {
+        const ubCh = tab.channels[ubId];
+        const ucCh = tab.channels[ucId];
+        const ibCh = tab.channels[ibId];
+        const icCh = tab.channels[icId];
+        if (!ubCh || !ucCh || !ibCh || !icCh) {
+          this.showToast('All 3 voltage and 3 current channels are required for 3-phase power.', 'error');
+          return;
+        }
+        power = computeInstantaneousPower(uaCh.v, ubCh.v, ucCh.v, iaCh.v, ibCh.v, icCh.v);
+        expr = `P3ph(${uaCh.name},${ubCh.name},${ucCh.name})`;
+        srcIds = [uaId, ubId, ucId, iaId, ibId, icId];
+      }
+
+      const pId = `power_${Date.now()}`;
+      const pCh: WaveformChannel = {
+        ...uaCh,
+        id: pId,
+        name: mode === '3ph' ? 'Power P3ph' : 'Power P(t)',
+        unit: 'W',
+        color: '#a78bfa',
+        visible: true,
+        v: power,
+        isMath: true,
+        coupling: 'DC',
+        inverted: false,
+        mathExpression: expr,
+        sourceChannelIds: srcIds,
+        voltsPerDiv: undefined,
+        vOffset: undefined,
+      };
+      fitChannelTo125(pCh);
+      tab.channels[pId] = pCh;
+      tab.drawOrder.push(pId);
+      tab.activeChannelId = pId;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
+
+      const summary = computePowerSummary(pCh.t, pCh.v);
+      this.showToast(
+        `P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, E=${formatEng(summary.energyJ, 'J', 3)}`,
+        'info'
+      );
+    } catch (err: any) {
+      this.showToast(`Power Calculation Failed: ${err.message}`, 'error');
+    }
+  }
+
+  // --- DOM Synchronization & Rendering ---
   public renderTabsBar(): void {
     const container = document.getElementById('tabsContainer');
     if (!container) return;
@@ -1608,12 +3015,14 @@ export class OscilloscopeApp {
     this.tabs.forEach((tab, idx) => {
       const isActive = idx === this.activeTabIndex;
       const tabEl = document.createElement('div');
-      tabEl.className = `tab-item flex items-center gap-2 px-3 py-1.5 cursor-pointer rounded-t text-sm border-r border-neutral-700 ${
-        isActive ? 'bg-[#0078d7] text-white font-medium' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'
+      tabEl.className = `tab-item flex items-center gap-2 px-2.5 py-1 cursor-pointer rounded-sm text-xs border transition ${
+        isActive
+          ? 'bg-[#161b22] border-cyan-500/70 text-cyan-200 font-medium'
+          : 'bg-[#0c0f13] border-[#222933] text-slate-400 hover:text-slate-200 hover:border-[#2c3543]'
       }`;
       tabEl.innerHTML = `
-        <span class="truncate max-w-[140px]">${tab.fileName}</span>
-        <button class="tab-close ml-1 hover:bg-black/30 rounded px-1" title="Close Tab">×</button>
+        <span class="truncate max-w-[145px]">${tab.fileName}</span>
+        <button class="tab-close text-slate-400 hover:text-white px-0.5 cursor-pointer" title="Close Tab">×</button>
       `;
 
       tabEl.addEventListener('click', (e) => {
@@ -1629,22 +3038,490 @@ export class OscilloscopeApp {
     });
   }
 
+  private updateScreenTelemetry(): void {
+    const tab = this.getActiveTab();
+    const tbEl = document.getElementById('timebaseReadout');
+    const srEl = document.getElementById('acqSampleRateReadout');
+    const depthEl = document.getElementById('acqDepthReadout');
+    const trigBtn = document.getElementById('triggerQuickBtn');
+    const timeBtn = document.getElementById('timeModeBtn');
+    const freqBtn = document.getElementById('freqModeBtn');
+    const xyBtn = document.getElementById('xyModeBtn');
+    const overlapBtn = document.getElementById('overlapViewBtn');
+    const sepBtn = document.getElementById('separateViewBtn');
+    const zoomBtn = document.getElementById('toolZoomBtn');
+    const ptBtn = document.getElementById('toolPointBtn');
+    const txtBtn = document.getElementById('toolTextBtn');
+    const areaBtn = document.getElementById('toolAreaBtn');
+    this.updateUndoRedoButtons();
+
+    if (!tab) {
+      if (tbEl) tbEl.innerText = '-- /div';
+      if (srEl) srEl.innerText = '-- Sa/s';
+      if (depthEl) depthEl.innerText = '0 pts';
+      if (trigBtn) trigBtn.innerText = 'TRIG: OFF';
+      return;
+    }
+
+    const tb = getTimebaseInfo(tab);
+    if (tbEl) tbEl.innerText = `${formatEng(tb.secPerDiv, 's', 2)}/div`;
+    if (srEl) srEl.innerText = tb.sampleRate ? formatEng(tb.sampleRate, 'Sa/s', 2) : 'Non-uniform';
+    if (depthEl) depthEl.innerText = `${tb.visiblePoints.toLocaleString()} / ${tb.totalPoints.toLocaleString()} pts`;
+
+    if (trigBtn) {
+      const trig = tab.triggerConfig;
+      const trigCh = tab.channels[trig.channelId];
+      if (trig.enabled && trigCh) {
+        const arrow = trig.type === 'rising' ? '↑' : '↓';
+        trigBtn.innerText = `TRIG ${trigCh.name} ${arrow} ${formatEng(trig.level, trigCh.unit, 2)}`;
+        trigBtn.className = 'px-2 py-1 bg-[#1e1610] border border-orange-500/60 rounded-sm font-mono text-[11px] text-orange-300 tabular-nums cursor-pointer';
+      } else {
+        trigBtn.innerText = 'TRIG: OFF';
+        trigBtn.className = 'px-2 py-1 bg-[#0c0f13] hover:bg-[#161b22] border border-[#222933] rounded-sm font-mono text-[11px] text-slate-400 tabular-nums cursor-pointer';
+      }
+    }
+
+    // Mode toggles (Time | FFT | XY)
+    const activeModeCls = 'px-2 py-0.5 rounded-sm bg-cyan-600 text-slate-950 font-semibold transition cursor-pointer whitespace-nowrap';
+    const inactiveModeCls = 'px-2 py-0.5 rounded-sm text-slate-300 hover:text-white transition cursor-pointer whitespace-nowrap';
+    if (timeBtn) timeBtn.className = tab.plotMode === 'time' ? activeModeCls : inactiveModeCls;
+    if (freqBtn) freqBtn.className = tab.plotMode === 'frequency' ? activeModeCls : inactiveModeCls;
+    if (xyBtn) xyBtn.className = tab.plotMode === 'xy' ? activeModeCls : inactiveModeCls;
+
+    if (overlapBtn && sepBtn) {
+      if (!tab.separateView) {
+        overlapBtn.className = 'px-2 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer';
+        sepBtn.className = 'px-2 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer';
+      } else {
+        sepBtn.className = 'px-2 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer';
+        overlapBtn.className = 'px-2 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer';
+      }
+    }
+
+    // Render Mode 4-way switch
+    const rm = tab.renderMode || 'vector';
+    const rVec = document.getElementById('renderModeVectorBtn');
+    const rSinc = document.getElementById('renderModeSincBtn');
+    const rDot = document.getElementById('renderModeDotsBtn');
+    const rMrk = document.getElementById('renderModeMarkersBtn');
+    const applyRmCls = (el: HTMLElement | null, active: boolean) => {
+      if (!el) return;
+      el.className = active
+        ? 'px-1.5 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer whitespace-nowrap'
+        : 'px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap';
+    };
+    applyRmCls(rVec, rm === 'vector');
+    applyRmCls(rSinc, rm === 'sinc');
+    applyRmCls(rDot, rm === 'dots');
+    applyRmCls(rMrk, rm === 'vector-markers');
+
+    // Decimation Mode 2-way switch
+    const dm = tab.decimationMode || 'minmax';
+    const dMm = document.getElementById('decimMinMaxBtn');
+    const dLttb = document.getElementById('decimLttbBtn');
+    if (dMm && dLttb) {
+      dMm.className =
+        dm === 'minmax'
+          ? 'px-1.5 py-0.5 rounded-sm bg-[#222933] text-cyan-300 font-medium transition cursor-pointer whitespace-nowrap'
+          : 'px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap';
+      dLttb.className =
+        dm === 'lttb'
+          ? 'px-1.5 py-0.5 rounded-sm bg-[#222933] text-cyan-300 font-medium transition cursor-pointer whitespace-nowrap'
+          : 'px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap';
+    }
+
+    const measCount = `${(tab.selectedMeasurements || []).length}`;
+    const measCountEl = document.getElementById('measureCountLabel');
+    if (measCountEl) measCountEl.innerText = measCount;
+    const sidebarMeasCountEl = document.getElementById('sidebarMeasureCountLabel');
+    if (sidebarMeasCountEl) sidebarMeasCountEl.innerText = measCount;
+
+    // Active Tool button highlights
+    const tool = tab.activeTool || 'pan';
+    const setToolBtnStyle = (el: HTMLElement | null, active: boolean) => {
+      if (!el) return;
+      el.classList.toggle('bg-cyan-600/30', active);
+      el.classList.toggle('text-cyan-200', active);
+      el.classList.toggle('border-cyan-500/70', active);
+    };
+    setToolBtnStyle(zoomBtn, tool === 'areaZoom');
+    setToolBtnStyle(ptBtn, tool === 'pointAnnotate');
+    setToolBtnStyle(txtBtn, tool === 'textAnnotate');
+    setToolBtnStyle(areaBtn, tool === 'areaAnnotate');
+  }
+
+  private renderSoftkeysOnly(tab: TabState): void {
+    const dock = document.getElementById('channelSoftkeysBar');
+    if (!dock) return;
+
+    dock.innerHTML = '';
+    if (tab.drawOrder.length === 0) {
+      dock.innerHTML = '<div class="text-[11px] text-slate-500 font-mono px-2 py-1">No active channels</div>';
+      return;
+    }
+
+    let inputIdx = 0;
+    let mathIdx = 0;
+    tab.drawOrder.forEach((id) => {
+      const ch = tab.channels[id];
+      if (!ch) return;
+      // Keep Compare reference overlay traces tucked inside the compact Compare Group Pill + sidebar Compare Groups list
+      if (ch.compareRole === 'ref') return;
+
+      const tag = ch.isMath ? `M${++mathIdx}` : `CH${++inputIdx}`;
+      const isSelected = tab.activeChannelId === id;
+      const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(ch);
+
+      const keyEl = document.createElement('div');
+      keyEl.className = `flex items-center gap-2 px-2.5 py-1 rounded-sm border cursor-pointer transition shrink-0 ${
+        isSelected
+          ? 'bg-[#1a222d] border-slate-400 text-slate-100'
+          : 'bg-[#0c0f13] border-[#222933] text-slate-300 hover:border-[#334155]'
+      } ${!ch.visible ? 'opacity-50' : ''}`;
+      keyEl.style.borderTopWidth = '2px';
+      keyEl.style.borderTopColor = ch.color;
+      if (ch.compareGroupColor) {
+        keyEl.style.borderLeftWidth = '3px';
+        keyEl.style.borderLeftColor = ch.compareGroupColor;
+      }
+
+      const refTag = ch.hasEdits ? '<span class="text-[9px] font-mono text-rose-300 border border-rose-500/50 px-1 ml-0.5">REF</span>' : '';
+      const grpBadge = ch.compareGroupName
+        ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${ch.compareGroupName}</span>`
+        : '';
+
+      keyEl.innerHTML = `
+        <button class="sk-vis-btn w-2.5 h-2.5 rounded-xs border border-slate-500 shrink-0 cursor-pointer" style="background:${ch.visible ? ch.color : 'transparent'}" title="Toggle trace visibility"></button>
+        <div class="flex flex-col leading-tight min-w-0">
+          <div class="flex items-center gap-1 font-mono text-[11px]">
+            ${grpBadge}
+            <span class="font-bold" style="color:${ch.color}">${tag}</span>
+            <span class="truncate max-w-[88px] text-slate-200 font-sans text-[11px]" title="${ch.name}">${ch.name}</span>${refTag}
+          </div>
+          <div class="font-mono text-[10px] text-slate-400 tabular-nums">
+            ${formatEng(voltsPerDiv, ch.unit, 1)}/ · ${ch.coupling || 'DC'}${ch.inverted ? ' · INV' : ''} · ${vOffset >= 0 ? '+' : ''}${vOffset.toFixed(1)}${ch.unit}
+          </div>
+        </div>
+      `;
+
+      keyEl.querySelector('.sk-vis-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.toggleChannelVisible(id);
+      });
+
+      keyEl.addEventListener('click', () => {
+        this.selectActiveChannel(id);
+      });
+
+      dock.appendChild(keyEl);
+    });
+
+    // Render one tidy Group Pill per Compare Group at the right end of the softkeys bar
+    const groupsMap = new Map<string, { name: string; color: string; refCount: number; diffCount: number; allRefVisible: boolean }>();
+    tab.drawOrder.forEach((id) => {
+      const ch = tab.channels[id];
+      if (!ch || !ch.compareGroupId) return;
+      let g = groupsMap.get(ch.compareGroupId);
+      if (!g) {
+        g = {
+          name: ch.compareGroupName || 'CMP',
+          color: ch.compareGroupColor || ch.color,
+          refCount: 0,
+          diffCount: 0,
+          allRefVisible: true,
+        };
+        groupsMap.set(ch.compareGroupId, g);
+      }
+      if (ch.compareRole === 'ref') {
+        g.refCount++;
+        if (!ch.visible) g.allRefVisible = false;
+      } else if (ch.compareRole === 'diff') {
+        g.diffCount++;
+        if (!ch.visible) g.allRefVisible = false;
+      }
+    });
+
+    groupsMap.forEach((grp, groupId) => {
+      if (grp.refCount === 0 && grp.diffCount === 0) return;
+      const totalOverlays = grp.refCount + grp.diffCount;
+      const grpChip = document.createElement('div');
+      grpChip.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-sm border bg-[#0c1118] text-[10px] font-mono shrink-0';
+      grpChip.style.borderColor = grp.color;
+      grpChip.innerHTML = `
+        <span class="w-2 h-2 rounded-full shrink-0" style="background:${grp.color}"></span>
+        <button type="button" class="grp-edit-btn font-bold hover:underline cursor-pointer" style="color:${grp.color}" title="Edit compare group">[${grp.name}]</button>
+        <span class="text-slate-400">· ${totalOverlays} ref${totalOverlays > 1 ? 's' : ''}</span>
+        <button type="button" class="grp-vis-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-slate-200 cursor-pointer" title="Show/Hide compare overlays">${grp.allRefVisible ? 'Hide' : 'Show'}</button>
+        <button type="button" class="grp-edit-icon-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 cursor-pointer" title="Edit / Re-align group">Edit</button>
+        <button type="button" class="grp-del-btn px-1 py-0.5 rounded-xs hover:bg-red-950/60 text-red-300 cursor-pointer" title="Remove compare group">✕</button>
+      `;
+      grpChip.querySelector('.grp-vis-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.toggleCompareGroupVisibility(groupId);
+      });
+      grpChip.querySelector('.grp-edit-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.onEditCompareGroup?.(groupId);
+      });
+      grpChip.querySelector('.grp-edit-icon-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.onEditCompareGroup?.(groupId);
+      });
+      grpChip.querySelector('.grp-del-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.removeCompareGroup(groupId);
+      });
+      dock.appendChild(grpChip);
+    });
+  }
+
+  private syncVerticalPanelOnly(ch: WaveformChannel): void {
+    const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(ch);
+
+    const vDivSel = document.getElementById('vDivSelect') as HTMLSelectElement;
+    if (vDivSel) {
+      let bestOpt = vDivSel.options[0]?.value || '1';
+      let bestRatio = Infinity;
+      for (let i = 0; i < vDivSel.options.length; i++) {
+        const v = parseFloat(vDivSel.options[i].value);
+        const r = Math.max(v / voltsPerDiv, voltsPerDiv / v);
+        if (r < bestRatio) {
+          bestRatio = r;
+          bestOpt = vDivSel.options[i].value;
+        }
+      }
+      vDivSel.value = bestOpt;
+    }
+
+    const offsetInput = document.getElementById('vOffsetInput') as HTMLInputElement;
+    if (offsetInput && document.activeElement !== offsetInput) {
+      offsetInput.value = vOffset.toFixed(2);
+    }
+
+    const offsetSlider = document.getElementById('vOffsetSlider') as HTMLInputElement;
+    if (offsetSlider && document.activeElement !== offsetSlider) {
+      const divs = Math.max(-4, Math.min(4, vOffset / voltsPerDiv));
+      offsetSlider.value = divs.toFixed(2);
+    }
+  }
+
+  private renderCursorReadoutOnly(tab: TabState): void {
+    const grid = document.getElementById('cursorReadoutGrid');
+    if (!grid) return;
+
+    const mode = resolveCursorMode(tab);
+    document.querySelectorAll('.cur-mode-btn').forEach((btn) => {
+      const m = btn.getAttribute('data-curmode');
+      if (m === mode) {
+        btn.classList.add('bg-cyan-600', 'text-slate-950', 'font-semibold');
+        btn.classList.remove('text-slate-400');
+      } else {
+        btn.classList.remove('bg-cyan-600', 'text-slate-950', 'font-semibold');
+        btn.classList.add('text-slate-400');
+      }
+    });
+
+    if (mode === 'off') {
+      grid.innerHTML = '<div class="text-slate-500">Cursors disabled. Select X, Y, X+Y, or Track.</div>';
+      return;
+    }
+
+    const targetId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
+    const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
+    const unit = targetCh?.unit || 'V';
+    const { x1, x2 } = tab.cursors;
+    let { y1, y2 } = tab.cursors;
+
+    if (mode === 'track' && targetCh) {
+      y1 = x1 !== null ? sampleChannelValueAtTime(targetCh, x1) : null;
+      y2 = x2 !== null ? sampleChannelValueAtTime(targetCh, x2) : null;
+    }
+
+    const dx = x1 !== null && x2 !== null ? Math.abs(x2 - x1) : null;
+    const freq = dx !== null && dx > 1e-15 ? formatEng(1 / dx, 'Hz', 2) : '--';
+    const dy = y1 !== null && y2 !== null ? y2 - y1 : null;
+    const slope = dx && dy !== null && dx > 1e-15 ? formatEng(dy / dx, `${unit}/s`, 2) : '--';
+
+    let html = '<div class="grid grid-cols-2 gap-x-3 gap-y-1 bg-[#0c0f13] border border-[#222933] p-2 rounded-sm">';
+    if (mode === 'x' || mode === 'xy' || mode === 'track') {
+      html += `
+        <div class="flex justify-between"><span class="text-sky-400">X1:</span><span>${x1 !== null ? formatEng(x1, 's', 3) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-sky-400">X2:</span><span>${x2 !== null ? formatEng(x2, 's', 3) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔX:</span><span class="text-slate-100 font-semibold">${dx !== null ? formatEng(dx, 's', 3) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">1/ΔX:</span><span class="text-cyan-300 font-semibold">${freq}</span></div>
+      `;
+    }
+    if (mode === 'y' || mode === 'xy' || mode === 'track') {
+      html += `
+        <div class="flex justify-between"><span class="text-violet-400">Y1:</span><span>${y1 !== null ? formatEng(y1, unit, 2) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-violet-400">Y2:</span><span>${y2 !== null ? formatEng(y2, unit, 2) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔY:</span><span class="text-slate-100 font-semibold">${dy !== null ? formatEng(dy, unit, 2) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔY/ΔX:</span><span>${slope}</span></div>
+      `;
+    }
+    html += '</div>';
+    grid.innerHTML = html;
+  }
+
   public renderSidebar(): void {
     const tab = this.getActiveTab();
     if (!tab) return;
+    this.ensureTabDefaults(tab);
 
-    // Toggle Sidebar Panels based on Plot Mode (prevents duplicates and cluttered controls)
-    const measSection = document.getElementById('measurementsSidebarSection');
+    // Toggle FFT & XY sidebar panels
     const fftPanel = document.getElementById('fftSidebarPanel');
-    if (tab.plotMode === 'frequency') {
-      if (measSection) measSection.style.display = 'none';
-      if (fftPanel) fftPanel.style.display = 'block';
-    } else {
-      if (measSection) measSection.style.display = 'block';
-      if (fftPanel) fftPanel.style.display = 'none';
+    if (fftPanel) {
+      fftPanel.style.display = tab.plotMode === 'frequency' ? 'block' : 'none';
+    }
+    const xyPanel = document.getElementById('xySidebarPanel');
+    if (xyPanel) {
+      xyPanel.style.display = tab.plotMode === 'xy' ? 'block' : 'none';
+      if (tab.plotMode === 'xy') {
+        const xSel = document.getElementById('xyXChannelSelect') as HTMLSelectElement | null;
+        const ySel = document.getElementById('xyYChannelSelect') as HTMLSelectElement | null;
+        const rSel = document.getElementById('xyRangeSelect') as HTMLSelectElement | null;
+        [xSel, ySel].forEach((sel, selIdx) => {
+          if (!sel) return;
+          const targetId =
+            selIdx === 0
+              ? tab.xyConfig?.xChannelId || tab.drawOrder[0]
+              : tab.xyConfig?.yChannelId || tab.drawOrder[1] || tab.drawOrder[0];
+          sel.innerHTML = '';
+          tab.drawOrder.forEach((id, idx) => {
+            const ch = tab.channels[id];
+            if (!ch) return;
+            const opt = document.createElement('option');
+            opt.value = id;
+            opt.text = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
+            if (id === targetId) opt.selected = true;
+            sel.appendChild(opt);
+          });
+        });
+        if (rSel && tab.xyConfig) rSel.value = tab.xyConfig.range;
+
+        const xyReadout = document.getElementById('xyMetricsReadout');
+        const xCh = tab.channels[tab.xyConfig?.xChannelId || tab.drawOrder[0]];
+        const yCh = tab.channels[tab.xyConfig?.yChannelId || tab.drawOrder[1] || tab.drawOrder[0]];
+        if (xyReadout && xCh && yCh) {
+          const m = computeXYMetrics(xCh, yCh, tab.view.startIndex, tab.view.endIndex);
+          xyReadout.innerHTML = `
+            <div class="flex justify-between"><span>X Span:</span><span>${formatEng(m.xMax - m.xMin, xCh.unit, 2)}</span></div>
+            <div class="flex justify-between"><span>Y Span:</span><span>${formatEng(m.yMax - m.yMin, yCh.unit, 2)}</span></div>
+            <div class="flex justify-between"><span>Circularity:</span><span class="text-cyan-300">${m.circularityPct !== null ? m.circularityPct.toFixed(1) + '%' : '--'}</span></div>
+            <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-amber-300">${m.lissajousPhaseDeg !== null ? m.lissajousPhaseDeg.toFixed(1) + '°' : '--'}</span></div>
+          `;
+        }
+      }
     }
 
-    // File summary
+    // Bottom Channel Softkeys
+    this.renderSoftkeysOnly(tab);
+
+    // 1. Vertical Control Panel
+    const activeChSel = document.getElementById('activeChannelSelect') as HTMLSelectElement;
+    const activeCh = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
+    if (activeChSel) {
+      activeChSel.innerHTML = '';
+      tab.drawOrder.forEach((id, idx) => {
+        const ch = tab.channels[id];
+        if (!ch) return;
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.text = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
+        if (id === activeCh?.id) opt.selected = true;
+        activeChSel.appendChild(opt);
+      });
+    }
+
+    if (activeCh) {
+      const colorInp = document.getElementById('activeChannelColor') as HTMLInputElement;
+      if (colorInp) colorInp.value = activeCh.color;
+
+      const visBtn = document.getElementById('activeChVisibleBtn');
+      if (visBtn) {
+        visBtn.innerText = activeCh.visible ? 'ON' : 'OFF';
+        visBtn.className = `py-1 border rounded-sm cursor-pointer ${
+          activeCh.visible
+            ? 'bg-emerald-950/50 border-emerald-600/60 text-emerald-300 font-semibold'
+            : 'bg-[#0c0f13] border-[#222933] text-slate-500'
+        }`;
+      }
+
+      const coupBtn = document.getElementById('activeChCouplingBtn');
+      if (coupBtn) {
+        coupBtn.innerText = activeCh.coupling || 'DC';
+        coupBtn.className = `py-1 border rounded-sm cursor-pointer ${
+          activeCh.coupling === 'AC'
+            ? 'bg-amber-950/50 border-amber-500/60 text-amber-300 font-semibold'
+            : 'bg-[#0c0f13] border-[#222933] text-slate-200'
+        }`;
+      }
+
+      const invBtn = document.getElementById('activeChInvertBtn');
+      if (invBtn) {
+        invBtn.className = `py-1 border rounded-sm cursor-pointer ${
+          activeCh.inverted
+            ? 'bg-purple-950/60 border-purple-500/70 text-purple-200 font-semibold'
+            : 'bg-[#0c0f13] border-[#222933] text-slate-400'
+        }`;
+      }
+
+      this.syncVerticalPanelOnly(activeCh);
+    }
+
+    // 2. Trigger Control Panel
+    const trigEnBtn = document.getElementById('trigEnableBtn');
+    if (trigEnBtn) {
+      trigEnBtn.innerText = tab.triggerConfig.enabled ? 'ON' : 'OFF';
+      trigEnBtn.className = `px-2 py-0.5 rounded-sm border text-[10px] font-mono cursor-pointer ${
+        tab.triggerConfig.enabled
+          ? 'bg-orange-950/60 border-orange-500/70 text-orange-300 font-semibold'
+          : 'bg-[#0c0f13] border-[#222933] text-slate-400'
+      }`;
+    }
+
+    const trigChSel = document.getElementById('trigQuickChannelSelect') as HTMLSelectElement;
+    if (trigChSel) {
+      trigChSel.innerHTML = '';
+      tab.drawOrder.forEach((id, idx) => {
+        const ch = tab.channels[id];
+        if (!ch) return;
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.text = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
+        if (id === tab.triggerConfig.channelId) opt.selected = true;
+        trigChSel.appendChild(opt);
+      });
+    }
+
+    const trigSlopeBtn = document.getElementById('trigQuickSlopeBtn');
+    if (trigSlopeBtn) {
+      trigSlopeBtn.innerText = tab.triggerConfig.type === 'rising' ? '↑ Rise' : '↓ Fall';
+    }
+
+    const trigLvlInp = document.getElementById('trigQuickLevelInput') as HTMLInputElement;
+    if (trigLvlInp && document.activeElement !== trigLvlInp) {
+      trigLvlInp.value = tab.triggerConfig.level.toFixed(3);
+    }
+
+    // 3. Cursors Panel
+    const curChSel = document.getElementById('cursorChannelSelect') as HTMLSelectElement;
+    if (curChSel) {
+      const targetCurId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
+      curChSel.innerHTML = '';
+      tab.drawOrder.forEach((id, idx) => {
+        const ch = tab.channels[id];
+        if (!ch) return;
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.text = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
+        if (id === targetCurId) opt.selected = true;
+        curChSel.appendChild(opt);
+      });
+    }
+    this.renderCursorReadoutOnly(tab);
+
+    // 4. File / Sampling Quality Summary
     const fileSummaryEl = document.getElementById('fileSummaryPanel');
     if (fileSummaryEl) {
       const primaryCh = tab.channels[tab.drawOrder[0]];
@@ -1653,235 +3530,184 @@ export class OscilloscopeApp {
       const durationStr = primaryCh ? formatEng(primaryCh.t[primaryCh.t.length - 1] - primaryCh.t[0], 's', 3) : '0 s';
       const qualityBadge = meta
         ? meta.qualityStatus === 'uniform'
-          ? '<span class="text-green-400 font-bold">Uniform</span>'
+          ? '<span class="text-emerald-400 font-semibold">Uniform</span>'
           : meta.qualityStatus === 'non-uniform'
-          ? '<span class="text-yellow-400 font-bold">Non-uniform</span>'
-          : '<span class="text-red-400 font-bold">Severe Jitter</span>'
+          ? '<span class="text-amber-300 font-semibold">Non-uniform</span>'
+          : '<span class="text-red-400 font-semibold">Severe Jitter</span>'
         : 'N/A';
 
       fileSummaryEl.innerHTML = `
-        <div class="flex justify-between text-xs py-0.5"><span>File:</span><span class="font-mono truncate max-w-[150px]">${tab.fileName}</span></div>
-        <div class="flex justify-between text-xs py-0.5"><span>Points:</span><span class="font-mono">${primaryCh?.v.length.toLocaleString() || 0}</span></div>
-        <div class="flex justify-between text-xs py-0.5"><span>Sample Rate:</span><span class="font-mono">${sampleRateStr}</span></div>
-        <div class="flex justify-between text-xs py-0.5"><span>Duration:</span><span class="font-mono">${durationStr}</span></div>
-        <div class="flex justify-between text-xs py-0.5"><span>Quality:</span><span>${qualityBadge}</span></div>
-        ${meta && meta.jitterRms !== null ? `<div class="flex justify-between text-xs py-0.5"><span>Jitter RMS:</span><span class="font-mono">${meta.jitterRms.toFixed(2)}%</span></div>` : ''}
-        ${meta && meta.gapCount > 0 ? `<div class="flex justify-between text-xs py-0.5 text-amber-400"><span>Gaps Detected:</span><span class="font-mono font-bold">${meta.gapCount}</span></div>` : ''}
-        ${meta && meta.belowTargetRate ? `<div class="text-xs py-0.5 text-red-400 font-bold">⚠ Below 20MHz target -- source lacks bandwidth for fast edges (re-export at full rate)</div>` : ''}
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">File</span><span class="font-mono text-slate-200 truncate max-w-[175px]">${tab.fileName}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Samples</span><span class="font-mono text-slate-200">${primaryCh?.v.length.toLocaleString() || 0}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Rate</span><span class="font-mono text-slate-200">${sampleRateStr}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Duration</span><span class="font-mono text-slate-200">${durationStr}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Timing</span><span>${qualityBadge}</span></div>
+        ${meta && meta.jitterRms !== null ? `<div class="flex justify-between py-0.5"><span class="text-slate-400">Jitter RMS</span><span class="font-mono text-slate-200">${meta.jitterRms.toFixed(2)}%</span></div>` : ''}
+        ${meta && meta.gapCount > 0 ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Gaps</span><span class="font-mono font-semibold">${meta.gapCount}</span></div>` : ''}
       `;
     }
 
-    // Input channels list
-    const inputChannelsListEl = document.getElementById('inputChannelsListPanel');
-    const mathChannelsListEl = document.getElementById('mathChannelsListPanel');
-    const mathCountBadge = document.getElementById('mathCountBadge');
+    // 4c. Compare Groups List (dedicated sidebar manager so overlaid refs don't clutter bottom dock or Math list)
+    const cmpSection = document.getElementById('compareGroupsSidebarSection');
+    const cmpBadge = document.getElementById('compareGroupsCountBadge');
+    const cmpPanel = document.getElementById('compareGroupsListPanel');
+    if (cmpSection && cmpPanel) {
+      const cmpGroups = new Map<
+        string,
+        {
+          name: string;
+          color: string;
+          targetName: string;
+          members: Array<{ id: string; ch: WaveformChannel }>;
+          allVisible: boolean;
+        }
+      >();
+      tab.drawOrder.forEach((id) => {
+        const ch = tab.channels[id];
+        if (!ch || !ch.compareGroupId) return;
+        let g = cmpGroups.get(ch.compareGroupId);
+        if (!g) {
+          g = {
+            name: ch.compareGroupName || 'CMP',
+            color: ch.compareGroupColor || ch.color,
+            targetName: '',
+            members: [],
+            allVisible: true,
+          };
+          cmpGroups.set(ch.compareGroupId, g);
+        }
+        if (ch.compareRole === 'target') {
+          g.targetName = ch.name;
+        } else {
+          g.members.push({ id, ch });
+          if (!ch.visible) g.allVisible = false;
+        }
+      });
 
-    const inputChannelIds = tab.drawOrder.filter((id) => !tab.channels[id]?.isMath);
-    const mathChannelIds = tab.drawOrder.filter((id) => tab.channels[id]?.isMath);
+      const activeGroups = Array.from(cmpGroups.entries()).filter(([, g]) => g.members.length > 0);
+      if (cmpBadge) cmpBadge.innerText = activeGroups.length.toString();
 
-    if (mathCountBadge) {
-      mathCountBadge.innerText = mathChannelIds.length.toString();
-    }
-
-    const activeId = getActiveChannel(tab)?.id;
-
-    if (inputChannelsListEl) {
-      inputChannelsListEl.innerHTML = '';
-      if (inputChannelIds.length === 0) {
-        inputChannelsListEl.innerHTML = '<div class="text-xs text-neutral-500">No channels available</div>';
+      if (activeGroups.length === 0) {
+        cmpSection.classList.add('hidden');
+        cmpPanel.innerHTML = '';
       } else {
-        inputChannelIds.forEach((id) => {
-          const ch = tab.channels[id];
-          if (!ch) return;
+        cmpSection.classList.remove('hidden');
+        cmpPanel.innerHTML = '';
+        activeGroups.forEach(([groupId, grp]) => {
+          const card = document.createElement('div');
+          card.className = 'p-2 rounded-sm bg-[#0c0f13] border border-[#222933] text-xs space-y-1.5';
+          card.style.borderLeftWidth = '3px';
+          card.style.borderLeftColor = grp.color;
 
-          const isActive = id === activeId;
-          const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
-          const vOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
-
-          const row = document.createElement('div');
-          row.className = `channel-item flex flex-col p-2.5 rounded mb-2 text-xs border-l-4 transition ${
-            isActive ? 'bg-neutral-800 border border-cyan-800/80' : 'bg-neutral-800/80 hover:bg-neutral-800 border border-neutral-700/50'
-          }`;
-          row.style.borderLeftColor = ch.color;
-
-          row.innerHTML = `
-            <div class="flex items-center justify-between mb-1.5">
-              <div class="flex items-center gap-1.5 overflow-hidden">
-                <input type="checkbox" class="ch-vis-chk cursor-pointer" ${ch.visible ? 'checked' : ''} />
-                <input type="color" class="ch-col-picker w-4 h-4 rounded cursor-pointer border-none bg-transparent" value="${ch.color}" />
-                <span class="font-bold truncate text-neutral-100 max-w-[110px] cursor-pointer ch-select-name hover:text-cyan-300" title="Click to make Active Channel">${ch.name}</span>
+          const headerHtml = `
+            <div class="flex items-center justify-between gap-1">
+              <div class="flex items-center gap-1.5 min-w-0">
+                <span class="w-2 h-2 rounded-full shrink-0" style="background:${grp.color}"></span>
+                <span class="font-mono font-bold truncate" style="color:${grp.color}">[${grp.name}]</span>
+                <span class="text-[10px] font-mono text-slate-400">×${grp.members.length}</span>
               </div>
-              <div class="flex items-center gap-1 font-mono text-[10px]">
-                ${isActive ? '<span class="bg-cyan-950 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/60 font-semibold">ACTIVE</span>' : ''}
-                <button class="ch-fit-btn px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded font-medium transition" title="Auto-scale 1-2-5 & center">AutoFit</button>
+              <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
+                <button type="button" class="cmp-sb-vis px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">${grp.allVisible ? 'Hide' : 'Show'}</button>
+                <button type="button" class="cmp-sb-edit px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Edit</button>
+                <button type="button" class="cmp-sb-del text-red-400 hover:text-red-300 px-1 py-0.5 cursor-pointer" title="Remove group">✕</button>
               </div>
             </div>
-
-            <!-- Scale (步进 V/div) -->
-            <div class="flex items-center justify-between text-[11px] py-1 border-t border-neutral-700/40">
-              <span class="text-neutral-400 font-medium">Scale (步进):</span>
-              <div class="flex items-center gap-1">
-                <button class="ch-scale-down px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 font-bold" title="Decrease V/div (Zoom In)">−</button>
-                <input type="number" step="any" class="ch-scale-input w-16 bg-neutral-900 border border-neutral-600 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vPerDiv.toPrecision(3)}" title="Volts per division" />
-                <span class="text-neutral-400 text-[10px]">${ch.unit}/div</span>
-                <button class="ch-scale-up px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 font-bold" title="Increase V/div (Zoom Out)">+</button>
-              </div>
-            </div>
-
-            <!-- Offset (上下偏移) -->
-            <div class="flex items-center justify-between text-[11px] py-1 border-t border-neutral-700/40">
-              <span class="text-neutral-400 font-medium">Offset (偏移):</span>
-              <div class="flex items-center gap-1">
-                <button class="ch-offset-zero px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-amber-300 font-mono text-[10px] font-bold" title="Reset Offset to 0">0</button>
-                <button class="ch-offset-down px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 text-[10px]" title="Shift Down (▼)">▼</button>
-                <input type="number" step="any" class="ch-offset-input w-16 bg-neutral-900 border border-neutral-600 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vOffset.toFixed(3)}" title="Vertical offset in ${ch.unit}" />
-                <span class="text-neutral-400 text-[10px]">${ch.unit}</span>
-                <button class="ch-offset-up px-1.5 py-0.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 text-[10px]" title="Shift Up (▲)">▲</button>
-              </div>
-            </div>
-
-            <!-- Bounds Readout -->
-            <div class="flex justify-between items-center text-[10px] text-neutral-400 pt-0.5 font-mono">
-              <span>Span: [${ch.vMin.toFixed(2)}, ${ch.vMax.toFixed(2)}] ${ch.unit}</span>
-            </div>
+            ${grp.targetName ? `<div class="text-[10px] font-mono text-slate-400 truncate">Base: <span class="text-slate-200">${grp.targetName}</span></div>` : ''}
           `;
+          card.innerHTML = headerHtml;
 
-          row.querySelector('.ch-vis-chk')?.addEventListener('change', (e: any) => {
-            const before = getCursorChannel(tab);
-            ch.visible = e.target.checked;
-            this.onVisibilityChanged(tab, before);
+          const membersWrap = document.createElement('div');
+          membersWrap.className = 'space-y-1 pt-1 border-t border-[#1b222c] max-h-36 overflow-y-auto';
+          const prefix = `[${grp.name}] `;
+          grp.members.forEach(({ id, ch }) => {
+            const shortName = ch.name.startsWith(prefix) ? ch.name.slice(prefix.length) : ch.name;
+            const row = document.createElement('div');
+            row.className = 'flex items-center justify-between gap-1 text-[11px] font-mono';
+            row.innerHTML = `
+              <label class="flex items-center gap-1.5 min-w-0 cursor-pointer flex-1">
+                <input type="checkbox" class="cmp-m-vis cursor-pointer accent-emerald-400" ${ch.visible ? 'checked' : ''} />
+                <span class="w-2 h-2 rounded-xs shrink-0" style="background:${ch.color}"></span>
+                <span class="truncate text-slate-200" title="${ch.name}">${shortName}</span>
+              </label>
+              <button type="button" class="cmp-m-del text-slate-500 hover:text-red-400 px-1 cursor-pointer" title="Remove trace">✕</button>
+            `;
+            row.querySelector('.cmp-m-vis')?.addEventListener('change', (e: any) => {
+              ch.visible = !!e.target.checked;
+              this.renderSoftkeysOnly(tab);
+              this.draw();
+            });
+            row.querySelector('.cmp-m-del')?.addEventListener('click', () => {
+              delete tab.channels[id];
+              tab.drawOrder = tab.drawOrder.filter((cid) => cid !== id);
+              if (tab.activeChannelId === id) tab.activeChannelId = tab.drawOrder[0];
+              this.renderSidebar();
+              this.draw();
+            });
+            membersWrap.appendChild(row);
           });
+          card.appendChild(membersWrap);
 
-          row.querySelector('.ch-col-picker')?.addEventListener('input', (e: any) => {
-            ch.color = e.target.value;
-            row.style.borderLeftColor = ch.color;
-            this.draw();
-          });
-
-          row.querySelector('.ch-select-name')?.addEventListener('click', () => {
-            this.setActiveChannel(tab, id);
-          });
-
-          row.querySelector('.ch-fit-btn')?.addEventListener('click', () => {
-            this.autoScaleChannel(id);
-          });
-
-          row.querySelector('.ch-scale-down')?.addEventListener('click', () => {
-            this.stepChannelScale(id, 'down');
-          });
-
-          row.querySelector('.ch-scale-up')?.addEventListener('click', () => {
-            this.stepChannelScale(id, 'up');
-          });
-
-          row.querySelector('.ch-scale-input')?.addEventListener('change', (e: any) => {
-            const val = parseFloat(e.target.value);
-            if (!isNaN(val) && val > 0) {
-              this.setChannelScale(id, val);
-            }
-          });
-
-          row.querySelector('.ch-offset-zero')?.addEventListener('click', () => {
-            this.zeroChannelOffset(id);
-          });
-
-          row.querySelector('.ch-offset-down')?.addEventListener('click', () => {
-            this.nudgeChannelOffset(id, 'down');
-          });
-
-          row.querySelector('.ch-offset-up')?.addEventListener('click', () => {
-            this.nudgeChannelOffset(id, 'up');
-          });
-
-          row.querySelector('.ch-offset-input')?.addEventListener('change', (e: any) => {
-            const val = parseFloat(e.target.value);
-            if (!isNaN(val)) {
-              this.setChannelOffset(id, val);
-            }
-          });
-
-          inputChannelsListEl.appendChild(row);
+          card.querySelector('.cmp-sb-vis')?.addEventListener('click', () => this.toggleCompareGroupVisibility(groupId));
+          card.querySelector('.cmp-sb-edit')?.addEventListener('click', () => this.onEditCompareGroup?.(groupId));
+          card.querySelector('.cmp-sb-del')?.addEventListener('click', () => this.removeCompareGroup(groupId));
+          cmpPanel.appendChild(card);
         });
       }
     }
 
-    // Math channels list
+    // 5. Math Channels List (exclude Compare Reference overlays which are managed above)
+    const mathChannelsListEl = document.getElementById('mathChannelsListPanel');
+    const mathCountBadge = document.getElementById('mathCountBadge');
+    const mathChannelIds = tab.drawOrder.filter((id) => {
+      const ch = tab.channels[id];
+      return ch?.isMath && ch.compareRole !== 'ref';
+    });
+
+    if (mathCountBadge) mathCountBadge.innerText = mathChannelIds.length.toString();
+
     if (mathChannelsListEl) {
       mathChannelsListEl.innerHTML = '';
       if (mathChannelIds.length === 0) {
-        mathChannelsListEl.innerHTML = '<div class="text-xs text-neutral-500 italic">No math channels yet. Click "+ Math" or "αβ" above.</div>';
+        mathChannelsListEl.innerHTML = '<div class="text-[11px] text-slate-500">No math channels defined.</div>';
       } else {
         mathChannelIds.forEach((id) => {
           const ch = tab.channels[id];
           if (!ch) return;
-
-          const isActive = id === activeId;
-          const vPerDiv = ch.vPerDiv || (ch.vMax - ch.vMin) / 8;
-          const vOffset = ch.vOffset !== undefined ? ch.vOffset : (ch.vMax + ch.vMin) / 2;
+          const { voltsPerDiv } = ensureChannelScaleOffset(ch);
 
           const row = document.createElement('div');
-          row.className = `channel-item flex flex-col p-2.5 rounded mb-2 text-xs border-l-4 transition ${
-            isActive ? 'bg-purple-950/70 border border-purple-600' : 'bg-purple-950/40 border border-purple-800/40 hover:bg-purple-950/60'
-          }`;
-          row.style.borderLeftColor = ch.color;
-
+          row.className = 'flex flex-col p-2 rounded-sm bg-[#0c0f13] border border-[#222933] hover:border-purple-500/50 text-xs';
+          if (ch.compareGroupColor) {
+            row.style.borderLeftWidth = '3px';
+            row.style.borderLeftColor = ch.compareGroupColor;
+          }
+          const grpBadgeHtml = ch.compareGroupName
+            ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${ch.compareGroupName}</span>`
+            : '';
           row.innerHTML = `
-            <div class="flex items-center justify-between mb-1.5">
+            <div class="flex items-center justify-between gap-1">
               <div class="flex items-center gap-1.5 overflow-hidden">
-                <input type="checkbox" class="ch-vis-chk cursor-pointer" ${ch.visible ? 'checked' : ''} />
-                <input type="color" class="ch-col-picker w-4 h-4 rounded cursor-pointer border-none bg-transparent" value="${ch.color}" />
-                <span class="font-bold text-purple-200 truncate max-w-[105px] cursor-pointer ch-select-name hover:text-white" title="Click to make Active Channel">${ch.name}</span>
+                <input type="checkbox" class="ch-vis-chk cursor-pointer accent-purple-400" ${ch.visible ? 'checked' : ''} />
+                <span class="w-2.5 h-2.5 rounded-xs shrink-0" style="background:${ch.color}"></span>
+                ${grpBadgeHtml}
+                <span class="font-medium text-purple-200 truncate max-w-[105px]" title="${ch.name}">${ch.name}</span>
               </div>
-              <div class="flex items-center gap-1 font-mono text-[10px]">
-                <button class="ch-fit-btn px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded font-medium transition" title="Auto-scale 1-2-5 & center">AutoFit</button>
-                <button class="ch-fft-btn px-1.5 py-0.5 bg-purple-900/70 hover:bg-purple-800 text-purple-200 rounded font-semibold transition" title="Analyze with FFT">FFT</button>
-                <button class="ch-del-btn text-red-400 hover:text-red-300 px-1 py-0.5" title="Delete math channel">✕</button>
-              </div>
-            </div>
-
-            <!-- Scale (步进 V/div) -->
-            <div class="flex items-center justify-between text-[11px] py-1 border-t border-purple-800/40">
-              <span class="text-neutral-400 font-medium">Scale (步进):</span>
-              <div class="flex items-center gap-1">
-                <button class="ch-scale-down px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 font-bold" title="Decrease V/div (Zoom In)">−</button>
-                <input type="number" step="any" class="ch-scale-input w-16 bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vPerDiv.toPrecision(3)}" title="Volts per division" />
-                <span class="text-neutral-400 text-[10px]">${ch.unit}/div</span>
-                <button class="ch-scale-up px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 font-bold" title="Increase V/div (Zoom Out)">+</button>
+              <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
+                <button class="ch-fit-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Fit</button>
+                <button class="ch-fft-btn px-1.5 py-0.5 bg-[#1d1729] hover:bg-[#2b2040] border border-purple-700/60 text-purple-200 rounded-sm cursor-pointer">FFT</button>
+                <button class="ch-del-btn text-red-400 hover:text-red-300 px-1 py-0.5 cursor-pointer" title="Delete math channel">✕</button>
               </div>
             </div>
-
-            <!-- Offset (上下偏移) -->
-            <div class="flex items-center justify-between text-[11px] py-1 border-t border-purple-800/40">
-              <span class="text-neutral-400 font-medium">Offset (偏移):</span>
-              <div class="flex items-center gap-1">
-                <button class="ch-offset-zero px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-amber-300 font-mono text-[10px] font-bold" title="Reset Offset to 0">0</button>
-                <button class="ch-offset-down px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 text-[10px]" title="Shift Down (▼)">▼</button>
-                <input type="number" step="any" class="ch-offset-input w-16 bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-right font-mono text-white text-[11px]" value="${vOffset.toFixed(3)}" title="Vertical offset in ${ch.unit}" />
-                <span class="text-neutral-400 text-[10px]">${ch.unit}</span>
-                <button class="ch-offset-up px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 text-[10px]" title="Shift Up (▲)">▲</button>
-              </div>
-            </div>
-
-            <div class="flex justify-between items-center text-[10px] text-neutral-400 mt-1 font-mono">
-              <span class="truncate max-w-[140px] text-purple-300/90 font-mono" title="${ch.mathExpression || ''}">${ch.mathExpression || 'Math'}</span>
-              <span>[${ch.vMin.toFixed(2)}, ${ch.vMax.toFixed(2)}] ${ch.unit}</span>
+            <div class="flex justify-between items-center text-[10px] text-slate-400 mt-1 font-mono tabular-nums">
+              <span class="truncate max-w-[165px] text-purple-300/80" title="${ch.mathExpression || ''}">${ch.mathExpression || 'Math'}</span>
+              <span>${formatEng(voltsPerDiv, ch.unit, 1)}/div</span>
             </div>
           `;
 
           row.querySelector('.ch-vis-chk')?.addEventListener('change', (e: any) => {
-            const before = getCursorChannel(tab);
             ch.visible = e.target.checked;
-            this.onVisibilityChanged(tab, before);
-          });
-
-          row.querySelector('.ch-col-picker')?.addEventListener('input', (e: any) => {
-            ch.color = e.target.value;
-            row.style.borderLeftColor = ch.color;
+            this.renderSoftkeysOnly(tab);
             this.draw();
-          });
-
-          row.querySelector('.ch-select-name')?.addEventListener('click', () => {
-            this.setActiveChannel(tab, id);
           });
 
           row.querySelector('.ch-fft-btn')?.addEventListener('click', () => {
@@ -1889,51 +3715,16 @@ export class OscilloscopeApp {
           });
 
           row.querySelector('.ch-fit-btn')?.addEventListener('click', () => {
-            this.autoScaleChannel(id);
-          });
-
-          row.querySelector('.ch-scale-down')?.addEventListener('click', () => {
-            this.stepChannelScale(id, 'down');
-          });
-
-          row.querySelector('.ch-scale-up')?.addEventListener('click', () => {
-            this.stepChannelScale(id, 'up');
-          });
-
-          row.querySelector('.ch-scale-input')?.addEventListener('change', (e: any) => {
-            const val = parseFloat(e.target.value);
-            if (!isNaN(val) && val > 0) {
-              this.setChannelScale(id, val);
-            }
-          });
-
-          row.querySelector('.ch-offset-zero')?.addEventListener('click', () => {
-            this.zeroChannelOffset(id);
-          });
-
-          row.querySelector('.ch-offset-down')?.addEventListener('click', () => {
-            this.nudgeChannelOffset(id, 'down');
-          });
-
-          row.querySelector('.ch-offset-up')?.addEventListener('click', () => {
-            this.nudgeChannelOffset(id, 'up');
-          });
-
-          row.querySelector('.ch-offset-input')?.addEventListener('change', (e: any) => {
-            const val = parseFloat(e.target.value);
-            if (!isNaN(val)) {
-              this.setChannelOffset(id, val);
-            }
+            fitChannelTo125(ch);
+            this.renderSidebar();
+            this.draw();
           });
 
           row.querySelector('.ch-del-btn')?.addEventListener('click', () => {
             delete tab.channels[id];
             tab.drawOrder = tab.drawOrder.filter((chId) => chId !== id);
-            if (tab.selectedMeasurementChannelId === id) {
-              tab.selectedMeasurementChannelId = tab.drawOrder[0];
-            }
-            if (tab.cursors.trackingChannel === id) tab.cursors.trackingChannel = null;
-            if (tab.triggerConfig.channelId === id) tab.triggerConfig.channelId = tab.drawOrder[0] || '';
+            if (tab.activeChannelId === id) tab.activeChannelId = tab.drawOrder[0];
+            if (tab.selectedMeasurementChannelId === id) tab.selectedMeasurementChannelId = tab.drawOrder[0];
             if (tab.selectedFftChannelId === id) {
               tab.selectedFftChannelId = tab.drawOrder[0];
               this.cachedSpectrum = null;
@@ -1948,54 +3739,21 @@ export class OscilloscopeApp {
       }
     }
 
-    // Sync Cursor Selectors in Toolbar
-    const cursorChannelSel = document.getElementById('cursorChannelSelect') as HTMLSelectElement;
-    if (cursorChannelSel) {
-      const items: Array<{ value: string; label: string }> = [{ value: '', label: 'Auto (active)' }];
-      tab.drawOrder.forEach((id) => {
-        const ch = tab.channels[id];
-        if (ch) items.push({ value: id, label: ch.visible ? ch.name : `${ch.name} (hidden)` });
-      });
-      this.syncSelect(cursorChannelSel, items, tab.cursors.trackingChannel || '');
-      cursorChannelSel.onchange = (e: any) => {
-        this.setCursorChannel(tab, e.target.value);
-      };
-      const cType = tab.cursors.type || 'x';
-      if (tab.cursors.enabled && (cType === 'y' || cType === 'xy')) {
-        cursorChannelSel.classList.remove('hidden');
-        const eff = getCursorChannel(tab);
-        cursorChannelSel.title = eff ? `Y cursors measure: ${eff.name}` : 'Select Y-cursor channel';
-      } else {
-        cursorChannelSel.classList.add('hidden');
-      }
-    }
-
-    const cursorTypeSel = document.getElementById('cursorTypeSelect') as HTMLSelectElement;
-    if (cursorTypeSel) {
-      cursorTypeSel.value = tab.cursors.enabled ? (tab.cursors.type || 'x') : 'off';
-    }
-
-    // Populate Channel Selectors for Measurements and FFT
-    const measChannelSel = document.getElementById('measChannelSelect') as HTMLSelectElement;
-    if (measChannelSel) {
-      const items = tab.drawOrder
-        .filter((id) => tab.channels[id])
-        .map((id) => ({ value: id, label: tab.channels[id].isMath ? `[Math] ${tab.channels[id].name}` : tab.channels[id].name }));
-      this.syncSelect(measChannelSel, items, getActiveChannel(tab)?.id || '');
-      measChannelSel.onchange = (e: any) => {
-        this.setActiveChannel(tab, e.target.value);
-      };
-    }
-
+    // 6. FFT channel selector
     const fftChannelSel = document.getElementById('fftChannelSelect') as HTMLSelectElement;
     if (fftChannelSel) {
-      const items = tab.drawOrder
-        .filter((id) => tab.channels[id])
-        .map((id) => {
-          const ch = tab.channels[id];
-          return { value: id, label: ch.isMath ? `[Math] ${ch.name} (${ch.mathExpression || ''})` : ch.name };
-        });
-      this.syncSelect(fftChannelSel, items, tab.selectedFftChannelId || tab.drawOrder[0] || '');
+      const selectedFftId = tab.selectedFftChannelId || tab.drawOrder[0];
+      fftChannelSel.innerHTML = '';
+      tab.drawOrder.forEach((id, idx) => {
+        const ch = tab.channels[id];
+        if (ch) {
+          const opt = document.createElement('option');
+          opt.value = id;
+          opt.text = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
+          if (id === selectedFftId) opt.selected = true;
+          fftChannelSel.appendChild(opt);
+        }
+      });
       fftChannelSel.onchange = (e: any) => {
         tab.selectedFftChannelId = e.target.value;
         this.cachedSpectrum = null;
@@ -2004,149 +3762,87 @@ export class OscilloscopeApp {
       };
     }
 
-    // Sync FFT controls values
-    const spanSel = document.getElementById('fftSpanSelect') as HTMLSelectElement;
-    if (spanSel) {
-      if (!tab.view.fMin && !tab.view.fMax) {
-        spanSel.value = 'auto';
-      }
-    }
-
     const rangeSel = document.getElementById('fftRangeSelect') as HTMLSelectElement;
     if (rangeSel) rangeSel.value = tab.fftOptions.range;
-
     const winSel = document.getElementById('fftWindowSelect') as HTMLSelectElement;
     if (winSel) winSel.value = tab.fftOptions.window;
-
     const scaleSel = document.getElementById('fftScaleSelect') as HTMLSelectElement;
     if (scaleSel) scaleSel.value = tab.fftOptions.scale;
-
     const padSel = document.getElementById('fftPaddingSelect') as HTMLSelectElement;
     if (padSel) padSel.value = tab.fftOptions.zeroPadding.toString();
-
     const dcChk = document.getElementById('fftRemoveDcChk') as HTMLInputElement;
     if (dcChk) dcChk.checked = tab.fftOptions.removeDC;
 
-    // Live Measurements
-    this.renderLiveMeasurements(tab);
-    this.updateToolbarState();
+    this.renderMeasurementStrip(tab);
+    this.updateScreenTelemetry();
   }
 
-  /**
-   * Updates a <select> without tearing it down when nothing changed. Rebuilding the options of
-   * a select while its popup is open makes the browser repaint the popup with its default
-   * (white) palette, so only touch the DOM when the option list really differs.
-   */
-  private syncSelect(sel: HTMLSelectElement, items: Array<{ value: string; label: string }>, value: string): void {
-    const sig = items.map((i) => `${i.value}\u0000${i.label}`).join('\u0001');
-    if (sel.dataset.sig !== sig) {
-      sel.innerHTML = '';
-      for (const it of items) {
-        const opt = document.createElement('option');
-        opt.value = it.value;
-        opt.textContent = it.label;
-        sel.appendChild(opt);
+  private getCachedMeasurements(tab: TabState, ch: WaveformChannel): ChannelMeasurements {
+    const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const key = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${this.editVersion}`;
+    const existing = this.measCache[ch.id];
+    if (existing && existing.key === key) {
+      return existing.value;
+    }
+    const computed = computeMeasurements(ch, tab.measurementGate, tab.view, tab.cursors);
+    this.measCache[ch.id] = { key, value: computed };
+    return computed;
+  }
+
+  private lastMeasStripKey: string = '';
+
+  public renderMeasurementStrip(tab: TabState): void {
+    const bar = document.getElementById('measurementStripBar');
+    const container = document.getElementById('measurementCardsContainer');
+    const gateSel = document.getElementById('stripMeasGateSelect') as HTMLSelectElement;
+    if (!bar || !container) return;
+
+    const items = tab.selectedMeasurements || [];
+    if (items.length === 0) {
+      if (this.lastMeasStripKey !== 'empty') {
+        this.lastMeasStripKey = 'empty';
+        bar.classList.add('hidden');
+        container.innerHTML = '';
       }
-      sel.dataset.sig = sig;
-    }
-    if (sel.value !== value) sel.value = value;
-  }
-
-  /** Reflects trigger / filter / edge-mark state on the toolbar buttons. */
-  public updateToolbarState(): void {
-    const tab = this.getActiveTab();
-    const setCls = (el: HTMLElement | null, on: string[], off: string[], active: boolean) => {
-      if (!el) return;
-      el.classList.remove(...(active ? off : on));
-      el.classList.add(...(active ? on : off));
-    };
-
-    const trigToggle = document.getElementById('triggerToggleBtn');
-    const trigSlope = document.getElementById('triggerSlopeBtn');
-    const trigOn = !!tab && tab.triggerConfig.enabled;
-    if (trigToggle) {
-      trigToggle.textContent = trigOn ? 'Trig ON' : 'Trig OFF';
-      setCls(trigToggle, ['bg-amber-600', 'text-black', 'border-amber-400'], ['bg-neutral-800', 'text-neutral-400', 'border-neutral-600'], trigOn);
-    }
-    if (trigSlope && tab) {
-      trigSlope.textContent = tab.triggerConfig.type === 'rising' ? '↑ Rising' : '↓ Falling';
-      trigSlope.title = 'Click to switch trigger slope (rising / falling)';
-      setCls(trigSlope, ['text-amber-300'], ['text-neutral-400'], trigOn);
-    }
-
-    const edgeBtn = document.getElementById('edgeMarksBtn');
-    if (edgeBtn) {
-      const on = !!tab && !!tab.showEdgeMarks;
-      setCls(edgeBtn, ['bg-emerald-700', 'text-white', 'border-emerald-400'], ['bg-neutral-700', 'text-neutral-200', 'border-transparent'], on);
-    }
-
-    const filterBtn = document.getElementById('filterBtn');
-    const filterToggle = document.getElementById('filterToggleBtn');
-    const act = tab ? getActiveChannel(tab) : undefined;
-    const fOn = !!act && !!act.filter;
-    if (filterBtn) {
-      filterBtn.textContent = fOn ? `Filter · ${describeFilter(act!.filter!).replace(/ \(.*$/, '')}` : 'Filter';
-      filterBtn.title = fOn ? describeFilter(act!.filter!) : 'Low-pass filter (-3 dB cutoff)';
-    }
-    if (filterToggle) {
-      filterToggle.textContent = fOn ? 'LPF ON' : 'LPF OFF';
-      setCls(filterToggle, ['bg-cyan-700', 'text-white', 'border-cyan-400'], ['bg-neutral-800', 'text-neutral-400', 'border-neutral-600'], fOn);
-    }
-  }
-
-  private flashStatus(msg: string): void {
-    this.statusFlash = msg;
-    if (this.statusFlashTimer) window.clearTimeout(this.statusFlashTimer);
-    this.statusFlashTimer = window.setTimeout(() => {
-      this.statusFlash = '';
-      this.updateStatusBar();
-    }, 4000);
-    this.updateStatusBar();
-  }
-
-  private renderLiveMeasurements(tab: TabState): void {
-    const measContainer = document.getElementById('measurementsPanel');
-    if (!measContainer) return;
-
-    const targetCh = getActiveChannel(tab);
-    if (!targetCh) {
-      measContainer.innerHTML = '<div class="text-xs text-neutral-400">No active channel for measurement</div>';
       return;
     }
 
-    const m = computeMeasurements(targetCh, tab.measurementGate, tab.view, tab.cursors);
+    const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const itemsKey = items.map((i) => `${i.id}:${i.channelId}:${i.metric}`).join('|');
+    const stripKey = `${tab.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${this.editVersion}_${itemsKey}`;
+    if (this.lastMeasStripKey === stripKey) return;
+    this.lastMeasStripKey = stripKey;
 
-    const fmtVal = (v: number | null, unit: string) =>
-      v !== null ? formatEng(v, unit, 3) : '<span class="text-neutral-500">N/A</span>';
+    bar.classList.remove('hidden');
+    if (gateSel) gateSel.value = tab.measurementGate;
 
-    measContainer.innerHTML = `
-      <div class="flex justify-between items-center mb-2 pb-1 border-b border-neutral-700">
-        <span class="text-xs font-semibold ${targetCh.isMath ? 'text-purple-300' : 'text-neutral-200'} truncate max-w-[150px]">${targetCh.name} (${targetCh.unit})</span>
-        ${targetCh.filter ? `<span class="text-[10px] text-cyan-300 font-mono" title="${describeFilter(targetCh.filter)}">LPF</span>` : ''}
-      </div>
-      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] font-mono">
-        <div class="flex justify-between"><span>Vpp:</span><span class="font-bold text-neutral-100">${fmtVal(m.vpp, targetCh.unit)}</span></div>
-        <div class="flex justify-between"><span>RMS:</span><span>${fmtVal(m.rms, targetCh.unit)}</span></div>
-        <div class="flex justify-between"><span>Max:</span><span>${fmtVal(m.max, targetCh.unit)}</span></div>
-        <div class="flex justify-between"><span>Min:</span><span>${fmtVal(m.min, targetCh.unit)}</span></div>
-        <div class="flex justify-between"><span>Average:</span><span>${fmtVal(m.average, targetCh.unit)}</span></div>
-        <div class="flex justify-between"><span>Freq:</span><span class="text-cyan-400 font-bold">${fmtVal(m.frequency, 'Hz')}</span></div>
-        <div class="flex justify-between"><span>Period:</span><span>${fmtVal(m.period, 's')}</span></div>
-        <div class="flex justify-between"><span>Duty:</span><span>${m.dutyCycle !== null ? m.dutyCycle.toFixed(1) + '%' : 'N/A'}</span></div>
-        <div class="flex justify-between"><span>RiseTime:</span><span>${fmtVal(m.riseTime, 's')}</span></div>
-        <div class="flex justify-between"><span>FallTime:</span><span>${fmtVal(m.fallTime, 's')}</span></div>
-      </div>
-      ${m.statusMessage ? `<div class="text-[10px] text-amber-400 mt-2">${m.statusMessage}</div>` : ''}
-    `;
+    container.innerHTML = '';
+    for (const item of items) {
+      const ch = tab.channels[item.channelId];
+      const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
+      if (!ch || !def) continue;
 
-    // The gate selector is static markup (rebuilding it while open repaints its popup white)
-    const gateSel = document.getElementById('measGateSelect') as HTMLSelectElement | null;
-    if (gateSel) {
-      if (gateSel.value !== tab.measurementGate) gateSel.value = tab.measurementGate;
-      gateSel.onchange = (e: any) => {
-        tab.measurementGate = e.target.value as MeasurementGate;
-        this.renderSidebar();
-      };
+      const m = this.getCachedMeasurements(tab, ch);
+      const valStr = formatMeasurementMetricValue(m, def, ch.unit);
+
+      const card = document.createElement('div');
+      card.className = 'flex items-center gap-2 px-2 py-1 bg-[#12161c] border border-[#222933] rounded-sm text-[11px] shrink-0';
+      card.style.borderTopWidth = '2px';
+      card.style.borderTopColor = ch.color;
+
+      card.innerHTML = `
+        <div class="flex flex-col leading-tight">
+          <span class="text-[10px] text-slate-400 truncate max-w-[115px]">${ch.name} · ${def.shortLabel}</span>
+          <span class="font-mono font-semibold text-slate-100 tabular-nums">${valStr}</span>
+        </div>
+        <button class="meas-card-remove text-slate-500 hover:text-red-300 px-0.5 font-mono cursor-pointer" title="Remove metric">×</button>
+      `;
+
+      card.querySelector('.meas-card-remove')?.addEventListener('click', () => {
+        this.removeMeasurementSelection(item.id);
+      });
+
+      container.appendChild(card);
     }
   }
 
@@ -2160,63 +3856,71 @@ export class OscilloscopeApp {
       return;
     }
 
-    const primaryCh = getTimeBaseChannel(tab);
-    const fsStr = primaryCh?.fs ? formatEng(primaryCh.fs, 'S/s', 2) : 'N/A';
-    const pts = primaryCh?.v.length || 0;
-    const mode = tab.plotMode.toUpperCase();
+    const mode =
+      tab.plotMode === 'frequency'
+        ? 'FFT'
+        : tab.plotMode === 'xy'
+        ? 'XY'
+        : tab.separateView
+        ? 'SEPARATE'
+        : 'OVERLAP';
+    const tool = tab.activeTool && tab.activeTool !== 'pan' ? ` | TOOL: ${tab.activeTool.toUpperCase()}` : '';
+    const activeCh = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
+    const activeStr = activeCh ? ` | ACTIVE: ${activeCh.name}` : '';
 
-    let cursorText = '';
-    if (tab.cursors.enabled) {
-      const cType = tab.cursors.type || 'x';
-      const parts: string[] = [];
-
-      if ((cType === 'x' || cType === 'xy') && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
-        const dt = Math.abs(tab.cursors.x2 - tab.cursors.x1);
-        const freq = dt > 0 ? formatEng(1 / dt, 'Hz', 2) : '∞';
-        parts.push(`ΔT: ${formatEng(dt, 's', 3)} (${freq})`);
-      }
-
-      if ((cType === 'y' || cType === 'xy') && tab.cursors.y1 !== null && tab.cursors.y2 !== null) {
-        const targetCh = getCursorChannel(tab) || primaryCh;
-        if (targetCh) {
-          const dv = Math.abs(tab.cursors.y2 - tab.cursors.y1);
-          parts.push(`ΔV [${targetCh.name}]: ${formatEng(dv, targetCh.unit, 3)}`);
-        }
-      }
-
-      if (parts.length > 0) {
-        cursorText = ' | ' + parts.join(' • ');
-      }
-    }
-
-    const filtered = getVisibleChannels(tab).filter((c) => c.filter);
-    const filterText = filtered.length
-      ? `<span class="text-cyan-300">• ${filtered.length === 1 ? filtered[0].name + ': ' + describeFilter(filtered[0].filter!) : filtered.length + ' channels low-pass filtered'}</span>`
-      : '';
-    statusEl.innerHTML = `
-      <span>[${mode}]</span>
-      <span>${tab.fileName}</span>
-      <span>• ${pts.toLocaleString()} pts</span>
-      <span>• Fs: ${fsStr}</span>
-      ${filterText}
-      <span class="text-cyan-300 font-mono">${cursorText}</span>
-      ${this.statusFlash ? `<span class="text-amber-300">• ${this.statusFlash}</span>` : ''}
-    `;
-  }
-
-  private updateHoverInfo(time: number, voltage: number, ch?: WaveformChannel): void {
-    const el = document.getElementById('hoverInfoReadout');
-    if (el) {
-      const name = ch && getVisibleChannels(this.getActiveTab() as TabState).length > 1 ? `${ch.name}: ` : '';
-      el.innerText = `T = ${formatEng(time, 's', 4)}, ${name}V = ${formatEng(voltage, ch?.unit || 'V', 3)}`;
-    }
+    statusEl.innerText = `[${mode}] ${tab.fileName}${activeStr}${tool}`;
   }
 
   // --- Export Operations ---
+  public exportEngineeringReport(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    try {
+      const dpr = window.devicePixelRatio || 1;
+      const width = this.canvas.width / dpr || 1200;
+      const height = this.canvas.height / dpr || 640;
+      const goldenEval = this.getGoldenEvaluation(tab);
+      const html = buildEngineeringReportHTML(
+        tab,
+        width,
+        height,
+        this.cachedSpectrum,
+        goldenEval,
+        tab.activeAnomalies,
+        this.theme
+      );
+      const filename = downloadEngineeringReportHTML(html, tab.fileName);
+      this.showToast(`Exported Test Report ${filename} (open in browser to print/save PDF).`, 'info');
+    } catch (err: any) {
+      this.showToast(`Test Report export failed: ${err.message}`, 'error');
+    }
+  }
+
   public exportPNG(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    try {
+      const dpr = window.devicePixelRatio || 1;
+      const width = this.canvas.width / dpr || 1200;
+      const height = this.canvas.height / dpr || 640;
+      const file = captureCompositeScopePNG(tab, width, height, this.cachedSpectrum, this.theme);
+      this.showToast(`Saved screenshot ${file}`, 'info');
+    } catch (err: any) {
+      this.showToast(`Screenshot failed: ${err.message}`, 'error');
+    }
+  }
+
+  public exportSVG(): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    const dpr = window.devicePixelRatio || 1;
+    const width = this.canvas.width / dpr || 1200;
+    const height = this.canvas.height / dpr || 640;
+    const svgStr = generateWaveformSVG(tab, width, height, this.theme, this.cachedSpectrum);
+    const blob = new Blob([svgStr], { type: 'image/svg+xml' });
     const link = document.createElement('a');
-    link.download = `waveform_${Date.now()}.png`;
-    link.href = this.canvas.toDataURL('image/png');
+    link.download = `${tab.fileName}_scope.svg`;
+    link.href = URL.createObjectURL(blob);
     link.click();
   }
 
@@ -2224,10 +3928,7 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     if (!tab) return;
 
-    const visibleChs = tab.drawOrder
-      .map((id) => tab.channels[id])
-      .filter((c) => c && c.visible);
-
+    const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
     if (visibleChs.length === 0) return;
 
     const baseCh = visibleChs[0];
@@ -2251,7 +3952,7 @@ export class OscilloscopeApp {
 
   public exportSpectrumCSV(): void {
     if (!this.cachedSpectrum) {
-      alert('No active FFT spectrum computed. Switch to Spectrum mode first.');
+      this.showToast('Switch to FFT Spectrum mode first to compute spectrum.', 'warn');
       return;
     }
 
@@ -2269,6 +3970,10 @@ export class OscilloscopeApp {
   }
 
   public saveSessionFile(): void {
+    if (this.tabs.length === 0) {
+      this.showToast('No open tabs to save.', 'warn');
+      return;
+    }
     const json = serializeSession(this.tabs, this.activeTabIndex);
     const blob = new Blob([json], { type: 'application/json' });
     const link = document.createElement('a');

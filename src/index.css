@@ -1,1 +1,68 @@
 @import "tailwindcss";
+
+@theme {
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  html,
+  body {
+    font-family: var(--font-sans);
+    background-color: #0c0f13;
+    color: #e2e8f0;
+  }
+
+  .font-mono,
+  input[type='number'],
+  select {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Crisp oscilloscope console scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27303d;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4758;
+}
+
+/* Crystal-clear non-blurring floating tool overlays so underlying waveform adjustments remain 100% sharp & visible */
+.modal-overlay {
+  background-color: transparent;
+  backdrop-filter: none;
+  pointer-events: none;
+}
+
+/* Light dim without blur only for blocking import/text prompts */
+.modal-overlay.modal-backdrop-dim {
+  background-color: rgba(4, 6, 9, 0.36);
+  backdrop-filter: none;
+  pointer-events: auto;
+}
+
+.modal-overlay > div {
+  pointer-events: auto;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(100, 116, 139, 0.3);
+}
+
+.modal-drag-handle {
+  cursor: move;
+  user-select: none;
+}

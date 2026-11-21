@@ -1,383 +1,596 @@
 <!doctype html>
-<html lang="en" class="h-full bg-neutral-950 text-neutral-100 antialiased select-none">
+<html lang="en" class="h-full bg-[#0c0f13] text-slate-200 antialiased select-none">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Waveform Viewer Pro - Web Oscilloscope</title>
-    <meta name="description" content="Professional web-based oscilloscope and waveform analysis tool for CSV and WFM data with FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
+    <meta name="description" content="Engineering web oscilloscope and waveform analyzer for CSV and WFM data with 1-2-5 V/div & s/div controls, X/Y/Track cursors, radix-2 FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
     <meta property="og:title" content="Waveform Viewer Pro - Web Oscilloscope" />
-    <meta property="og:description" content="Professional web-based oscilloscope and waveform analysis tool for CSV and WFM data with FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
+    <meta property="og:description" content="Engineering web oscilloscope and waveform analyzer for CSV and WFM data with 1-2-5 V/div & s/div controls, X/Y/Track cursors, radix-2 FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
-    <style>
-      /* Dark native controls: without this the <select> popup (and date/number spinners) are
-         drawn with the OS light palette, giving white option lists with light, unreadable text. */
-      :root { color-scheme: dark; }
-      select, input, textarea { color-scheme: dark; }
-      select option, select optgroup {
-        background-color: #262626;
-        color: #e5e5e5;
-      }
-      select option:disabled { color: #737373; }
-      /* Toolbar buttons never wrap their label or collapse to "F..." - the bar wraps instead */
-      nav button, nav select, nav a { white-space: nowrap; flex-shrink: 0; }
-      /* NOTE: no image-rendering: pixelated on the canvas. On 125% / 150% display scaling it
-         made lines and text look soft and uneven. The canvas is sized in whole device pixels. */
-      .modal-overlay {
-        background-color: rgba(0, 0, 0, 0.75);
-        backdrop-filter: blur(2px);
-      }
-    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
   </head>
-  <body class="h-full flex flex-col overflow-hidden bg-[#1a1a1a] text-neutral-200">
-    <!-- Top Bar: File Tabs & Header -->
-    <header class="flex items-center justify-between bg-neutral-900 border-b border-neutral-800 px-3 h-10 shrink-0">
-      <div class="flex items-center gap-2 overflow-x-auto" id="tabsBar">
-        <div class="flex items-center gap-1.5 font-bold text-sm tracking-wide text-cyan-400 mr-2 shrink-0">
-          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+  <body class="h-full flex flex-col overflow-hidden bg-[#0c0f13] text-slate-200">
+    <!-- Top Instrument Chassis Header & File Tabs -->
+    <header class="flex items-center justify-between bg-[#0c0f13] border-b border-[#222933] px-3 h-10 shrink-0 gap-2">
+      <div class="flex items-center gap-3 overflow-x-auto min-w-0">
+        <div class="flex items-center gap-2 font-semibold text-xs tracking-wider uppercase text-slate-100 shrink-0">
+          <svg class="w-4 h-4 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
           </svg>
           <span>Waveform Viewer Pro</span>
         </div>
-        <div id="tabsContainer" class="flex items-center gap-1"></div>
+        <div class="h-4 w-px bg-[#222933] shrink-0"></div>
+        <div id="tabsContainer" class="flex items-center gap-1 overflow-x-auto"></div>
       </div>
 
-      <div class="flex items-center gap-2 shrink-0">
-        <a href="/waveform-viewer-standalone.html" download="waveform-viewer-pro.html" class="flex items-center gap-1.5 text-xs px-2.5 py-1 bg-emerald-700 hover:bg-emerald-600 text-white font-medium rounded shadow transition border border-emerald-500/50" title="下载离线独立 HTML 单文件（无需安装任何环境，双击即可直接在浏览器运行）">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-          <span>下载单文件 HTML</span>
-        </a>
-        <button id="loadSampleSignalBtn" class="text-xs px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-cyan-300 rounded border border-cyan-800/60 transition" title="Load synthetic 3-phase BLDC signal for instant interactive demo">
-          Demo Signal
+      <div class="flex items-center gap-1.5 shrink-0 text-xs">
+        <button id="loadBtn" class="flex items-center gap-1.5 px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm transition cursor-pointer">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+          Open CSV / WFM
         </button>
-        <button id="testSuiteBtn" class="text-xs px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-emerald-400 rounded border border-emerald-800/60 transition" title="Run mathematical verification test suite">
-          Diagnostics & Tests
+        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.graphx,.txt" multiple />
+
+        <button id="saveSessionBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm transition cursor-pointer whitespace-nowrap" title="Save session (.graphx)">
+          Save Session
+        </button>
+
+        <div class="relative group">
+          <button class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm flex items-center gap-1 transition cursor-pointer whitespace-nowrap">
+            <span>Export</span>
+            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div class="absolute right-0 top-full pt-1 hidden group-hover:flex flex-col z-50 min-w-[195px]">
+            <div class="flex flex-col bg-[#161b22] border border-[#2c3543] rounded-sm shadow-xl py-1">
+              <button id="exportPngBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">PNG Screenshot (Ctrl+S)</button>
+              <button id="exportReportHtmlBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-emerald-300 cursor-pointer">Test Report (HTML / PDF)</button>
+              <button id="exportSvgBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">SVG Vector Plot</button>
+              <button id="exportCsvWaveformBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Full Waveform CSV</button>
+              <button id="openCropExportMenuBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-cyan-300 cursor-pointer">Crop Slice CSV / JSON...</button>
+              <button id="exportCsvSpectrumBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Spectrum CSV</button>
+              <div class="my-1 border-t border-[#222933]"></div>
+              <button id="exportStandaloneHtmlBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-cyan-300 font-semibold cursor-pointer">Offline App (.html)</button>
+            </div>
+          </div>
+        </div>
+
+        <button id="downloadOfflineTopBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-800/70 text-cyan-300 rounded-sm transition cursor-pointer whitespace-nowrap" title="Download single-file offline HTML app">
+          Offline HTML
+        </button>
+
+        <button id="screenshotTopBtn" class="flex items-center gap-1 px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="One-Click Composite PNG Screenshot (Ctrl+S or F12)">
+          <svg class="w-3.5 h-3.5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+            <circle cx="12" cy="13" r="4"></circle>
+          </svg>
+          <span>Shot</span>
+        </button>
+
+        <button id="openBatchModalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Batch measure multiple files or folder">
+          Batch
+        </button>
+        <button id="openPresetModalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Save or apply analysis presets">
+          Presets
+        </button>
+
+        <div class="h-4 w-px bg-[#222933] mx-0.5"></div>
+
+        <button id="loadSampleSignalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] text-cyan-300 rounded-sm border border-[#222933] transition cursor-pointer whitespace-nowrap" title="Load synthetic 3-phase BLDC motor waveform">
+          Demo 3-Ph
+        </button>
+        <button id="testSuiteBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] text-emerald-400 rounded-sm border border-[#222933] transition cursor-pointer whitespace-nowrap" title="Run verification test suite">
+          Self-Test
+        </button>
+        <button id="openShortcutsModalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 font-mono rounded-sm transition cursor-pointer whitespace-nowrap" title="Keyboard Shortcuts Reference">
+          ?
+        </button>
+        <button id="togglePanelBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm transition cursor-pointer whitespace-nowrap" title="Toggle right oscilloscope control panel">
+          Hide Panel
         </button>
       </div>
     </header>
 
-    <!-- Main Toolbar -->
-    <nav class="flex items-center justify-between gap-x-3 gap-y-1 flex-wrap bg-neutral-800/90 border-b border-neutral-700 px-3 py-1 min-h-[2.75rem] shrink-0 text-xs">
-      <div class="flex items-center gap-1.5 flex-wrap">
-        <button id="loadBtn" class="flex items-center gap-1.5 px-3 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] text-white rounded font-medium transition shadow-sm">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-          Load File / CSV
-        </button>
-        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.graphx,.txt" multiple />
+    <!-- Main Oscilloscope Chassis Body -->
+    <main class="flex-1 flex overflow-hidden min-h-0">
+      <!-- Left/Center Oscilloscope Screen Bay -->
+      <section class="flex-1 flex flex-col min-w-0 bg-[#080b0f] relative">
+        <!-- Top Screen Telemetry & Scope Toolbar (2 compact non-overflowing rows) -->
+        <div class="bg-[#12161c] border-b border-[#222933] px-3 py-1.5 flex flex-col gap-1.5 shrink-0 text-xs">
+          <!-- Row 1: Horizontal Timebase, Trigger & Rendering Modes -->
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center gap-1.5">
+              <div class="flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+                <span class="px-2 py-0.5 bg-[#161b22] text-[11px] font-mono font-semibold text-slate-400 border-r border-[#222933]">H</span>
+                <button id="timebaseDecBtn" class="px-2 py-0.5 hover:bg-[#1e2530] text-slate-200 font-mono cursor-pointer" title="Zoom in timebase (smaller s/div)">−</button>
+                <span id="timebaseReadout" class="px-2 py-0.5 font-mono font-semibold text-amber-300 tabular-nums min-w-[84px] text-center">-- /div</span>
+                <button id="timebaseIncBtn" class="px-2 py-0.5 hover:bg-[#1e2530] text-slate-200 font-mono cursor-pointer" title="Zoom out timebase (larger s/div)">+</button>
+              </div>
 
-        <div class="h-5 w-px bg-neutral-700 mx-1"></div>
+              <div class="flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+                <button id="panLeftBtn" class="px-2 py-0.5 hover:bg-[#1e2530] text-slate-300 font-mono cursor-pointer" title="Pan left 1 division">◀</button>
+                <button id="panRightBtn" class="px-2 py-0.5 hover:bg-[#1e2530] text-slate-300 font-mono border-l border-[#222933] cursor-pointer" title="Pan right 1 division">▶</button>
+              </div>
 
-        <!-- View Mode: Time vs Frequency -->
-        <div class="flex rounded bg-neutral-900 p-0.5 border border-neutral-700">
-          <button id="timeModeBtn" class="px-2.5 py-1 rounded bg-[#0078d7] text-white font-medium transition">
-            Waveform
-          </button>
-          <button id="freqModeBtn" class="px-2.5 py-1 rounded bg-neutral-800 text-neutral-300 hover:text-white transition">
-            Spectrum (FFT)
-          </button>
-        </div>
+              <div class="hidden xl:flex items-center gap-2 px-2 py-0.5 bg-[#0c0f13] border border-[#222933] rounded-sm font-mono text-[11px] text-slate-300 tabular-nums">
+                <span id="acqSampleRateReadout">-- Sa/s</span>
+                <span class="text-slate-600">|</span>
+                <span id="acqDepthReadout">0 pts</span>
+              </div>
 
-        <div class="h-5 w-px bg-neutral-700 mx-1"></div>
+              <button id="triggerQuickBtn" class="px-2 py-0.5 bg-[#0c0f13] hover:bg-[#161b22] border border-[#222933] rounded-sm font-mono text-[11px] text-orange-300 tabular-nums cursor-pointer" title="Open Trigger Configuration">
+                TRIG: OFF
+              </button>
+            </div>
 
-        <!-- Oscilloscope Core Actions -->
-        <button id="autoSetBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition font-medium" title="Automatic 1-2-5 scale setup">
-          AutoSet
-        </button>
-        <!-- Trigger: setup dialog + ON/OFF + slope -->
-        <div class="flex items-center gap-1 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-700">
-          <button id="triggerBtn" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 transition font-medium" title="Configure edge trigger (channel, slope, level)">
-            Trigger
-          </button>
-          <button id="triggerToggleBtn" class="px-2 py-1 rounded border bg-neutral-800 text-neutral-400 border-neutral-600 font-semibold transition" title="Trigger ON / OFF">Trig OFF</button>
-          <button id="triggerSlopeBtn" class="px-2 py-1 rounded border border-neutral-600 bg-neutral-800 text-neutral-400 hover:bg-neutral-700 transition" title="Click to switch trigger slope (rising / falling)">↑ Rising</button>
-        </div>
+            <div class="flex flex-wrap items-center gap-1.5">
+              <!-- Waveform / FFT / XY Segmented Toggle -->
+              <div class="flex bg-[#0c0f13] p-0.5 border border-[#222933] rounded-sm">
+                <button id="timeModeBtn" class="px-2 py-0.5 rounded-sm bg-cyan-600 text-slate-950 font-semibold transition cursor-pointer whitespace-nowrap">
+                  Time
+                </button>
+                <button id="freqModeBtn" class="px-2 py-0.5 rounded-sm text-slate-300 hover:text-white transition cursor-pointer whitespace-nowrap">
+                  FFT
+                </button>
+                <button id="xyModeBtn" class="px-2 py-0.5 rounded-sm text-slate-300 hover:text-white transition cursor-pointer whitespace-nowrap" title="Lissajous XY Phase / Trajectory Plot">
+                  XY
+                </button>
+              </div>
 
-        <!-- Low-pass filter: dialog + ON/OFF -->
-        <div class="flex items-center gap-1 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-700">
-          <button id="filterBtn" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 transition font-medium max-w-[150px] truncate" title="Low-pass filter (-3 dB cutoff)">Filter</button>
-          <button id="filterToggleBtn" class="px-2 py-1 rounded border bg-neutral-800 text-neutral-400 border-neutral-600 font-semibold transition" title="Filter ON / OFF for the active channel">LPF OFF</button>
-        </div>
+              <!-- Overlap / Separate Segmented Toggle -->
+              <div class="flex bg-[#0c0f13] p-0.5 border border-[#222933] rounded-sm">
+                <button id="overlapViewBtn" class="px-2 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer whitespace-nowrap" title="Overlay all active channels on shared grid">
+                  Overlap
+                </button>
+                <button id="separateViewBtn" class="px-2 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap" title="Stack each channel in its own dedicated subplot & Y-axis">
+                  Separate
+                </button>
+              </div>
 
-        <button id="edgeMarksBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 border border-transparent rounded text-neutral-200 transition font-medium" title="Mark 10% / 90% levels and rise / fall edges (tr / tf) on the active channel">
-          Edge Marks
-        </button>
-        <button id="fitViewBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Fit View (Shortcut: F)">
-          Fit (F)
-        </button>
-        
-        <!-- Cursors Group: X (Time), Y (Voltage), XY (Dual) -->
-        <div class="flex items-center gap-1 bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-700">
-          <button id="toggleCursorsBtn" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-200 transition font-medium text-xs" title="Toggle Cursors (Shortcut: T)">
-            Cursors
-          </button>
-          <select id="cursorTypeSelect" class="bg-neutral-800 border border-neutral-700 text-neutral-200 rounded px-1.5 py-1 text-xs outline-none" title="Select Cursor Dimension">
-            <option value="off">Off</option>
-            <option value="x">X (Time)</option>
-            <option value="y">Y (Volt)</option>
-            <option value="xy">XY (Dual)</option>
-          </select>
-          <select id="cursorChannelSelect" class="bg-neutral-800 border border-neutral-700 text-neutral-200 rounded px-1.5 py-1 text-xs max-w-[100px] truncate outline-none hidden" title="Select Y-Cursor Target Channel"></select>
-        </div>
+              <!-- Render Mode 4-Way Switch (Vector | Sin(x)/x | Dots | V+M) -->
+              <div class="flex bg-[#0c0f13] p-0.5 border border-[#222933] rounded-sm font-mono text-[11px]" title="Waveform Trace Display Mode">
+                <button id="renderModeVectorBtn" class="px-1.5 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer whitespace-nowrap" title="Continuous Straight Vector Lines">Vector</button>
+                <button id="renderModeSincBtn" class="px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap" title="Smooth Sin(x)/x Curve Interpolation for Low-Sample-Rate Waveforms">Sin(x)/x</button>
+                <button id="renderModeDotsBtn" class="px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap" title="Sample Dots Only">Dots</button>
+                <button id="renderModeMarkersBtn" class="px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap" title="Vector Line + Sample Markers">V+M</button>
+              </div>
 
-        <button id="toggleSeparateBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Toggle Separate / Overlapped Diagram">
-          Separate
-        </button>
-
-        <div class="h-5 w-px bg-neutral-700 mx-1"></div>
-
-        <!-- Math & Engineering Analysis -->
-        <button id="addMathBtn" class="px-2.5 py-1.5 bg-purple-900/60 hover:bg-purple-800/80 border border-purple-700/60 text-purple-200 rounded transition font-medium">
-          + Math Channel
-        </button>
-        <button id="transformBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition">
-          Clarke / Park
-        </button>
-        <button id="motorBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition">
-          BLDC Harmonics
-        </button>
-      </div>
-
-      <div class="flex items-center gap-1.5 shrink-0">
-        <!-- Export Actions -->
-        <div class="relative group">
-          <button class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 flex items-center gap-1 transition">
-            <span>Export</span>
-            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
-          </button>
-          <div class="absolute right-0 top-full mt-1 hidden group-hover:flex flex-col bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 min-w-[180px] z-50">
-            <a href="/waveform-viewer-standalone.html" download="waveform-viewer-pro.html" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs text-emerald-400 font-semibold flex items-center justify-between">
-              <span>单文件 HTML (离线使用)</span>
-              <span class="text-[10px] text-neutral-400">.html</span>
-            </a>
-            <div class="h-px bg-neutral-700 my-0.5"></div>
-            <button id="exportPngBtn" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs">PNG Screenshot</button>
-            <button id="exportCsvWaveformBtn" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs">Waveform CSV</button>
-            <button id="exportCsvSpectrumBtn" class="text-left px-3 py-1.5 hover:bg-neutral-700 text-xs">Spectrum CSV</button>
-          </div>
-        </div>
-
-        <button id="saveSessionBtn" class="px-2.5 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-neutral-200 transition" title="Save session to .graphx file">
-          Save Session
-        </button>
-      </div>
-    </nav>
-
-    <!-- Main Workspace Container -->
-    <main class="flex-1 flex overflow-hidden">
-      <!-- Left Sidebar (Channels, Math, Measurements, FFT Settings) -->
-      <aside class="w-80 bg-neutral-900 border-r border-neutral-800 flex flex-col shrink-0 overflow-y-auto h-full text-xs">
-        <!-- File Overview & Sampling Quality Panel -->
-        <section class="p-3 border-b border-neutral-800 shrink-0">
-          <div class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Sampling Quality & File</div>
-          <div id="fileSummaryPanel" class="space-y-1">
-            <div class="text-xs text-neutral-500">No file loaded</div>
-          </div>
-        </section>
-
-        <!-- Input Channels List -->
-        <section class="p-3 border-b border-neutral-800 shrink-0">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-[11px] font-bold uppercase tracking-wider text-neutral-400">Input Channels</span>
-            <span class="text-[11px] text-neutral-500">Scale / Bounds</span>
-          </div>
-          <div id="inputChannelsListPanel" class="space-y-1.5">
-            <div class="text-xs text-neutral-500">No channels available</div>
-          </div>
-        </section>
-
-        <!-- Math & Virtual Channels List -->
-        <section class="p-3 border-b border-neutral-800 shrink-0">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-[11px] font-bold uppercase tracking-wider text-purple-400 flex items-center gap-1.5">
-              <span>Math Channels</span>
-              <span id="mathCountBadge" class="bg-purple-900/60 text-purple-300 text-[10px] px-1.5 py-0.2 rounded-full font-mono">0</span>
-            </span>
-            <div class="flex items-center gap-1">
-              <button id="sidebarAddMathBtn" class="text-[10px] text-purple-300 hover:text-white bg-purple-900/50 hover:bg-purple-800 px-2 py-0.5 rounded border border-purple-700/60 transition">+ Math</button>
-              <button id="sidebarClarkeBtn" class="text-[10px] text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-1.5 py-0.5 rounded border border-neutral-700 transition">αβ</button>
+              <!-- Decimator Mode Toggle (>10k points) -->
+              <div class="flex bg-[#0c0f13] p-0.5 border border-[#222933] rounded-sm font-mono text-[10px]" title="Large-dataset (>10k pts) decimation algorithm">
+                <button id="decimMinMaxBtn" class="px-1.5 py-0.5 rounded-sm bg-[#222933] text-cyan-300 font-medium transition cursor-pointer whitespace-nowrap" title="Min-Max Peak Hold (preserves narrow glitches)">MinMax</button>
+                <button id="decimLttbBtn" class="px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap" title="Largest-Triangle-Three-Buckets (LTTB)">LTTB</button>
+              </div>
             </div>
           </div>
-          <div id="mathChannelsListPanel" class="space-y-1.5">
-            <div class="text-xs text-neutral-500 italic">No math channels yet. Click "+ Math" or "Clarke / Park" to generate.</div>
-          </div>
-        </section>
 
-        <!-- Oscilloscope Cursors Readout & Fine Tuning Section -->
-        <section id="cursorsSidebarSection" class="p-3 border-b border-neutral-800 bg-neutral-950/30 shrink-0 hidden">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-[11px] font-bold uppercase tracking-wider text-cyan-400">Cursors Readout</span>
-            <span id="cursorModeIndicator" class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-800/60">X (Time)</span>
-          </div>
-          <div id="cursorsReadoutPanel" class="space-y-1.5 font-mono text-[11px]">
-            <!-- Dynamically populated -->
-          </div>
-        </section>
+          <!-- Row 2: Always-Visible Analysis, Measurement, Edit/Ref/Golden, Scan, Phase, Sync, Undo/Redo -->
+          <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1b212a]">
+            <div class="flex flex-wrap items-center gap-1.5">
+              <button id="openMeasureModalBtn" class="flex items-center gap-1.5 px-2.5 py-0.5 bg-cyan-950/50 hover:bg-cyan-900/60 border border-cyan-500/60 text-cyan-200 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Select automated oscilloscope measurements">
+                <span>Measure</span>
+                <span id="measureCountLabel" class="px-1 bg-[#0c0f13] border border-cyan-500/40 font-mono text-[10px] text-cyan-300 tabular-nums">0</span>
+              </button>
+              <button id="openCompareModalBtn" class="px-2.5 py-0.5 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-500/60 text-emerald-200 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Compare waveforms across files, tabs, or channels with time alignment, RMSE/Corr metrics, and Pass/Fail tolerance band">
+                Compare
+              </button>
+              <button id="openPhaseModalBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Two-channel phase difference ΔΦ">
+                ΔΦ Phase
+              </button>
+              <button id="openBldcModalBtn" class="px-2.5 py-0.5 bg-orange-950/50 hover:bg-orange-900/60 border border-orange-500/60 text-orange-200 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="BLDC Motor Diagnostics: 3-Phase Balance, Hall 6-Step Commutation, PWM Dead-Time & Ringing, 6x Torque Ripple">
+                BLDC Diag
+              </button>
+              <button id="openAnomalyModalBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] hover:border-amber-500/60 text-amber-300 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Scan for over-voltage, sag, glitch, or missing edges">
+                Scan
+              </button>
+              <button id="openEditModalBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] hover:border-rose-500/50 text-rose-300 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Edit waveform, Golden Tolerance Band & Reference compare">
+                Edit / Ref
+              </button>
+              <button id="openCropExportBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Export cropped time slice (CSV / JSON)">
+                Crop
+              </button>
+            </div>
 
-        <!-- Live Oscilloscope Measurements Panel (visible in Waveform mode) -->
-        <section id="measurementsSidebarSection" class="p-3 border-b border-neutral-800 bg-neutral-950/40 shrink-0">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-[11px] font-bold uppercase tracking-wider text-cyan-400">Live Measurements</span>
-            <select id="measChannelSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white max-w-[140px] truncate" title="Select channel to measure"></select>
+            <div class="flex flex-wrap items-center gap-1.5">
+              <button id="syncUnitScaleBtn" class="px-2 py-0.5 bg-[#162229] hover:bg-[#1d303a] border border-cyan-600/60 text-cyan-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Unify V/div, ground & offset for all same-unit channels driven by the largest trace (Shortcut: U)">
+                Sync Unit (U)
+              </button>
+              <button id="autoSetBtn" class="px-2 py-0.5 bg-[#1a222d] hover:bg-[#243040] border border-[#2c3849] text-emerald-300 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="AutoSet 1-2-5 scales & trigger (Shortcut: A)">
+                AutoSet
+              </button>
+              <button id="fitViewBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Fit all signals (F / Esc / Double-Click)">
+                Fit
+              </button>
+              <button id="toolZoomBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Area Box Zoom (Z or Right-Drag)">
+                Zoom
+              </button>
+
+              <div class="flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+                <button id="undoBtn" class="px-1.5 py-0.5 hover:bg-[#1e2530] text-slate-300 text-[11px] cursor-pointer disabled:opacity-40" title="Undo (Ctrl+Z)">↶</button>
+                <button id="redoBtn" class="px-1.5 py-0.5 hover:bg-[#1e2530] text-slate-300 text-[11px] border-l border-[#222933] cursor-pointer disabled:opacity-40" title="Redo (Ctrl+Y)">↷</button>
+              </div>
+
+              <!-- Annotation Tools -->
+              <div class="flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+                <button id="toolPointBtn" class="px-1.5 py-0.5 hover:bg-[#1e2530] text-slate-300 text-[11px] cursor-pointer" title="Point Measurement Annotation">Pt</button>
+                <button id="toolTextBtn" class="px-1.5 py-0.5 hover:bg-[#1e2530] text-slate-300 text-[11px] border-l border-[#222933] cursor-pointer" title="Text Callout Annotation">Txt</button>
+                <button id="toolAreaBtn" class="px-1.5 py-0.5 hover:bg-[#1e2530] text-slate-300 text-[11px] border-l border-[#222933] cursor-pointer" title="Box ΔT / ΔV Area Annotation">Box</button>
+                <button id="clearAnnBtn" class="px-1.5 py-0.5 hover:bg-red-950/60 text-slate-400 hover:text-red-300 text-[11px] border-l border-[#222933] cursor-pointer" title="Clear all annotations">Clr</button>
+              </div>
+            </div>
           </div>
-          <div class="flex items-center justify-between mb-2 text-[11px]">
-            <span class="text-neutral-400">Gate</span>
-            <select id="measGateSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white">
-              <option value="view">View Window</option>
-              <option value="cursors">Cursors X1~X2</option>
-              <option value="entire">Entire Data</option>
+        </div>
+
+        <!-- Graticule Canvas Container -->
+        <div class="flex-1 relative overflow-hidden min-h-0">
+          <canvas id="waveformCanvas" class="absolute inset-0 w-full h-full cursor-crosshair"></canvas>
+
+          <!-- Empty State Overlay (hidden once data is loaded) -->
+          <div id="emptyScopeOverlay" class="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div class="bg-[#12161c]/95 border border-[#222933] p-6 max-w-md text-center rounded-sm pointer-events-auto shadow-2xl">
+              <div class="text-sm font-semibold text-slate-100 mb-1.5">Oscilloscope Graticule Ready</div>
+              <p class="text-xs text-slate-400 mb-4 leading-relaxed">
+                Drop a CSV or WFM capture file onto the screen, press <kbd class="px-1.5 py-0.5 bg-[#0c0f13] border border-[#2c3543] font-mono text-slate-300">Ctrl+V</kbd> to paste CSV data, or launch the synthetic 3-phase motor capture.
+              </p>
+              <div class="flex items-center justify-center gap-2">
+                <button id="emptyLoadBtn" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold text-xs rounded-sm cursor-pointer">
+                  Open CSV / WFM
+                </button>
+                <button id="emptyDemoBtn" class="px-3 py-1.5 bg-[#1a222d] hover:bg-[#243040] border border-[#2c3849] text-cyan-300 font-medium text-xs rounded-sm cursor-pointer">
+                  Load 3-Phase BLDC Demo
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Non-blocking Inline Toast Banner -->
+          <div id="scopeToast" class="hidden absolute bottom-3 left-1/2 -translate-x-1/2 bg-[#161b22] border border-amber-500/60 text-amber-200 px-3 py-1.5 rounded-sm text-xs font-mono shadow-lg z-30"></div>
+        </div>
+
+        <!-- On-Demand Dynamic Measurement Strip (Hidden by default until user checks items) -->
+        <div id="measurementStripBar" class="hidden bg-[#0e1217] border-t border-[#222933] px-2.5 py-1.5 flex items-center justify-between gap-2 shrink-0">
+          <div id="measurementCardsContainer" class="flex flex-wrap items-center gap-1.5 flex-1 min-w-0"></div>
+          <div class="flex items-center gap-1.5 shrink-0 text-[11px]">
+            <select id="stripMeasGateSelect" class="bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-0.5 font-mono text-slate-300" title="Measurement Gate Window">
+              <option value="view">Gate: View</option>
+              <option value="cursors">Gate: Cursors</option>
+              <option value="entire">Gate: Entire</option>
             </select>
+            <button id="stripAddMeasBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer whitespace-nowrap">+ Metric</button>
+            <button id="stripClearMeasBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-red-950/50 border border-[#222933] text-slate-400 hover:text-red-300 rounded-sm cursor-pointer whitespace-nowrap">Clear</button>
           </div>
-          <div id="measurementsPanel">
-            <div class="text-xs text-neutral-500">Waiting for data...</div>
+        </div>
+
+        <!-- Bottom Channel Softkeys Dock -->
+        <div class="bg-[#12161c] border-t border-[#222933] px-2.5 py-1.5 flex items-center justify-between gap-2 shrink-0 overflow-x-auto">
+          <div id="channelSoftkeysBar" class="flex items-center gap-1.5 min-w-0 overflow-x-auto">
+            <div class="text-[11px] text-slate-500 font-mono px-2 py-1">No active channels</div>
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0 text-xs">
+            <button id="addMathBtn" class="px-2.5 py-1.5 bg-[#1d1729] hover:bg-[#2b2040] border border-purple-700/60 text-purple-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap">
+              + Math
+            </button>
+            <button id="transformBtn" class="px-2 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Clarke αβ, Park dq0 & Three-Phase Power P(t)">
+              3-Ph / Power
+            </button>
+            <button id="motorBtn" class="px-2 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Configure BLDC Harmonic Markers & RPM Estimate">
+              Motor / RPM
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Oscilloscope Front-Panel Control Console -->
+      <aside id="rightControlPanel" class="w-[340px] bg-[#12161c] border-l border-[#222933] flex flex-col shrink-0 overflow-y-auto h-full text-xs">
+        <!-- 1. Vertical Channel Control (Scale V/div + Position Offset + Coupling + Invert) -->
+        <section class="p-3 border-b border-[#222933] shrink-0">
+          <div class="flex items-center justify-between mb-2.5">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Vertical Control</span>
+            <div class="flex items-center gap-1.5">
+              <input type="color" id="activeChannelColor" class="w-4 h-4 bg-transparent border border-[#2c3543] rounded-sm cursor-pointer" value="#facc15" title="Trace color" />
+              <select id="activeChannelSelect" class="bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-0.5 text-slate-100 font-mono text-[11px] max-w-[165px] truncate"></select>
+            </div>
+          </div>
+
+          <!-- Channel Mode Toggles -->
+          <div class="grid grid-cols-5 gap-1 mb-2.5 font-mono text-[11px]">
+            <button id="activeChVisibleBtn" class="py-1 bg-[#0c0f13] border border-[#222933] hover:border-slate-500 rounded-sm text-slate-200 cursor-pointer">ON</button>
+            <button id="activeChCouplingBtn" class="py-1 bg-[#0c0f13] border border-[#222933] hover:border-slate-500 rounded-sm text-slate-200 cursor-pointer" title="Toggle DC / AC Coupling">DC</button>
+            <button id="activeChInvertBtn" class="py-1 bg-[#0c0f13] border border-[#222933] hover:border-slate-500 rounded-sm text-slate-300 cursor-pointer" title="Invert Waveform Polarity">INV</button>
+            <button id="activeChFitBtn" class="py-1 bg-[#0c0f13] border border-[#222933] hover:border-cyan-500/60 rounded-sm text-cyan-300 cursor-pointer" title="Snap channel to clean 1-2-5 scale">Fit</button>
+            <button id="sidebarSyncUnitBtn" class="py-1 bg-[#0c0f13] border border-cyan-700/50 hover:border-cyan-400 rounded-sm text-cyan-200 cursor-pointer" title="Sync V/div & offset for all same-unit channels (Shortcut: U)">Sync</button>
+          </div>
+
+          <!-- Vertical Scale (V/div) 1-2-5 Stepper -->
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <span class="text-[11px] text-slate-400 w-14 shrink-0">Scale</span>
+            <div class="flex-1 flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+              <button id="vDivDecBtn" class="px-2.5 py-1 hover:bg-[#1e2530] text-slate-200 font-mono font-bold border-r border-[#222933] cursor-pointer" title="Zoom In Vertically (finer V/div)">−</button>
+              <select id="vDivSelect" class="flex-1 bg-transparent px-2 py-1 text-center font-mono text-amber-300 font-semibold text-[11px] focus:outline-none cursor-pointer"></select>
+              <button id="vDivIncBtn" class="px-2.5 py-1 hover:bg-[#1e2530] text-slate-200 font-mono font-bold border-l border-[#222933] cursor-pointer" title="Zoom Out Vertically (coarser V/div)">+</button>
+            </div>
+          </div>
+
+          <!-- Vertical Position / Offset -->
+          <div class="flex items-center justify-between gap-2 mb-1.5">
+            <span class="text-[11px] text-slate-400 w-14 shrink-0">Position</span>
+            <div class="flex-1 flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+              <button id="vOffsetDownBtn" class="px-2 py-1 hover:bg-[#1e2530] text-slate-300 font-mono text-[11px] border-r border-[#222933] cursor-pointer" title="Move waveform down 0.5 div">▼</button>
+              <input id="vOffsetInput" type="number" step="0.1" class="flex-1 min-w-0 bg-transparent px-2 py-1 text-center font-mono text-slate-100 text-[11px] focus:outline-none" value="0.00" />
+              <button id="vOffsetUpBtn" class="px-2 py-1 hover:bg-[#1e2530] text-slate-300 font-mono text-[11px] border-l border-[#222933] cursor-pointer" title="Move waveform up 0.5 div">▲</button>
+              <button id="vOffsetZeroBtn" class="px-2 py-1 hover:bg-[#1e2530] text-cyan-300 font-mono text-[10px] border-l border-[#222933] cursor-pointer" title="Center Ground (0V)">0V</button>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2 pl-16">
+            <input id="vOffsetSlider" type="range" min="-4" max="4" step="0.05" value="0" class="w-full accent-cyan-400 cursor-pointer h-1.5" title="Drag vertical position (-4 to +4 divisions)" />
           </div>
         </section>
 
-        <!-- FFT Controls Sub-panel (visible in Spectrum mode) -->
-        <section id="fftSidebarPanel" class="p-3 bg-neutral-950/60 shrink-0 hidden">
-          <div class="flex items-center justify-between mb-2 pb-1 border-b border-neutral-800">
-            <span class="text-[11px] font-bold uppercase tracking-wider text-amber-400">FFT Spectrum Analysis</span>
-            <select id="fftChannelSelect" class="text-[11px] bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-white max-w-[140px] truncate" title="Select channel to analyze with FFT"></select>
+        <!-- 2. Trigger Control -->
+        <section class="p-3 border-b border-[#222933] shrink-0">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Trigger</span>
+            <div class="flex items-center gap-1">
+              <button id="trigEnableBtn" class="px-2 py-0.5 rounded-sm border border-[#222933] bg-[#0c0f13] text-[10px] font-mono cursor-pointer">OFF</button>
+              <button id="trigModalOpenBtn" class="px-1.5 py-0.5 rounded-sm border border-[#222933] bg-[#0c0f13] hover:bg-[#1e2530] text-[10px] text-slate-300 cursor-pointer" title="Detailed Trigger Modal">Setup</button>
+            </div>
+          </div>
+          <div class="grid grid-cols-12 gap-1.5 mb-2">
+            <select id="trigQuickChannelSelect" class="col-span-6 bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-[11px] font-mono text-slate-100 truncate"></select>
+            <button id="trigQuickSlopeBtn" class="col-span-3 bg-[#0c0f13] hover:bg-[#1e2530] border border-[#222933] rounded-sm px-1.5 py-1 text-[11px] font-mono text-orange-300 cursor-pointer">↑ Rise</button>
+            <button id="trigAlignBtn" class="col-span-3 bg-orange-600/20 hover:bg-orange-600/30 border border-orange-500/50 rounded-sm px-1.5 py-1 text-[11px] font-medium text-orange-200 cursor-pointer">Align</button>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <span class="text-[11px] text-slate-400 w-10 shrink-0">Level</span>
+            <div class="flex-1 flex items-center bg-[#0c0f13] border border-[#222933] rounded-sm overflow-hidden">
+              <button id="trigLevelDecBtn" class="px-2 py-0.5 hover:bg-[#1e2530] text-slate-300 font-mono border-r border-[#222933] cursor-pointer">−</button>
+              <input id="trigQuickLevelInput" type="number" step="0.1" class="flex-1 min-w-0 bg-transparent px-2 py-0.5 text-center font-mono text-orange-300 text-[11px] focus:outline-none" value="0.00" />
+              <button id="trigLevelIncBtn" class="px-2 py-0.5 hover:bg-[#1e2530] text-slate-300 font-mono border-l border-[#222933] cursor-pointer">+</button>
+            </div>
+            <button id="trigAuto50Btn" class="px-2 py-0.5 bg-[#0c0f13] hover:bg-[#1e2530] border border-[#222933] rounded-sm font-mono text-[10px] text-slate-300 cursor-pointer" title="Set trigger to 50% signal midpoint">50%</button>
+          </div>
+        </section>
+
+        <!-- 3. Cursors (X, Y, X+Y, Track) with Viewport Clamping & Center Recall -->
+        <section class="p-3 border-b border-[#222933] shrink-0">
+          <div class="flex items-center justify-between gap-1.5 mb-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 shrink-0">Cursors</span>
+            <div class="flex items-center gap-1 min-w-0">
+              <button id="centerCursorsBtn" class="px-1.5 py-0.5 bg-[#0c0f13] hover:bg-[#1e2530] border border-[#222933] hover:border-cyan-500/60 text-[10px] font-mono text-cyan-300 rounded-sm cursor-pointer whitespace-nowrap" title="Recall cursors to 25% & 75% of current viewport">Center</button>
+              <select id="cursorChannelSelect" class="bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-0.5 text-[11px] font-mono text-slate-200 max-w-[125px] truncate" title="Target channel for Y & Tracking cursors"></select>
+            </div>
+          </div>
+
+          <!-- Segmented Cursor Mode Switch -->
+          <div class="grid grid-cols-5 bg-[#0c0f13] border border-[#222933] rounded-sm p-0.5 mb-2 font-mono text-[11px]">
+            <button id="curModeOff" data-curmode="off" class="cur-mode-btn py-1 rounded-sm text-slate-400 hover:text-white cursor-pointer">Off</button>
+            <button id="curModeX" data-curmode="x" class="cur-mode-btn py-1 rounded-sm text-slate-400 hover:text-white cursor-pointer">X</button>
+            <button id="curModeY" data-curmode="y" class="cur-mode-btn py-1 rounded-sm text-slate-400 hover:text-white cursor-pointer">Y</button>
+            <button id="curModeXY" data-curmode="xy" class="cur-mode-btn py-1 rounded-sm text-slate-400 hover:text-white cursor-pointer">X+Y</button>
+            <button id="curModeTrack" data-curmode="track" class="cur-mode-btn py-1 rounded-sm text-slate-400 hover:text-white cursor-pointer">Track</button>
+          </div>
+
+          <div id="cursorReadoutGrid" class="text-[11px] font-mono text-slate-400 tabular-nums">
+            <div class="text-slate-500">Cursors disabled. Select X, Y, X+Y, or Track.</div>
+          </div>
+        </section>
+
+        <!-- 3b. On-Demand Measurements Quick Entry -->
+        <section class="px-3 py-2 border-b border-[#222933] shrink-0 flex items-center justify-between gap-2">
+          <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Measurements</span>
+          <button id="sidebarOpenMeasureBtn" class="flex items-center gap-1.5 px-2.5 py-1 bg-cyan-950/50 hover:bg-cyan-900/60 border border-cyan-500/60 text-cyan-200 font-medium rounded-sm text-[11px] transition cursor-pointer">
+            <span>Measure Setup</span>
+            <span id="sidebarMeasureCountLabel" class="px-1 bg-[#0c0f13] border border-cyan-500/40 font-mono text-[10px] text-cyan-300 tabular-nums">0</span>
+          </button>
+        </section>
+
+        <!-- 4. FFT Spectrum Controls (Frequency Mode Only) -->
+        <section id="fftSidebarPanel" class="p-3 border-b border-[#222933] shrink-0 hidden">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-amber-400">FFT Spectrum</span>
+            <select id="fftChannelSelect" class="text-[11px] bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-0.5 text-slate-100 font-mono max-w-[155px] truncate"></select>
           </div>
           <div class="space-y-2 text-xs">
-            <div>
-              <label class="block text-[11px] text-neutral-400 mb-1">Frequency Zoom / Span</label>
-              <select id="fftSpanSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
-                <option value="auto" selected>Auto Focus (Signal Band)</option>
-                <option value="1k">0 ~ 1.0 kHz (Low Freq)</option>
-                <option value="5k">0 ~ 5.0 kHz (Motor / Inverter)</option>
-                <option value="20k">0 ~ 20.0 kHz (Full Audio)</option>
-                <option value="full">Full Nyquist Span</option>
-              </select>
+            <div class="grid grid-cols-2 gap-1.5">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Freq Span</label>
+                <select id="fftSpanSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono">
+                  <option value="auto" selected>Auto Band</option>
+                  <option value="1k">0 - 1 kHz</option>
+                  <option value="5k">0 - 5 kHz</option>
+                  <option value="20k">0 - 20 kHz</option>
+                  <option value="full">Full Nyquist</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Input Range</label>
+                <select id="fftRangeSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono">
+                  <option value="view" selected>Current View</option>
+                  <option value="cursors">Cursors X1~X2</option>
+                  <option value="entire">Entire Data</option>
+                </select>
+              </div>
             </div>
-            <div>
-              <label class="block text-[11px] text-neutral-400 mb-1">Analysis Range</label>
-              <select id="fftRangeSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
-                <option value="view" selected>Current View Window</option>
-                <option value="cursors">Between Cursors X1~X2</option>
-                <option value="entire">Entire Dataset</option>
-              </select>
+            <div class="grid grid-cols-2 gap-1.5">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Window</label>
+                <select id="fftWindowSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono">
+                  <option value="hann" selected>Hann</option>
+                  <option value="hamming">Hamming</option>
+                  <option value="blackman-harris">Blackman-Harris</option>
+                  <option value="rectangular">Rectangular</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Y Scale</label>
+                <select id="fftScaleSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono">
+                  <option value="db" selected>dBV (Ref 1V)</option>
+                  <option value="magnitude">Linear (V)</option>
+                </select>
+              </div>
             </div>
-            <div>
-              <label class="block text-[11px] text-neutral-400 mb-1">Window Function</label>
-              <select id="fftWindowSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
-                <option value="hann" selected>Hann (Recommended)</option>
-                <option value="hamming">Hamming</option>
-                <option value="blackman-harris">Blackman-Harris</option>
-                <option value="rectangular">Rectangular (No window)</option>
-              </select>
+            <div class="grid grid-cols-2 gap-1.5 items-end">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Zero Padding</label>
+                <select id="fftPaddingSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono">
+                  <option value="1" selected>1x (Native)</option>
+                  <option value="2">2x</option>
+                  <option value="4">4x</option>
+                  <option value="8">8x</option>
+                </select>
+              </div>
+              <label class="flex items-center gap-1.5 py-1 px-2 bg-[#0c0f13] border border-[#222933] rounded-sm cursor-pointer">
+                <input type="checkbox" id="fftRemoveDcChk" class="cursor-pointer accent-cyan-400" checked />
+                <span class="text-[11px] text-slate-300">Remove DC</span>
+              </label>
             </div>
-            <div>
-              <label class="block text-[11px] text-neutral-400 mb-1">Scale Mode</label>
-              <select id="fftScaleSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
-                <option value="db" selected>dBV (Decibel, Ref: 1V)</option>
-                <option value="magnitude">Linear Magnitude (V)</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-[11px] text-neutral-400 mb-1">Zero Padding</label>
-              <select id="fftPaddingSelect" class="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-white text-xs">
-                <option value="1" selected>None (1x)</option>
-                <option value="2">2x (Higher density)</option>
-                <option value="4">4x (Higher density)</option>
-                <option value="8">8x (Higher density)</option>
-              </select>
-              <div class="text-[10px] text-neutral-500 mt-0.5">Increases spectral sampling density; does not enhance physical frequency resolution.</div>
-            </div>
-            <div class="flex items-center gap-2 pt-1">
-              <input type="checkbox" id="fftRemoveDcChk" class="cursor-pointer" checked />
-              <label for="fftRemoveDcChk" class="text-neutral-300">Remove DC Offset</label>
-            </div>
-
-            <!-- Detected Spectral Peaks Summary -->
-            <div id="fftPeaksSummaryPanel" class="mt-3 pt-2 border-t border-neutral-800">
-              <div class="text-[11px] font-semibold text-neutral-400 mb-1">Detected Spectral Peaks</div>
-              <div id="fftPeaksList" class="space-y-1 font-mono text-[11px] text-neutral-300">
-                <div class="text-neutral-500 italic">No peaks detected</div>
+            <div id="fftPeaksSummaryPanel" class="pt-2 border-t border-[#222933]">
+              <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">Detected Peaks</div>
+              <div id="fftPeaksList" class="space-y-0.5 font-mono text-[11px] text-slate-300 tabular-nums">
+                <div class="text-slate-500">No peaks detected</div>
               </div>
             </div>
           </div>
         </section>
+
+        <!-- 4b. XY Lissajous Controls (XY Mode Only) -->
+        <section id="xySidebarPanel" class="p-3 border-b border-[#222933] shrink-0 hidden">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-cyan-300">XY Lissajous</span>
+            <select id="xyRangeSelect" class="bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-0.5 text-[11px] font-mono text-slate-200">
+              <option value="view">Current View</option>
+              <option value="cursors">Cursors X1~X2</option>
+              <option value="entire">Entire Data</option>
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5 text-xs mb-2">
+            <div>
+              <label class="block text-[10px] text-slate-400 mb-0.5">X-Axis Channel</label>
+              <select id="xyXChannelSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono"></select>
+            </div>
+            <div>
+              <label class="block text-[10px] text-slate-400 mb-0.5">Y-Axis Channel</label>
+              <select id="xyYChannelSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-1.5 py-1 text-slate-100 text-[11px] font-mono"></select>
+            </div>
+          </div>
+          <div id="xyMetricsReadout" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2 font-mono text-[11px] text-slate-300 tabular-nums space-y-0.5">
+            <div>Select X and Y channels to inspect phase ellipse or αβ circle.</div>
+          </div>
+        </section>
+
+        <!-- 4c. Compare Groups (Hidden when empty) -->
+        <section id="compareGroupsSidebarSection" class="p-3 border-b border-[#222933] shrink-0 hidden">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-emerald-300">
+              Compare Groups (<span id="compareGroupsCountBadge" class="font-mono">0</span>)
+            </span>
+            <button id="sidebarOpenCompareBtn" class="text-[10px] text-emerald-200 bg-emerald-950/60 hover:bg-emerald-900/70 px-2 py-0.5 rounded-sm border border-emerald-600/60 transition cursor-pointer">+ Compare</button>
+          </div>
+          <div id="compareGroupsListPanel" class="space-y-1.5"></div>
+        </section>
+
+        <!-- 5. Math Channels List -->
+        <section class="p-3 border-b border-[#222933] shrink-0">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-purple-300">
+              Math Channels (<span id="mathCountBadge" class="font-mono">0</span>)
+            </span>
+            <div class="flex items-center gap-1">
+              <button id="sidebarAddMathBtn" class="text-[10px] text-purple-200 bg-[#1d1729] hover:bg-[#2b2040] px-2 py-0.5 rounded-sm border border-purple-700/60 transition cursor-pointer">+ Math</button>
+              <button id="sidebarClarkeBtn" class="text-[10px] text-slate-300 bg-[#0c0f13] hover:bg-[#1e2530] px-1.5 py-0.5 rounded-sm border border-[#222933] transition cursor-pointer">αβ</button>
+            </div>
+          </div>
+          <div id="mathChannelsListPanel" class="space-y-1.5">
+            <div class="text-[11px] text-slate-500">No math channels defined.</div>
+          </div>
+        </section>
+
+        <!-- 6. Sampling Quality Audit Summary -->
+        <section class="p-3 shrink-0">
+          <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Sampling Quality</div>
+          <div id="fileSummaryPanel" class="space-y-0.5 text-[11px] tabular-nums">
+            <div class="text-slate-500">No capture loaded</div>
+          </div>
+        </section>
       </aside>
-
-      <!-- Center Waveform Canvas Area -->
-      <section class="flex-1 flex flex-col min-w-0 bg-[#1e1e1e] relative">
-        <div class="flex-1 relative overflow-hidden">
-          <canvas id="waveformCanvas" class="absolute inset-0 w-full h-full cursor-crosshair"></canvas>
-        </div>
-
-        <!-- Hover info overlay strip -->
-        <div id="hoverInfoReadout" class="absolute top-2 right-4 text-xs font-mono bg-neutral-900/80 px-2 py-1 rounded border border-neutral-700 text-neutral-300 pointer-events-none">
-          T = 0.0000 s, V = 0.000 V
-        </div>
-      </section>
     </main>
 
-    <!-- Bottom Status Bar -->
-    <footer class="h-7 bg-neutral-900 border-t border-neutral-800 px-3 flex items-center justify-between text-xs text-neutral-400 shrink-0">
-      <div id="statusBarContent" class="flex items-center gap-3">
+    <!-- Bottom Instrument Status Footer -->
+    <footer class="h-7 bg-[#0c0f13] border-t border-[#222933] px-3 flex items-center justify-between text-[11px] font-mono text-slate-400 shrink-0 tabular-nums">
+      <div id="statusBarContent" class="flex items-center gap-2 truncate">
         <span>Ready</span>
       </div>
-      <div class="flex items-center gap-4 text-[11px]">
-        <span>Drag: Pan</span>
-        <span>Wheel: Zoom</span>
-        <span>Z: Area Zoom</span>
-        <span>T: Cursors</span>
-        <span>F: Fit</span>
+      <div id="hoverInfoReadout" class="text-cyan-300 font-medium px-2">
+        T = --   V = --
+      </div>
+      <div class="hidden lg:flex items-center gap-3 text-[10px] text-slate-500 shrink-0">
+        <span>L-Drag: Pan</span>
+        <span>R-Drag: Zoom Box</span>
+        <span>DblClick: Fit</span>
+        <span>Wheel: H-Zoom</span>
+        <span>Shift+Wheel: V/div</span>
+        <span>Ctrl+S: Shot</span>
       </div>
     </footer>
 
     <!-- CSV Quality Inspection & Mapping Modal -->
-    <div id="csvQualityModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-3xl w-full p-5 flex flex-col max-h-[90vh]">
-        <div class="flex justify-between items-center pb-3 border-b border-neutral-800 mb-4">
-          <h2 class="text-base font-bold text-neutral-100 flex items-center gap-2">
-            <span class="text-cyan-400">CSV Import & Sampling Quality Audit</span>
-          </h2>
-          <button id="csvCancelBtn" class="text-neutral-400 hover:text-white text-lg">✕</button>
+    <div id="csvQualityModal" class="modal-overlay modal-backdrop-dim fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-3xl w-full p-5 flex flex-col max-h-[90vh]">
+        <div class="flex justify-between items-center pb-3 border-b border-[#222933] mb-4">
+          <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">CSV Import & Sampling Quality Audit</h2>
+          <button id="csvCancelBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
         </div>
 
-        <!-- Details Strip -->
-        <div class="grid grid-cols-3 gap-3 bg-neutral-950 p-3 rounded mb-4 text-xs">
-          <div class="flex items-center gap-1.5"><span class="text-neutral-500">Rows:</span> <span id="csvTotalRows" class="font-mono text-neutral-200">0</span></div>
+        <div id="csvQualityMetricsStrip" class="grid grid-cols-1 md:grid-cols-4 gap-3 bg-[#0c0f13] border border-[#222933] p-3 rounded-sm mb-4 text-xs font-mono tabular-nums">
+          <div><span class="text-slate-500">Rows:</span> <span id="csvTotalRows" class="text-slate-100">0</span></div>
+          <div><span class="text-slate-500">Delimiter:</span> <span id="csvDelimiter" class="text-slate-100">,</span></div>
           <div class="flex items-center gap-2">
-            <span class="text-neutral-500">Delimiter:</span>
-            <select id="csvDelimiterSelect" class="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-xs text-white outline-none">
-              <option value="auto">Auto (自动检测)</option>
-              <option value=" ">Space (空格 / 多空格)</option>
-              <option value="&#9;">Tab (\t 制表符)</option>
-              <option value=",">Comma (, 逗号)</option>
-              <option value=";">Semicolon (; 分号)</option>
-            </select>
-          </div>
-          <div class="flex items-center gap-2">
-            <span class="text-neutral-500">Time Unit:</span>
-            <select id="csvTimeUnitSelect" class="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-xs text-white">
+            <span class="text-slate-500 shrink-0">Time Unit:</span>
+            <select id="csvTimeUnitSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-0.5 text-xs text-white w-full">
               <option value="s">s (Seconds)</option>
               <option value="ms">ms (Milliseconds)</option>
-              <option value="us">us (Microseconds)</option>
+              <option value="us">µs (Microseconds)</option>
               <option value="ns">ns (Nanoseconds)</option>
+              <option value="ps">ps (Picoseconds)</option>
             </select>
           </div>
-          <div id="csvSampleRateWrap" class="flex items-center gap-2" style="display:none">
-            <span class="text-neutral-500">Sample Rate:</span>
-            <input id="csvSampleRateInput" type="number" min="1" step="any" placeholder="e.g. 100000" class="w-28 bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-xs text-white" />
-            <span class="text-neutral-500">S/s (无时间列时必填)</span>
+          <div class="flex items-center gap-1.5">
+            <span class="text-slate-500 shrink-0">Rate:</span>
+            <select id="csvSampleRatePresetSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-0.5 text-xs text-cyan-200 w-full">
+              <option value="auto">Auto (Time Col)</option>
+              <option value="1e9">1 GSa/s (1 ns)</option>
+              <option value="5e8">500 MSa/s (2 ns)</option>
+              <option value="2.5e8">250 MSa/s (4 ns)</option>
+              <option value="1e8">100 MSa/s (10 ns)</option>
+              <option value="1e7">10 MSa/s (100 ns)</option>
+              <option value="1e6">1 MSa/s (1 µs)</option>
+              <option value="1e5">100 kSa/s (10 µs)</option>
+              <option value="1e4">10 kSa/s (100 µs)</option>
+              <option value="1e3">1 kSa/s (1 ms)</option>
+              <option value="custom">Custom (Sa/s)...</option>
+            </select>
+            <input id="csvCustomRateInput" type="number" step="any" min="0.001" placeholder="Hz" class="hidden w-24 bg-[#12161c] border border-cyan-600/60 rounded-sm px-1.5 py-0.5 text-xs text-white" />
           </div>
+          <div id="csvAuditSummaryRow" class="md:col-span-4 pt-2 border-t border-[#222933] flex flex-wrap gap-4 text-[11px] text-slate-300"></div>
         </div>
 
-        <!-- Preview Table -->
-        <div class="text-xs font-semibold text-neutral-300 mb-1.5">Column Roles & First Sample Rows:</div>
-        <div id="csvPreviewContainer" class="flex-1 overflow-auto border border-neutral-700 rounded bg-neutral-950 mb-4"></div>
+        <div class="text-xs font-semibold text-slate-300 mb-1.5">Column Roles & Preview:</div>
+        <div id="csvPreviewContainer" class="flex-1 overflow-auto border border-[#222933] rounded-sm bg-[#0c0f13] mb-4"></div>
 
-        <div class="flex items-center justify-between pt-3 border-t border-neutral-800">
-          <div class="text-xs text-neutral-400">
-            For non-uniform or jittered sampling, <strong class="text-cyan-400">Load + Resample</strong> generates a robust uniform time grid.
+        <div class="flex items-center justify-between pt-3 border-t border-[#222933]">
+          <div class="text-xs text-slate-400">
+            For non-uniform timestamps, <strong class="text-cyan-400">Load + Resample</strong> builds a continuous uniform grid. Use <strong class="text-cyan-200">Rate</strong> to force up to 1 GSa/s+.
           </div>
           <div class="flex items-center gap-2">
-            <button id="csvLoadOriginalBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded text-xs transition">
+            <button id="csvLoadOriginalBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs transition cursor-pointer">
               Load Original
             </button>
-            <button id="csvLoadResampleBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] text-white font-medium rounded text-xs transition">
+            <button id="csvLoadResampleBtn" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm text-xs transition cursor-pointer">
               Load + Resample
             </button>
           </div>
@@ -387,242 +600,917 @@
 
     <!-- Math Channel Modal -->
     <div id="mathModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-lg w-full p-5">
-        <div class="flex justify-between items-center pb-2 border-b border-neutral-800 mb-3">
-          <h2 class="text-base font-bold text-neutral-100 flex items-center gap-2">
-            <span class="text-purple-400">+ Add Virtual Math Channel</span>
-          </h2>
-          <button id="mathModalCloseBtn" class="text-neutral-400 hover:text-white text-lg">✕</button>
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5">
+        <div class="flex justify-between items-center pb-2 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-purple-300 uppercase tracking-wider">+ Virtual Math Channel</h2>
+          <button id="mathModalCloseBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
         </div>
 
-        <div id="mathModalError" class="hidden p-2.5 rounded bg-red-950/80 border border-red-700/80 text-red-200 text-xs mb-3 font-mono"></div>
+        <div id="mathModalError" class="hidden p-2.5 rounded-sm bg-red-950/80 border border-red-700/80 text-red-200 text-xs mb-3 font-mono"></div>
 
         <div class="space-y-3 text-xs">
           <div>
-            <label class="block text-neutral-400 mb-1">Channel Name</label>
-            <input id="mathNameInput" type="text" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white" value="Math 1" />
+            <label class="block text-slate-400 mb-1">Channel Name</label>
+            <input id="mathNameInput" type="text" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white" value="Math 1" />
           </div>
 
           <div>
             <div class="flex justify-between items-center mb-1">
-              <label class="text-neutral-400">Available Channels (click to insert)</label>
-              <span class="text-[10px] text-neutral-500">Aliases CH1, CH2... or names</span>
+              <label class="text-slate-400">Available Channels (click to insert)</label>
+              <span class="text-[10px] text-slate-500">Aliases CH1, CH2... or full names</span>
             </div>
-            <div id="mathAvailableChannels" class="flex flex-wrap gap-1.5 p-2 bg-neutral-950/70 border border-neutral-800 rounded min-h-[34px] items-center"></div>
+            <div id="mathAvailableChannels" class="flex flex-wrap gap-1.5 p-2 bg-[#0c0f13] border border-[#222933] rounded-sm min-h-[34px] items-center"></div>
           </div>
 
           <div>
-            <label class="block text-neutral-400 mb-1">Expression</label>
-            <input id="mathExprInput" type="text" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-2 text-white font-mono text-sm tracking-wide" placeholder="e.g. CH1 - CH2, deriv(CH1), abs(CH1)" />
-            <div class="text-[11px] text-neutral-500 mt-1">Supports: +, -, *, /, ^, abs, sqrt, sin, cos, tan, mean, rms, min, max, diff, deriv</div>
+            <label class="block text-slate-400 mb-1">Expression</label>
+            <input id="mathExprInput" type="text" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-2 text-white font-mono text-sm tracking-wide" placeholder="e.g. CH1 - CH2, deriv(CH1), abs(CH1)" />
+            <div class="text-[11px] text-slate-500 mt-1">Supports: +, -, *, /, ^, abs, sqrt, sin, cos, tan, mean, rms, min, max, diff, deriv</div>
           </div>
 
           <div>
-            <label class="block text-neutral-400 mb-1">Quick Keypad</label>
+            <label class="block text-slate-400 mb-1">Keypad</label>
             <div id="mathKeypad" class="flex flex-wrap gap-1 text-xs">
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" + ">+</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" - ">-</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" * ">*</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" / ">/</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert=" ^ ">^</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded font-mono" data-insert="()">()</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="deriv()">deriv()</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="mean()">mean()</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="rms()">rms()</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="abs()">abs()</button>
-              <button type="button" class="keypad-btn px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-purple-300 rounded font-mono" data-insert="sqrt()">sqrt()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm font-mono cursor-pointer" data-insert=" + ">+</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm font-mono cursor-pointer" data-insert=" - ">-</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm font-mono cursor-pointer" data-insert=" * ">*</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm font-mono cursor-pointer" data-insert=" / ">/</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm font-mono cursor-pointer" data-insert=" ^ ">^</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm font-mono cursor-pointer" data-insert="()">()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-purple-300 rounded-sm font-mono cursor-pointer" data-insert="deriv()">deriv()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-purple-300 rounded-sm font-mono cursor-pointer" data-insert="mean()">mean()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-purple-300 rounded-sm font-mono cursor-pointer" data-insert="rms()">rms()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-purple-300 rounded-sm font-mono cursor-pointer" data-insert="abs()">abs()</button>
+              <button type="button" class="keypad-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-purple-300 rounded-sm font-mono cursor-pointer" data-insert="sqrt()">sqrt()</button>
             </div>
           </div>
 
           <div>
-            <label class="block text-neutral-400 mb-1.5">Quick Presets</label>
+            <label class="block text-slate-400 mb-1.5">Presets</label>
             <div id="quickMathPresets"></div>
           </div>
         </div>
 
-        <div class="flex justify-end gap-2 mt-5 pt-3 border-t border-neutral-800">
-          <button id="mathCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
-          <button id="mathApplyBtn" class="px-4 py-1.5 bg-purple-700 hover:bg-purple-600 rounded text-white font-medium text-xs shadow-md">Create Math Channel</button>
+        <div class="flex justify-end gap-2 mt-5 pt-3 border-t border-[#222933]">
+          <button id="mathCancelBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+          <button id="mathApplyBtn" class="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 rounded-sm text-white font-semibold text-xs cursor-pointer">Create Math Channel</button>
         </div>
       </div>
     </div>
 
     <!-- Trigger Modal -->
     <div id="triggerModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-sm w-full p-5">
-        <h2 class="text-base font-bold text-neutral-100 mb-3">Oscilloscope Trigger Setup</h2>
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-sm w-full p-5">
+        <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider mb-3">Edge Trigger Setup</h2>
         <div class="space-y-3 text-xs">
-          <div class="flex items-center gap-2">
-            <input type="checkbox" id="trigEnableChk" class="cursor-pointer" checked />
-            <label for="trigEnableChk" class="text-neutral-200 font-medium">Trigger enabled</label>
+          <div>
+            <label class="block text-slate-400 mb-1">Source Channel</label>
+            <select id="trigChannelSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
           </div>
           <div>
-            <label class="block text-neutral-400 mb-1">Source Channel</label>
-            <select id="trigChannelSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
-          </div>
-          <div>
-            <label class="block text-neutral-400 mb-1">Edge Slope</label>
-            <select id="trigSlopeSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
+            <label class="block text-slate-400 mb-1">Edge Slope</label>
+            <select id="trigSlopeSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono">
               <option value="rising">Rising Edge (↑)</option>
               <option value="falling">Falling Edge (↓)</option>
             </select>
           </div>
           <div>
-            <label class="block text-neutral-400 mb-1">Threshold Level (V)</label>
-            <input id="trigLevelInput" type="number" step="0.1" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" value="0.0" />
+            <label class="block text-slate-400 mb-1">Threshold Level</label>
+            <input id="trigLevelInput" type="number" step="0.1" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white font-mono" value="0.0" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Horizontal Trigger Position (%)</label>
+            <input id="trigPosInput" type="number" min="5" max="95" step="5" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white font-mono" value="50" />
           </div>
         </div>
         <div class="flex justify-end gap-2 mt-5">
-          <button id="triggerCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
-          <button id="triggerApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Align View to Trigger</button>
+          <button id="triggerCancelBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+          <button id="triggerApplyBtn" class="px-4 py-1.5 bg-orange-600 hover:bg-orange-500 rounded-sm text-white font-semibold text-xs cursor-pointer">Align View to Trigger</button>
         </div>
       </div>
     </div>
 
-    <!-- Low-pass Filter Modal -->
-    <div id="filterModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-md w-full p-5">
-        <h2 class="text-base font-bold text-neutral-100 mb-1">Low-pass Filter <span class="text-cyan-400 font-mono text-sm">(-3 dB)</span></h2>
-        <p class="text-[11px] text-neutral-500 mb-3">Attenuates content above the cutoff; the response is -3 dB (70.7 %) exactly at the cutoff frequency.</p>
-        <div class="space-y-3 text-xs">
-          <div>
-            <label class="block text-neutral-400 mb-1">Apply to</label>
-            <select id="filterScopeSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
-              <option value="active">Active channel</option>
-              <option value="visible">All visible input channels</option>
-              <option value="all">All input channels</option>
-            </select>
-          </div>
-          <div>
-            <label class="block text-neutral-400 mb-1">Cutoff frequency (-3 dB)</label>
-            <div class="flex gap-2">
-              <input id="filterCutoffInput" type="number" min="0" step="any" class="flex-1 bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" value="10" />
-              <select id="filterUnitSelect" class="w-24 bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
-                <option value="1">Hz</option>
-                <option value="1000" selected>kHz</option>
-                <option value="1000000">MHz</option>
-              </select>
-            </div>
-            <div id="filterPresets" class="flex flex-wrap gap-1 mt-1.5">
-              <button type="button" data-hz="100" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">100 Hz</button>
-              <button type="button" data-hz="1000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">1 kHz</button>
-              <button type="button" data-hz="10000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">10 kHz</button>
-              <button type="button" data-hz="100000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">100 kHz</button>
-              <button type="button" data-hz="1000000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">1 MHz</button>
-              <button type="button" data-hz="20000000" class="filter-preset px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 rounded font-mono text-neutral-300">20 MHz</button>
-            </div>
-            <div id="filterNyquistHint" class="text-[10px] text-neutral-500 mt-1"></div>
-          </div>
-          <div>
-            <label class="block text-neutral-400 mb-1">Poles (steepness)</label>
-            <select id="filterOrderSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white">
-              <option value="1">1 pole (gentle)</option>
-              <option value="2" selected>2 poles</option>
-              <option value="4">4 poles (steep)</option>
-            </select>
-            <div id="filterRolloffHint" class="text-[10px] text-neutral-500 mt-1"></div>
-          </div>
-          <div class="flex items-start gap-2">
-            <input type="checkbox" id="filterZeroPhaseChk" class="cursor-pointer mt-0.5" checked />
-            <label for="filterZeroPhaseChk" class="text-neutral-300">Zero-phase (no time delay)
-              <span class="block text-[10px] text-neutral-500">Filters forward and backward so edges and cursors stay aligned with the unfiltered channels. Turn off to see the real causal delay.</span>
-            </label>
-          </div>
-          <div class="text-[10px] text-neutral-500 border-t border-neutral-800 pt-2">
-            Measurements, FFT, Math channels and CSV export use the filtered samples. The original data is kept and restored by <b>Remove filter</b>.
-          </div>
-          <div id="filterError" class="hidden p-2 rounded bg-red-950/80 border border-red-700/80 text-red-200 text-xs font-mono"></div>
-        </div>
-        <div class="flex justify-between gap-2 mt-5">
-          <button id="filterRemoveBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-red-300 text-xs">Remove filter</button>
-          <div class="flex gap-2">
-            <button id="filterCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
-            <button id="filterApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Apply</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Clarke / Park Transform Modal -->
+    <!-- 3-Phase Transform & Power Modal (Clarke αβ | Park dq0 | Power P(t)) -->
     <div id="transformModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-md w-full p-5">
-        <h2 class="text-base font-bold text-neutral-100 mb-3">Clarke Transform (3-Phase αβ)</h2>
-        <div class="space-y-3 text-xs">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">3-Phase Motor &amp; Power Math</h2>
+          <button id="transformCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <!-- Segmented Tab Header -->
+        <div class="grid grid-cols-3 bg-[#0c0f13] border border-[#222933] rounded-sm p-0.5 mb-4 text-xs font-medium">
+          <button id="tfTabClarkeBtn" type="button" class="tf-tab-btn py-1 rounded-sm bg-cyan-600 text-slate-950 font-semibold cursor-pointer">Clarke αβ</button>
+          <button id="tfTabParkBtn" type="button" class="tf-tab-btn py-1 rounded-sm text-slate-300 hover:text-white cursor-pointer">Park dq0</button>
+          <button id="tfTabPowerBtn" type="button" class="tf-tab-btn py-1 rounded-sm text-slate-300 hover:text-white cursor-pointer">Power P(t)</button>
+        </div>
+
+        <!-- Panel 1: Clarke αβ -->
+        <div id="tfPanelClarke" class="space-y-3 text-xs">
           <div>
-            <label class="block text-neutral-400 mb-1">Phase A Channel (Ua)</label>
-            <select id="clarkeUaSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+            <label class="block text-slate-400 mb-1">Phase A Channel (Ua / Ia)</label>
+            <select id="clarkeUaSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
           </div>
           <div>
-            <label class="block text-neutral-400 mb-1">Phase B Channel (Ub)</label>
-            <select id="clarkeUbSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+            <label class="block text-slate-400 mb-1">Phase B Channel (Ub / Ib)</label>
+            <select id="clarkeUbSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
           </div>
           <div>
-            <label class="block text-neutral-400 mb-1">Phase C Channel (Uc)</label>
-            <select id="clarkeUcSelect" class="w-full bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 text-white"></select>
+            <label class="block text-slate-400 mb-1">Phase C Channel (Uc / Ic)</label>
+            <select id="clarkeUcSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+          </div>
+          <div class="flex justify-end gap-2 mt-4 pt-3 border-t border-[#222933]">
+            <button id="transformCancelBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+            <button id="clarkeApplyBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 rounded-sm text-slate-950 font-semibold text-xs cursor-pointer">Generate α &amp; β</button>
           </div>
         </div>
-        <div class="flex justify-end gap-2 mt-5">
-          <button id="transformCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
-          <button id="clarkeApplyBtn" class="px-4 py-1.5 bg-[#0078d7] hover:bg-[#0063b1] rounded text-white font-medium text-xs">Generate α & β Channels</button>
+
+        <!-- Panel 2: Park dq0 -->
+        <div id="tfPanelPark" class="hidden space-y-3 text-xs">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Alpha (α) Channel</label>
+              <select id="parkAlphaSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Beta (β) Channel</label>
+              <select id="parkBetaSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+            </div>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Electrical Rotor Angle θ(t) Source</label>
+            <select id="parkAngleModeSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-cyan-200 font-mono">
+              <option value="auto">Auto atan2(β, α) from Alpha/Beta</option>
+              <option value="channel">Explicit Angle Channel (Radians)</option>
+            </select>
+          </div>
+          <div id="parkAngleChannelWrap" class="hidden">
+            <label class="block text-slate-400 mb-1">Theta Angle Channel (rad)</label>
+            <select id="parkAngleSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Phase Offset Δθ (deg)</label>
+            <input id="parkOffsetDegInput" type="number" step="1" value="0" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white font-mono" />
+          </div>
+          <div class="flex justify-end gap-2 mt-4 pt-3 border-t border-[#222933]">
+            <button id="parkCancelBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+            <button id="parkApplyBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 rounded-sm text-slate-950 font-semibold text-xs cursor-pointer">Generate d &amp; q</button>
+          </div>
+        </div>
+
+        <!-- Panel 3: Instantaneous Power P(t) -->
+        <div id="tfPanelPower" class="hidden space-y-2.5 text-xs">
+          <div>
+            <label class="block text-slate-400 mb-1">Topology</label>
+            <select id="powerModeSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-cyan-200 font-mono">
+              <option value="3ph">3-Phase: P(t) = Ua·Ia + Ub·Ib + Uc·Ic</option>
+              <option value="1ph">Single-Phase / DC: P(t) = Ua·Ia</option>
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Ua Voltage</label>
+              <select id="powerUaSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Ia Current</label>
+              <select id="powerIaSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+            </div>
+          </div>
+          <div id="power3PhRowB" class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Ub Voltage</label>
+              <select id="powerUbSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Ib Current</label>
+              <select id="powerIbSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+            </div>
+          </div>
+          <div id="power3PhRowC" class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Uc Voltage</label>
+              <select id="powerUcSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Ic Current</label>
+              <select id="powerIcSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+            </div>
+          </div>
+          <div class="flex justify-end gap-2 mt-4 pt-3 border-t border-[#222933]">
+            <button id="powerCancelBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+            <button id="powerApplyBtn" type="button" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-sm text-slate-950 font-semibold text-xs cursor-pointer">Compute P(t) [W]</button>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- BLDC Motor Analysis Modal -->
+    <!-- BLDC Motor Analysis & RPM Estimation Modal -->
     <div id="motorModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-sm w-full p-5">
-        <h2 class="text-base font-bold text-neutral-100 mb-3">BLDC Motor Harmonic Analysis</h2>
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
+        <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider mb-3">BLDC Motor Harmonics &amp; RPM Estimator</h2>
         <div class="space-y-3 text-xs">
           <div class="flex items-center gap-2">
-            <input type="checkbox" id="motorEnableChk" class="cursor-pointer" checked />
-            <label for="motorEnableChk" class="text-neutral-200 font-medium">Enable Harmonic Markers (1x, 2x, 3x, 6x, 12x)</label>
+            <input type="checkbox" id="motorEnableChk" class="cursor-pointer accent-orange-500" checked />
+            <label for="motorEnableChk" class="text-slate-200 font-medium">Enable Harmonic Markers (1x, 2x, 3x, 6x, 12x)</label>
           </div>
-          <div>
-            <label class="block text-neutral-400 mb-1">Mechanical Speed (RPM)</label>
-            <input id="motorRpmInput" type="number" step="1" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" placeholder="e.g. 3000" />
-            <span class="text-[10px] text-neutral-500">Required. No fake or assumed RPM is used.</span>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Mechanical Speed (RPM)</label>
+              <input id="motorRpmInput" type="number" step="1" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white font-mono" placeholder="e.g. 3000" />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Rotor Pole Pairs (p)</label>
+              <input id="motorPolesInput" type="number" step="1" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white font-mono" value="4" />
+            </div>
           </div>
-          <div>
-            <label class="block text-neutral-400 mb-1">Rotor Pole Pairs (p)</label>
-            <input id="motorPolesInput" type="number" step="1" class="w-full bg-neutral-950 border border-neutral-700 rounded px-3 py-1.5 text-white font-mono" value="4" />
+
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 space-y-2">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-cyan-300">Auto-Estimate RPM from Signal Zero-Crossings</div>
+            <div class="flex items-center gap-1.5">
+              <select id="motorEstChannelSelect" class="flex-1 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+              <button id="motorEstBtn" type="button" class="px-2.5 py-1 bg-cyan-950/60 hover:bg-cyan-900/70 border border-cyan-500/60 text-cyan-200 font-semibold rounded-sm cursor-pointer whitespace-nowrap">Estimate RPM</button>
+            </div>
+            <div id="motorEstOutput" class="font-mono text-[11px] text-slate-400 tabular-nums">Uses rising mid-level crossings across active viewport.</div>
           </div>
         </div>
         <div class="flex justify-end gap-2 mt-5">
-          <button id="motorCancelBtn" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-neutral-300 text-xs">Cancel</button>
-          <button id="motorApplyBtn" class="px-4 py-1.5 bg-orange-600 hover:bg-orange-500 rounded text-white font-medium text-xs">Apply Markers</button>
+          <button id="motorCancelBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+          <button id="motorApplyBtn" class="px-4 py-1.5 bg-orange-600 hover:bg-orange-500 rounded-sm text-white font-semibold text-xs cursor-pointer">Apply Markers</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Inline Text Annotation Modal -->
+    <div id="textAnnotationModal" class="modal-overlay modal-backdrop-dim fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-sm w-full p-4">
+        <h2 class="text-xs font-semibold text-amber-300 uppercase tracking-wider mb-2">Add Waveform Annotation</h2>
+        <input id="textAnnInput" type="text" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white text-xs font-mono mb-3" placeholder="Enter callout text (e.g. Switching Spike)" />
+        <div class="flex justify-end gap-2">
+          <button id="textAnnCancelBtn" class="px-3 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 text-xs cursor-pointer">Cancel</button>
+          <button id="textAnnApplyBtn" class="px-3 py-1 bg-amber-500 hover:bg-amber-400 rounded-sm text-slate-950 font-semibold text-xs cursor-pointer">Place Note</button>
         </div>
       </div>
     </div>
 
     <!-- Verification / Test Suite Modal -->
     <div id="testSuiteModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
-      <div class="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl max-w-xl w-full p-5 max-h-[85vh] flex flex-col">
-        <div class="flex justify-between items-center pb-2 border-b border-neutral-800 mb-3">
-          <h2 class="text-base font-bold text-neutral-100 flex items-center gap-2">
-            <span class="text-emerald-400">Algorithmic Verification & Tests</span>
-          </h2>
-          <button onclick="document.getElementById('testSuiteModal').style.display='none'" class="text-neutral-400 hover:text-white">✕</button>
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-xl w-full p-5 max-h-[85vh] flex flex-col">
+        <div class="flex justify-between items-center pb-2 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-emerald-400 uppercase tracking-wider">Algorithmic Verification & Self-Tests</h2>
+          <button id="testSuiteCloseTopBtn" class="text-slate-400 hover:text-white cursor-pointer">✕</button>
         </div>
         <div id="testResultsList" class="flex-1 overflow-y-auto pr-1"></div>
         <div class="flex justify-end mt-4">
-          <button onclick="document.getElementById('testSuiteModal').style.display='none'" class="px-4 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-white text-xs">Close</button>
+          <button id="testSuiteCloseBtn" class="px-4 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-white text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- On-Demand Automated Measurements Modal -->
+    <div id="measureModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-2xl w-full p-5 flex flex-col max-h-[88vh]">
+        <div class="flex justify-between items-center pb-3 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Automated Measurements Setup</h2>
+          <button id="measureModalCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4 text-xs">
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">Source Channel</label>
+            <select id="measureModalChannelSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-slate-100 font-mono"></select>
+          </div>
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">Measurement Gate Window</label>
+            <select id="measureModalGateSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-slate-100 font-mono">
+              <option value="view">Current Viewport</option>
+              <option value="cursors">Between Cursors (X1 ~ X2)</option>
+              <option value="entire">Entire Record</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 overflow-y-auto pr-1 text-xs">
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-amber-300 mb-2 pb-1 border-b border-[#222933]">Voltage / Amplitude</div>
+            <div id="measureVoltageList" class="space-y-1.5"></div>
+          </div>
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-cyan-300 mb-2 pb-1 border-b border-[#222933]">Timing / Frequency</div>
+            <div id="measureTimingList" class="space-y-1.5"></div>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between pt-3 mt-4 border-t border-[#222933] text-xs">
+          <div class="flex items-center gap-2">
+            <button id="measureSelectAllChBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">Select All (Ch)</button>
+            <button id="measureClearAllBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-red-950/50 border border-[#222933] text-slate-300 hover:text-red-300 rounded-sm cursor-pointer">Clear All</button>
+          </div>
+          <button id="measureModalDoneBtn" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Waveform Data Edit & Same-Screen Reference Modal -->
+    <div id="waveformEditModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-2xl w-full p-5 flex flex-col max-h-[90vh]">
+        <div class="flex justify-between items-center pb-3 border-b border-[#222933] mb-3">
+          <div>
+            <h2 class="text-sm font-semibold text-rose-300 uppercase tracking-wider">Waveform Edit &amp; Reference Comparison</h2>
+            <div id="editModalStatusLine" class="text-[11px] font-mono text-slate-400 mt-0.5">Original trace is auto-locked as Reference before first edit.</div>
+          </div>
+          <button id="editModalCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="flex items-center justify-between gap-3 mb-3 text-xs">
+          <div class="flex items-center gap-2 flex-1">
+            <label class="text-slate-400 shrink-0">Target Channel:</label>
+            <select id="editModalChannelSelect" class="flex-1 bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-slate-100 font-mono"></select>
+          </div>
+          <span id="editModalRefBadge" class="px-2 py-1 bg-[#0c0f13] border border-[#222933] font-mono text-[11px] text-slate-400 rounded-sm">Unmodified</span>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 overflow-y-auto pr-1 text-xs">
+          <!-- Global Edits -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2.5">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-300 pb-1 border-b border-[#222933]">Global Trace Operations</div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-slate-400 w-20 shrink-0">+ Offset</span>
+              <input id="editGlobalOffsetInput" type="number" step="0.1" value="1.0" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <button id="editApplyGlobalOffsetBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Apply</button>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-slate-400 w-20 shrink-0">× Gain</span>
+              <input id="editGlobalGainInput" type="number" step="0.1" value="1.2" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <button id="editApplyGlobalGainBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Apply</button>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-slate-400 w-20 shrink-0">Smooth N</span>
+              <input id="editSmoothWindowInput" type="number" min="3" max="201" step="2" value="9" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <button id="editApplySmoothBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Filter</button>
+            </div>
+          </div>
+
+          <!-- Local [X1, X2] Edits -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2.5">
+            <div class="flex items-center justify-between pb-1 border-b border-[#222933]">
+              <span class="text-[11px] font-semibold uppercase tracking-wider text-amber-300">Local Edit [X1 ~ X2]</span>
+              <span id="editLocalRangeDisplay" class="font-mono text-[10px] text-slate-400 tabular-nums">--</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-slate-400 w-20 shrink-0">Flatten to</span>
+              <input id="editLocalFlattenInput" type="number" step="0.1" value="0.0" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <button id="editApplyLocalFlattenBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-300 rounded-sm cursor-pointer">Flatten</button>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-slate-400 w-20 shrink-0">Local +ΔV</span>
+              <input id="editLocalOffsetInput" type="number" step="0.1" value="0.5" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <button id="editApplyLocalOffsetBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-300 rounded-sm cursor-pointer">Apply</button>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-slate-400 w-20 shrink-0">Local ×k</span>
+              <input id="editLocalGainInput" type="number" step="0.1" value="0.5" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <button id="editApplyLocalGainBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-300 rounded-sm cursor-pointer">Apply</button>
+            </div>
+            <button id="editApplyLocalBridgeBtn" class="w-full py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">
+              Linear Bridge [X1 ~ X2] (Interpolate Anomaly)
+            </button>
+          </div>
+        </div>
+
+        <!-- Golden Reference Tolerance Envelope Band -->
+        <div class="mt-3 bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2 text-xs">
+          <div class="flex items-center justify-between">
+            <label class="flex items-center gap-2 font-semibold uppercase tracking-wider text-emerald-300 cursor-pointer">
+              <input id="goldenEnableChk" type="checkbox" class="accent-emerald-500 cursor-pointer" />
+              <span>Golden Reference Tolerance Band (Pass / Fail)</span>
+            </label>
+            <span id="goldenEvalReadout" class="font-mono text-[11px] text-slate-400 tabular-nums">Disabled</span>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-2 items-center">
+            <select id="goldenSourceSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-slate-200"></select>
+            <div class="flex items-center gap-1">
+              <select id="goldenModeSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-slate-200">
+                <option value="percent">% of Vpp</option>
+                <option value="absolute">± Absolute Unit</option>
+              </select>
+              <input id="goldenTolInput" type="number" step="0.5" min="0.01" value="5" class="w-20 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+            </div>
+            <button id="goldenCaptureBtn" type="button" class="px-2.5 py-1 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-600/60 text-emerald-200 rounded-sm cursor-pointer">Capture Current as Golden</button>
+          </div>
+        </div>
+
+        <!-- Same-Screen Ref / Diff Overlay Controls -->
+        <div class="flex flex-wrap items-center justify-between gap-2 pt-3 mt-4 border-t border-[#222933] text-xs">
+          <div class="flex items-center gap-3">
+            <label class="flex items-center gap-1.5 cursor-pointer text-slate-200">
+              <input id="editShowRefChk" type="checkbox" class="accent-cyan-400 cursor-pointer" checked />
+              <span>Show Ref (Dashed)</span>
+            </label>
+            <label class="flex items-center gap-1.5 cursor-pointer text-rose-300">
+              <input id="editShowDiffChk" type="checkbox" class="accent-rose-400 cursor-pointer" />
+              <span>Show Diff (New − Ref)</span>
+            </label>
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="editRevertRefBtn" class="px-3 py-1.5 bg-red-950/50 hover:bg-red-900/60 border border-red-700/60 text-red-200 rounded-sm cursor-pointer">Revert to Original</button>
+            <button id="editModalCloseBtn" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Done</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Time-Range Crop Export Modal (CSV / JSON) -->
+    <div id="cropExportModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">Crop Slice Export (CSV / JSON)</h2>
+          <button id="cropExportCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="space-y-3 text-xs">
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">Time Slice Source</label>
+            <select id="cropRangeModeSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-slate-100 font-mono">
+              <option value="view">Current Viewport Window</option>
+              <option value="cursors">Active Cursors [X1 ~ X2]</option>
+            </select>
+            <div id="cropSampleCountPreview" class="text-[11px] font-mono text-cyan-300 mt-1.5 tabular-nums">--</div>
+          </div>
+
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">Channels to Export</label>
+            <div id="cropChannelsList" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 space-y-1.5 max-h-44 overflow-y-auto"></div>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 mt-5 pt-3 border-t border-[#222933] text-xs">
+          <button id="cropCancelBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Cancel</button>
+          <button id="cropConfirmJsonBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-300 font-medium rounded-sm cursor-pointer">Export JSON</button>
+          <button id="cropConfirmCsvBtn" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Export CSV</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Two-Channel Phase Difference (ΔΦ) Modal -->
+    <div id="phaseModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Two-Channel Phase Difference (ΔΦ)</h2>
+          <button id="phaseCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+        <div class="space-y-3 text-xs">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Reference Channel</label>
+              <select id="phaseRefSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Target Channel</label>
+              <select id="phaseTargetSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+            </div>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Analysis Window</label>
+            <select id="phaseGateSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-slate-100 font-mono">
+              <option value="view">Current Viewport</option>
+              <option value="cursors">Between Cursors (X1 ~ X2)</option>
+              <option value="entire">Entire Record</option>
+            </select>
+          </div>
+          <div id="phaseResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-1">
+            <div class="text-slate-500">Select two periodic signals to measure ΔΦ.</div>
+          </div>
+        </div>
+        <div class="flex justify-end gap-2 mt-4">
+          <button id="phaseRecomputeBtn" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 rounded-sm text-xs cursor-pointer">Recompute</button>
+          <button id="phaseCloseBtn" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Automated Anomaly Scanner Modal -->
+    <div id="anomalyModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-2xl w-full p-5 flex flex-col max-h-[88vh]">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-amber-300 uppercase tracking-wider">Automated Anomaly Scanner</h2>
+          <button id="anomalyCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 text-xs">
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-1">Channel</label>
+            <select id="anomChannelSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-1">&gt; High Limit</label>
+            <input id="anomHighInput" type="number" step="any" placeholder="Optional" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-1">&lt; Low Limit</label>
+            <input id="anomLowInput" type="number" step="any" placeholder="Optional" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-1">Min |dv/dt| (/s)</label>
+            <input id="anomDvDtInput" type="number" step="any" placeholder="e.g. 1e5" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-1">Max Edge Gap (s)</label>
+            <input id="anomGapInput" type="number" step="any" placeholder="Optional" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between gap-2 mb-2 text-xs">
+          <div id="anomSummaryCount" class="font-mono text-slate-400 tabular-nums">Set one or more rules and click Scan Record.</div>
+          <div class="flex items-center gap-2">
+            <button id="anomClearBtn" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Clear Markers</button>
+            <button id="anomRunBtn" class="px-3.5 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold rounded-sm cursor-pointer">Scan Record</button>
+          </div>
+        </div>
+
+        <div id="anomResultsTableWrap" class="flex-1 overflow-y-auto border border-[#222933] rounded-sm bg-[#0c0f13] min-h-[180px]">
+          <div class="p-4 text-xs font-mono text-slate-500">Click any detected anomaly row to jump and zoom directly to its timestamp.</div>
+        </div>
+
+        <div class="flex justify-end mt-3 pt-2.5 border-t border-[#222933]">
+          <button id="anomalyCloseBtn" class="px-4 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Batch Multi-File / Folder Measurement Modal -->
+    <div id="batchModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-4xl w-full p-5 flex flex-col max-h-[90vh]">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Batch Multi-File Measurement Suite</h2>
+          <button id="batchCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-6 gap-2 mb-3 text-xs items-end">
+          <div class="md:col-span-2 flex items-center gap-1.5">
+            <button id="batchPickFilesBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">Select Files...</button>
+            <button id="batchPickFolderBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 rounded-sm cursor-pointer whitespace-nowrap">Select Folder</button>
+            <input id="batchFilesInput" type="file" multiple accept=".csv,.txt,.wfm" class="hidden" />
+            <input id="batchFolderInput" type="file" webkitdirectory directory multiple class="hidden" />
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-0.5">Channel Index</label>
+            <input id="batchChIndexInput" type="number" min="1" value="1" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-0.5">Pass/Fail Metric</label>
+            <select id="batchRuleMetricSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono">
+              <option value="">None (Audit Only)</option>
+              <option value="vpp">Vpp</option>
+              <option value="max">Vmax</option>
+              <option value="min">Vmin</option>
+              <option value="rms">Vrms</option>
+              <option value="frequency">Freq</option>
+              <option value="overshoot">Overshoot %</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-0.5">Min Limit</label>
+            <input id="batchMinLimitInput" type="number" step="any" placeholder="--" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+          <div>
+            <label class="block text-[10px] text-slate-400 mb-0.5">Max Limit</label>
+            <input id="batchMaxLimitInput" type="number" step="any" placeholder="--" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between gap-2 mb-2 text-xs">
+          <div id="batchFileCountLabel" class="font-mono text-slate-400">No files queued.</div>
+          <div class="flex items-center gap-2">
+            <button id="batchRunBtn" type="button" class="px-3.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Run Batch Measure</button>
+            <button id="batchExportCsvBtn" type="button" class="px-3 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">Export CSV Summary</button>
+          </div>
+        </div>
+
+        <div id="batchResultsWrap" class="flex-1 overflow-auto border border-[#222933] rounded-sm bg-[#0c0f13] min-h-[220px]">
+          <div class="p-4 text-xs font-mono text-slate-500">Queue multiple CSV/WFM captures or pick a test folder to generate a multi-unit summary comparison table.</div>
+        </div>
+
+        <div class="flex justify-end mt-3 pt-2.5 border-t border-[#222933]">
+          <button id="batchCloseBtn" class="px-4 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Workbench Analysis Presets Modal -->
+    <div id="presetModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5 flex flex-col max-h-[85vh]">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">Test Templates &amp; Workbench Presets</h2>
+          <button id="presetCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="flex items-center gap-2 mb-3 text-xs">
+          <input id="presetNameInput" type="text" placeholder="Template name (e.g. BLDC Gate Drive Check)" class="flex-1 bg-[#0c0f13] border border-[#222933] rounded-sm px-3 py-1.5 text-white" />
+          <button id="presetSaveBtn" type="button" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">Save Current</button>
+        </div>
+
+        <div class="text-[11px] text-slate-400 mb-2">Saves Math formulas, selected Measure strip metrics, Render/Decimation mode, Overlap/Separate layout, and Trigger polarity.</div>
+
+        <div id="presetListWrap" class="flex-1 overflow-y-auto border border-[#222933] rounded-sm bg-[#0c0f13] p-2 space-y-1.5 min-h-[160px]"></div>
+
+        <div class="flex justify-end mt-3 pt-2.5 border-t border-[#222933]">
+          <button id="presetCloseBtn" class="px-4 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cross-File / Cross-Channel Multi-Waveform Group Compare Modal -->
+    <div id="compareModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-5xl w-full p-5 flex flex-col max-h-[94vh]">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <div>
+            <h2 class="text-sm font-semibold text-emerald-300 uppercase tracking-wider">Multi-Waveform Compare Group (Align, Scale &amp; Overlay)</h2>
+            <div class="text-[11px] font-mono text-slate-400 mt-0.5">Load multiple CSV/WFM files (auto-skips identical duplicates), align start/ms-vs-s step differences, and preview live.</div>
+          </div>
+          <button id="compareCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+
+        <div class="space-y-2.5 text-xs overflow-y-auto pr-1 flex-1 min-h-0">
+          <!-- Group Identity & Visual Binding Bar -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 grid grid-cols-1 md:grid-cols-12 gap-2.5 items-end">
+            <div class="md:col-span-3">
+              <label class="block text-[10px] text-slate-400 uppercase mb-1">Group Name / Tag</label>
+              <input id="cmpGroupNameInput" type="text" value="CMP1" maxlength="20" placeholder="e.g. CMP1, MotorA" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2.5 py-1 text-white font-mono" />
+            </div>
+            <div class="md:col-span-3">
+              <label class="block text-[10px] text-slate-400 uppercase mb-1">Group Badge Color</label>
+              <div id="cmpGroupColorSwatches" class="flex items-center gap-1.5 h-[28px]"></div>
+            </div>
+            <div class="md:col-span-4">
+              <label class="block text-[10px] text-slate-400 uppercase mb-1">Trace Color Mode</label>
+              <select id="cmpPaletteModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-slate-200 font-mono">
+                <option value="family">Same-Hue Shades (同色系渐变 · 整组一眼认出)</option>
+                <option value="distinct">Distinct Colors + Group Badge (高区分彩线 + 组徽章)</option>
+              </select>
+            </div>
+            <div class="md:col-span-2 flex items-center h-[28px]">
+              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer" title="Tag the Target baseline channel with the same Group Name and Color">
+                <input id="cmpTagTargetChk" type="checkbox" class="accent-emerald-400 cursor-pointer" checked />
+                <span class="text-[11px]">Bind Target</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Target + Multi-File / Channel Adder -->
+          <div class="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-end">
+            <div class="md:col-span-4">
+              <label class="block text-[11px] text-slate-400 mb-1">Target Baseline (Current Tab)</label>
+              <select id="cmpTargetSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono"></select>
+            </div>
+            <div class="md:col-span-8">
+              <div class="flex items-center justify-between mb-1">
+                <label class="text-[11px] text-slate-400">Add Waveforms (Multi-File or Any Tab/Channel)</label>
+                <span id="cmpQueueCountBadge" class="text-[11px] font-mono text-emerald-300">0 waveform(s) in group</span>
+              </div>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <select id="cmpRefSelect" class="flex-1 min-w-[180px] bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono"></select>
+                <button id="cmpAddRefBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Add Channel</button>
+                <button id="cmpLoadFileBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Load File(s)...</button>
+                <input type="file" id="cmpRefFileInput" multiple class="hidden" accept=".csv,.wfm,.txt" />
+              </div>
+            </div>
+          </div>
+
+          <!-- Live Mini Oscilloscope Comparison Preview -->
+          <div class="bg-[#080b0f] border border-[#222933] rounded-sm overflow-hidden">
+            <div class="flex items-center justify-between px-2.5 py-1 bg-[#0c0f13] border-b border-[#1b222c] font-mono text-[10px]">
+              <span id="cmpPreviewBanner" class="text-slate-300 truncate">Live Overlay Preview (Base + Group Waveforms)</span>
+              <span id="cmpScaleWarnBanner" class="text-amber-300 hidden"></span>
+            </div>
+            <canvas id="cmpPreviewCanvas" class="w-full h-[155px] block"></canvas>
+          </div>
+
+          <!-- Batch Alignment, Time-Scale & Conditioning -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span class="text-slate-400 font-semibold mr-0.5">Align All:</span>
+              <button id="cmpAlignStartBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-emerald-300 rounded-sm cursor-pointer" title="Align starting timestamp t[0] of all waveforms to Target t[0]">Align Start (t0)</button>
+              <button id="cmpAlignEdgeBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Align Edge</button>
+              <button id="cmpAlignPeakBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Align Peak</button>
+              <button id="cmpAlignXCorrBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-300 rounded-sm cursor-pointer">Auto XCorr</button>
+              <button id="cmpMatchSpanBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-amber-500/50 text-amber-200 rounded-sm cursor-pointer" title="Auto-scale ms vs s time steps to match Target span and align start">Match Span (ms↔s)</button>
+              <button id="cmpAlignResetBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Reset 1× / Δt=0</button>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-3">
+              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer" title="Automatically align start t0 and match ms/s span difference when adding files">
+                <input id="cmpAutoFitOnAddChk" type="checkbox" class="accent-emerald-400 cursor-pointer" checked />
+                <span>Auto-Align on Add</span>
+              </label>
+              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                <input id="cmpRemoveDcChk" type="checkbox" class="accent-cyan-400 cursor-pointer" />
+                <span>Remove DC</span>
+              </label>
+              <div class="flex items-center gap-1.5">
+                <span class="text-slate-400">Tol:</span>
+                <select id="cmpTolModeSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 font-mono text-slate-200">
+                  <option value="percent">% Vpp</option>
+                  <option value="absolute">± Abs</option>
+                </select>
+                <input id="cmpTolValueInput" type="number" step="0.5" min="0.01" value="5" class="w-14 bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 font-mono text-white" />
+              </div>
+              <label class="flex items-center gap-1.5 text-emerald-300 cursor-pointer">
+                <input id="cmpEnableGoldenChk" type="checkbox" class="accent-emerald-400 cursor-pointer" checked />
+                <span>Tol Band</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Multi-Waveform Comparison Table -->
+          <div id="cmpQueueTableWrap" class="border border-[#222933] rounded-sm bg-[#0c0f13] overflow-auto max-h-[210px] min-h-[120px]"></div>
+        </div>
+
+        <div class="flex flex-wrap items-center justify-between gap-2 pt-3 mt-3 border-t border-[#222933] text-xs">
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="cmpClearQueueBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-red-950/50 border border-[#222933] text-slate-300 hover:text-red-300 rounded-sm cursor-pointer">Clear Queue</button>
+            <button id="cmpClearBandBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Clear Band</button>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="cmpAddDiffBtn" type="button" class="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900/70 border border-rose-600/60 text-rose-200 font-semibold rounded-sm cursor-pointer">+ Diff Traces (All)</button>
+            <button id="cmpApplyOverlayBtn" type="button" class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold rounded-sm cursor-pointer">Overlay Group onto Scope</button>
+            <button id="cmpCloseBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- BLDC Motor & Inverter Diagnostics Suite Modal -->
+    <div id="bldcModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-3xl w-full p-5 flex flex-col max-h-[90vh]">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <div>
+            <h2 class="text-sm font-semibold text-orange-300 uppercase tracking-wider">BLDC Motor &amp; Inverter Waveform Diagnostics</h2>
+            <div class="text-[11px] font-mono text-slate-400 mt-0.5">3-Phase Balance · 6-Step Hall Commutation · PWM Dead-Time &amp; Ringing · 6× Torque Ripple</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <select id="bldcGateSelect" class="bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1 text-[11px] font-mono text-slate-200" title="Analysis Gate Window">
+              <option value="view">Gate: Viewport</option>
+              <option value="cursors">Gate: Cursors X1~X2</option>
+              <option value="entire">Gate: Entire Record</option>
+            </select>
+            <button id="bldcCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+          </div>
+        </div>
+
+        <!-- 4 BLDC Diagnostic Tabs -->
+        <div class="grid grid-cols-4 bg-[#0c0f13] border border-[#222933] rounded-sm p-0.5 mb-3 text-xs font-medium">
+          <button id="bldcTabBalanceBtn" type="button" class="bldc-tab-btn py-1.5 rounded-sm bg-orange-600 text-slate-950 font-semibold cursor-pointer">3-Ph Balance</button>
+          <button id="bldcTabHallBtn" type="button" class="bldc-tab-btn py-1.5 rounded-sm text-slate-300 hover:text-white cursor-pointer">Hall / 6-Step</button>
+          <button id="bldcTabPwmBtn" type="button" class="bldc-tab-btn py-1.5 rounded-sm text-slate-300 hover:text-white cursor-pointer">PWM / Dead-Time</button>
+          <button id="bldcTabRippleBtn" type="button" class="bldc-tab-btn py-1.5 rounded-sm text-slate-300 hover:text-white cursor-pointer">Torque / 6× Ripple</button>
+        </div>
+
+        <div class="overflow-y-auto pr-1 flex-1 min-h-0 space-y-3 text-xs">
+          <!-- Panel 1: Three-Phase Balance & Derived BLDC Waveforms -->
+          <div id="bldcPanelBalance" class="space-y-3">
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Phase U / A</label>
+                <select id="bldcBalUSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Phase V / B</label>
+                <select id="bldcBalVSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Phase W / C</label>
+                <select id="bldcBalWSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <button id="bldcBalRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Analyze 3-Phase Balance</button>
+              <div class="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
+                <button id="bldcGenLineToLineBtn" type="button" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/50 text-cyan-300 rounded-sm cursor-pointer" title="Generate Line-to-Line traces: Uuv, Uvw, Uwu">+ Line-to-Line (Uuv/vw/wu)</button>
+                <button id="bldcGenZeroSeqBtn" type="button" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-purple-600/50 text-purple-300 rounded-sm cursor-pointer" title="Generate Zero-Sequence / 3rd Harmonic trace V0=(Ua+Ub+Uc)/3">+ Zero-Seq V0</button>
+                <button id="bldcGenSvmMagBtn" type="button" class="px-2.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-emerald-600/50 text-emerald-300 rounded-sm cursor-pointer" title="Generate Space Vector Magnitude |Vs| = sqrt(α² + β²)">+ Space Vector |Vs|</button>
+              </div>
+            </div>
+            <div id="bldcBalResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
+              <div class="text-slate-400">Select 3 phase voltage or current channels to evaluate amplitude unbalance %, 120° phase symmetry, and zero-sequence offset.</div>
+            </div>
+          </div>
+
+          <!-- Panel 2: 6-Step Hall / Back-EMF Commutation Audit -->
+          <div id="bldcPanelHall" class="hidden space-y-3">
+            <div class="grid grid-cols-4 gap-2">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Hall A / BEMF U</label>
+                <select id="bldcHallASelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Hall B / BEMF V</label>
+                <select id="bldcHallBSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Hall C / BEMF W</label>
+                <select id="bldcHallCSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Pole Pairs (p)</label>
+                <input id="bldcHallPolesInput" type="number" min="1" step="1" value="4" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono" />
+              </div>
+            </div>
+            <div>
+              <button id="bldcHallRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Audit 6-Step Sectors &amp; Jitter</button>
+            </div>
+            <div id="bldcHallResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
+              <div class="text-slate-400">Measures each 60° electrical Hall sector width, sensor mounting error, CW/CCW sequence direction, illegal states (000/111), and cycle RPM ripple.</div>
+            </div>
+          </div>
+
+          <!-- Panel 3: PWM Switching, Dead-Time & Ringing -->
+          <div id="bldcPanelPwm" class="hidden space-y-3">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">High-Side / Phase Node (PWM_H / SW)</label>
+                <select id="bldcPwmHighSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Complementary Low-Side (Optional Dead-Time)</label>
+                <select id="bldcPwmLowSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+            </div>
+            <div>
+              <button id="bldcPwmRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Inspect PWM, Dead-Time &amp; Ringing</button>
+            </div>
+            <div id="bldcPwmResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
+              <div class="text-slate-400">Extracts switching carrier frequency (kHz), duty cycle modulation range, edge dV/dt, overshoot %, LC ringing frequency (MHz), dead-time (ns), and shoot-through overlaps.</div>
+            </div>
+          </div>
+
+          <!-- Panel 4: Torque / Current Ripple & 6x Commutation Harmonic -->
+          <div id="bldcPanelRipple" class="hidden space-y-3">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Current / Torque / Power Channel (Ia, Iq, Ibus, P)</label>
+                <select id="bldcRippleChSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Electrical Freq fe (Hz, blank = Auto FFT)</label>
+                <input id="bldcRippleFeInput" type="number" step="any" placeholder="Auto detect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono" />
+              </div>
+            </div>
+            <div>
+              <button id="bldcRippleRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Analyze Torque Ripple &amp; 6× Harmonic</button>
+            </div>
+            <div id="bldcRippleResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
+              <div class="text-slate-400">Quantifies Peak-to-Peak &amp; RMS ripple factor %, plus 1×, 2×, 6× (6-step commutation), and 12× harmonic amplitudes.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 mt-4 pt-3 border-t border-[#222933]">
+          <button id="bldcCloseBtn" type="button" class="px-4 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Keyboard Shortcuts Cheat-Sheet Modal -->
+    <div id="shortcutsModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5">
+        <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
+          <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">Oscilloscope Keyboard Shortcuts</h2>
+          <button id="shortcutsCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
+        </div>
+        <div class="grid grid-cols-2 gap-2 text-xs font-mono">
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">1 – 8</span><span class="text-slate-300">Select CH1–CH8</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">U</span><span class="text-slate-300">Sync Same-Unit Scale</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">A</span><span class="text-slate-300">AutoSet All Channels</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">F</span><span class="text-slate-300">Fit View</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">Esc</span><span class="text-slate-300">Close / Pan / Reset Fit</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">Z</span><span class="text-slate-300">Area Box Zoom</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">T</span><span class="text-slate-300">Toggle X+Y Cursors</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">O / S</span><span class="text-slate-300">Overlap / Separate</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">← / →</span><span class="text-slate-300">Pan Time ±1 Div</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">↑ / ↓</span><span class="text-slate-300">V/div Finer / Coarser</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">+ / −</span><span class="text-slate-300">Timebase Out / In</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between"><span class="text-cyan-300">Ctrl+Z / Y</span><span class="text-slate-300">Undo / Redo</span></div>
+          <div class="bg-[#0c0f13] border border-[#222933] p-2 flex justify-between col-span-2"><span class="text-cyan-300">Ctrl+S / F12</span><span class="text-slate-300">Composite PNG Scope Screenshot</span></div>
+        </div>
+        <div class="flex justify-end mt-4">
+          <button id="shortcutsCloseBtn" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm text-xs cursor-pointer">Close</button>
         </div>
       </div>
     </div>
 
     <!-- Drag & Drop Visual Overlay -->
-    <div id="drag-overlay" class="fixed inset-0 bg-[#0078d7]/80 z-50 hidden items-center justify-center pointer-events-none">
+    <div id="drag-overlay" class="fixed inset-0 bg-cyan-950/85 z-50 hidden items-center justify-center pointer-events-none border-2 border-dashed border-cyan-400">
       <div class="text-center text-white">
-        <svg class="w-20 h-20 mx-auto animate-bounce" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <svg class="w-16 h-16 mx-auto text-cyan-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
           <polyline points="7 10 12 15 17 10"></polyline>
           <line x1="12" y1="15" x2="12" y2="3"></line>
         </svg>
-        <span class="block text-2xl font-bold mt-4">Drop CSV or WFM file to open in Oscilloscope</span>
+        <span class="block text-xl font-semibold mt-3 tracking-wide">Drop CSV, WFM, or .graphx Session</span>
       </div>
     </div>
 
-    <!-- App Entry Point -->
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -23,17 +23,33 @@ export interface SamplingMetadata {
   qualityStatus: TimeQualityStatus;
   gapCount: number;
   gapIndices: number[];
-  /** True if resampling detected the source can't meet the requested minimum bandwidth (e.g. 20MHz for fast edges). */
-  belowTargetRate?: boolean;
 }
 
-/** Low-pass filter applied to a channel's displayed samples (-3 dB at cutoffHz). */
-export interface ChannelFilterSpec {
-  cutoffHz: number;
-  /** Number of cascaded first-order RC sections (poles): 1, 2 or 4. */
-  order: 1 | 2 | 4;
-  /** Forward-backward pass: no time delay between filtered and unfiltered traces. */
-  zeroPhase: boolean;
+export type ChannelCoupling = 'DC' | 'AC';
+export type RenderMode = 'vector' | 'sinc' | 'dots' | 'vector-markers';
+export type DecimationMode = 'minmax' | 'lttb';
+
+export type MeasurementMetricKey =
+  | 'max'
+  | 'min'
+  | 'vpp'
+  | 'average'
+  | 'rms'
+  | 'vtop'
+  | 'vbase'
+  | 'overshoot'
+  | 'frequency'
+  | 'period'
+  | 'riseTime'
+  | 'fallTime'
+  | 'posWidth'
+  | 'negWidth'
+  | 'dutyCycle';
+
+export interface SelectedMeasurementItem {
+  id: string;
+  channelId: string;
+  metric: MeasurementMetricKey;
 }
 
 export interface WaveformChannel {
@@ -61,19 +77,67 @@ export interface WaveformChannel {
   rawT?: Float64Array;
   rawV?: Float32Array;
 
-  // Vertical scaling limits
+  // Locked Reference waveform before user edits (for same-screen Ref & Diff comparison)
+  refV?: Float32Array;
+  hasEdits?: boolean;
+  showRef?: boolean;
+  showDiff?: boolean;
+
+  // Vertical scaling limits (8 divisions total: vMin = -4*voltsPerDiv - vOffset, vMax = +4*voltsPerDiv - vOffset)
   vMin: number;
   vMax: number;
-  vPerDiv?: number; // Volts per division (e.g. 8 vertical divisions)
-  vOffset?: number; // Vertical offset in Volts
 
-  // Optional low-pass filter state. `vOriginal` keeps the unfiltered samples so the
-  // filter can be changed or removed without compounding.
-  vOriginal?: Float32Array;
-  filter?: ChannelFilterSpec;
+  // Authentic oscilloscope vertical controls
+  voltsPerDiv?: number;
+  vOffset?: number; // Vertical position in signal units (positive shifts waveform UP; 0 = ground centered)
+  inverted?: boolean;
+  coupling?: ChannelCoupling;
+
+  // Multi-waveform comparison group visual binding
+  compareGroupId?: string;
+  compareGroupName?: string;
+  compareGroupColor?: string;
+  compareRole?: 'target' | 'ref' | 'diff';
 }
 
-export type PlotMode = 'time' | 'frequency';
+export type PlotMode = 'time' | 'frequency' | 'xy';
+
+export interface XYConfig {
+  xChannelId: string;
+  yChannelId: string;
+  range: 'view' | 'cursors' | 'entire';
+}
+
+export interface GoldenBandConfig {
+  enabled: boolean;
+  channelId: string;
+  mode: 'percent' | 'absolute';
+  tolerance: number;
+  refLabel?: string;
+  refT?: Float64Array;
+  refV?: Float32Array;
+}
+
+export interface AnomalyEvent {
+  index: number;
+  time: number;
+  value: number;
+  kind: 'over' | 'under' | 'dvdt' | 'edge-gap';
+  detail: string;
+}
+
+export interface WorkbenchPreset {
+  id: string;
+  name: string;
+  createdAt: string;
+  separateView: boolean;
+  renderMode: RenderMode;
+  decimationMode: DecimationMode;
+  measurementGate: MeasurementGate;
+  mathDefs: Array<{ name: string; expr: string; color: string }>;
+  selectedMetricsByIndex: Array<{ chIdx: number; metric: MeasurementMetricKey }>;
+  triggerRule?: { chIdx: number; type: TriggerType; positionPercent: number };
+}
 
 export type FFTWindowType = 'rectangular' | 'hann' | 'hamming' | 'blackman-harris';
 export type FFTScaleType = 'magnitude' | 'db';
@@ -94,9 +158,9 @@ export interface FFTOptions {
 export interface SpectrumPeak {
   frequency: number; // Hz
   magnitude: number; // V (peak)
-  db: number;        // dBV or dB
+  db: number; // dBV or dB
   isFundamental?: boolean;
-  order?: number;    // harmonic order
+  order?: number; // harmonic order
 }
 
 export interface HarmonicMarker {
@@ -122,6 +186,11 @@ export interface SpectrumResult {
   sampleCount: number;
   yMin?: number;
   yMax?: number;
+  dbYMin?: number;
+  dbYMax?: number;
+  magYMin?: number;
+  magYMax?: number;
+  cappedWarning?: string;
 }
 
 export interface MotorConfig {
@@ -151,31 +220,35 @@ export interface ChannelMeasurements {
   timeStart: number;
   timeEnd: number;
 
-  // Basic statistics
+  // Voltage / amplitude statistics
   max: number | null;
   min: number | null;
   average: number | null;
   rms: number | null;
   vpp: number | null;
   peak: number | null;
+  vtop: number | null;
+  vbase: number | null;
+  overshoot: number | null; // %
+  undershoot: number | null; // %
 
   // Pulse & timing statistics
   period: number | null;
   frequency: number | null;
   dutyCycle: number | null; // %
-  riseTime: number | null;  // s (10% to 90%)
-  fallTime: number | null;  // s (90% to 10%)
-  overshoot: number | null; // %
-  undershoot: number | null;// %
+  riseTime: number | null; // s (10% to 90%)
+  fallTime: number | null; // s (90% to 10%)
+  posWidth: number | null; // s (+Width at 50%)
+  negWidth: number | null; // s (-Width at 50%)
 
   statusMessage?: string;
 }
 
-export type CursorType = 'x' | 'y' | 'xy';
+export type CursorMode = 'off' | 'x' | 'y' | 'xy' | 'track';
 
 export interface CursorsState {
   enabled: boolean;
-  type?: CursorType; // 'x' | 'y' | 'xy'
+  mode?: CursorMode;
   x1: number | null;
   x2: number | null;
   y1: number | null;
@@ -195,10 +268,11 @@ export interface AnnotationItem {
   color?: string;
 }
 
+export type ActiveTool = 'pan' | 'areaZoom' | 'pointAnnotate' | 'textAnnotate' | 'areaAnnotate';
+
 export interface ViewState {
   startIndex: number;
   endIndex: number;
-  // For frequency domain zoom
   fMin?: number;
   fMax?: number;
 }
@@ -206,6 +280,7 @@ export interface ViewState {
 export interface TabState {
   id: string;
   fileName: string;
+  fileFingerprint?: string;
   channels: Record<string, WaveformChannel>;
   drawOrder: string[];
   view: ViewState;
@@ -215,15 +290,22 @@ export interface TabState {
   annotationsVisible: boolean;
   isOverlap: boolean;
   plotMode: PlotMode;
+  renderMode?: RenderMode;
+  decimationMode?: DecimationMode;
   fftOptions: FFTOptions;
   motorConfig: MotorConfig;
   triggerConfig: TriggerConfig;
   measurementGate: MeasurementGate;
+  selectedMeasurements?: SelectedMeasurementItem[];
   separateView: boolean;
-  /** Draw 10%/90% levels, crossing points and rise/fall labels for the active channel. */
-  showEdgeMarks?: boolean;
   selectedMeasurementChannelId?: string;
   selectedFftChannelId?: string;
+  activeChannelId?: string;
+  activeTool?: ActiveTool;
+  xyConfig?: XYConfig;
+  goldenBand?: GoldenBandConfig;
+  activeAnomalies?: AnomalyEvent[];
+  selectedAnomalyIndex?: number | null;
 }
 
 export interface CsvColumnMapping {
@@ -235,14 +317,21 @@ export interface CsvColumnMapping {
 }
 
 export interface CsvPreviewInfo {
-  /** True when the source contained a textual header row. */
-  hasHeader: boolean;
   headers: string[];
   delimiter: string;
   rows: string[][];
   totalRows: number;
+  hasHeader: boolean;
+  skipLines?: number;
   timeColIndex: number;
-  timeUnit: 's' | 'ms' | 'us' | 'ns';
+  timeUnit: 's' | 'ms' | 'us' | 'ns' | 'ps';
+  sampleRateOverrideHz?: number | null;
   columnMappings: CsvColumnMapping[];
   quality: SamplingMetadata | null;
+}
+
+export interface ChannelFilterSpec {
+  cutoffHz: number;
+  order: 1 | 2 | 4;
+  zeroPhase: boolean;
 }

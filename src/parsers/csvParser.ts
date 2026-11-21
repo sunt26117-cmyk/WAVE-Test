@@ -1,92 +1,137 @@
 /**
  * Waveform Viewer Pro - CSV & Clipboard Parser
- * Intelligent column role detection, time unit scaling, sampling quality audit,
- * and robust Float64Array / Float32Array channel instantiation.
+ * Intelligent preamble/header detection, clock/ISO/numeric timestamp parsing,
+ * live sampling quality audit, and Float64Array / Float32Array channel instantiation.
  */
 
 import {
   WaveformChannel,
   CsvPreviewInfo,
   CsvColumnMapping,
+  SamplingMetadata,
 } from '../types/models';
 import { analyzeSamplingQuality, getTimeUnitMultiplier } from '../modules/qualityCheck';
 import { resampleUniform } from '../modules/resampler';
 
-const TIME_HEADER_REGEX = /^(time|t|timestamp|time_s|time_ms|seconds|sec|t_sec|t_s)($|[\s_(\[])/i;
+const TIME_HEADER_REGEX = /^(time|t|timestamp|date|datetime|time_s|time_ms|time_us|time_ns|time_ps|seconds|sec|t_sec|t_s|x)($|[\s_(\[])/i;
 
 /**
- * Detects the most likely delimiter for the CSV/Text text.
- * Fully supports Tab (\t), Comma (,), Semicolon (;), and single/multiple spaces (' ').
+ * Strips optional UTF-8 BOM from imported CSV text.
+ */
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
+ * Parses a numeric signal cell (supports scientific notation and optional trailing units like "1.25V").
+ */
+export function parseNumericCell(raw: string): number {
+  const s = (raw || '').trim().replace(/^["']|["']$/g, '').trim();
+  if (!s) return NaN;
+
+  // Fast path pure numbers
+  if (/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) {
+    const v = Number(s);
+    return isFinite(v) ? v : NaN;
+  }
+
+  // Tolerate trailing common engineering units (e.g. "3.30V", "-12.5 mV", "100uA")
+  const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(?:m?V|uV|µV|kV|m?A|uA|µA|m?W|kW|Hz|kHz|MHz|GHz|Ω|ohm|deg|rad|%)$/i.exec(s);
+  if (match) {
+    const v = Number(match[1]);
+    return isFinite(v) ? v : NaN;
+  }
+
+  return NaN;
+}
+
+/**
+ * Parses a numeric or clock/ISO timestamp cell into raw time units (or epoch seconds for clock strings).
+ */
+export function parseTimeCell(raw: string): { value: number; isClock: boolean } {
+  const s = (raw || '').trim().replace(/^["']|["']$/g, '').trim();
+  if (!s) return { value: NaN, isClock: false };
+
+  // Pure numeric (fast path, including scientific notation)
+  if (/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) {
+    return { value: Number(s), isClock: false };
+  }
+
+  // HH:MM:SS(.sss) clock format
+  const hms = /^(\d{1,2}):(\d{2}):(\d{2})(\.\d+)?$/.exec(s);
+  if (hms) {
+    const h = parseInt(hms[1], 10);
+    const m = parseInt(hms[2], 10);
+    const sec = parseFloat(hms[3] + (hms[4] || ''));
+    return { value: h * 3600 + m * 60 + sec, isClock: true };
+  }
+
+  // Full ISO / Date-Time string (e.g. 2026-11-19 08:00:01.250)
+  if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(s)) {
+    const ms = Date.parse(s);
+    if (!isNaN(ms)) {
+      return { value: ms / 1000, isClock: true };
+    }
+  }
+
+  const fallback = parseNumericCell(s);
+  return { value: isFinite(fallback) ? fallback : NaN, isClock: false };
+}
+
+/**
+ * Checks whether a split CSV row is predominantly numeric data.
+ */
+function isNumericDataRow(fields: string[]): boolean {
+  if (fields.length === 0) return false;
+  let numericCount = 0;
+  let nonEmptyCount = 0;
+  for (let i = 0; i < fields.length; i++) {
+    const cell = fields[i].trim();
+    if (!cell) continue;
+    nonEmptyCount++;
+    const parsed = parseTimeCell(cell);
+    if (!isNaN(parsed.value) && isFinite(parsed.value)) {
+      numericCount++;
+    }
+  }
+  return nonEmptyCount > 0 && numericCount >= Math.max(1, Math.ceil(nonEmptyCount * 0.6));
+}
+
+/**
+ * Detects the most likely delimiter for the CSV text.
  */
 export function detectDelimiter(text: string): string {
-  const firstLines = text.split(/\r?\n/).slice(0, 15).filter((l) => l.trim().length > 0);
+  const clean = stripBom(text);
+  const allLines = clean.split(/\r?\n/).filter((l) => l.trim().length > 0 && !l.trim().startsWith('#'));
+  const firstLines = allLines.slice(-Math.min(allLines.length, 15));
   if (firstLines.length === 0) return ',';
 
-  // 1. Check for tab '\t' first (standard in TSV, LTspice, LabVIEW)
-  const tabCounts = firstLines.map((l) => (l.match(/\t/g) || []).length);
-  if (tabCounts.every((c) => c > 0 && c === tabCounts[0])) {
-    return '\t';
-  }
-
-  // 2. Check for comma ','
-  const commaCounts = firstLines.map((l) => (l.match(/,/g) || []).length);
-  if (commaCounts.every((c) => c > 0 && c === commaCounts[0])) {
-    return ',';
-  }
-
-  // 3. Check for semicolon ';'
-  const semiCounts = firstLines.map((l) => (l.match(/;/g) || []).length);
-  if (semiCounts.every((c) => c > 0 && c === semiCounts[0])) {
-    return ';';
-  }
-
-  // 4. Check for space / multiple whitespace alignment
-  // If each line has multiple tokens separated by whitespace (\s+), and token count is consistent (> 1)
-  const whitespaceTokens = firstLines.map((l) => l.trim().split(/\s+/).length);
-  if (whitespaceTokens.length > 0 && whitespaceTokens[0] > 1 && whitespaceTokens.every((c) => c === whitespaceTokens[0])) {
-    return ' ';
-  }
-
-  // Fallback candidate scoring for slightly irregular lines
   const candidates = [',', '\t', ';', ' '];
   let bestDelim = ',';
   let bestScore = -1;
 
   for (const delim of candidates) {
-    if (delim === ' ') {
-      // Score whitespace token counts
-      const counts = firstLines.map((l) => l.trim().split(/\s+/).length - 1);
-      const min = Math.min(...counts);
-      const max = Math.max(...counts);
-      if (min > 0 && max - min <= 1) {
-        const score = min * 8;
-        if (score > bestScore) {
-          bestScore = score;
-          bestDelim = ' ';
-        }
+    const counts = firstLines.map((line) => {
+      let count = 0;
+      for (let i = 0; i < line.length; i++) {
+        if (line[i] === delim) count++;
       }
-    } else {
-      const counts = firstLines.map((line) => {
-        let count = 0;
-        for (let i = 0; i < line.length; i++) {
-          if (line[i] === delim) count++;
-        }
-        return count;
-      });
-      const min = Math.min(...counts);
-      const max = Math.max(...counts);
-      if (min > 0 && min === max) {
-        const score = min * 10;
-        if (score > bestScore) {
-          bestScore = score;
-          bestDelim = delim;
-        }
-      } else if (min > 0 && max - min <= 1) {
-        const score = min * 5;
-        if (score > bestScore) {
-          bestScore = score;
-          bestDelim = delim;
-        }
+      return count;
+    });
+
+    const minCount = Math.min(...counts);
+    const maxCount = Math.max(...counts);
+    if (minCount > 0 && minCount === maxCount) {
+      const score = minCount * 10;
+      if (score > bestScore) {
+        bestScore = score;
+        bestDelim = delim;
+      }
+    } else if (minCount > 0 && maxCount - minCount <= 1) {
+      const score = minCount * 5;
+      if (score > bestScore) {
+        bestScore = score;
+        bestDelim = delim;
       }
     }
   }
@@ -95,43 +140,9 @@ export function detectDelimiter(text: string): string {
 }
 
 /**
- * Splits a CSV/Text line taking quotes and whitespace into account.
- * When delimiter is ' ', treats one or more whitespace characters as a single delimiter.
+ * Splits a CSV line taking quotes into account.
  */
 export function splitCsvLine(line: string, delimiter: string): string[] {
-  if (delimiter === ' ') {
-    const trimmed = line.trim();
-    if (!trimmed) return [];
-    if (!trimmed.includes('"')) {
-      return trimmed.split(/\s+/);
-    }
-    const fields: string[] = [];
-    let current = '';
-    let inQuotes = false;
-    for (let i = 0; i < trimmed.length; i++) {
-      const ch = trimmed[i];
-      if (ch === '"') {
-        if (inQuotes && i + 1 < trimmed.length && trimmed[i + 1] === '"') {
-          current += '"';
-          i++;
-        } else {
-          inQuotes = !inQuotes;
-        }
-      } else if (/\s/.test(ch) && !inQuotes) {
-        if (current.length > 0) {
-          fields.push(current);
-          current = '';
-        }
-      } else {
-        current += ch;
-      }
-    }
-    if (current.length > 0) {
-      fields.push(current);
-    }
-    return fields;
-  }
-
   const fields: string[] = [];
   let current = '';
   let inQuotes = false;
@@ -141,7 +152,7 @@ export function splitCsvLine(line: string, delimiter: string): string[] {
     if (ch === '"') {
       if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
         current += '"';
-        i++; // skip escaped quote
+        i++;
       } else {
         inQuotes = !inQuotes;
       }
@@ -157,108 +168,236 @@ export function splitCsvLine(line: string, delimiter: string): string[] {
 }
 
 /**
- * Parses initial CSV/Text structure to generate preview information.
- * Allows customDelimiter override.
+ * Locates where the actual header + numeric table begins (skipping oscilloscope metadata preambles & comments).
  */
-export function previewCsv(text: string, customDelimiter?: string): CsvPreviewInfo {
-  const delimiter = customDelimiter || detectDelimiter(text);
-  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length === 0) throw new Error('CSV file is empty.');
+function findTableStart(lines: string[], delimiter: string): { skipLines: number; hasHeader: boolean } {
+  const scanLimit = Math.min(lines.length, 40);
+  let firstNumericIdx = -1;
 
-  const rawFirst = splitCsvLine(lines[0], delimiter);
-  const firstNumeric = rawFirst.length > 0 && rawFirst.every((field) => {
-    const n = Number(field);
-    return field.trim() !== '' && isFinite(n);
-  });
-
-  const hasHeader = !firstNumeric;
-  const dataStartLine = hasHeader ? 1 : 0;
-  let headers = hasHeader
-    ? rawFirst.map((h, idx) => h ? h.replace(/^["']|["']$/g, '').trim() : `Col_${idx + 1}`)
-    : rawFirst.map((_, idx) => `Col_${idx + 1}`);
-
-  let timeColIndex = -1;
-  for (let i = 0; i < headers.length; i++) {
-    if (TIME_HEADER_REGEX.test(headers[i])) {
-      timeColIndex = i;
+  for (let i = 0; i < scanLimit; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const fields = splitCsvLine(trimmed, delimiter);
+    if (isNumericDataRow(fields)) {
+      firstNumericIdx = i;
       break;
     }
   }
 
-  // Find numeric data rows while ignoring simulator metadata such as
-  // "Step Information: ..." between blocks.
-  const candidateRows: string[][] = [];
-  for (let i = dataStartLine; i < lines.length && candidateRows.length < 40; i++) {
-    const cols = splitCsvLine(lines[i], delimiter);
-    const timeNumeric = timeColIndex >= 0 && timeColIndex < cols.length && isFinite(Number(cols[timeColIndex]));
-    const anyNumeric = cols.some((c) => c.trim() !== '' && isFinite(Number(c)));
-    if ((timeColIndex >= 0 && timeNumeric) || (timeColIndex < 0 && anyNumeric)) candidateRows.push(cols);
+  if (firstNumericIdx === -1) {
+    return { skipLines: 0, hasHeader: true };
   }
 
-  if (timeColIndex === -1 && candidateRows.length > 2) {
-    let monotonic = true;
-    let prev = Number(candidateRows[0][0]);
-    if (!isFinite(prev)) monotonic = false;
-    for (let r = 1; monotonic && r < candidateRows.length; r++) {
-      const cur = Number(candidateRows[r][0]);
-      if (!isFinite(cur) || cur < prev) monotonic = false;
-      prev = cur;
+  if (firstNumericIdx === 0) {
+    return { skipLines: 0, hasHeader: false };
+  }
+
+  // Check if the line immediately preceding firstNumericIdx is a unit row (e.g. "s,V,V") with another header above it
+  const dataCols = splitCsvLine(lines[firstNumericIdx], delimiter).length;
+  const headerIdx = firstNumericIdx - 1;
+  if (headerIdx >= 1) {
+    const prevFields = splitCsvLine(lines[headerIdx], delimiter);
+    const prevPrevFields = splitCsvLine(lines[headerIdx - 1], delimiter);
+    const looksLikeUnits = prevFields.every((f) => /^[\[\(]?(s|ms|us|µs|ns|ps|v|mv|a|ma|hz|w|%)[\]\)]?$/i.test(f.trim()));
+    if (looksLikeUnits && prevPrevFields.length >= dataCols) {
+      return { skipLines: headerIdx - 1, hasHeader: true };
     }
-    if (monotonic) timeColIndex = 0;
   }
 
-  let timeUnit: 's' | 'ms' | 'us' | 'ns' = 's';
+  return { skipLines: headerIdx, hasHeader: true };
+}
+
+/**
+ * Computes SamplingMetadata preview from raw CSV text and current column/unit settings.
+ */
+export function computeCsvPreviewQuality(
+  text: string,
+  preview: CsvPreviewInfo,
+  timeUnitOverride?: 's' | 'ms' | 'us' | 'ns' | 'ps',
+  sampleRateOverrideHz?: number | null
+): SamplingMetadata | null {
+  const effectiveFs = sampleRateOverrideHz !== undefined ? sampleRateOverrideHz : preview.sampleRateOverrideHz;
+  const clean = stripBom(text);
+  const lines = clean.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const startLine = (preview.skipLines || 0) + (preview.hasHeader ? 1 : 0);
+  const totalData = Math.max(0, lines.length - startLine);
+
+  if (effectiveFs && effectiveFs > 0 && isFinite(effectiveFs)) {
+    if (totalData < 2) return null;
+    const dt = 1 / effectiveFs;
+    const sampleCount = Math.min(totalData, 50000);
+    const synthetic = new Float64Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      synthetic[i] = i * dt;
+    }
+    const meta = analyzeSamplingQuality(synthetic, 0);
+    meta.originalSampleCount = totalData;
+    meta.originalTimeEnd = (totalData - 1) * dt;
+    meta.sampleRate = effectiveFs;
+    meta.nominalDt = dt;
+    meta.medianDt = dt;
+    meta.meanDt = dt;
+    return meta;
+  }
+
+  if (preview.timeColIndex < 0) return null;
+  if (totalData < 2) return null;
+
+  const maxScan = Math.min(lines.length, startLine + 50000);
+  const mult = getTimeUnitMultiplier(timeUnitOverride || preview.timeUnit);
+  const times: number[] = [];
+  let baseClockT: number | null = null;
+  let invalidCount = 0;
+
+  for (let i = startLine; i < maxScan; i++) {
+    const cols = splitCsvLine(lines[i], preview.delimiter);
+    if (preview.timeColIndex >= cols.length) {
+      invalidCount++;
+      continue;
+    }
+    const parsed = parseTimeCell(cols[preview.timeColIndex]);
+    if (isNaN(parsed.value) || !isFinite(parsed.value)) {
+      invalidCount++;
+      continue;
+    }
+    if (parsed.isClock) {
+      if (baseClockT === null) baseClockT = parsed.value;
+      times.push(parsed.value - baseClockT);
+    } else {
+      times.push(parsed.value * mult);
+    }
+  }
+
+  if (times.length < 2) return null;
+  times.sort((a, b) => a - b);
+  return analyzeSamplingQuality(Float64Array.from(times), invalidCount);
+}
+
+/**
+ * Parses initial CSV structure to generate preview information.
+ */
+export function previewCsv(text: string): CsvPreviewInfo {
+  const clean = stripBom(text);
+  const delimiter = detectDelimiter(clean);
+  const lines = clean.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) {
+    throw new Error('CSV file is empty.');
+  }
+
+  const { skipLines, hasHeader } = findTableStart(lines, delimiter);
+  const headerOrFirstLine = splitCsvLine(lines[skipLines], delimiter);
+  const dataStartLine = hasHeader ? skipLines + 1 : skipLines;
+
+  const previewRows: string[][] = [];
+  const maxPreview = Math.min(lines.length, dataStartLine + 25);
+  for (let i = dataStartLine; i < maxPreview; i++) {
+    const row = splitCsvLine(lines[i], delimiter);
+    if (isNumericDataRow(row)) {
+      previewRows.push(row);
+    }
+  }
+
+  const colCount = Math.max(headerOrFirstLine.length, previewRows[0]?.length || 0);
+  const headers: string[] = [];
+  for (let idx = 0; idx < colCount; idx++) {
+    if (!hasHeader) {
+      headers.push(`Col_${idx + 1}`);
+    } else {
+      const h = headerOrFirstLine[idx];
+      headers.push(h ? h.replace(/^["']|["']$/g, '').trim() : `Col_${idx + 1}`);
+    }
+  }
+
+  // Detect time column index
+  let timeColIndex = -1;
+  if (headers.length >= 2) {
+    for (let i = 0; i < headers.length; i++) {
+      if (TIME_HEADER_REGEX.test(headers[i])) {
+        timeColIndex = i;
+        break;
+      }
+    }
+  }
+
+  // Detect time unit from header e.g. "Time (ms)" or "Time (ns)" or "Time (ps)"
+  let timeUnit: 's' | 'ms' | 'us' | 'ns' | 'ps' = 's';
   if (timeColIndex >= 0) {
     const th = headers[timeColIndex].toLowerCase();
-    if (th.includes('(ns)') || th.includes('[ns]')) timeUnit = 'ns';
-    else if (th.includes('(us)') || th.includes('[us]') || th.includes('(µs)') || th.includes('[µs]')) timeUnit = 'us';
-    else if (th.includes('(ms)') || th.includes('[ms]')) timeUnit = 'ms';
+    if (th.includes('(ps)') || th.includes('[ps]') || th.includes('_ps')) timeUnit = 'ps';
+    else if (th.includes('(ns)') || th.includes('[ns]') || th.includes('_ns')) timeUnit = 'ns';
+    else if (th.includes('(us)') || th.includes('[us]') || th.includes('(µs)') || th.includes('[µs]') || th.includes('_us')) timeUnit = 'us';
+    else if (th.includes('(ms)') || th.includes('[ms]') || th.includes('_ms')) timeUnit = 'ms';
+    else if (th.includes('(s)') || th.includes('[s]') || th.includes('_s')) timeUnit = 's';
+  }
+
+  // If no explicit time column found and >= 2 columns, check if col 0 is strictly increasing
+  if (timeColIndex === -1 && headers.length >= 2 && previewRows.length > 2) {
+    let isNonDecreasing = true;
+    let strictIncCount = 0;
+    let prev = parseTimeCell(previewRows[0][0]).value;
+    if (!isNaN(prev)) {
+      for (let r = 1; r < previewRows.length; r++) {
+        const cur = parseTimeCell(previewRows[r][0]).value;
+        if (isNaN(cur) || cur < prev) {
+          isNonDecreasing = false;
+          break;
+        }
+        if (cur > prev) strictIncCount++;
+        prev = cur;
+      }
+      if (isNonDecreasing && strictIncCount >= Math.max(1, Math.floor((previewRows.length - 1) * 0.5))) {
+        timeColIndex = 0;
+      }
+    }
   }
 
   const columnMappings: CsvColumnMapping[] = headers.map((header, idx) => {
     if (idx === timeColIndex) {
-      return { index: idx, header, role: 'time', channelName: 'Time', unit: timeUnit };
+      return {
+        index: idx,
+        header,
+        role: 'time',
+        channelName: 'Time',
+        unit: timeUnit,
+      };
     }
-
-    let detectedUnit = '';
-    if (/^(i(?:\(|_|$)|current|curr(?:ent)?)/i.test(header) || /I\(/i.test(header)) detectedUnit = 'A';
-    else if (/^(p(?:\(|_|$)|power)/i.test(header) || /P\(/i.test(header)) detectedUnit = 'W';
-    else if (/^(u|v)(?:\(|_|$)|volt(?:age)?/i.test(header) || /U\(/i.test(header) || /V\(/i.test(header)) detectedUnit = 'V';
-    else if (/temp|temperature|℃|degc/i.test(header)) detectedUnit = '°C';
-    else if (/rpm|speed/i.test(header)) detectedUnit = 'rpm';
-
     return {
       index: idx,
       header,
       role: 'channel',
       channelName: header || `CH ${idx + 1}`,
-      unit: detectedUnit,
+      unit: 'V',
     };
   });
 
-  return {
-    hasHeader,
+  const info: CsvPreviewInfo = {
     headers,
     delimiter,
-    rows: candidateRows.slice(0, 25),
+    rows: previewRows,
     totalRows: Math.max(0, lines.length - dataStartLine),
+    hasHeader,
+    skipLines,
     timeColIndex,
     timeUnit,
+    sampleRateOverrideHz: null,
     columnMappings,
     quality: null,
   };
+
+  info.quality = computeCsvPreviewQuality(clean, info, timeUnit, null);
+  return info;
 }
 
 export interface ParseCsvOptions {
   delimiter: string;
   hasHeader: boolean;
+  skipLines?: number;
   timeColIndex: number;
-  timeUnit: 's' | 'ms' | 'us' | 'ns';
+  timeUnit: 's' | 'ms' | 'us' | 'ns' | 'ps';
+  sampleRateOverrideHz?: number | null;
   columnMappings: CsvColumnMapping[];
   resample: boolean;
   colors: string[];
-  /** Minimum acceptable output sample rate in Hz when resampling. Defaults to 20e6 (20 MHz). */
-  minSampleRateHz?: number;
 }
 
 /**
@@ -266,149 +405,201 @@ export interface ParseCsvOptions {
  */
 export function parseFullCsv(
   text: string,
-  options: ParseCsvOptions & { sampleRate?: number }
+  options: ParseCsvOptions
 ): {
   channels: Record<string, WaveformChannel>;
   drawOrder: string[];
   quality: any;
 } {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const clean = stripBom(text);
+  const lines = clean.split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length === 0) throw new Error('File has no content.');
 
-  const startIndex = options.hasHeader ? 1 : 0;
-  const timeMultiplier = getTimeUnitMultiplier(options.timeUnit);
-  const activeChannels = options.columnMappings.filter((m) => m.role === 'channel');
-  if (activeChannels.length === 0) throw new Error('No data channels selected for import.');
+  const startIndex = (options.skipLines || 0) + (options.hasHeader ? 1 : 0);
+  const numDataRows = lines.length - startIndex;
+  if (numDataRows <= 0) throw new Error('No data rows found in CSV.');
 
-  if (options.timeColIndex < 0 && (!options.sampleRate || !isFinite(options.sampleRate) || options.sampleRate <= 0)) {
-    throw new Error('No time column was selected. Enter a valid sample rate before importing.');
+  const timeMultiplier = getTimeUnitMultiplier(options.timeUnit);
+  const overrideFs = options.sampleRateOverrideHz && options.sampleRateOverrideHz > 0 && isFinite(options.sampleRateOverrideHz)
+    ? options.sampleRateOverrideHz
+    : null;
+
+  const rawTime = new Float64Array(numDataRows);
+  const hasExplicitTime = options.timeColIndex >= 0 && overrideFs === null;
+  let invalidRows = 0;
+  let baseClockTime: number | null = null;
+
+  const activeChannels = options.columnMappings.filter((m) => m.role === 'channel');
+  if (activeChannels.length === 0) {
+    throw new Error('No data channels selected for import.');
   }
 
-  const rawTime = new Float64Array(lines.length - startIndex);
-  const rawValues = activeChannels.map(() => new Float32Array(lines.length - startIndex));
+  const rawValues: Float32Array[] = activeChannels.map(() => new Float32Array(numDataRows));
+
   let parsedRowIdx = 0;
-  let invalidRows = 0;
+  let needsSort = false;
+  let prevTime = -Infinity;
 
   for (let lineIdx = startIndex; lineIdx < lines.length; lineIdx++) {
-    const cols = splitCsvLine(lines[lineIdx], options.delimiter);
-    if (!cols.length) continue;
+    const trimmed = lines[lineIdx].trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const cols = splitCsvLine(trimmed, options.delimiter);
 
-    let rowT: number;
-    if (options.timeColIndex >= 0) {
-      const rawT = Number(cols[options.timeColIndex]);
-      if (!isFinite(rawT)) {
-        // Ignore non-data simulator metadata lines. Count malformed numeric rows
-        // only when at least one other numeric field is present.
-        const hasAnyNumeric = cols.some((c) => c.trim() !== '' && isFinite(Number(c)));
-        if (hasAnyNumeric) invalidRows++;
+    let rowT = 0;
+    if (overrideFs !== null) {
+      rowT = parsedRowIdx / overrideFs;
+    } else if (hasExplicitTime) {
+      if (options.timeColIndex >= cols.length) {
+        invalidRows++;
         continue;
       }
-      rowT = rawT * timeMultiplier;
+      const parsedT = parseTimeCell(cols[options.timeColIndex]);
+      if (isNaN(parsedT.value) || !isFinite(parsedT.value)) {
+        invalidRows++;
+        continue;
+      }
+      if (parsedT.isClock) {
+        if (baseClockTime === null) baseClockTime = parsedT.value;
+        rowT = parsedT.value - baseClockTime;
+      } else {
+        rowT = parsedT.value * timeMultiplier;
+      }
     } else {
-      rowT = parsedRowIdx / (options.sampleRate as number);
+      rowT = parsedRowIdx * 1e-4; // 10 kS/s default grid if file has no time column
     }
 
+    if (parsedRowIdx > 0 && rowT < prevTime) {
+      needsSort = true;
+    }
+    prevTime = rowT;
     rawTime[parsedRowIdx] = rowT;
-    let rowHasInvalidValue = false;
+
     for (let c = 0; c < activeChannels.length; c++) {
       const colIdx = activeChannels[c].index;
-      const raw = colIdx < cols.length ? cols[colIdx].trim() : '';
-      const value = raw === '' ? NaN : Number(raw);
-      if (!isFinite(value)) rowHasInvalidValue = true;
-      rawValues[c][parsedRowIdx] = isFinite(value) ? value : NaN;
+      const cell = colIdx < cols.length ? cols[colIdx] : '';
+      const vVal = parseNumericCell(cell);
+      rawValues[c][parsedRowIdx] = isNaN(vVal) || !isFinite(vVal) ? NaN : vVal;
     }
-    if (rowHasInvalidValue) invalidRows++;
+
     parsedRowIdx++;
   }
 
-  if (parsedRowIdx < 2) throw new Error('No usable numeric waveform rows found.');
+  const validCount = parsedRowIdx;
+  if (validCount === 0) {
+    throw new Error('No valid numeric samples found in CSV.');
+  }
 
-  const finalTime = rawTime.slice(0, parsedRowIdx);
+  let finalTime = rawTime.slice(0, validCount);
+  const orderedValues: Float32Array[] = rawValues.map((arr) => arr.slice(0, validCount));
+
+  // If timestamps are out of order, sort all channels chronologically so traces never jump backward or vanish
+  if (needsSort) {
+    const order = Array.from({ length: validCount }, (_, i) => i);
+    order.sort((a, b) => finalTime[a] - finalTime[b]);
+    const sortedTime = new Float64Array(validCount);
+    for (let i = 0; i < validCount; i++) {
+      sortedTime[i] = finalTime[order[i]];
+    }
+    finalTime = sortedTime;
+    for (let c = 0; c < orderedValues.length; c++) {
+      const src = orderedValues[c];
+      const dst = new Float32Array(validCount);
+      for (let i = 0; i < validCount; i++) {
+        dst[i] = src[order[i]];
+      }
+      orderedValues[c] = dst;
+    }
+  }
+
+  // Quality check
   const quality = analyzeSamplingQuality(finalTime, invalidRows);
+  if (overrideFs !== null && validCount >= 2) {
+    quality.isUniformSampling = true;
+    quality.qualityStatus = 'uniform';
+    quality.sampleRate = overrideFs;
+    quality.nominalDt = 1 / overrideFs;
+    quality.medianDt = 1 / overrideFs;
+    quality.meanDt = 1 / overrideFs;
+    quality.gapCount = 0;
+    quality.gapIndices = [];
+  }
+
   const channels: Record<string, WaveformChannel> = {};
   const drawOrder: string[] = [];
 
   for (let c = 0; c < activeChannels.length; c++) {
     const chMap = activeChannels[c];
-    const chRawV = rawValues[c].slice(0, parsedRowIdx);
+    const chRawV = orderedValues[c];
 
-    let finalT = finalTime as Float64Array;
-    let finalV = chRawV as Float32Array;
+    let finalT: Float64Array = finalTime;
+    let finalV: Float32Array = chRawV;
     let fs = quality.sampleRate;
     let dt = quality.nominalDt;
+    let chMetadata = {
+      ...quality,
+      sampleRate: fs,
+      nominalDt: dt,
+    };
 
-    let belowTargetRate = false;
-    if (options.resample) {
-      if (!(quality.nominalDt && quality.nominalDt > 0)) throw new Error('Cannot resample: invalid source time base.');
-      const res = resampleUniform(finalTime, chRawV, {
-        nominalDt: quality.nominalDt,
-        // 20 MHz floor: enough bandwidth for MOSFET gate-drive edges
-        // (rise times of a few ns to a few tens of ns). This never discards
-        // resolution the source has -- it only flags when the source itself
-        // can't support it, and skips needless interpolation when the
-        // capture is already a clean fixed-rate acquisition.
-        minSampleRate: options.minSampleRateHz ?? 20e6,
-      });
+    if (options.resample && overrideFs === null && (!quality.isUniformSampling || quality.qualityStatus !== 'uniform')) {
+      // allowGapInterpolation: true guarantees Load + Resample never punches NaN holes into user captures
+      const res = resampleUniform(finalTime, chRawV, { allowGapInterpolation: true });
       finalT = res.t;
       finalV = res.v;
       fs = res.fs;
       dt = res.dt;
-      belowTargetRate = !!res.belowTargetRate;
-      if (belowTargetRate) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[csvParser] Channel "${chMap.channelName || c}": native sample rate ${(fs / 1e6).toFixed(2)}MHz ` +
-            `is below the ${(((options.minSampleRateHz ?? 20e6) / 1e6)).toFixed(0)}MHz target -- this data ` +
-            'was captured/exported without enough bandwidth to resolve fast edges; no amount of ' +
-            'downstream processing can add resolution back. Re-export from the scope at full rate/points.'
-        );
-      }
+      chMetadata = {
+        ...quality,
+        isUniformSampling: true,
+        qualityStatus: 'uniform',
+        sampleRate: fs,
+        nominalDt: dt,
+        medianDt: dt,
+        meanDt: dt,
+        minDt: dt,
+        maxDt: dt,
+        jitterRms: 0,
+        jitterMax: 0,
+        gapCount: 0,
+        gapIndices: [],
+      };
     }
 
     let min = Infinity;
     let max = -Infinity;
-    const invalidIndices: number[] = [];
     for (let i = 0; i < finalV.length; i++) {
       const val = finalV[i];
-      if (isFinite(val)) {
+      if (!isNaN(val) && isFinite(val)) {
         if (val < min) min = val;
         if (val > max) max = val;
-      } else {
-        invalidIndices.push(i);
       }
     }
     if (!isFinite(min)) min = -1;
     if (!isFinite(max)) max = 1;
-    const margin = Math.max((max - min) * 0.1, 1e-12);
+    const margin = (max - min) * 0.1 || 1.0;
 
     const chId = `csv_ch_${chMap.index}_${c}`;
-    const chColor = options.colors[c % Math.max(1, options.colors.length)] || '#00e5ff';
+    const chColor = options.colors[c % options.colors.length] || '#00e5ff';
+
     channels[chId] = {
       id: chId,
       name: chMap.channelName || `CH ${c + 1}`,
-      unit: chMap.unit || '',
+      unit: chMap.unit || 'V',
       color: chColor,
       visible: true,
       t: finalT,
       v: finalV,
-      fs: fs,
-      dt: dt,
+      fs,
+      dt,
       isMath: false,
       sourceChannelIds: [],
-      metadata: {
-        ...quality,
-        invalidSamples: invalidIndices.length,
-        gapCount: invalidIndices.length,
-        gapIndices: invalidIndices,
-        sampleRate: fs,
-        nominalDt: dt,
-        belowTargetRate,
-      },
+      metadata: chMetadata,
       rawT: finalTime,
       rawV: chRawV,
       vMin: min - margin,
       vMax: max + margin,
     };
+
     drawOrder.push(chId);
   }
 

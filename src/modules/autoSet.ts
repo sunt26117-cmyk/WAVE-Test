@@ -37,7 +37,7 @@ export function snapTo125(value: number): number {
 }
 
 export interface AutoSetResult {
-  updatedChannels: Record<string, { vMin: number; vMax: number }>;
+  updatedChannels: Record<string, { vMin: number; vMax: number; voltsPerDiv: number; vOffset: number }>;
   view: ViewState;
   triggerConfig: TriggerConfig;
   statusMessage: string;
@@ -142,7 +142,7 @@ export function performAutoSet(
   }
 
   // Snap vertical scale using 1-2-5 sequence (8 divisions)
-  const updatedChannels: Record<string, { vMin: number; vMax: number }> = {};
+  const updatedChannels: Record<string, { vMin: number; vMax: number; voltsPerDiv: number; vOffset: number }> = {};
   for (const ch of visibleChannels) {
     let chMin = Infinity;
     let chMax = -Infinity;
@@ -158,10 +158,13 @@ export function performAutoSet(
     const voltsPerDivRaw = span / 6; // Leave 1 division headroom top & bottom
     const voltsPerDivSnapped = snapTo125(voltsPerDivRaw);
     const fullSpan = voltsPerDivSnapped * 8;
+    const vOffset = Math.abs(center) < voltsPerDivSnapped * 0.05 ? 0 : -center;
 
     updatedChannels[ch.id] = {
-      vMin: center - fullSpan / 2,
-      vMax: center + fullSpan / 2,
+      vMin: -fullSpan / 2 - vOffset,
+      vMax: fullSpan / 2 - vOffset,
+      voltsPerDiv: voltsPerDivSnapped,
+      vOffset,
     };
   }
 

@@ -78,13 +78,19 @@ export function radix2FFT(real: Float64Array, imag: Float64Array): void {
   }
 }
 
+const windowCache = new Map<string, { weights: Float64Array; coherentGain: number }>();
+
 /**
- * Computes window function values and coherent gain.
+ * Computes window function values and coherent gain (cached for instant re-use).
  */
 export function getWindow(
   type: FFTWindowType,
   length: number
 ): { weights: Float64Array; coherentGain: number } {
+  const key = `${type}_${length}`;
+  const cached = windowCache.get(key);
+  if (cached) return cached;
+
   const weights = new Float64Array(length);
   let sum = 0;
 
@@ -126,7 +132,13 @@ export function getWindow(
   }
 
   const coherentGain = sum / length;
-  return { weights, coherentGain };
+  const result = { weights, coherentGain };
+  if (windowCache.size >= 6) {
+    const firstKey = windowCache.keys().next().value;
+    if (firstKey !== undefined) windowCache.delete(firstKey);
+  }
+  windowCache.set(key, result);
+  return result;
 }
 
 /**
@@ -236,13 +248,7 @@ export function detectPeaks(
 
 /**
  * Computes single-sided amplitude spectrum from time-domain signal.
- *
- * @param t Time array (Float64Array in seconds)
- * @param v Voltage/signal values (Float32Array)
- * @param sampleRate Sampling rate (in Hz)
- * @param options FFT options
- * @param channelId Source channel identifier
- * @param channelName Source channel name
+ * Optimized with responsive 262k FFT size cap, cached windows, NaN safety, and dual dB/Mag bounds.
  */
 export function computeFFT(
   t: Float64Array,
@@ -257,32 +263,48 @@ export function computeFFT(
     throw new Error('Insufficient points or invalid sample rate for FFT.');
   }
 
-  // Choose power of 2 length
-  const baseN = floorPowerOfTwo(totalSamples);
-  const paddingFactor = options.zeroPadding || 1;
+  const MAX_FFT_SIZE = 262144; // Keeps UI interactive (<30 ms) even on 1M+ sample captures
+  let baseN = Math.min(floorPowerOfTwo(totalSamples), MAX_FFT_SIZE);
+  let paddingFactor = options.zeroPadding || 1;
+  while (baseN * paddingFactor > MAX_FFT_SIZE && paddingFactor > 1) {
+    paddingFactor >>= 1;
+  }
   const fftN = baseN * paddingFactor;
+  const cappedWarning =
+    totalSamples > MAX_FFT_SIZE
+      ? `Windowed to ${baseN.toLocaleString()} pts for interactive speed`
+      : undefined;
 
-  // Extract base slice
+  // Sanitize NaN/Inf values once and compute DC mean
   let sliceMean = 0;
-  if (options.removeDC) {
-    let sum = 0;
-    for (let i = 0; i < baseN; i++) {
-      sum += v[i];
+  let validSum = 0;
+  let validCount = 0;
+  let lastValid = 0;
+  const cleanSlice = new Float64Array(baseN);
+  for (let i = 0; i < baseN; i++) {
+    const val = v[i];
+    if (isFinite(val)) {
+      cleanSlice[i] = val;
+      lastValid = val;
+      validSum += val;
+      validCount++;
+    } else {
+      cleanSlice[i] = lastValid;
     }
-    sliceMean = sum / baseN;
+  }
+  if (options.removeDC && validCount > 0) {
+    sliceMean = validSum / validCount;
   }
 
-  // Compute Window
+  // Compute or fetch cached Window
   const { weights, coherentGain } = getWindow(options.window, baseN);
 
   const real = new Float64Array(fftN);
   const imag = new Float64Array(fftN);
 
   for (let i = 0; i < baseN; i++) {
-    const val = v[i] - sliceMean;
-    real[i] = val * weights[i];
+    real[i] = (cleanSlice[i] - sliceMean) * weights[i];
   }
-  // Zero padding fills remainder with 0.0 automatically
 
   // Run Cooley-Tukey Radix-2
   radix2FFT(real, imag);
@@ -296,6 +318,9 @@ export function computeFFT(
   const binResolution = sampleRate / fftN;
   const normFactor = baseN * coherentGain;
 
+  let maxMag = 0;
+  let maxDb = -Infinity;
+
   for (let k = 0; k < numBins; k++) {
     frequencies[k] = k * binResolution;
 
@@ -303,19 +328,14 @@ export function computeFFT(
     const im = imag[k];
     const rawMag = Math.sqrt(r * r + im * im);
 
-    // Single-sided scaling:
-    // DC (k=0) and Nyquist (k=numBins-1 when fftN is even) are unmultiplied by 2
-    // All AC bins are multiplied by 2
-    let mag: number;
-    if (k === 0 || k === numBins - 1) {
-      mag = rawMag / normFactor;
-    } else {
-      mag = (2.0 * rawMag) / normFactor;
-    }
-
+    const mag = k === 0 || k === numBins - 1 ? rawMag / normFactor : (2.0 * rawMag) / normFactor;
     magnitudes[k] = mag;
-    const safeMag = Math.max(mag, 1e-12);
-    dbValues[k] = 20 * Math.log10(safeMag); // relative to 1.0 V reference
+    if (mag > maxMag) maxMag = mag;
+
+    const safeMag = mag > 1e-12 ? mag : 1e-12;
+    const db = 20 * Math.log10(safeMag);
+    dbValues[k] = db;
+    if (db > maxDb) maxDb = db;
   }
 
   // Peak detection
@@ -325,26 +345,13 @@ export function computeFFT(
     maxPeaks: options.maxPeaks ?? 8,
   });
 
-  // Calculate dynamic range bounds
-  let yMin = -120;
-  let yMax = 20;
-  if (options.scale === 'magnitude') {
-    let maxMag = 0;
-    for (let k = 0; k < numBins; k++) {
-      if (magnitudes[k] > maxMag) maxMag = magnitudes[k];
-    }
-    yMin = 0;
-    yMax = Math.max(0.1, maxMag * 1.15);
-  } else {
-    let maxDb = -Infinity;
-    for (let k = 0; k < numBins; k++) {
-      if (dbValues[k] > maxDb) maxDb = dbValues[k];
-    }
-    if (isFinite(maxDb)) {
-      yMax = Math.ceil(maxDb / 10) * 10 + 10;
-      yMin = yMax - 120;
-    }
-  }
+  const magYMin = 0;
+  const magYMax = Math.max(0.1, maxMag * 1.15);
+  const dbYMax = isFinite(maxDb) ? Math.ceil(maxDb / 10) * 10 + 10 : 20;
+  const dbYMin = dbYMax - 120;
+
+  const yMin = options.scale === 'magnitude' ? magYMin : dbYMin;
+  const yMax = options.scale === 'magnitude' ? magYMax : dbYMax;
 
   return {
     frequencies,
@@ -359,10 +366,15 @@ export function computeFFT(
     window: options.window,
     peaks,
     startTime: t[0],
-    endTime: t[baseN - 1],
+    endTime: t[Math.min(t.length - 1, baseN - 1)],
     sampleCount: baseN,
     yMin,
     yMax,
+    dbYMin,
+    dbYMax,
+    magYMin,
+    magYMax,
+    cappedWarning,
   };
 }
 

@@ -11,20 +11,26 @@ if (!fs.existsSync(distDir)) {
 
 let html = fs.readFileSync(path.join(distDir, 'index.html'), 'utf-8');
 
-// Find CSS file
+// Find CSS file and inline into <head>
 const cssFiles = fs.readdirSync(assetsDir).filter(f => f.endsWith('.css'));
 if (cssFiles.length > 0) {
   const cssContent = fs.readFileSync(path.join(assetsDir, cssFiles[0]), 'utf-8');
-  // Replace <link rel="stylesheet" ... href="/assets/..."> with <style>...</style>
-  html = html.replace(/<link rel="stylesheet"[^>]+href="[^"]+\.css"[^>]*>/i, `<style>\n${cssContent}\n</style>`);
+  html = html.replace(
+    /<link rel="stylesheet"[^>]+href="[^"]+\.css"[^>]*>/i,
+    () => `<style>\n${cssContent}\n</style>`
+  );
 }
 
-// Find JS file
+// Find JS file, strip original <script> tag from <head>, and place inline <script type="module"> right before </body>
 const jsFiles = fs.readdirSync(assetsDir).filter(f => f.endsWith('.js'));
 if (jsFiles.length > 0) {
-  const jsContent = fs.readFileSync(path.join(assetsDir, jsFiles[0]), 'utf-8');
-  // Replace <script type="module"[^>]+src="[^"]+\.js"><\/script> with <script type="module">...</script>
-  html = html.replace(/<script type="module"[^>]+src="[^"]+\.js"><\/script>/i, `<script type="module">\n${jsContent}\n</script>`);
+  const rawJs = fs.readFileSync(path.join(assetsDir, jsFiles[0]), 'utf-8');
+  const safeJs = rawJs.replace(/<\/script>/gi, '<\\/script>');
+  html = html.replace(/<script type="module"[^>]+src="[^"]+\.js"[^>]*><\/script>\s*/i, '');
+  html = html.replace(
+    /<\/body>/i,
+    () => `<script type="module">\n${safeJs}\n</script>\n</body>`
+  );
 }
 
 const outputPath = path.join(distDir, 'waveform-viewer-standalone.html');
@@ -37,4 +43,11 @@ if (!fs.existsSync(publicDir)) {
 const publicOutputPath = path.join(publicDir, 'waveform-viewer-standalone.html');
 fs.writeFileSync(publicOutputPath, html, 'utf-8');
 
-console.log(`Successfully generated standalone HTML: ${outputPath} and ${publicOutputPath} (${(fs.statSync(outputPath).size / 1024).toFixed(1)} KB)`);
+// JSON-wrapped copy is served as application/json so reverse proxies cannot inject HTML/scripts into downloaded offline HTML
+const publicJsonPath = path.join(publicDir, 'waveform-viewer-offline.json');
+fs.writeFileSync(publicJsonPath, JSON.stringify({ html }), 'utf-8');
+
+const rootOutputPath = path.resolve('waveform-viewer-pro.html');
+fs.writeFileSync(rootOutputPath, html, 'utf-8');
+
+console.log(`Successfully generated standalone HTML: ${outputPath}, ${publicOutputPath}, ${publicJsonPath}, and ${rootOutputPath} (${(fs.statSync(outputPath).size / 1024).toFixed(1)} KB)`);

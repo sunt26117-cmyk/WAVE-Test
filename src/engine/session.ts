@@ -1,12 +1,22 @@
 /**
  * Waveform Viewer Pro - Session Serialization & Deserialization
- * Saves and restores .graphx files containing channels, views, cursors, annotations,
- * math definitions, and FFT/Motor configuration.
+ * Saves and restores .graphx files containing channels (including V/div, offset,
+ * AC/DC coupling, inversion), views, cursors, annotations, math definitions, and FFT/Motor configuration.
  */
 
-import { TabState, WaveformChannel, AnnotationItem, ChannelFilterSpec } from '../types/models';
-import { lowPassFilter } from '../modules/filter';
+import {
+  TabState,
+  WaveformChannel,
+  AnnotationItem,
+  ChannelCoupling,
+  RenderMode,
+  DecimationMode,
+  SelectedMeasurementItem,
+  PlotMode,
+  XYConfig,
+} from '../types/models';
 import { evaluateMathExpression } from '../modules/mathParser';
+import { ensureChannelScaleOffset, syncChannelBoundsFromScaleOffset } from '../modules/oscilloscopeScale';
 
 export interface SerializedChannel {
   id: string;
@@ -19,14 +29,19 @@ export interface SerializedChannel {
   sourceChannelIds: string[];
   vMin: number;
   vMax: number;
+  voltsPerDiv?: number;
+  vOffset?: number;
+  inverted?: boolean;
+  coupling?: ChannelCoupling;
   fs: number | null;
   dt: number | null;
   metadata: any;
-  /** Low-pass filter applied to this channel. `v` then holds the ORIGINAL samples. */
-  filter?: ChannelFilterSpec;
-  // Encoded Float arrays
   t: number[];
   v: number[];
+  refV?: number[];
+  hasEdits?: boolean;
+  showRef?: boolean;
+  showDiff?: boolean;
 }
 
 export interface SerializedSession {
@@ -40,12 +55,20 @@ export interface SerializedSession {
     view: { startIndex: number; endIndex: number; fMin?: number; fMax?: number };
     cursors: any;
     annotations: AnnotationItem[];
-    plotMode: 'time' | 'frequency';
+    annotationsVisible?: boolean;
+    plotMode: PlotMode;
+    renderMode?: RenderMode;
+    decimationMode?: DecimationMode;
     fftOptions: any;
     motorConfig: any;
     triggerConfig: any;
+    measurementGate?: 'view' | 'cursors' | 'entire';
+    selectedMeasurements?: SelectedMeasurementItem[];
     separateView: boolean;
-    showEdgeMarks?: boolean;
+    activeChannelId?: string;
+    selectedMeasurementChannelId?: string;
+    selectedFftChannelId?: string;
+    xyConfig?: XYConfig;
   }[];
   activeTabIndex: number;
 }
@@ -58,10 +81,8 @@ export function serializeSession(tabs: TabState[], activeTabIndex: number): stri
     const serializedChannels: Record<string, SerializedChannel> = {};
 
     for (const [id, ch] of Object.entries(tab.channels)) {
-      // Convert Float32Array and Float64Array to standard arrays (or downsample if huge)
       const tArr = Array.from(ch.t);
-      // Always store the unfiltered samples; the filter is re-applied on load.
-      const vArr = Array.from(ch.vOriginal ?? ch.v);
+      const vArr = Array.from(ch.v);
 
       serializedChannels[id] = {
         id: ch.id,
@@ -74,12 +95,19 @@ export function serializeSession(tabs: TabState[], activeTabIndex: number): stri
         sourceChannelIds: ch.sourceChannelIds,
         vMin: ch.vMin,
         vMax: ch.vMax,
+        voltsPerDiv: ch.voltsPerDiv,
+        vOffset: ch.vOffset,
+        inverted: ch.inverted,
+        coupling: ch.coupling,
         fs: ch.fs,
         dt: ch.dt,
         metadata: ch.metadata,
-        filter: ch.filter,
         t: tArr,
         v: vArr,
+        refV: ch.refV ? Array.from(ch.refV) : undefined,
+        hasEdits: ch.hasEdits,
+        showRef: ch.showRef,
+        showDiff: ch.showDiff,
       };
     }
 
@@ -91,17 +119,25 @@ export function serializeSession(tabs: TabState[], activeTabIndex: number): stri
       view: tab.view,
       cursors: tab.cursors,
       annotations: tab.annotations,
+      annotationsVisible: tab.annotationsVisible,
       plotMode: tab.plotMode,
+      renderMode: tab.renderMode || 'vector',
+      decimationMode: tab.decimationMode || 'minmax',
       fftOptions: tab.fftOptions,
       motorConfig: tab.motorConfig,
       triggerConfig: tab.triggerConfig,
+      measurementGate: tab.measurementGate,
+      selectedMeasurements: tab.selectedMeasurements || [],
       separateView: tab.separateView,
-      showEdgeMarks: tab.showEdgeMarks,
+      activeChannelId: tab.activeChannelId,
+      selectedMeasurementChannelId: tab.selectedMeasurementChannelId,
+      selectedFftChannelId: tab.selectedFftChannelId,
+      xyConfig: tab.xyConfig,
     };
   });
 
   const sessionObj: SerializedSession = {
-    version: 2,
+    version: 4,
     createdAt: new Date().toISOString(),
     tabs: serializedTabs,
     activeTabIndex,
@@ -120,7 +156,7 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
     const channels: Record<string, WaveformChannel> = {};
 
     for (const [id, sCh] of Object.entries(tab.channels)) {
-      channels[id] = {
+      const ch: WaveformChannel = {
         id: sCh.id,
         name: sCh.name,
         unit: sCh.unit,
@@ -131,23 +167,23 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
         sourceChannelIds: sCh.sourceChannelIds || [],
         vMin: sCh.vMin,
         vMax: sCh.vMax,
+        voltsPerDiv: sCh.voltsPerDiv,
+        vOffset: sCh.vOffset,
+        inverted: !!sCh.inverted,
+        coupling: sCh.coupling || 'DC',
         fs: sCh.fs,
         dt: sCh.dt,
         metadata: sCh.metadata,
         t: new Float64Array(sCh.t),
         v: new Float32Array(sCh.v),
+        refV: sCh.refV ? new Float32Array(sCh.refV) : undefined,
+        hasEdits: !!sCh.hasEdits,
+        showRef: sCh.showRef !== undefined ? sCh.showRef : true,
+        showDiff: !!sCh.showDiff,
       };
-      if (sCh.filter && !sCh.isMath) {
-        const ch = channels[id];
-        try {
-          ch.vOriginal = ch.v;
-          ch.v = lowPassFilter(ch.t, ch.vOriginal, sCh.filter);
-          ch.filter = { ...sCh.filter };
-        } catch (e) {
-          console.warn(`Could not re-apply filter on ${id}:`, e);
-          ch.vOriginal = undefined;
-        }
-      }
+      ensureChannelScaleOffset(ch);
+      syncChannelBoundsFromScaleOffset(ch);
+      channels[id] = ch;
     }
 
     // Deterministically recompute Math channels if expression is present
@@ -161,6 +197,14 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
             id,
             ch.name
           );
+          recomputed.color = ch.color;
+          recomputed.visible = ch.visible;
+          recomputed.voltsPerDiv = ch.voltsPerDiv;
+          recomputed.vOffset = ch.vOffset;
+          recomputed.inverted = ch.inverted;
+          recomputed.coupling = ch.coupling;
+          ensureChannelScaleOffset(recomputed);
+          syncChannelBoundsFromScaleOffset(recomputed);
           channels[id] = recomputed;
         } catch (e) {
           console.warn(`Could not re-evaluate math expression for ${id}:`, e);
@@ -168,18 +212,35 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
       }
     }
 
+    const rawCursors = tab.cursors || {
+      enabled: false,
+      mode: 'off',
+      x1: null,
+      x2: null,
+      y1: null,
+      y2: null,
+      trackingChannel: null,
+    };
+    const cursorMode = rawCursors.mode || (rawCursors.enabled ? 'x' : 'off');
+
     return {
       id: tab.id,
       fileName: tab.fileName,
       channels,
       drawOrder: tab.drawOrder,
       view: tab.view,
-      cursors: tab.cursors,
+      cursors: {
+        ...rawCursors,
+        mode: cursorMode,
+        enabled: cursorMode !== 'off',
+      },
       annotations: tab.annotations || [],
       annotationMode: false,
-      annotationsVisible: true,
+      annotationsVisible: tab.annotationsVisible !== false,
       isOverlap: false,
       plotMode: tab.plotMode || 'time',
+      renderMode: tab.renderMode || 'vector',
+      decimationMode: tab.decimationMode || 'minmax',
       fftOptions: tab.fftOptions || {
         range: 'view',
         window: 'hann',
@@ -195,9 +256,18 @@ export function deserializeSession(jsonStr: string): { tabs: TabState[]; activeT
         level: 0,
         positionPercent: 50,
       },
-      measurementGate: 'view',
+      measurementGate: tab.measurementGate || 'view',
+      selectedMeasurements: tab.selectedMeasurements || [],
       separateView: !!tab.separateView,
-      showEdgeMarks: !!tab.showEdgeMarks,
+      activeChannelId: tab.activeChannelId || tab.drawOrder[0],
+      selectedMeasurementChannelId: tab.selectedMeasurementChannelId || tab.drawOrder[0],
+      selectedFftChannelId: tab.selectedFftChannelId || tab.drawOrder[0],
+      activeTool: 'pan',
+      xyConfig: tab.xyConfig || {
+        xChannelId: tab.drawOrder[0] || '',
+        yChannelId: tab.drawOrder[1] || tab.drawOrder[0] || '',
+        range: 'view',
+      },
     };
   });
 
