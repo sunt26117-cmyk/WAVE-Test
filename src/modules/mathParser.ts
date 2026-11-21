@@ -585,6 +585,9 @@ export function evaluateMathExpression(
     fs: baseCh.fs,
     dt: baseCh.dt,
     isMath: true,
+    channelKind: 'computed',
+    derivedKind: 'math',
+    derivedBadge: 'fx',
     mathExpression: expression,
     sourceChannelIds: referencedIds,
     metadata: {

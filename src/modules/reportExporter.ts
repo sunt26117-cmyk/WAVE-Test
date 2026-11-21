@@ -64,9 +64,16 @@ export function buildEngineeringReportHTML(
         if (!def) return '--';
         return formatMeasurementMetricValue(m, def, ch.unit);
       };
+      const isComputed = ch.channelKind === 'computed' || !!ch.isMath;
+      const swatchHtml = isComputed
+        ? `<span style="display:inline-block;width:14px;height:0;border-top:2px dashed ${esc(ch.color)};margin-right:6px;vertical-align:middle;"></span>`
+        : `<span style="display:inline-block;width:10px;height:10px;background:${esc(ch.color)};margin-right:6px;vertical-align:middle;"></span>`;
+      const badgeHtml = isComputed
+        ? ` <span style="font-size:9px;padding:1px 4px;border:1px solid #cbd5e1;border-radius:2px;color:#475569;">${esc(ch.derivedBadge || 'fx')}</span>`
+        : '';
       return `
         <tr>
-          <td><span style="display:inline-block;width:10px;height:10px;background:${esc(ch.color)};margin-right:6px;vertical-align:middle;"></span><strong>${esc(ch.name)}</strong></td>
+          <td>${swatchHtml}<strong>${esc(ch.name)}</strong>${badgeHtml}</td>
           <td>${esc(ch.unit)}</td>
           <td>${fmt('vpp', 'vpp')}</td>
           <td>${fmt('max', 'max')}</td>

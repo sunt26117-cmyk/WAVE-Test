@@ -21,12 +21,13 @@ import {
   AnomalyEvent,
   ChannelCoupling,
   AnnotationItem,
+  ThemeId,
 } from '../types/models';
 import {
   PlotArea,
   RenderTheme,
   DEFAULT_THEME,
-  OVERLAP_COLORS,
+  isComputedChannel,
   getPlotArea,
   getTimeBoundsForView,
   resolveCursorMode,
@@ -41,6 +42,7 @@ import {
   drawGndMarkers,
   drawAnnotations,
   drawAxisLabels,
+  drawOverlapTraceLegend,
   drawCompareGroupLegend,
   drawXYPlot,
   drawGoldenToleranceBand,
@@ -51,6 +53,13 @@ import {
   formatEng,
   formatMeasurementMetricValue,
 } from './canvasRenderer';
+import {
+  ThemePreset,
+  THEME_PRESETS,
+  applyThemeToDocument,
+  getComputedPaletteColor,
+  getRawPaletteColor,
+} from '../modules/themeManager';
 import {
   STANDARD_125_VALUES,
   stepScale125,
@@ -94,11 +103,38 @@ import { computeXYMetrics } from '../modules/xyAnalysis';
 import { serializeSession, deserializeSession } from './session';
 import { previewCsv, parseFullCsv, computeCsvPreviewQuality } from '../parsers/csvParser';
 import { parseWfmBuffer } from '../parsers/wfmParser';
+import {
+  parseLtspiceRawBuffer,
+  isLtspiceExportText,
+  parseLtspiceText,
+} from '../parsers/ltspiceParser';
 import { computeBufferFingerprint, computeTextFingerprint } from '../modules/waveformCompare';
+import { closeActiveToolDrawerItem } from '../modules/toolDrawer';
 
 type DragMode =
   | null
-  | { type: 'pan'; startX: number; initialStartIdx: number; initialEndIdx: number; initialFMin: number; initialFMax: number }
+  | {
+      type: 'pan';
+      startX: number;
+      startY: number;
+      initialStartIdx: number;
+      initialEndIdx: number;
+      initialFMin: number;
+      initialFMax: number;
+      targetChannelId?: string;
+      initialVOffset?: number;
+      voltsPerDiv?: number;
+      area?: PlotArea;
+      undoPushed?: boolean;
+    }
+  | {
+      type: 'yAxisOffset';
+      channelId: string;
+      startY: number;
+      initialVOffset: number;
+      voltsPerDiv: number;
+      area: PlotArea;
+    }
   | { type: 'cursorX'; which: 'x1' | 'x2' }
   | { type: 'cursorY'; which: 'y1' | 'y2'; channelId: string; area: PlotArea }
   | { type: 'gnd'; channelId: string; area: PlotArea }
@@ -109,6 +145,7 @@ type DragMode =
 export class OscilloscopeApp {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private themeId: ThemeId = 'obsidian';
   private theme: RenderTheme = DEFAULT_THEME;
 
   private tabs: TabState[] = [];
@@ -176,6 +213,81 @@ export class OscilloscopeApp {
     this.populateScaleDropdown();
     this.initEvents();
     this.handleResize();
+  }
+
+  public getThemeId(): ThemeId {
+    return this.themeId;
+  }
+
+  public getThemePreset(): ThemePreset {
+    return THEME_PRESETS[this.themeId] || THEME_PRESETS.obsidian;
+  }
+
+  public getRawColors(): string[] {
+    return this.getThemePreset().rawPalette;
+  }
+
+  public getNextComputedColor(offset: number = 0): string {
+    const tab = this.getActiveTab();
+    const existingCount = tab
+      ? tab.drawOrder.filter((id) => {
+          const ch = tab.channels[id];
+          return ch && isComputedChannel(ch);
+        }).length
+      : 0;
+    return getComputedPaletteColor(this.themeId, existingCount + offset);
+  }
+
+  public setTheme(themeId: ThemeId, remapTraceColors: boolean = true): void {
+    const prevPreset = THEME_PRESETS[this.themeId] || THEME_PRESETS.obsidian;
+    const preset = applyThemeToDocument(themeId);
+    this.themeId = preset.id;
+    this.theme = preset.canvas;
+
+    if (remapTraceColors) {
+      for (const tab of this.tabs) {
+        let rawIdx = 0;
+        let compIdx = 0;
+        for (const id of tab.drawOrder) {
+          const ch = tab.channels[id];
+          if (!ch) continue;
+          if (ch.compareGroupId && ch.compareRole === 'ref') continue;
+          const lowerColor = (ch.color || '').toLowerCase();
+          if (isComputedChannel(ch)) {
+            if (ch.derivedKind === 'diff' || ch.compareRole === 'diff') {
+              ch.color = preset.isLight ? '#e11d48' : '#fb7185';
+            } else if (ch.derivedKind === 'ref') {
+              ch.color = preset.isLight ? '#475569' : '#94a3b8';
+            } else {
+              const prevIdx = prevPreset.computedPalette.findIndex((c) => c.toLowerCase() === lowerColor);
+              const legacy = ['#ff007f', '#f472b6', '#4ade80', '#38bdf8', '#fb923c', '#a78bfa'];
+              if (prevIdx >= 0 || legacy.includes(lowerColor)) {
+                ch.color = preset.computedPalette[(prevIdx >= 0 ? prevIdx : compIdx) % preset.computedPalette.length];
+              }
+            }
+            compIdx++;
+          } else {
+            const prevIdx = prevPreset.rawPalette.findIndex((c) => c.toLowerCase() === lowerColor);
+            if (prevIdx >= 0) {
+              ch.color = preset.rawPalette[prevIdx % preset.rawPalette.length];
+            } else if (!ch.compareGroupId) {
+              const defaultMatch = Object.values(THEME_PRESETS).some((tp) =>
+                tp.rawPalette.some((c) => c.toLowerCase() === lowerColor)
+              );
+              if (defaultMatch) {
+                ch.color = getRawPaletteColor(preset.id, rawIdx);
+              }
+            }
+            rawIdx++;
+          }
+        }
+      }
+    }
+
+    this.lastMeasStripKey = '';
+    this.renderTabsBar();
+    this.renderSidebar();
+    this.draw();
   }
 
   public showToast(message: string, level: 'info' | 'warn' | 'error' = 'info'): void {
@@ -959,11 +1071,14 @@ export class OscilloscopeApp {
         id: refChId,
         name: `REF: ${refLabel}`,
         unit: targetCh.unit || 'V',
-        color: '#94a3b8',
+        color: this.theme.isLight ? '#475569' : '#94a3b8',
         visible: true,
         t: targetCh.t,
         v: new Float32Array(alignedRefV),
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'ref',
+        derivedBadge: 'REF',
         mathExpression: `Compare Reference (${refLabel})`,
         sourceChannelIds: [targetChannelId],
         coupling: 'DC',
@@ -1002,11 +1117,14 @@ export class OscilloscopeApp {
         id: diffChId,
         name: `Δ(${targetCh.name} − ${refLabel})`,
         unit: targetCh.unit || 'V',
-        color: '#fb7185',
+        color: this.theme.isLight ? '#e11d48' : '#fb7185',
         visible: true,
         t: targetCh.t,
         v: new Float32Array(diffV),
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'diff',
+        derivedBadge: 'DIFF',
         mathExpression: `${targetCh.name} - ${refLabel}`,
         sourceChannelIds: [targetChannelId],
         coupling: 'DC',
@@ -1128,6 +1246,9 @@ export class OscilloscopeApp {
           t: targetCh.t,
           v: new Float32Array(item.alignedRefV),
           isMath: true,
+          channelKind: 'computed',
+          derivedKind: 'ref',
+          derivedBadge: 'REF',
           mathExpression: `Compare [${groupConfig.groupName}]: ${item.refLabel}`,
           sourceChannelIds: [targetChannelId],
           coupling: 'DC',
@@ -1176,6 +1297,9 @@ export class OscilloscopeApp {
           t: targetCh.t,
           v: new Float32Array(item.diffV),
           isMath: true,
+          channelKind: 'computed',
+          derivedKind: 'diff',
+          derivedBadge: 'DIFF',
           mathExpression: `${targetCh.name} - ${item.refLabel}`,
           sourceChannelIds: [targetChannelId],
           coupling: 'DC',
@@ -1344,15 +1468,22 @@ export class OscilloscopeApp {
         drawGrid(this.ctx, p, this.theme, 10, 8, true);
       }
       this.renderTimeDomain(tab, p);
-      drawGndMarkers(this.ctx, p, tab);
+      drawGndMarkers(this.ctx, p, tab, this.theme);
       drawCursors(this.ctx, tab, p, this.theme);
-      drawActiveAnomalyMarkers(this.ctx, tab, p);
-      drawAnnotations(this.ctx, tab, p);
+      drawActiveAnomalyMarkers(this.ctx, tab, p, this.theme);
+      drawAnnotations(this.ctx, tab, p, this.theme);
     }
 
     drawAxisLabels(this.ctx, p, tab, this.theme, 10, 8, this.cachedSpectrum);
     if (tab.plotMode === 'time') {
-      drawCompareGroupLegend(this.ctx, tab, p);
+      const legendBottom = drawOverlapTraceLegend(this.ctx, tab, p, this.theme);
+      drawCompareGroupLegend(
+        this.ctx,
+        tab,
+        p,
+        this.theme,
+        legendBottom > p.y + 8 ? legendBottom + 6 : undefined
+      );
     }
 
     // Interactive box drag overlay (Area Zoom or Area Annotation)
@@ -1387,14 +1518,14 @@ export class OscilloscopeApp {
       const rects = getSubplotRects(p, visibleChs, true);
       rects.forEach((rect) => {
         drawGrid(this.ctx, rect.area, this.theme, 10, 4, true);
-        drawChannelWaveform(this.ctx, tab, rect.channel, p, rect.area);
+        drawChannelWaveform(this.ctx, tab, rect.channel, p, rect.area, this.theme);
         if (goldenEval && tab.goldenBand?.channelId === rect.channel.id) {
           drawGoldenToleranceBand(this.ctx, tab, rect.channel, p, goldenEval, rect.area);
         }
       });
     } else {
       for (const ch of visibleChs) {
-        drawChannelWaveform(this.ctx, tab, ch, p);
+        drawChannelWaveform(this.ctx, tab, ch, p, undefined, this.theme);
         if (goldenEval && tab.goldenBand?.channelId === ch.id) {
           drawGoldenToleranceBand(this.ctx, tab, ch, p, goldenEval);
         }
@@ -1507,7 +1638,25 @@ export class OscilloscopeApp {
     window.addEventListener('resize', () => this.handleResize());
 
     this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-    this.canvas.addEventListener('dblclick', () => this.fitView());
+    this.canvas.addEventListener('dblclick', (e) => {
+      const tab = this.getActiveTab();
+      if (tab && tab.plotMode === 'time') {
+        const rect = this.canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const p = getPlotArea(rect.width, rect.height);
+        if (x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
+          const hit = this.findSubplotAtPoint(tab, p, y);
+          const targetCh = tab.separateView && hit ? hit.channel : tab.channels[tab.activeChannelId || ''] || hit?.channel;
+          if (targetCh) {
+            this.zeroChannelOffset(targetCh.id);
+            this.showToast(`Zeroed vertical offset (${targetCh.name} = 0 ${targetCh.unit})`, 'info');
+            return;
+          }
+        }
+      }
+      this.fitView();
+    });
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('mousemove', (e) => this.handleMouseMove(e));
     window.addEventListener('mouseup', () => this.handleMouseUp());
@@ -1572,10 +1721,11 @@ export class OscilloscopeApp {
         return;
       }
 
-      // Close open modal on Escape even if focus is inside an input
+      // Close active docked drawer tab or blocking modal on Escape even if focus is inside an input
       if (key === 'ESCAPE') {
+        if (closeActiveToolDrawerItem()) return;
         let closedModal = false;
-        document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+        document.querySelectorAll('.modal-overlay:not(.tool-dockable)').forEach((overlay) => {
           const el = overlay as HTMLElement;
           if (el.style.display === 'flex') {
             el.style.display = 'none';
@@ -1645,7 +1795,7 @@ export class OscilloscopeApp {
     });
   }
 
-  private handleResize(): void {
+  public handleResize(): void {
     const dpr = window.devicePixelRatio || 1;
     const rect = this.canvas.parentElement?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return;
@@ -1706,6 +1856,29 @@ export class OscilloscopeApp {
         area: trigHandle.area,
       };
       return;
+    }
+
+    // 2b. Check Left Y-Axis Gutter for direct Vertical Offset dragging
+    if (e.button === 0 && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
+      const hit = this.findSubplotAtPoint(tab, p, y);
+      const targetCh = tab.separateView && hit ? hit.channel : tab.channels[tab.activeChannelId || ''] || hit?.channel;
+      if (targetCh) {
+        const area = hit ? hit.area : p;
+        const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(targetCh);
+        this.pushUndoSnapshot(`Drag Y-Axis Offset (${targetCh.name})`);
+        if (tab.separateView && targetCh.id !== tab.activeChannelId) {
+          this.selectActiveChannel(targetCh.id);
+        }
+        this.dragState = {
+          type: 'yAxisOffset',
+          channelId: targetCh.id,
+          startY: y,
+          initialVOffset: vOffset,
+          voltsPerDiv,
+          area,
+        };
+        return;
+      }
     }
 
     if (x < p.x || x > p.x + p.width || y < p.y || y > p.y + p.height) return;
@@ -1826,13 +1999,24 @@ export class OscilloscopeApp {
     } else {
       const targetFftCh = tab.channels[tab.selectedFftChannelId || tab.drawOrder[0]];
       const nyquist = (targetFftCh?.fs || 1e5) / 2;
+      const panTargetCh =
+        tab.separateView && subHit
+          ? subHit.channel
+          : tab.channels[tab.activeChannelId || ''] || subHit?.channel;
+      const panScale = panTargetCh ? ensureChannelScaleOffset(panTargetCh) : null;
       this.dragState = {
         type: 'pan',
         startX: x,
+        startY: y,
         initialStartIdx: tab.view.startIndex,
         initialEndIdx: tab.view.endIndex,
         initialFMin: tab.view.fMin ?? 0,
         initialFMax: tab.view.fMax ?? nyquist,
+        targetChannelId: panTargetCh?.id,
+        initialVOffset: panScale?.vOffset ?? 0,
+        voltsPerDiv: panScale?.voltsPerDiv ?? 1,
+        area: subHit?.area || p,
+        undoPushed: false,
       };
     }
   }
@@ -1854,6 +2038,22 @@ export class OscilloscopeApp {
           const { area } = this.dragState;
           const fracFromBottom = Math.max(-0.25, Math.min(1.25, (area.y + area.height - y) / area.height));
           ch.vOffset = (fracFromBottom - 0.5) * (8 * voltsPerDiv);
+          syncChannelBoundsFromScaleOffset(ch);
+          clampCursorsToViewport(tab);
+          this.syncVerticalPanelOnly(ch);
+          this.renderSoftkeysOnly(tab);
+          this.renderCursorReadoutOnly(tab);
+          this.draw();
+        }
+        return;
+      }
+
+      if (this.dragState.type === 'yAxisOffset') {
+        const ch = tab.channels[this.dragState.channelId];
+        if (ch) {
+          const { area, startY, initialVOffset, voltsPerDiv } = this.dragState;
+          const deltaV = ((startY - y) / Math.max(1, area.height)) * (8 * voltsPerDiv);
+          ch.vOffset = initialVOffset + deltaV;
           syncChannelBoundsFromScaleOffset(ch);
           clampCursorsToViewport(tab);
           this.syncVerticalPanelOnly(ch);
@@ -1952,6 +2152,24 @@ export class OscilloscopeApp {
 
         tab.view.startIndex = Math.max(0, newStart);
         tab.view.endIndex = Math.min(totalN, newEnd);
+
+        if (tab.plotMode === 'time' && this.dragState.targetChannelId && Math.abs(y - this.dragState.startY) > 1.5) {
+          const ch = tab.channels[this.dragState.targetChannelId];
+          if (ch) {
+            if (!this.dragState.undoPushed) {
+              this.pushUndoSnapshot('2D Canvas Pan');
+              this.dragState.undoPushed = true;
+            }
+            const area = this.dragState.area || p;
+            const vPerDiv = this.dragState.voltsPerDiv || 1;
+            const deltaV = ((this.dragState.startY - y) / Math.max(1, area.height)) * (8 * vPerDiv);
+            ch.vOffset = (this.dragState.initialVOffset ?? 0) + deltaV;
+            syncChannelBoundsFromScaleOffset(ch);
+            this.syncVerticalPanelOnly(ch);
+            this.renderSoftkeysOnly(tab);
+          }
+        }
+
         clampCursorsToViewport(tab);
         this.renderCursorReadoutOnly(tab);
         this.draw();
@@ -1973,6 +2191,10 @@ export class OscilloscopeApp {
 
       const trigHandle = getTriggerHandlePosition(p, tab);
       if (trigHandle && x >= trigHandle.x - 4 && x <= trigHandle.x + 22 && Math.abs(y - trigHandle.y) <= 9) {
+        nextCursor = 'ns-resize';
+      }
+
+      if (nextCursor === 'crosshair' && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
         nextCursor = 'ns-resize';
       }
 
@@ -2223,16 +2445,29 @@ export class OscilloscopeApp {
     this.draw();
   }
 
-  public async openFileDirectInTab(file: File): Promise<void> {
+  private markRawChannelsAndFit(channels: Record<string, WaveformChannel>): void {
+    for (const ch of Object.values(channels)) {
+      ch.channelKind = 'raw';
+      fitChannelTo125(ch);
+    }
+  }
+
+  public async openFileDirectInTab(file: File): Promise<string | null> {
     const ext = file.name.split('.').pop()?.toLowerCase();
-    if (ext === 'wfm') {
+    const colors = this.getRawColors();
+
+    if (ext === 'wfm' || ext === 'raw') {
       const buf = await file.arrayBuffer();
       const fileFingerprint = computeBufferFingerprint(file.name, buf);
-      const parsed = parseWfmBuffer(buf, file.name, OVERLAP_COLORS);
-      for (const ch of Object.values(parsed.channels)) fitChannelTo125(ch);
+      const parsed =
+        ext === 'raw'
+          ? parseLtspiceRawBuffer(buf, colors)
+          : parseWfmBuffer(buf, file.name, colors);
+      this.markRawChannelsAndFit(parsed.channels);
       const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+      const tabId = `tab_${Date.now()}_${Math.random()}`;
       this.addTab({
-        id: `tab_${Date.now()}_${Math.random()}`,
+        id: tabId,
         fileName: file.name,
         fileFingerprint,
         channels: parsed.channels,
@@ -2252,28 +2487,36 @@ export class OscilloscopeApp {
         activeChannelId: parsed.drawOrder[0],
         activeTool: 'pan',
       });
-      return;
+      return tabId;
     }
 
     const text = await file.text();
     const fileFingerprint = computeTextFingerprint(file.name, text);
-    const p = previewCsv(text);
-    const shouldResample = !!(p.quality && !p.quality.isUniformSampling);
-    const parsed = parseFullCsv(text, {
-      delimiter: p.delimiter,
-      hasHeader: p.hasHeader,
-      skipLines: p.skipLines,
-      timeColIndex: p.timeColIndex,
-      timeUnit: p.timeUnit,
-      sampleRateOverrideHz: p.sampleRateOverrideHz ?? null,
-      columnMappings: p.columnMappings,
-      resample: shouldResample,
-      colors: OVERLAP_COLORS,
-    });
-    for (const ch of Object.values(parsed.channels)) fitChannelTo125(ch);
+    let parsed: { channels: Record<string, WaveformChannel>; drawOrder: string[] };
+
+    if (ext === 'txt' && isLtspiceExportText(text)) {
+      parsed = parseLtspiceText(text, colors);
+    } else {
+      const p = previewCsv(text);
+      const shouldResample = !!(p.quality && !p.quality.isUniformSampling);
+      parsed = parseFullCsv(text, {
+        delimiter: p.delimiter,
+        hasHeader: p.hasHeader,
+        skipLines: p.skipLines,
+        timeColIndex: p.timeColIndex,
+        timeUnit: p.timeUnit,
+        sampleRateOverrideHz: p.sampleRateOverrideHz ?? null,
+        columnMappings: p.columnMappings,
+        resample: shouldResample,
+        colors,
+      });
+    }
+
+    this.markRawChannelsAndFit(parsed.channels);
     const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+    const tabId = `tab_${Date.now()}_${Math.random()}`;
     this.addTab({
-      id: `tab_${Date.now()}_${Math.random()}`,
+      id: tabId,
       fileName: file.name,
       fileFingerprint,
       channels: parsed.channels,
@@ -2293,10 +2536,140 @@ export class OscilloscopeApp {
       activeChannelId: parsed.drawOrder[0],
       activeTool: 'pan',
     });
+    return tabId;
   }
 
-  // --- File Handling (CSV, WFM, .graphx Session) ---
+  public async reloadTabFromFile(tabId: string, file: File): Promise<boolean> {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) return false;
+
+    try {
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      const colors = this.getRawColors();
+      let parsed: { channels: Record<string, WaveformChannel>; drawOrder: string[] };
+      let fileFingerprint: string;
+
+      if (ext === 'raw' || ext === 'wfm') {
+        const buf = await file.arrayBuffer();
+        fileFingerprint = computeBufferFingerprint(file.name, buf);
+        parsed =
+          ext === 'raw'
+            ? parseLtspiceRawBuffer(buf, colors)
+            : parseWfmBuffer(buf, file.name, colors);
+      } else {
+        const text = await file.text();
+        fileFingerprint = computeTextFingerprint(file.name, text);
+        if (ext === 'txt' && isLtspiceExportText(text)) {
+          parsed = parseLtspiceText(text, colors);
+        } else {
+          const p = previewCsv(text);
+          const shouldResample = !!(p.quality && !p.quality.isUniformSampling);
+          parsed = parseFullCsv(text, {
+            delimiter: p.delimiter,
+            hasHeader: p.hasHeader,
+            skipLines: p.skipLines,
+            timeColIndex: p.timeColIndex,
+            timeUnit: p.timeUnit,
+            sampleRateOverrideHz: p.sampleRateOverrideHz ?? null,
+            columnMappings: p.columnMappings,
+            resample: shouldResample,
+            colors,
+          });
+        }
+      }
+
+      if (parsed.drawOrder.length === 0) return false;
+
+      // Match existing raw channels by name first, then positional fallback
+      const existingRawIds = tab.drawOrder.filter((id) => {
+        const c = tab.channels[id];
+        return c && !isComputedChannel(c);
+      });
+
+      const oldLength = Object.values(tab.channels)[0]?.v.length || 0;
+      const newLength = parsed.channels[parsed.drawOrder[0]]?.v.length || 0;
+
+      parsed.drawOrder.forEach((newId, idx) => {
+        const nextCh = parsed.channels[newId];
+        if (!nextCh) return;
+        nextCh.channelKind = 'raw';
+
+        const matchedOldId =
+          existingRawIds.find((oid) => tab.channels[oid]?.name === nextCh.name) ||
+          existingRawIds[idx];
+        const prevCh = matchedOldId ? tab.channels[matchedOldId] : undefined;
+
+        if (prevCh) {
+          prevCh.t = nextCh.t;
+          prevCh.v = nextCh.v;
+          prevCh.fs = nextCh.fs;
+          prevCh.dt = nextCh.dt;
+          prevCh.metadata = nextCh.metadata;
+          prevCh.rawT = nextCh.rawT;
+          prevCh.rawV = nextCh.rawV;
+          prevCh.ltspiceStepLabel = nextCh.ltspiceStepLabel;
+          prevCh.channelKind = 'raw';
+          syncChannelBoundsFromScaleOffset(prevCh);
+        } else {
+          fitChannelTo125(nextCh);
+          tab.channels[newId] = nextCh;
+          tab.drawOrder.push(newId);
+        }
+      });
+
+      // Recalculate any computed Math channels whose expression still applies
+      for (const id of tab.drawOrder) {
+        const ch = tab.channels[id];
+        if (!ch || !ch.isMath || !ch.mathExpression || ch.compareGroupId) continue;
+        if (ch.derivedKind === 'math') {
+          try {
+            const recalc = evaluateMathExpression(
+              ch.mathExpression,
+              tab.channels,
+              tab.drawOrder,
+              ch.id,
+              ch.name
+            );
+            ch.t = recalc.t;
+            ch.v = recalc.v;
+            ch.fs = recalc.fs;
+            ch.dt = recalc.dt;
+            ch.metadata = recalc.metadata;
+            syncChannelBoundsFromScaleOffset(ch);
+          } catch {
+            // Keep prior buffer if formula variables changed
+          }
+        }
+      }
+
+      if (newLength > 0) {
+        const ratio = oldLength > 0 ? newLength / oldLength : 0;
+        if (ratio < 0.5 || ratio > 2 || tab.view.endIndex > newLength) {
+          tab.view.startIndex = 0;
+          tab.view.endIndex = newLength;
+        }
+      }
+
+      tab.fileName = file.name;
+      tab.fileFingerprint = fileFingerprint;
+      this.editVersion++;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      clampCursorsToViewport(tab);
+      this.renderTabsBar();
+      this.renderSidebar();
+      this.draw();
+      this.showToast(`Reloaded LTspice data: ${file.name}`, 'info');
+      return true;
+    } catch (err: any) {
+      this.showToast(`Reload failed (${file.name}): ${err.message}`, 'error');
+      return false;
+    }
+  }
+
+  // --- File Handling (CSV, WFM, LTspice .raw / .txt, .graphx Session) ---
   public handleFiles(files: File[]): void {
+    const colors = this.getRawColors();
     for (const file of files) {
       const ext = file.name.split('.').pop()?.toLowerCase();
       if (ext === 'graphx') {
@@ -2316,16 +2689,17 @@ export class OscilloscopeApp {
           }
         };
         reader.readAsText(file);
-      } else if (ext === 'wfm') {
+      } else if (ext === 'wfm' || ext === 'raw') {
         const reader = new FileReader();
         reader.onload = (e) => {
           try {
             const buf = e.target?.result as ArrayBuffer;
             const fileFingerprint = computeBufferFingerprint(file.name, buf);
-            const parsed = parseWfmBuffer(buf, file.name, OVERLAP_COLORS);
-            for (const ch of Object.values(parsed.channels)) {
-              fitChannelTo125(ch);
-            }
+            const parsed =
+              ext === 'raw'
+                ? parseLtspiceRawBuffer(buf, colors)
+                : parseWfmBuffer(buf, file.name, colors);
+            this.markRawChannelsAndFit(parsed.channels);
             const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
             const tab: TabState = {
               id: `tab_${Date.now()}_${Math.random()}`,
@@ -2349,8 +2723,12 @@ export class OscilloscopeApp {
               activeTool: 'pan',
             };
             this.addTab(tab);
+            if (ext === 'raw') {
+              const stepInfo = (parsed as any).stepCount > 1 ? ` · ${(parsed as any).stepCount} steps` : '';
+              this.showToast(`Loaded LTspice .raw (${parsed.drawOrder.length} traces${stepInfo})`, 'info');
+            }
           } catch (err: any) {
-            this.showToast(`Failed to parse WFM: ${err.message}`, 'error');
+            this.showToast(`Failed to parse ${ext?.toUpperCase()}: ${err.message}`, 'error');
           }
         };
         reader.readAsArrayBuffer(file);
@@ -2359,9 +2737,39 @@ export class OscilloscopeApp {
         reader.onload = (e) => {
           try {
             const text = e.target?.result as string;
+            if (ext === 'txt' && isLtspiceExportText(text)) {
+              const fileFingerprint = computeTextFingerprint(file.name, text);
+              const parsed = parseLtspiceText(text, colors);
+              this.markRawChannelsAndFit(parsed.channels);
+              const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+              this.addTab({
+                id: `tab_${Date.now()}_${Math.random()}`,
+                fileName: file.name,
+                fileFingerprint,
+                channels: parsed.channels,
+                drawOrder: parsed.drawOrder,
+                view: { startIndex: 0, endIndex: totalPoints },
+                cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
+                annotations: [],
+                annotationMode: false,
+                annotationsVisible: true,
+                isOverlap: false,
+                plotMode: 'time',
+                fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+                motorConfig: { rpm: null, polePairs: null, enabled: false },
+                triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
+                measurementGate: 'view',
+                separateView: false,
+                activeChannelId: parsed.drawOrder[0],
+                activeTool: 'pan',
+              });
+              const stepInfo = parsed.stepCount > 1 ? ` · ${parsed.stepCount} steps` : '';
+              this.showToast(`Loaded LTspice export (${parsed.drawOrder.length} traces${stepInfo})`, 'info');
+              return;
+            }
             this.showCsvImportModal(text, file.name);
           } catch (err: any) {
-            this.showToast(`Failed to inspect CSV: ${err.message}`, 'error');
+            this.showToast(`Failed to inspect file: ${err.message}`, 'error');
           }
         };
         reader.readAsText(file);
@@ -2541,12 +2949,10 @@ export class OscilloscopeApp {
         sampleRateOverrideHz: this.pendingCsvPreview.sampleRateOverrideHz ?? null,
         columnMappings: this.pendingCsvPreview.columnMappings,
         resample,
-        colors: OVERLAP_COLORS,
+        colors: this.getRawColors(),
       });
 
-      for (const ch of Object.values(parsed.channels)) {
-        fitChannelTo125(ch);
-      }
+      this.markRawChannelsAndFit(parsed.channels);
 
       const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
       const tab: TabState = {
@@ -2644,6 +3050,10 @@ export class OscilloscopeApp {
     try {
       const mathId = `math_${Date.now()}`;
       const mathCh = evaluateMathExpression(expr, tab.channels, tab.drawOrder, mathId, name);
+      mathCh.color = this.getNextComputedColor(0);
+      mathCh.channelKind = 'computed';
+      mathCh.derivedKind = 'math';
+      mathCh.derivedBadge = 'fx';
       mathCh.coupling = 'DC';
       mathCh.inverted = false;
       fitChannelTo125(mathCh);
@@ -2692,11 +3102,14 @@ export class OscilloscopeApp {
         id: traceId,
         name: sp.name,
         unit: sp.unit || baseCh.unit || 'V',
-        color: sp.color,
+        color: sp.color || this.getNextComputedColor(idx),
         visible: true,
         t: baseCh.t,
         v: new Float32Array(sp.values),
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'math',
+        derivedBadge: 'fx',
         mathExpression: sp.expr,
         sourceChannelIds: sp.sourceIds,
         coupling: 'DC',
@@ -2792,10 +3205,13 @@ export class OscilloscopeApp {
         id: alphaId,
         name: 'Clarke α',
         unit: baseCh.unit || 'V',
-        color: '#f472b6',
+        color: this.getNextComputedColor(0),
         visible: true,
         v: alpha,
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'transform',
+        derivedBadge: 'fx',
         coupling: 'DC',
         inverted: false,
         mathExpression: `Clarke α(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
@@ -2812,10 +3228,13 @@ export class OscilloscopeApp {
         id: betaId,
         name: 'Clarke β',
         unit: baseCh.unit || 'V',
-        color: '#4ade80',
+        color: this.getNextComputedColor(1),
         visible: true,
         v: beta,
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'transform',
+        derivedBadge: 'fx',
         coupling: 'DC',
         inverted: false,
         mathExpression: `Clarke β(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
@@ -2882,10 +3301,13 @@ export class OscilloscopeApp {
         id: dId,
         name: 'Park Id/Ud',
         unit: alphaCh.unit || 'V',
-        color: '#38bdf8',
+        color: this.getNextComputedColor(0),
         visible: true,
         v: d,
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'transform',
+        derivedBadge: 'fx',
         coupling: 'DC',
         inverted: false,
         mathExpression: `Park_d(${alphaCh.name}, ${betaCh.name})`,
@@ -2900,10 +3322,13 @@ export class OscilloscopeApp {
         id: qId,
         name: 'Park Iq/Uq',
         unit: alphaCh.unit || 'V',
-        color: '#fb923c',
+        color: this.getNextComputedColor(1),
         visible: true,
         v: q,
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'transform',
+        derivedBadge: 'fx',
         coupling: 'DC',
         inverted: false,
         mathExpression: `Park_q(${alphaCh.name}, ${betaCh.name})`,
@@ -2976,10 +3401,13 @@ export class OscilloscopeApp {
         id: pId,
         name: mode === '3ph' ? 'Power P3ph' : 'Power P(t)',
         unit: 'W',
-        color: '#a78bfa',
+        color: this.getNextComputedColor(0),
         visible: true,
         v: power,
         isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'power',
+        derivedBadge: 'P(t)',
         coupling: 'DC',
         inverted: false,
         mathExpression: expr,
@@ -3161,14 +3589,14 @@ export class OscilloscopeApp {
     }
 
     let inputIdx = 0;
-    let mathIdx = 0;
     tab.drawOrder.forEach((id) => {
       const ch = tab.channels[id];
       if (!ch) return;
       // Keep Compare reference overlay traces tucked inside the compact Compare Group Pill + sidebar Compare Groups list
       if (ch.compareRole === 'ref') return;
 
-      const tag = ch.isMath ? `M${++mathIdx}` : `CH${++inputIdx}`;
+      const computed = isComputedChannel(ch);
+      const tag = computed ? `[${ch.derivedBadge || 'fx'}]` : `CH${++inputIdx}`;
       const isSelected = tab.activeChannelId === id;
       const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(ch);
 
@@ -3179,6 +3607,7 @@ export class OscilloscopeApp {
           : 'bg-[#0c0f13] border-[#222933] text-slate-300 hover:border-[#334155]'
       } ${!ch.visible ? 'opacity-50' : ''}`;
       keyEl.style.borderTopWidth = '2px';
+      keyEl.style.borderTopStyle = computed ? 'dashed' : 'solid';
       keyEl.style.borderTopColor = ch.color;
       if (ch.compareGroupColor) {
         keyEl.style.borderLeftWidth = '3px';
@@ -3189,9 +3618,12 @@ export class OscilloscopeApp {
       const grpBadge = ch.compareGroupName
         ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${ch.compareGroupName}</span>`
         : '';
+      const swatchEl = computed
+        ? `<button class="sk-vis-btn w-4 h-3 flex items-center justify-center shrink-0 cursor-pointer" title="Toggle computed trace visibility"><span class="w-4 h-0 border-t-2 border-dashed block" style="border-color:${ch.color};opacity:${ch.visible ? 1 : 0.3}"></span></button>`
+        : `<button class="sk-vis-btn w-2.5 h-2.5 rounded-xs border border-slate-500 shrink-0 cursor-pointer" style="background:${ch.visible ? ch.color : 'transparent'}" title="Toggle trace visibility"></button>`;
 
       keyEl.innerHTML = `
-        <button class="sk-vis-btn w-2.5 h-2.5 rounded-xs border border-slate-500 shrink-0 cursor-pointer" style="background:${ch.visible ? ch.color : 'transparent'}" title="Toggle trace visibility"></button>
+        ${swatchEl}
         <div class="flex flex-col leading-tight min-w-0">
           <div class="flex items-center gap-1 font-mono text-[11px]">
             ${grpBadge}
@@ -3684,13 +4116,15 @@ export class OscilloscopeApp {
           const grpBadgeHtml = ch.compareGroupName
             ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${ch.compareGroupName}</span>`
             : '';
+          const badgeTxt = ch.derivedBadge || 'fx';
           row.innerHTML = `
             <div class="flex items-center justify-between gap-1">
               <div class="flex items-center gap-1.5 overflow-hidden">
                 <input type="checkbox" class="ch-vis-chk cursor-pointer accent-purple-400" ${ch.visible ? 'checked' : ''} />
-                <span class="w-2.5 h-2.5 rounded-xs shrink-0" style="background:${ch.color}"></span>
+                <span class="w-4 h-0 border-t-2 border-dashed shrink-0" style="border-color:${ch.color}"></span>
+                <span class="text-[9px] font-mono px-1 rounded-xs border border-purple-500/40 text-purple-300 shrink-0">[${badgeTxt}]</span>
                 ${grpBadgeHtml}
-                <span class="font-medium text-purple-200 truncate max-w-[105px]" title="${ch.name}">${ch.name}</span>
+                <span class="font-medium text-purple-200 truncate max-w-[92px]" title="${ch.name}">${ch.name}</span>
               </div>
               <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
                 <button class="ch-fit-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Fit</button>
@@ -3826,13 +4260,16 @@ export class OscilloscopeApp {
       const valStr = formatMeasurementMetricValue(m, def, ch.unit);
 
       const card = document.createElement('div');
+      const isComputed = isComputedChannel(ch);
       card.className = 'flex items-center gap-2 px-2 py-1 bg-[#12161c] border border-[#222933] rounded-sm text-[11px] shrink-0';
       card.style.borderTopWidth = '2px';
+      card.style.borderTopStyle = isComputed ? 'dashed' : 'solid';
       card.style.borderTopColor = ch.color;
 
+      const fxTag = isComputed ? `<span class="text-[9px] font-mono text-purple-300 mr-1">[${ch.derivedBadge || 'fx'}]</span>` : '';
       card.innerHTML = `
         <div class="flex flex-col leading-tight">
-          <span class="text-[10px] text-slate-400 truncate max-w-[115px]">${ch.name} · ${def.shortLabel}</span>
+          <span class="text-[10px] text-slate-400 truncate max-w-[125px]">${fxTag}${ch.name} · ${def.shortLabel}</span>
           <span class="font-mono font-semibold text-slate-100 tabular-nums">${valStr}</span>
         </div>
         <button class="meas-card-remove text-slate-500 hover:text-red-300 px-0.5 font-mono cursor-pointer" title="Remove metric">×</button>

@@ -1,16 +1,77 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Calibrated Multi-Theme Surface Hierarchy */
+:root,
+html[data-theme="obsidian"] {
+  color-scheme: dark;
+  --bg-chassis: #0c1016;
+  --bg-panel: #111722;
+  --bg-elevated: #1b2433;
+  --bg-well: #080b10;
+  --bg-hover: #243044;
+  --border-subtle: #232d3d;
+  --border-strong: #394860;
+  --text-primary: #f1f5f9;
+  --text-secondary: #cbd5e1;
+  --text-muted: #8a99ad;
+  --accent: #06b6d4;
+  --accent-hover: #22d3ee;
+  --accent-fg: #041318;
+  --accent-soft: rgba(6, 182, 212, 0.14);
+  --canvas-stage: #07090e;
+}
+
+html[data-theme="midnight"] {
+  color-scheme: dark;
+  --bg-chassis: #0d1526;
+  --bg-panel: #131d33;
+  --bg-elevated: #1e2c48;
+  --bg-well: #090f1d;
+  --bg-hover: #293b5f;
+  --border-subtle: #273858;
+  --border-strong: #475d85;
+  --text-primary: #f8fafc;
+  --text-secondary: #e2e8f0;
+  --text-muted: #94a3b8;
+  --accent: #38bdf8;
+  --accent-hover: #7dd3fc;
+  --accent-fg: #041423;
+  --accent-soft: rgba(56, 189, 248, 0.16);
+  --canvas-stage: #080e1c;
+}
+
+html[data-theme="daylight"] {
+  color-scheme: light;
+  --bg-chassis: #eaeff5;
+  --bg-panel: #f6f8fb;
+  --bg-elevated: #ffffff;
+  --bg-well: #eef2f6;
+  --bg-hover: #e2e8f0;
+  --border-subtle: #d3dce6;
+  --border-strong: #94a3b8;
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --accent: #0284c7;
+  --accent-hover: #0369a1;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(2, 132, 199, 0.12);
+  --canvas-stage: #ffffff;
 }
 
 @layer base {
   html,
   body {
     font-family: var(--font-sans);
-    background-color: #0c0f13;
-    color: #e2e8f0;
+    background-color: var(--bg-chassis);
+    color: var(--text-primary);
   }
 
   .font-mono,
@@ -24,6 +85,47 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Semantic Surface & Text Tokens */
+.surface-stage {
+  background-color: var(--canvas-stage);
+}
+
+.surface-chassis {
+  background-color: var(--bg-chassis);
+}
+
+.surface-panel {
+  background-color: var(--bg-panel);
+}
+
+.surface-elevated {
+  background-color: var(--bg-elevated);
+}
+
+.surface-well {
+  background-color: var(--bg-well);
+}
+
+.border-theme {
+  border-color: var(--border-subtle);
+}
+
+.border-theme-strong {
+  border-color: var(--border-strong);
+}
+
+.text-theme-primary {
+  color: var(--text-primary);
+}
+
+.text-theme-secondary {
+  color: var(--text-secondary);
+}
+
+.text-theme-muted {
+  color: var(--text-muted);
+}
+
 /* Crisp oscilloscope console scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
@@ -31,38 +133,382 @@
 }
 
 ::-webkit-scrollbar-track {
-  background: #0d1117;
+  background: var(--bg-well);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #27303d;
+  background: var(--border-strong);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3b4758;
+  background: var(--text-muted);
 }
 
-/* Crystal-clear non-blurring floating tool overlays so underlying waveform adjustments remain 100% sharp & visible */
+/* Blocking centered dialogs */
 .modal-overlay {
   background-color: transparent;
   backdrop-filter: none;
   pointer-events: none;
 }
 
-/* Light dim without blur only for blocking import/text prompts */
 .modal-overlay.modal-backdrop-dim {
-  background-color: rgba(4, 6, 9, 0.36);
+  background-color: rgba(4, 6, 9, 0.44);
   backdrop-filter: none;
   pointer-events: auto;
 }
 
 .modal-overlay > div {
   pointer-events: auto;
-  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(100, 116, 139, 0.3);
+  background-color: var(--bg-elevated);
+  border-color: var(--border-strong);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px var(--border-strong);
 }
 
 .modal-drag-handle {
   cursor: move;
   user-select: none;
+}
+
+/* Side-by-Side Non-Overlapping Tool Drawer */
+.tool-drawer {
+  background-color: var(--bg-elevated);
+  border-left: 1px solid var(--border-strong);
+  color: var(--text-primary);
+}
+
+.tool-drawer-resize-handle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 20;
+  transition: background-color 0.15s ease;
+}
+
+.tool-drawer-resize-handle:hover,
+.tool-drawer-resize-handle:active {
+  background-color: var(--accent);
+}
+
+.tool-drawer-header {
+  background-color: var(--bg-panel);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.tool-drawer-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-well);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: all 0.12s ease;
+}
+
+.tool-drawer-tab:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tool-drawer-tab.is-active {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+.tool-drawer-tab.is-secondary {
+  border-color: var(--accent);
+  background-color: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.tool-drawer-tab-btn {
+  cursor: pointer;
+}
+
+.tool-drawer-tab-close {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.72;
+  padding: 0 2px;
+}
+
+.tool-drawer-tab-close:hover {
+  opacity: 1;
+}
+
+.tool-drawer-split-btn {
+  background-color: var(--bg-well);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.tool-drawer-split-btn:hover:not(:disabled) {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tool-drawer-split-btn:disabled {
+  opacity: 0.45;
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.tool-drawer-split-btn.is-active {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+/* Docked tool panels inside #toolDrawerBody flow cleanly without overlay shadows or overlap */
+#toolDrawerBody .modal-overlay.tool-dockable {
+  position: static !important;
+  inset: auto !important;
+  z-index: auto !important;
+  padding: 0 !important;
+  width: 100% !important;
+  display: block !important;
+  pointer-events: auto !important;
+  background-color: transparent !important;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+#toolDrawerBody .modal-overlay.tool-dockable[style*="display: none"] {
+  display: none !important;
+}
+
+#toolDrawerBody .modal-overlay.tool-dockable:last-child {
+  border-bottom: none;
+}
+
+#toolDrawerBody .modal-overlay.tool-dockable > div {
+  max-width: 100% !important;
+  width: 100% !important;
+  max-height: none !important;
+  box-shadow: none !important;
+  border: none !important;
+  border-radius: 0 !important;
+  background-color: var(--bg-elevated) !important;
+  padding: 12px 14px !important;
+}
+
+/* Ensure Compare & Multi-Column Tool Grids Stay Compact Inside Docked Drawer */
+#toolDrawerBody #compareModal .md\:grid-cols-12,
+#toolDrawerBody #batchModal .md\:grid-cols-6,
+#toolDrawerBody #anomalyModal .md\:grid-cols-5 {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+
+#toolDrawerBody #compareModal .md\:col-span-3,
+#toolDrawerBody #compareModal .md\:col-span-4,
+#toolDrawerBody #compareModal .md\:col-span-8,
+#toolDrawerBody #compareModal .md\:col-span-2 {
+  grid-column: span 2 / span 2 !important;
+}
+
+#toolDrawerBody #compareModal .max-h-\[210px\] {
+  max-height: 240px;
+}
+
+/* Click-toggled dropdown menus */
+.wvp-dropdown-menu {
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
+}
+
+/* Surface luminance separation for dark & midnight themes on existing utility cards */
+html.dark .bg-\[\#12161c\] {
+  background-color: var(--bg-panel);
+}
+
+html.dark .bg-\[\#0c0f13\],
+html.dark .bg-\[\#0e1217\] {
+  background-color: var(--bg-chassis);
+}
+
+html.dark .bg-\[\#080b0f\] {
+  background-color: var(--canvas-stage);
+}
+
+html.dark .bg-\[\#161b22\] {
+  background-color: var(--bg-elevated);
+}
+
+html.dark .border-\[\#222933\],
+html.dark .border-\[\#1b212a\],
+html.dark .border-\[\#1b222c\],
+html.dark .border-\[\#1f2732\] {
+  border-color: var(--border-subtle);
+}
+
+html.dark .border-\[\#2c3543\] {
+  border-color: var(--border-strong);
+}
+
+/* Daylight Lab Light Theme Contrast Overrides (preserves all dark-mode utility classes cleanly) */
+html:not(.dark) {
+  background-color: var(--bg-chassis);
+  color: var(--text-primary);
+}
+
+html:not(.dark) body {
+  background-color: var(--bg-chassis);
+  color: var(--text-primary);
+}
+
+html:not(.dark) .bg-\[\#0c0f13\],
+html:not(.dark) .bg-\[\#0e1217\] {
+  background-color: var(--bg-well) !important;
+}
+
+html:not(.dark) .bg-\[\#080b0f\] {
+  background-color: var(--canvas-stage) !important;
+}
+
+html:not(.dark) .bg-\[\#12161c\],
+html:not(.dark) .bg-\[\#12161c\]\/95 {
+  background-color: var(--bg-panel) !important;
+}
+
+html:not(.dark) .bg-\[\#161b22\],
+html:not(.dark) .bg-\[\#1a222d\],
+html:not(.dark) .bg-\[\#162229\],
+html:not(.dark) .bg-\[\#1d1729\],
+html:not(.dark) .bg-\[\#1f2732\] {
+  background-color: var(--bg-elevated) !important;
+}
+
+html:not(.dark) .hover\:bg-\[\#1e2530\]:hover,
+html:not(.dark) .hover\:bg-\[\#243040\]:hover,
+html:not(.dark) .hover\:bg-\[\#1a222d\]:hover,
+html:not(.dark) .hover\:bg-\[\#1d303a\]:hover,
+html:not(.dark) .hover\:bg-\[\#2b2040\]:hover,
+html:not(.dark) .hover\:bg-\[\#161b22\]:hover {
+  background-color: var(--bg-hover) !important;
+}
+
+html:not(.dark) .bg-\[\#222933\] {
+  background-color: #cbd5e1 !important;
+}
+
+html:not(.dark) .bg-cyan-950\/50,
+html:not(.dark) .bg-cyan-950\/60 {
+  background-color: rgba(2, 132, 199, 0.12) !important;
+}
+
+html:not(.dark) .bg-emerald-950\/30,
+html:not(.dark) .bg-emerald-950\/60 {
+  background-color: rgba(5, 150, 105, 0.12) !important;
+}
+
+html:not(.dark) .bg-orange-950\/50,
+html:not(.dark) .bg-orange-600\/20 {
+  background-color: rgba(234, 88, 12, 0.12) !important;
+}
+
+html:not(.dark) .bg-rose-950\/50,
+html:not(.dark) .bg-rose-950\/60,
+html:not(.dark) .bg-red-950\/30,
+html:not(.dark) .bg-red-950\/50,
+html:not(.dark) .bg-red-950\/80 {
+  background-color: rgba(220, 38, 38, 0.1) !important;
+}
+
+html:not(.dark) .border-\[\#222933\],
+html:not(.dark) .border-\[\#1b212a\],
+html:not(.dark) .border-\[\#1b222c\],
+html:not(.dark) .border-\[\#1f2732\],
+html:not(.dark) .border-\[\#2c3543\],
+html:not(.dark) .border-\[\#2c3849\] {
+  border-color: var(--border-subtle) !important;
+}
+
+html:not(.dark) .text-white,
+html:not(.dark) .text-slate-100,
+html:not(.dark) .text-slate-200 {
+  color: #0f172a !important;
+}
+
+html:not(.dark) .text-slate-300 {
+  color: #334155 !important;
+}
+
+html:not(.dark) .text-slate-400,
+html:not(.dark) .text-slate-500 {
+  color: #64748b !important;
+}
+
+html:not(.dark) .text-cyan-200,
+html:not(.dark) .text-cyan-300,
+html:not(.dark) .text-cyan-400 {
+  color: #0369a1 !important;
+}
+
+html:not(.dark) .text-amber-200,
+html:not(.dark) .text-amber-300,
+html:not(.dark) .text-amber-400 {
+  color: #b45309 !important;
+}
+
+html:not(.dark) .text-emerald-200,
+html:not(.dark) .text-emerald-300,
+html:not(.dark) .text-emerald-400 {
+  color: #047857 !important;
+}
+
+html:not(.dark) .text-purple-200,
+html:not(.dark) .text-purple-300 {
+  color: #6d28d9 !important;
+}
+
+html:not(.dark) .text-rose-200,
+html:not(.dark) .text-rose-300,
+html:not(.dark) .text-red-200,
+html:not(.dark) .text-red-300,
+html:not(.dark) .text-red-400 {
+  color: #be123c !important;
+}
+
+html:not(.dark) .text-orange-200,
+html:not(.dark) .text-orange-300 {
+  color: #c2410c !important;
+}
+
+/* Primary filled action buttons retain crisp white text on light theme */
+html:not(.dark) .bg-cyan-600,
+html:not(.dark) .bg-emerald-500,
+html:not(.dark) .bg-emerald-600,
+html:not(.dark) .bg-orange-600,
+html:not(.dark) .bg-purple-600,
+html:not(.dark) .bg-amber-500 {
+  color: #ffffff !important;
+}
+
+html:not(.dark) #timeModeBtn.bg-cyan-600,
+html:not(.dark) #freqModeBtn.bg-cyan-600,
+html:not(.dark) #xyModeBtn.bg-cyan-600 {
+  color: #ffffff !important;
+}
+
+html:not(.dark) input,
+html:not(.dark) select {
+  color: #0f172a;
+}
+
+html:not(.dark) .modal-overlay.modal-backdrop-dim {
+  background-color: rgba(15, 23, 42, 0.35);
 }

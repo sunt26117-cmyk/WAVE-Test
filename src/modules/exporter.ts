@@ -22,6 +22,8 @@ import {
   drawXYPlot,
   drawGoldenToleranceBand,
   drawMeasurementStripOnCanvas,
+  drawOverlapTraceLegend,
+  drawCompareGroupLegend,
   formatEng,
 } from '../engine/canvasRenderer';
 import { getSubplotRects, getTimebaseInfo } from './oscilloscopeScale';
@@ -221,14 +223,14 @@ function buildCompositeScopePngInternal(
 
   ctx.scale(scale, scale);
 
-  // Full dark chassis background
-  ctx.fillStyle = '#0c0f13';
+  // Full theme chassis background
+  ctx.fillStyle = theme.chassisBg || '#0c0f13';
   ctx.fillRect(0, 0, w, totalH);
 
   // Header telemetry bar
-  ctx.fillStyle = '#12161c';
+  ctx.fillStyle = theme.headerBg || '#12161c';
   ctx.fillRect(0, 0, w, headerH);
-  ctx.strokeStyle = '#222933';
+  ctx.strokeStyle = theme.hudBorder || '#222933';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(0, headerH - 0.5);
@@ -248,12 +250,12 @@ function buildCompositeScopePngInternal(
   const renderStr = (tab.renderMode || 'vector').toUpperCase();
 
   ctx.font = '600 12px "IBM Plex Sans", sans-serif';
-  ctx.fillStyle = '#f1f5f9';
+  ctx.fillStyle = theme.text || '#f1f5f9';
   ctx.textAlign = 'left';
   ctx.fillText(`${tab.fileName}`, 14, 23);
 
   ctx.font = '11px "JetBrains Mono", monospace';
-  ctx.fillStyle = '#94a3b8';
+  ctx.fillStyle = theme.axisText || '#94a3b8';
   ctx.textAlign = 'right';
   ctx.fillText(
     `H: ${formatEng(tb.secPerDiv, 's', 2)}/div  |  ${srText}  |  ${modeStr}  |  ${renderStr}`,
@@ -291,7 +293,7 @@ function buildCompositeScopePngInternal(
         if (goldenEval && tab.goldenBand?.channelId === rect.channel.id) {
           drawGoldenToleranceBand(ctx, tab, rect.channel, p, goldenEval, rect.area);
         }
-        drawChannelWaveform(ctx, tab, rect.channel, p, rect.area);
+        drawChannelWaveform(ctx, tab, rect.channel, p, rect.area, theme);
       });
     } else {
       drawGrid(ctx, p, theme, 10, 8, true);
@@ -299,13 +301,15 @@ function buildCompositeScopePngInternal(
         drawGoldenToleranceBand(ctx, tab, goldenCh, p, goldenEval);
       }
       for (const ch of visibleChs) {
-        drawChannelWaveform(ctx, tab, ch, p);
+        drawChannelWaveform(ctx, tab, ch, p, undefined, theme);
       }
     }
     drawTriggerLine(ctx, tab, p, theme);
-    drawGndMarkers(ctx, p, tab);
+    drawGndMarkers(ctx, p, tab, theme);
     drawCursors(ctx, tab, p, theme);
-    drawAnnotations(ctx, tab, p);
+    drawAnnotations(ctx, tab, p, theme);
+    const legendBottom = drawOverlapTraceLegend(ctx, tab, p, theme);
+    drawCompareGroupLegend(ctx, tab, p, theme, legendBottom > p.y + 8 ? legendBottom + 6 : undefined);
   }
 
   drawAxisLabels(ctx, p, tab, theme, 10, 8, cachedSpectrum);
@@ -313,12 +317,12 @@ function buildCompositeScopePngInternal(
 
   // Draw active measurement strip at bottom
   if (selectedItems.length > 0) {
-    ctx.strokeStyle = '#222933';
+    ctx.strokeStyle = theme.hudBorder || '#222933';
     ctx.beginPath();
     ctx.moveTo(0, headerH + plotH + 0.5);
     ctx.lineTo(w, headerH + plotH + 0.5);
     ctx.stroke();
-    drawMeasurementStripOnCanvas(ctx, tab, w, headerH + plotH, measByChannel);
+    drawMeasurementStripOnCanvas(ctx, tab, w, headerH + plotH, measByChannel, theme);
   }
 
   const filename = buildScreenshotFilename();

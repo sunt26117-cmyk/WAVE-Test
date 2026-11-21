@@ -40,6 +40,7 @@ export interface RenderTheme {
   bg: string;
   grid: string;
   gridSub: string;
+  frame: string;
   axisText: string;
   cursor: string;
   cursorY: string;
@@ -48,13 +49,19 @@ export interface RenderTheme {
   harmonic: string;
   peak: string;
   text: string;
+  hudBg: string;
+  hudBorder: string;
+  chassisBg: string;
+  headerBg: string;
+  isLight?: boolean;
   bwTraces?: string[];
 }
 
 export const DEFAULT_THEME: RenderTheme = {
-  bg: '#080b0f',
-  grid: '#1d2633',
+  bg: '#07090e',
+  grid: '#1b2330',
   gridSub: '#2b3749',
+  frame: '#334155',
   axisText: '#94a3b8',
   cursor: '#38bdf8',
   cursorY: '#a78bfa',
@@ -63,7 +70,16 @@ export const DEFAULT_THEME: RenderTheme = {
   harmonic: '#f87171',
   peak: '#4ade80',
   text: '#f1f5f9',
+  hudBg: 'rgba(15, 21, 32, 0.92)',
+  hudBorder: '#334155',
+  chassisBg: '#0c1016',
+  headerBg: '#121822',
+  isLight: false,
 };
+
+export function isComputedChannel(ch: WaveformChannel): boolean {
+  return ch.channelKind === 'computed' || !!ch.isMath;
+}
 
 // Authentic phosphor oscilloscope trace palette (CH1 Yellow, CH2 Cyan, CH3 Magenta, CH4 Green, ...)
 export const OVERLAP_COLORS = [
@@ -326,7 +342,7 @@ export function drawGrid(
   }
 
   // Crisp outer graticule frame
-  ctx.strokeStyle = '#334155';
+  ctx.strokeStyle = theme.frame || '#334155';
   ctx.lineWidth = 1;
   ctx.strokeRect(p.x + 0.5, p.y + 0.5, p.width - 1, p.height - 1);
   ctx.restore();
@@ -373,6 +389,8 @@ function drawSegmentsOnCanvas(
     ctx.stroke();
 
     // Ensure isolated single-sample segments remain visible in line modes
+    const savedDash = ctx.getLineDash();
+    if (savedDash.length > 0) ctx.setLineDash([]);
     for (const seg of segments) {
       if (seg.length === 1) {
         const x = area.x + ((seg[0].time - viewStartTime) / viewDuration) * area.width;
@@ -382,9 +400,12 @@ function drawSegmentsOnCanvas(
         ctx.fill();
       }
     }
+    if (savedDash.length > 0) ctx.setLineDash(savedDash);
   }
 
   if (drawMarkers) {
+    const savedDash = ctx.getLineDash();
+    if (savedDash.length > 0) ctx.setLineDash([]);
     let totalPts = 0;
     for (const seg of segments) totalPts += seg.length;
     const stride = totalPts > 1400 ? Math.ceil(totalPts / 1400) : 1;
@@ -398,6 +419,7 @@ function drawSegmentsOnCanvas(
         ctx.fill();
       }
     }
+    if (savedDash.length > 0) ctx.setLineDash(savedDash);
   }
 }
 
@@ -410,7 +432,8 @@ export function drawChannelWaveform(
   tab: TabState,
   ch: WaveformChannel,
   p: PlotArea,
-  subPlotArea?: PlotArea
+  subPlotArea?: PlotArea,
+  theme: RenderTheme = DEFAULT_THEME
 ): void {
   if (!ch.visible || ch.v.length === 0) return;
 
@@ -453,7 +476,7 @@ export function drawChannelWaveform(
   if (0 >= vMin && 0 <= vMax) {
     const zeroY = area.y + area.height - ((0 - vMin) / vRange) * area.height;
     ctx.save();
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+    ctx.strokeStyle = theme.isLight ? 'rgba(100, 116, 139, 0.28)' : 'rgba(148, 163, 184, 0.16)';
     ctx.setLineDash([2, 4]);
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -526,11 +549,25 @@ export function drawChannelWaveform(
       ? interpolateSmoothSegments(rawActiveSegments, 8)
       : rawActiveSegments;
 
+  const computed = isComputedChannel(ch);
   ctx.strokeStyle = ch.color;
   ctx.fillStyle = ch.color;
-  ctx.lineWidth = ch.id === tab.activeChannelId ? 1.85 : 1.45;
+  ctx.lineWidth = ch.id === tab.activeChannelId ? 1.9 : computed ? 1.4 : 1.5;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  if (computed) {
+    const dash =
+      ch.derivedKind === 'diff' || ch.compareRole === 'diff'
+        ? [3, 3]
+        : ch.derivedKind === 'ref' || ch.compareRole === 'ref'
+        ? [6, 4]
+        : [7, 4];
+    ctx.setLineDash(dash);
+    ctx.globalAlpha = ch.id === tab.activeChannelId ? 1.0 : 0.88;
+  } else {
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1.0;
+  }
 
   const drawLines = renderMode === 'vector' || renderMode === 'sinc' || renderMode === 'vector-markers';
   const drawMarkers = renderMode === 'dots' || renderMode === 'vector-markers';
@@ -564,6 +601,9 @@ export function drawChannelWaveform(
     );
   }
 
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1.0;
+
   // 3. Same-screen Diff (New - Ref) curve
   if (ch.refV && ch.hasEdits && ch.showDiff && ch.refV.length === totalN) {
     const refArr = ch.refV;
@@ -580,9 +620,10 @@ export function drawChannelWaveform(
       gapThreshold
     );
 
+    const diffCol = theme.isLight ? '#e11d48' : '#fb7185';
     ctx.save();
-    ctx.strokeStyle = '#fb7185';
-    ctx.fillStyle = '#fb7185';
+    ctx.strokeStyle = diffCol;
+    ctx.fillStyle = diffCol;
     ctx.lineWidth = 1.35;
     ctx.setLineDash([3, 3]);
     drawSegmentsOnCanvas(
@@ -652,7 +693,12 @@ export function getGndHandlePositions(p: PlotArea, tab: TabState): GndHandlePosi
 /**
  * Draws clickable/draggable hardware GND ground flags on the left border of the graticule.
  */
-export function drawGndMarkers(ctx: CanvasRenderingContext2D, p: PlotArea, tab: TabState): void {
+export function drawGndMarkers(
+  ctx: CanvasRenderingContext2D,
+  p: PlotArea,
+  tab: TabState,
+  theme: RenderTheme = DEFAULT_THEME
+): void {
   const handles = getGndHandlePositions(p, tab);
   if (handles.length === 0) return;
 
@@ -674,13 +720,13 @@ export function drawGndMarkers(ctx: CanvasRenderingContext2D, p: PlotArea, tab: 
     ctx.lineTo(h.x - 5, h.y + halfH);
     ctx.closePath();
 
-    ctx.fillStyle = h.clamped ? '#1e293b' : h.color;
+    ctx.fillStyle = h.clamped ? (theme.isLight ? '#e2e8f0' : '#1e293b') : h.color;
     ctx.fill();
-    ctx.strokeStyle = isActive ? '#ffffff' : h.color;
+    ctx.strokeStyle = isActive ? theme.text : h.color;
     ctx.lineWidth = isActive ? 1.5 : 1;
     ctx.stroke();
 
-    ctx.fillStyle = h.clamped ? h.color : '#090d12';
+    ctx.fillStyle = h.clamped ? h.color : theme.isLight ? '#ffffff' : '#090d12';
     ctx.fillText(h.label, h.x - 10.5, h.y + 0.5);
   }
 
@@ -772,7 +818,7 @@ export function drawSpectrum(
   const endBin = df > 0 ? Math.min(n - 1, Math.ceil(maxFreq / df) + 1) : n - 1;
   const binsInView = Math.max(0, endBin - startBin + 1);
 
-  ctx.strokeStyle = '#22d3ee';
+  ctx.strokeStyle = theme.cursor;
   ctx.lineWidth = 1.5;
   ctx.beginPath();
 
@@ -851,13 +897,13 @@ export function drawSpectrum(
     ctx.lineTo(lastX, p.y + p.height);
     ctx.lineTo(firstX, p.y + p.height);
     ctx.closePath();
-    ctx.fillStyle = 'rgba(34, 211, 238, 0.08)';
+    ctx.fillStyle = theme.cursorFill;
     ctx.fill();
   }
 
   // Spectrum telemetry banner
   ctx.font = '600 11px "JetBrains Mono", monospace';
-  ctx.fillStyle = '#22d3ee';
+  ctx.fillStyle = theme.cursor;
   const warnSuffix = spectrum.cappedWarning ? `  |  [${spectrum.cappedWarning}]` : '';
   ctx.fillText(
     `FFT: ${spectrum.sourceChannelName}  |  Fs: ${formatEng(spectrum.sampleRate, 'S/s', 1)}  |  Δf: ${spectrum.resolution.toFixed(2)} Hz  |  Span: ${formatEng(minFreq, 'Hz', 1)} - ${formatEng(maxFreq, 'Hz', 1)}${warnSuffix}`,
@@ -897,7 +943,7 @@ export function drawSpectrum(
         const tw = ctx.measureText(marker.label).width;
         const lx = Math.min(x + 4, p.x + p.width - tw - 6);
 
-        ctx.fillStyle = 'rgba(12, 15, 19, 0.9)';
+        ctx.fillStyle = theme.hudBg;
         ctx.fillRect(lx - 2, labelY - 10, tw + 6, 13);
         ctx.fillStyle = theme.harmonic;
         ctx.fillText(marker.label, lx + 1, labelY);
@@ -910,6 +956,7 @@ export function drawSpectrum(
   const visiblePeaks = spectrum.peaks.filter(
     (peak) => peak.frequency >= minFreq && peak.frequency <= maxFreq
   );
+  const fundColor = theme.isLight ? '#b45309' : '#facc15';
 
   for (let idx = 0; idx < visiblePeaks.length; idx++) {
     const peak = visiblePeaks[idx];
@@ -917,7 +964,7 @@ export function drawSpectrum(
     const peakVal = scaleMode === 'db' ? peak.db : peak.magnitude;
     const y = p.y + p.height - ((peakVal - yMin) / ySpan) * p.height;
 
-    ctx.fillStyle = peak.isFundamental ? '#facc15' : theme.peak;
+    ctx.fillStyle = peak.isFundamental ? fundColor : theme.peak;
     ctx.beginPath();
     ctx.moveTo(x, y - 4);
     ctx.lineTo(x - 4.5, y - 12);
@@ -932,13 +979,13 @@ export function drawSpectrum(
     const labelX = Math.max(p.x + 8, Math.min(p.x + p.width - tw - 8, x - tw / 2));
     const labelY = Math.max(p.y + 28, Math.min(p.y + p.height - 12, y - 16 - (idx % 2) * 14));
 
-    ctx.fillStyle = 'rgba(12, 15, 19, 0.92)';
+    ctx.fillStyle = theme.hudBg;
     ctx.fillRect(labelX - 3, labelY - 10, tw + 6, 13);
-    ctx.strokeStyle = peak.isFundamental ? '#facc15' : theme.peak;
+    ctx.strokeStyle = peak.isFundamental ? fundColor : theme.peak;
     ctx.lineWidth = 1;
     ctx.strokeRect(labelX - 3, labelY - 10, tw + 6, 13);
 
-    ctx.fillStyle = peak.isFundamental ? '#facc15' : '#f1f5f9';
+    ctx.fillStyle = peak.isFundamental ? fundColor : theme.text;
     ctx.fillText(label, labelX, labelY);
   }
 
@@ -996,7 +1043,7 @@ export function drawTriggerLine(
   ctx.fill();
 
   ctx.font = 'bold 9px "JetBrains Mono", monospace';
-  ctx.fillStyle = '#090d12';
+  ctx.fillStyle = theme.isLight ? '#ffffff' : '#090d12';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText('T', hx + 12, y + 0.5);
@@ -1060,7 +1107,7 @@ export function drawCursors(
 
         ctx.fillStyle = theme.cursor;
         ctx.fillRect(x1Px - 10, p.y - 14, 20, 13);
-        ctx.fillStyle = '#080b0f';
+        ctx.fillStyle = theme.isLight ? '#ffffff' : '#080b0f';
         ctx.textAlign = 'center';
         ctx.fillText('X1', x1Px, p.y - 4);
       }
@@ -1080,7 +1127,7 @@ export function drawCursors(
 
         ctx.fillStyle = theme.cursor;
         ctx.fillRect(x2Px - 10, p.y - 14, 20, 13);
-        ctx.fillStyle = '#080b0f';
+        ctx.fillStyle = theme.isLight ? '#ffffff' : '#080b0f';
         ctx.textAlign = 'center';
         ctx.fillText('X2', x2Px, p.y - 4);
       }
@@ -1125,12 +1172,12 @@ export function drawCursors(
       // Y badge inside left margin of targetArea
       ctx.fillStyle = theme.cursorY;
       ctx.fillRect(targetArea.x + 4, yPx - 14, 20, 12);
-      ctx.fillStyle = '#080b0f';
+      ctx.fillStyle = theme.isLight ? '#ffffff' : '#080b0f';
       ctx.textAlign = 'center';
       ctx.fillText(label, targetArea.x + 14, yPx - 4.5);
 
       if (showTrack && pxAtTime !== null && pxAtTime >= p.x && pxAtTime <= p.x + p.width) {
-        ctx.strokeStyle = '#ffffff';
+        ctx.strokeStyle = theme.text;
         ctx.fillStyle = targetCh.color;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -1149,7 +1196,7 @@ export function drawCursors(
       const top = Math.max(targetArea.y, Math.min(y1Px, y2Px));
       const bot = Math.min(targetArea.y + targetArea.height, Math.max(y1Px, y2Px));
       if (bot > top) {
-        ctx.fillStyle = 'rgba(167, 139, 250, 0.08)';
+        ctx.fillStyle = theme.isLight ? 'rgba(124, 58, 237, 0.08)' : 'rgba(167, 139, 250, 0.08)';
         ctx.fillRect(targetArea.x, top, targetArea.width, bot - top);
       }
     }
@@ -1182,14 +1229,14 @@ export function drawCursors(
     const bx = p.x + p.width - boxW - 8;
     const by = p.y + 8;
 
-    ctx.fillStyle = 'rgba(8, 11, 15, 0.88)';
+    ctx.fillStyle = theme.hudBg;
     ctx.fillRect(bx, by, boxW, boxH);
-    ctx.strokeStyle = '#334155';
+    ctx.strokeStyle = theme.hudBorder;
     ctx.lineWidth = 1;
     ctx.strokeRect(bx, by, boxW, boxH);
 
     lines.forEach((ln, idx) => {
-      ctx.fillStyle = idx < 2 && showX ? '#7dd3fc' : '#c4b5fd';
+      ctx.fillStyle = idx < 2 && showX ? theme.cursor : theme.cursorY;
       ctx.fillText(ln, bx + 8, by + 15 + idx * 15);
     });
   }
@@ -1200,7 +1247,12 @@ export function drawCursors(
 /**
  * Draws Point, Text, and Area measurement annotations on the canvas.
  */
-export function drawAnnotations(ctx: CanvasRenderingContext2D, tab: TabState, p: PlotArea): void {
+export function drawAnnotations(
+  ctx: CanvasRenderingContext2D,
+  tab: TabState,
+  p: PlotArea,
+  theme: RenderTheme = DEFAULT_THEME
+): void {
   if (!tab.annotationsVisible || tab.annotations.length === 0 || tab.plotMode !== 'time') return;
 
   ctx.save();
@@ -1221,7 +1273,7 @@ export function drawAnnotations(ctx: CanvasRenderingContext2D, tab: TabState, p:
       ctx.beginPath();
       ctx.arc(pt.x, pt.y, 4, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = '#ffffff';
+      ctx.strokeStyle = theme.text;
       ctx.lineWidth = 1;
       ctx.stroke();
 
@@ -1229,11 +1281,11 @@ export function drawAnnotations(ctx: CanvasRenderingContext2D, tab: TabState, p:
       const tw = ctx.measureText(label).width;
       const lx = Math.min(pt.x + 8, area.x + area.width - tw - 8);
       const ly = Math.max(area.y + 18, pt.y - 8);
-      ctx.fillStyle = 'rgba(8, 11, 15, 0.9)';
+      ctx.fillStyle = theme.hudBg;
       ctx.fillRect(lx - 3, ly - 11, tw + 6, 14);
       ctx.strokeStyle = ann.color || ch.color;
       ctx.strokeRect(lx - 3, ly - 11, tw + 6, 14);
-      ctx.fillStyle = '#f8fafc';
+      ctx.fillStyle = theme.text;
       ctx.textAlign = 'left';
       ctx.fillText(label, lx, ly);
     } else if (ann.type === 'text') {
@@ -1246,17 +1298,17 @@ export function drawAnnotations(ctx: CanvasRenderingContext2D, tab: TabState, p:
       const lx = Math.min(pt.x + 10, area.x + area.width - tw - 10);
       const ly = Math.max(area.y + 20, pt.y - 16);
 
-      ctx.strokeStyle = '#fbbf24';
+      ctx.strokeStyle = theme.isLight ? '#d97706' : '#fbbf24';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(pt.x, pt.y);
       ctx.lineTo(lx, ly - 3);
       ctx.stroke();
 
-      ctx.fillStyle = 'rgba(18, 22, 28, 0.94)';
+      ctx.fillStyle = theme.hudBg;
       ctx.fillRect(lx - 4, ly - 12, tw + 8, 16);
       ctx.strokeRect(lx - 4, ly - 12, tw + 8, 16);
-      ctx.fillStyle = '#fde68a';
+      ctx.fillStyle = theme.isLight ? '#92400e' : '#fde68a';
       ctx.textAlign = 'left';
       ctx.fillText(label, lx, ly);
     } else if (ann.type === 'area' && ann.x2 !== undefined && ann.y2 !== undefined) {
@@ -1270,7 +1322,7 @@ export function drawAnnotations(ctx: CanvasRenderingContext2D, tab: TabState, p:
 
       ctx.fillStyle = 'rgba(52, 211, 153, 0.12)';
       ctx.fillRect(rx, ry, rw, rh);
-      ctx.strokeStyle = '#34d399';
+      ctx.strokeStyle = theme.peak;
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 3]);
       ctx.strokeRect(rx, ry, rw, rh);
@@ -1282,9 +1334,9 @@ export function drawAnnotations(ctx: CanvasRenderingContext2D, tab: TabState, p:
       const tw = ctx.measureText(lbl).width;
       const lx = Math.min(rx + 4, area.x + area.width - tw - 6);
       const ly = Math.max(area.y + 14, ry + 14);
-      ctx.fillStyle = 'rgba(8, 11, 15, 0.9)';
+      ctx.fillStyle = theme.hudBg;
       ctx.fillRect(lx - 2, ly - 10, tw + 6, 13);
-      ctx.fillStyle = '#6ee7b7';
+      ctx.fillStyle = theme.peak;
       ctx.textAlign = 'left';
       ctx.fillText(lbl, lx + 1, ly);
     }
@@ -1419,7 +1471,8 @@ export function drawAxisLabels(
 
       // Per-subplot corner channel header
       const chIdx = tab.drawOrder.indexOf(ch.id);
-      const tag = ch.isMath ? 'M' : `CH${chIdx + 1}`;
+      const computed = isComputedChannel(ch);
+      const tag = computed ? `[${ch.derivedBadge || 'fx'}]` : `CH${chIdx + 1}`;
       const grpPrefix = ch.compareGroupName ? `[${ch.compareGroupName}] ` : '';
       const vDivStr = formatEng(ch.voltsPerDiv || vSpan / 8, ch.unit, 1);
       const offStr = formatEng(ch.vOffset || 0, ch.unit, 2);
@@ -1430,19 +1483,29 @@ export function drawAxisLabels(
       const tw = ctx.measureText(header).width;
       const hx = area.x + 6;
       const hy = area.y + 4;
-      ctx.fillStyle = 'rgba(8, 11, 15, 0.85)';
-      ctx.fillRect(hx, hy, tw + 10, 15);
-      ctx.strokeStyle = ch.compareGroupColor || (ch.id === tab.activeChannelId ? ch.color : '#222933');
+      ctx.fillStyle = theme.hudBg;
+      ctx.fillRect(hx, hy, tw + 12, 16);
+      ctx.strokeStyle = ch.compareGroupColor || (ch.id === tab.activeChannelId ? ch.color : theme.hudBorder);
       ctx.lineWidth = 1;
-      ctx.strokeRect(hx, hy, tw + 10, 15);
+      ctx.strokeRect(hx, hy, tw + 12, 16);
       if (ch.compareGroupColor) {
         ctx.fillStyle = ch.compareGroupColor;
-        ctx.fillRect(hx, hy, 3, 15);
+        ctx.fillRect(hx, hy, 3, 16);
+      } else if (computed) {
+        ctx.save();
+        ctx.strokeStyle = ch.color;
+        ctx.setLineDash([4, 2]);
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(hx + 2, hy + 15);
+        ctx.lineTo(hx + tw + 10, hy + 15);
+        ctx.stroke();
+        ctx.restore();
       }
 
       ctx.textAlign = 'left';
       ctx.fillStyle = ch.color;
-      ctx.fillText(header, hx + 6, hy + 10.5);
+      ctx.fillText(header, hx + 6, hy + 11);
     });
   } else {
     // Overlap mode: Y-axis graduation corresponds to active channel
@@ -1474,13 +1537,105 @@ export function drawAxisLabels(
 }
 
 /**
+ * Draws a compact, scannable top-left trace legend in Overlap time-domain mode,
+ * distinguishing Solid Raw Signals from Dashed [fx] Computed/Derived traces.
+ * Returns the bottom Y coordinate of the rendered legend box.
+ */
+export function drawOverlapTraceLegend(
+  ctx: CanvasRenderingContext2D,
+  tab: TabState,
+  p: PlotArea,
+  theme: RenderTheme = DEFAULT_THEME
+): number {
+  if (tab.plotMode !== 'time' || tab.separateView) return p.y + 8;
+
+  const visibleChs = tab.drawOrder
+    .map((id) => tab.channels[id])
+    .filter((c) => c && c.visible && !c.compareGroupId);
+  if (visibleChs.length === 0) return p.y + 8;
+
+  const maxRows = Math.min(visibleChs.length, 8);
+  const hiddenMore = Math.max(0, visibleChs.length - maxRows);
+  const rows = visibleChs.slice(0, maxRows);
+
+  ctx.save();
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'left';
+
+  let maxW = 140;
+  const entries = rows.map((ch) => {
+    const computed = isComputedChannel(ch);
+    const badge = computed ? `[${ch.derivedBadge || 'fx'}] ` : '';
+    const vDivStr = ch.voltsPerDiv ? ` (${formatEng(ch.voltsPerDiv, ch.unit, 1)}/d)` : '';
+    const lbl = `${badge}${ch.name}${vDivStr}`;
+    const w = ctx.measureText(lbl).width + 32;
+    if (w > maxW) maxW = w;
+    return { ch, computed, lbl };
+  });
+
+  const boxW = Math.min(280, maxW + 8);
+  const lineH = 14;
+  const totalLines = entries.length + (hiddenMore > 0 ? 1 : 0);
+  const boxH = 8 + totalLines * lineH;
+  const bx = p.x + 8;
+  const by = p.y + 8;
+
+  if (by + boxH > p.y + p.height - 14) {
+    ctx.restore();
+    return p.y + 8;
+  }
+
+  ctx.fillStyle = theme.hudBg;
+  ctx.fillRect(bx, by, boxW, boxH);
+  ctx.strokeStyle = theme.hudBorder;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, boxW, boxH);
+
+  entries.forEach((item, idx) => {
+    const ry = by + 13 + idx * lineH;
+    const isAct = item.ch.id === tab.activeChannelId;
+
+    ctx.save();
+    ctx.strokeStyle = item.ch.color;
+    ctx.lineWidth = isAct ? 2.4 : 1.8;
+    if (item.computed) {
+      ctx.setLineDash([4, 2]);
+    }
+    ctx.beginPath();
+    ctx.moveTo(bx + 8, ry - 3.5);
+    ctx.lineTo(bx + 22, ry - 3.5);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.font = isAct ? '700 10px "JetBrains Mono", monospace' : '500 10px "JetBrains Mono", monospace';
+    ctx.fillStyle = isAct ? theme.text : theme.axisText;
+    let drawText = item.lbl;
+    while (drawText.length > 6 && ctx.measureText(drawText).width > boxW - 34) {
+      drawText = drawText.slice(0, -2) + '…';
+    }
+    ctx.fillText(drawText, bx + 26, ry);
+  });
+
+  if (hiddenMore > 0) {
+    const ry = by + 13 + entries.length * lineH;
+    ctx.fillStyle = theme.axisText;
+    ctx.fillText(`+${hiddenMore} more traces`, bx + 26, ry);
+  }
+
+  ctx.restore();
+  return by + boxH;
+}
+
+/**
  * Draws a compact Compare Group Legend in Overlap time-domain mode so all traces
  * belonging to the same comparison group can be visually identified at a glance.
  */
 export function drawCompareGroupLegend(
   ctx: CanvasRenderingContext2D,
   tab: TabState,
-  p: PlotArea
+  p: PlotArea,
+  theme: RenderTheme = DEFAULT_THEME,
+  yStart?: number
 ): void {
   if (tab.plotMode !== 'time' || tab.separateView) return;
 
@@ -1510,7 +1665,7 @@ export function drawCompareGroupLegend(
   ctx.font = '10px "JetBrains Mono", monospace';
   ctx.textAlign = 'left';
 
-  let curY = p.y + 8;
+  let curY = yStart && yStart > p.y + 8 ? yStart : p.y + 8;
   const maxBoxBottom = p.y + p.height - 16;
 
   grouped.forEach((grp) => {
@@ -1540,9 +1695,9 @@ export function drawCompareGroupLegend(
     const bx = p.x + 8;
     const by = curY;
 
-    ctx.fillStyle = 'rgba(8, 11, 15, 0.86)';
+    ctx.fillStyle = theme.hudBg;
     ctx.fillRect(bx, by, boxW, boxH);
-    ctx.strokeStyle = '#222933';
+    ctx.strokeStyle = theme.hudBorder;
     ctx.lineWidth = 1;
     ctx.strokeRect(bx, by, boxW, boxH);
 
@@ -1560,14 +1715,21 @@ export function drawCompareGroupLegend(
     rowLabels.forEach((item, idx) => {
       const ry = by + 13 + (idx + 1) * lineH;
       // Line swatch
+      ctx.save();
       ctx.strokeStyle = item.ch.color;
-      ctx.lineWidth = 2.2;
+      ctx.lineWidth = 2.0;
+      if (isComputedChannel(item.ch)) {
+        ctx.setLineDash(
+          item.ch.compareRole === 'diff' || item.ch.derivedKind === 'diff' ? [2, 2] : [4, 2]
+        );
+      }
       ctx.beginPath();
       ctx.moveTo(bx + 9, ry - 3);
       ctx.lineTo(bx + 21, ry - 3);
       ctx.stroke();
+      ctx.restore();
 
-      ctx.fillStyle = item.ch.id === tab.activeChannelId ? '#ffffff' : '#cbd5e1';
+      ctx.fillStyle = item.ch.id === tab.activeChannelId ? theme.text : theme.axisText;
       let drawText = item.lbl;
       while (drawText.length > 6 && ctx.measureText(drawText).width > boxW - 30) {
         drawText = drawText.slice(0, -2) + '…';
@@ -1577,7 +1739,7 @@ export function drawCompareGroupLegend(
 
     if (hiddenMore > 0) {
       const ry = by + 13 + (rowLabels.length + 1) * lineH;
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = theme.axisText;
       ctx.fillText(`+${hiddenMore} more in group`, bx + 25, ry);
     }
 
@@ -1607,7 +1769,7 @@ export function generateWaveformSVG(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="background:${theme.bg};font-family:'JetBrains Mono',monospace;">`
   );
   parts.push(
-    `<rect x="${p.x}" y="${p.y}" width="${p.width}" height="${p.height}" fill="${theme.bg}" stroke="#334155" stroke-width="1"/>`
+    `<rect x="${p.x}" y="${p.y}" width="${p.width}" height="${p.height}" fill="${theme.bg}" stroke="${theme.frame || '#334155'}" stroke-width="1"/>`
   );
 
   // Grid
@@ -1655,7 +1817,7 @@ export function generateWaveformSVG(
       const y = p.y + p.height - ((vals[pickIdx] - yMin) / ySpan) * p.height;
       pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
     }
-    parts.push(`<polyline fill="none" stroke="#22d3ee" stroke-width="1.5" points="${pts.join(' ')}"/>`);
+    parts.push(`<polyline fill="none" stroke="${theme.cursor}" stroke-width="1.5" points="${pts.join(' ')}"/>`);
   } else {
     const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
     const rects = getSubplotRects(p, visibleChs, tab.separateView);
@@ -1691,7 +1853,16 @@ export function generateWaveformSVG(
           `<polyline fill="none" stroke="${ch.color}" stroke-opacity="0.45" stroke-dasharray="5,4" stroke-width="1.3" points="${refPts.join(' ')}"/>`
         );
       }
-      parts.push(`<polyline fill="none" stroke="${ch.color}" stroke-width="1.5" points="${pts.join(' ')}"/>`);
+      const computed = isComputedChannel(ch);
+      const dashAttr = computed
+        ? ch.derivedKind === 'diff' || ch.compareRole === 'diff'
+          ? ' stroke-dasharray="3,3"'
+          : ch.derivedKind === 'ref' || ch.compareRole === 'ref'
+          ? ' stroke-dasharray="6,4"'
+          : ' stroke-dasharray="7,4"'
+        : '';
+      const opacityAttr = computed && ch.id !== tab.activeChannelId ? ' stroke-opacity="0.88"' : '';
+      parts.push(`<polyline fill="none" stroke="${ch.color}"${dashAttr}${opacityAttr} stroke-width="1.5" points="${pts.join(' ')}"/>`);
     });
   }
 
@@ -1730,7 +1901,8 @@ export function drawMeasurementStripOnCanvas(
   tab: TabState,
   width: number,
   yStart: number,
-  measByChannel: Record<string, ChannelMeasurements>
+  measByChannel: Record<string, ChannelMeasurements>,
+  theme: RenderTheme = DEFAULT_THEME
 ): number {
   const items = tab.selectedMeasurements || [];
   if (items.length === 0) return 0;
@@ -1763,9 +1935,9 @@ export function drawMeasurementStripOnCanvas(
       curY += cardH + 6;
     }
 
-    ctx.fillStyle = '#12161c';
+    ctx.fillStyle = theme.headerBg || '#12161c';
     ctx.fillRect(curX, curY, cardW, cardH);
-    ctx.strokeStyle = '#222933';
+    ctx.strokeStyle = theme.hudBorder || '#222933';
     ctx.lineWidth = 1;
     ctx.strokeRect(curX, curY, cardW, cardH);
 
@@ -1775,11 +1947,11 @@ export function drawMeasurementStripOnCanvas(
 
     ctx.textAlign = 'left';
     ctx.font = '10px "IBM Plex Sans", sans-serif';
-    ctx.fillStyle = '#94a3b8';
+    ctx.fillStyle = theme.axisText || '#94a3b8';
     ctx.fillText(titleStr, curX + 8, curY + 14);
 
     ctx.font = '600 12px "JetBrains Mono", monospace';
-    ctx.fillStyle = '#f1f5f9';
+    ctx.fillStyle = theme.text || '#f1f5f9';
     ctx.fillText(valStr, curX + 8, curY + 30);
 
     curX += cardW + gap;
@@ -1892,7 +2064,7 @@ export function drawXYPlot(
   const totalCount = Math.max(0, iEnd - iStart);
   const stride = totalCount > 24000 ? Math.ceil(totalCount / 24000) : 1;
 
-  ctx.strokeStyle = '#22d3ee';
+  ctx.strokeStyle = theme.cursor;
   ctx.lineWidth = 1.6;
   ctx.lineJoin = 'round';
   ctx.beginPath();
@@ -1921,13 +2093,13 @@ export function drawXYPlot(
   ctx.stroke();
 
   if (firstPx) {
-    ctx.fillStyle = '#4ade80';
+    ctx.fillStyle = theme.peak;
     ctx.beginPath();
     ctx.arc(firstPx.x, firstPx.y, 4, 0, Math.PI * 2);
     ctx.fill();
   }
   if (lastPx) {
-    ctx.fillStyle = '#fb923c';
+    ctx.fillStyle = theme.trigger;
     ctx.beginPath();
     ctx.arc(lastPx.x, lastPx.y, 3.5, 0, Math.PI * 2);
     ctx.fill();
@@ -1949,13 +2121,13 @@ export function drawXYPlot(
   }
   const bx = p.x + p.width - maxW - 24;
   const by = p.y + 8;
-  ctx.fillStyle = 'rgba(8, 11, 15, 0.9)';
+  ctx.fillStyle = theme.hudBg;
   ctx.fillRect(bx, by, maxW + 16, lines.length * 15 + 10);
-  ctx.strokeStyle = '#334155';
+  ctx.strokeStyle = theme.hudBorder;
   ctx.strokeRect(bx, by, maxW + 16, lines.length * 15 + 10);
   ctx.textAlign = 'left';
   lines.forEach((ln, idx) => {
-    ctx.fillStyle = idx === 0 ? '#67e8f9' : theme.text;
+    ctx.fillStyle = idx === 0 ? theme.cursor : theme.text;
     ctx.fillText(ln, bx + 8, by + 15 + idx * 15);
   });
 
@@ -2075,7 +2247,8 @@ export function drawGoldenToleranceBand(
 export function drawActiveAnomalyMarkers(
   ctx: CanvasRenderingContext2D,
   tab: TabState,
-  p: PlotArea
+  p: PlotArea,
+  theme: RenderTheme = DEFAULT_THEME
 ): void {
   const anomalies = tab.activeAnomalies;
   if (!anomalies || anomalies.length === 0 || tab.plotMode !== 'time') return;
@@ -2115,7 +2288,7 @@ export function drawActiveAnomalyMarkers(
     }
 
     ctx.fillStyle = isSelected ? '#ef4444' : '#f59e0b';
-    ctx.strokeStyle = '#ffffff';
+    ctx.strokeStyle = theme.text;
     ctx.lineWidth = isSelected ? 1.5 : 1;
     ctx.beginPath();
     ctx.arc(x, Math.max(area.y + 6, Math.min(area.y + area.height - 6, y)), isSelected ? 5.5 : 3.5, 0, Math.PI * 2);

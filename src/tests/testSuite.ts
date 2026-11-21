@@ -13,6 +13,8 @@ import { computeClarke, computePark, computeInstantaneousPower } from '../module
 import { computeMeasurements } from '../modules/measurements';
 import { WaveformChannel, TabState } from '../types/models';
 import { runDynamicMutationTests } from './dynamicMutationTest';
+import { parseLtspiceRawBuffer, isLtspiceExportText, parseLtspiceText } from '../parsers/ltspiceParser';
+import { THEME_PRESETS } from '../modules/themeManager';
 import {
   snapScale125,
   stepScale125,
@@ -1767,6 +1769,151 @@ export function runAllTests(): TestResult[] {
   } catch (err: any) {
     results.push({
       name: 'BLDC Motor & Inverter Diagnostics Suite Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 22. LTspice .raw (ASCII + Binary), Stepped .txt Import & Computed Trace Identification Test
+  try {
+    const palette = THEME_PRESETS.obsidian.rawPalette;
+    // 22a) ASCII .raw
+    const asciiRaw = [
+      'Title: * Buck_Converter.asc',
+      'Date: Fri Nov 21 08:00:00 2026',
+      'Plotname: Transient Analysis',
+      'Flags: real forward',
+      'No. Variables: 3',
+      'No. Points: 4',
+      'Variables:',
+      '\t0\ttime\ttime',
+      '\t1\tV(out)\tvoltage',
+      '\t2\tI(L1)\tdevice_current',
+      'Values:',
+      '0\t0.000000e+00',
+      '\t5.000000e+00',
+      '\t1.000000e+00',
+      '1\t1.000000e-06',
+      '\t5.100000e+00',
+      '\t1.200000e+00',
+      '2\t2.000000e-06',
+      '\t5.200000e+00',
+      '\t1.400000e+00',
+      '3\t3.000000e-06',
+      '\t5.300000e+00',
+      '\t1.600000e+00',
+      '',
+    ].join('\n');
+    const asciiBuf = new TextEncoder().encode(asciiRaw).buffer;
+    const parsedAscii = parseLtspiceRawBuffer(asciiBuf, palette);
+    const vOutCh = parsedAscii.channels[parsedAscii.drawOrder[0]];
+    const iL1Ch = parsedAscii.channels[parsedAscii.drawOrder[1]];
+    const asciiOk =
+      parsedAscii.drawOrder.length === 2 &&
+      vOutCh.name === 'V(out)' &&
+      vOutCh.unit === 'V' &&
+      iL1Ch.name === 'I(L1)' &&
+      iL1Ch.unit === 'A' &&
+      Math.abs(vOutCh.v[3] - 5.3) < 1e-4 &&
+      Math.abs(iL1Ch.v[2] - 1.4) < 1e-4;
+
+    // 22b) Binary .raw (float64 time + float32 vars)
+    const binHeader = [
+      'Title: * Binary_Test.asc',
+      'Plotname: Transient Analysis',
+      'Flags: real forward',
+      'No. Variables: 2',
+      'No. Points: 3',
+      'Variables:',
+      '\t0\ttime\ttime',
+      '\t1\tV(sw)\tvoltage',
+      'Binary:',
+      '',
+    ].join('\n');
+    const hdrBytes = new TextEncoder().encode(binHeader);
+    const stride = 8 + 4; // float64 time + float32 V(sw)
+    const binBuf = new ArrayBuffer(hdrBytes.length + 3 * stride);
+    new Uint8Array(binBuf).set(hdrBytes, 0);
+    const dv = new DataView(binBuf, hdrBytes.length);
+    for (let p = 0; p < 3; p++) {
+      dv.setFloat64(p * stride, p * 1e-6, true);
+      dv.setFloat32(p * stride + 8, (p + 1) * 12, true);
+    }
+    const parsedBin = parseLtspiceRawBuffer(binBuf, palette);
+    const swCh = parsedBin.channels[parsedBin.drawOrder[0]];
+    const binOk =
+      parsedBin.drawOrder.length === 1 &&
+      swCh.name === 'V(sw)' &&
+      Math.abs(swCh.v[0] - 12) < 1e-3 &&
+      Math.abs(swCh.v[2] - 36) < 1e-3;
+
+    // 22c) Stepped .txt export
+    const steppedTxt = [
+      'time\tV(out)\tI(L1)',
+      'Step Information: Rload=10 (Run: 1/2)',
+      '0.000e+00\t5.0\t0.5',
+      '1.000e-06\t5.0\t0.5',
+      '2.000e-06\t5.0\t0.5',
+      'Step Information: Rload=5 (Run: 2/2)',
+      '0.000e+00\t4.8\t0.96',
+      '1.000e-06\t4.8\t0.96',
+      '2.000e-06\t4.8\t0.96',
+    ].join('\n');
+    const detectedTxt = isLtspiceExportText(steppedTxt);
+    const parsedTxt = parseLtspiceText(steppedTxt, palette);
+    const txtOk =
+      detectedTxt &&
+      parsedTxt.stepCount === 2 &&
+      parsedTxt.drawOrder.length === 4 &&
+      parsedTxt.channels[parsedTxt.drawOrder[0]].ltspiceStepLabel === 'Rload=10';
+
+    // 22d) Derived math channel expression using LTspice trace names
+    const mathPower = evaluateMathExpression('V(out) * I(L1)', parsedAscii.channels, parsedAscii.drawOrder, 'math_pwr', 'P(L1)');
+    const mathOk =
+      mathPower.channelKind === 'computed' &&
+      mathPower.derivedBadge === 'fx' &&
+      Math.abs(mathPower.v[3] - 5.3 * 1.6) < 1e-2;
+
+    results.push({
+      name: 'LTspice (.raw Binary/ASCII, Stepped .txt & Math V*I) Test',
+      passed: asciiOk && binOk && txtOk && mathOk,
+      message: `asciiOk=${asciiOk}, binOk=${binOk}, steppedTxt=${parsedTxt.stepCount} runs/${parsedTxt.drawOrder.length} ch, mathBadge=${mathPower.derivedBadge}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'LTspice (.raw Binary/ASCII, Stepped .txt & Math V*I) Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 23. Multi-Theme Preset & Surface Luminance Integrity Test
+  try {
+    const ids: Array<keyof typeof THEME_PRESETS> = ['obsidian', 'midnight', 'daylight'];
+    const allValid = ids.every((id) => {
+      const p = THEME_PRESETS[id];
+      return (
+        p &&
+        p.rawPalette.length >= 8 &&
+        p.computedPalette.length >= 6 &&
+        Boolean(p.cssVars['--bg-chassis']) &&
+        Boolean(p.cssVars['--bg-panel']) &&
+        Boolean(p.cssVars['--bg-elevated']) &&
+        Boolean(p.cssVars['--canvas-stage']) &&
+        p.cssVars['--bg-chassis'] !== p.cssVars['--bg-panel'] &&
+        p.cssVars['--bg-panel'] !== p.cssVars['--bg-elevated'] &&
+        p.canvas.bg !== p.cssVars['--bg-panel']
+      );
+    });
+    const lightFlagOk = !THEME_PRESETS.obsidian.isLight && !THEME_PRESETS.midnight.isLight && THEME_PRESETS.daylight.isLight;
+    results.push({
+      name: 'Three-Theme Calibration & Surface Contrast Test',
+      passed: allValid && lightFlagOk,
+      message: `themes=${ids.join('/')}, lightModeDaylight=${THEME_PRESETS.daylight.isLight}, rawCols=${THEME_PRESETS.daylight.rawPalette.length}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Three-Theme Calibration & Surface Contrast Test',
       passed: false,
       message: `Exception: ${err.message}`,
     });

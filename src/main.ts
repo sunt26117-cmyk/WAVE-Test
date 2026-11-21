@@ -7,8 +7,11 @@
 import './index.css';
 import { OscilloscopeApp } from './engine/uiController';
 import { runAllTests } from './tests/testSuite';
-import { TabState, WaveformChannel, CursorMode, MeasurementGate, MeasurementMetricKey } from './types/models';
-import { OVERLAP_COLORS, formatEng, getTimeBoundsForView } from './engine/canvasRenderer';
+import { TabState, WaveformChannel, CursorMode, MeasurementGate, MeasurementMetricKey, ThemeId } from './types/models';
+import { formatEng, getTimeBoundsForView, isComputedChannel } from './engine/canvasRenderer';
+import { getSavedThemeId } from './modules/themeManager';
+import { LtspiceFileWatcher } from './modules/ltspiceWatcher';
+import { setupToolDrawer } from './modules/toolDrawer';
 import { fitChannelTo125 } from './modules/oscilloscopeScale';
 import { MEASUREMENT_DEFINITIONS } from './modules/measurements';
 import { estimateSpeedFromSignal, computeTwoChannelPhaseDiff } from './modules/motorAnalysis';
@@ -72,16 +75,74 @@ let compareGroupCounter: number = 1;
 let editingCompareGroupId: string | null = null;
 
 let app: OscilloscopeApp;
+let ltspiceWatcher: LtspiceFileWatcher | null = null;
+
+function syncLtspiceWatchUI() {
+  const tab = app?.getActiveTab() || null;
+  const entry = ltspiceWatcher?.getEntry(tab?.id || null) || null;
+  const reloadBtn = document.getElementById('reloadLtspiceBtn');
+  const autoWrap = document.getElementById('ltspiceAutoWrap');
+  const autoChk = document.getElementById('autoLtspiceChk') as HTMLInputElement | null;
+  const badge = document.getElementById('ltspiceWatchBadge');
+
+  if (entry) {
+    reloadBtn?.classList.remove('hidden');
+    if (autoWrap) {
+      autoWrap.classList.remove('hidden');
+      autoWrap.classList.add('inline-flex');
+    }
+    if (autoChk) autoChk.checked = entry.autoReload;
+    if (badge) {
+      badge.classList.remove('hidden');
+      badge.innerText = entry.autoReload ? 'LIVE' : 'PAUSED';
+    }
+  } else {
+    reloadBtn?.classList.add('hidden');
+    if (autoWrap) {
+      autoWrap.classList.add('hidden');
+      autoWrap.classList.remove('inline-flex');
+    }
+    badge?.classList.add('hidden');
+  }
+}
 
 window.addEventListener('DOMContentLoaded', () => {
   const canvas = document.getElementById('waveformCanvas') as HTMLCanvasElement;
   if (!canvas) return;
 
   app = new OscilloscopeApp(canvas);
+
+  // Apply persisted oscilloscope theme before initial draw
+  const initialTheme = getSavedThemeId();
+  app.setTheme(initialTheme, false);
+  const themeSel = document.getElementById('themeSelect') as HTMLSelectElement | null;
+  if (themeSel) themeSel.value = initialTheme;
+
   app.onEditCompareGroup = (groupId: string) => {
     const tab = app.getActiveTab();
     if (tab) openCompareModal(tab, groupId);
   };
+
+  // Dockable Side-by-Side Tool Drawer + Live LTspice Watcher
+  setupToolDrawer(() => app.handleResize());
+  ltspiceWatcher = new LtspiceFileWatcher(
+    async (tabId, file) => {
+      await app.reloadTabFromFile(tabId, file);
+      syncLtspiceWatchUI();
+    },
+    () => syncLtspiceWatchUI()
+  );
+
+  // Re-measure Compare live preview canvas when switched/shown inside Tool Drawer
+  window.addEventListener('wvp-drawer-panel-shown', (ev: Event) => {
+    const detail = (ev as CustomEvent<{ id: string }>).detail;
+    if (detail?.id === 'compareModal') {
+      requestAnimationFrame(() => {
+        const tab = app.getActiveTab();
+        if (tab) recomputeComparePanel(tab);
+      });
+    }
+  });
 
   bindToolbarActions();
   bindFrontPanelControls();
@@ -90,13 +151,14 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // Load 3-phase BLDC sample on startup for immediate interactive oscilloscope workspace
   loadSynthetic3PhaseMotorData();
+  syncLtspiceWatchUI();
 
   const testResults = runAllTests();
   console.log('Oscilloscope Verification Test Results:', testResults);
 });
 
 function bindToolbarActions() {
-  // Load File button + empty state quick open
+  // Load File button + empty state quick open + LTspice Live Watch
   const fileInput = document.getElementById('fileInput') as HTMLInputElement;
   const triggerOpen = () => fileInput?.click();
   document.getElementById('loadBtn')?.addEventListener('click', triggerOpen);
@@ -107,6 +169,78 @@ function bindToolbarActions() {
     if (e.target.files && e.target.files.length > 0) {
       app.handleFiles(Array.from(e.target.files));
       fileInput.value = '';
+    }
+  });
+
+  document.getElementById('watchLtspiceBtn')?.addEventListener('click', async () => {
+    if (!ltspiceWatcher) return;
+    const res = await ltspiceWatcher.pickAndWatch(async (file) => {
+      return await app.openFileDirectInTab(file);
+    });
+    if (!res.ok && res.reason) {
+      app.showToast(res.reason, 'warn');
+    } else if (res.ok) {
+      app.showToast('LTspice file linked. Auto-reload on simulation rerun is active.', 'info');
+    }
+    syncLtspiceWatchUI();
+  });
+
+  document.getElementById('reloadLtspiceBtn')?.addEventListener('click', async () => {
+    const tab = app.getActiveTab();
+    if (tab && ltspiceWatcher) {
+      const ok = await ltspiceWatcher.forceReload(tab.id);
+      if (!ok) app.showToast('No watched LTspice file handle linked to active tab.', 'warn');
+    }
+  });
+
+  document.getElementById('autoLtspiceChk')?.addEventListener('change', () => {
+    const tab = app.getActiveTab();
+    if (tab && ltspiceWatcher) {
+      ltspiceWatcher.toggleAutoReload(tab.id);
+    }
+  });
+
+  document.getElementById('tabsContainer')?.addEventListener('click', () => {
+    requestAnimationFrame(() => syncLtspiceWatchUI());
+  });
+
+  // Theme Selector
+  document.getElementById('themeSelect')?.addEventListener('change', (e: any) => {
+    const themeId = e.target.value as ThemeId;
+    app.setTheme(themeId, true);
+    const cmpModal = document.getElementById('compareModal');
+    if (cmpModal && cmpModal.style.display === 'flex') {
+      const tab = app.getActiveTab();
+      if (tab) recomputeComparePanel(tab);
+    }
+  });
+
+  // Click-toggled header/toolbar dropdowns (Tools, Export, Analyze)
+  const closeAllDropdowns = () => {
+    document.querySelectorAll('.wvp-dropdown-menu').forEach((menu) => {
+      menu.classList.add('hidden');
+      menu.classList.remove('flex');
+    });
+  };
+  document.querySelectorAll('.wvp-dropdown-trigger').forEach((trigger) => {
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const parent = trigger.closest('.wvp-dropdown');
+      const menu = parent?.querySelector('.wvp-dropdown-menu');
+      const isCurrentlyOpen = menu ? !menu.classList.contains('hidden') : false;
+      closeAllDropdowns();
+      if (menu && !isCurrentlyOpen) {
+        menu.classList.remove('hidden');
+        menu.classList.add('flex');
+      }
+    });
+  });
+  document.querySelectorAll('.wvp-dropdown-menu button').forEach((item) => {
+    item.addEventListener('click', () => closeAllDropdowns());
+  });
+  document.addEventListener('click', (e) => {
+    if (!(e.target as HTMLElement)?.closest('.wvp-dropdown')) {
+      closeAllDropdowns();
     }
   });
 
@@ -237,10 +371,9 @@ function bindToolbarActions() {
     if (tab) openMotorModal(tab);
   });
 
-  // Exports, Test Report, Screenshot, Panel Toggle, Session, Demo & Tests
+  // Exports, Test Report, Panel Toggle, Session, Demo & Tests
   document.getElementById('exportPngBtn')?.addEventListener('click', () => app.exportPNG());
   document.getElementById('exportReportHtmlBtn')?.addEventListener('click', () => app.exportEngineeringReport());
-  document.getElementById('screenshotTopBtn')?.addEventListener('click', () => app.exportPNG());
   document.getElementById('togglePanelBtn')?.addEventListener('click', () => app.toggleRightPanel());
   document.getElementById('exportSvgBtn')?.addEventListener('click', () => app.exportSVG());
   document.getElementById('exportCsvWaveformBtn')?.addEventListener('click', () => app.exportWaveformCSV());
@@ -283,7 +416,6 @@ function bindToolbarActions() {
     }
   };
   document.getElementById('exportStandaloneHtmlBtn')?.addEventListener('click', triggerOfflineHtmlDownload);
-  document.getElementById('downloadOfflineTopBtn')?.addEventListener('click', triggerOfflineHtmlDownload);
   document.getElementById('saveSessionBtn')?.addEventListener('click', () => app.saveSessionFile());
   document.getElementById('testSuiteBtn')?.addEventListener('click', () => openTestSuiteModal());
   document.getElementById('loadSampleSignalBtn')?.addEventListener('click', () => loadSynthetic3PhaseMotorData());
@@ -1108,7 +1240,7 @@ function bindModals() {
         }
 
         // 4. Parse new unique file
-        const parsed = await parseReferenceFileToChannels(file, OVERLAP_COLORS);
+        const parsed = await parseReferenceFileToChannels(file, app.getRawColors());
         if (parsed.channels.length === 0) continue;
         const shortFile = parsed.fileName.replace(/\.[^.]+$/, '');
         parsed.channels.forEach((ch, idx) => {
@@ -1373,7 +1505,7 @@ function bindModals() {
   document.getElementById('batchPickFolderBtn')?.addEventListener('click', () => batchFolderInp?.click());
   const onBatchFilesSelected = (list: FileList | null) => {
     if (!list) return;
-    batchQueuedFiles = Array.from(list).filter((f) => /\.(csv|txt|wfm)$/i.test(f.name));
+    batchQueuedFiles = Array.from(list).filter((f) => /\.(csv|txt|wfm|raw)$/i.test(f.name));
     const lbl = document.getElementById('batchFileCountLabel');
     if (lbl) lbl.innerText = `${batchQueuedFiles.length} supported file(s) queued.`;
   };
@@ -1492,7 +1624,7 @@ function bindModals() {
         baseChannelId: ph.chU.id,
         values: derived.uuv,
         expr: `${ph.chU.name} - ${ph.chV.name}`,
-        color: '#22d3ee',
+        color: app.getNextComputedColor(0),
         sourceIds: [ph.chU.id, ph.chV.id],
       },
       {
@@ -1501,7 +1633,7 @@ function bindModals() {
         baseChannelId: ph.chV.id,
         values: derived.uvw,
         expr: `${ph.chV.name} - ${ph.chW.name}`,
-        color: '#a78bfa',
+        color: app.getNextComputedColor(1),
         sourceIds: [ph.chV.id, ph.chW.id],
       },
       {
@@ -1510,7 +1642,7 @@ function bindModals() {
         baseChannelId: ph.chW.id,
         values: derived.uwu,
         expr: `${ph.chW.name} - ${ph.chU.name}`,
-        color: '#fb923c',
+        color: app.getNextComputedColor(2),
         sourceIds: [ph.chW.id, ph.chU.id],
       },
     ]);
@@ -1530,7 +1662,7 @@ function bindModals() {
         baseChannelId: ph.chU.id,
         values: derived.v0,
         expr: `(${ph.chU.name}+${ph.chV.name}+${ph.chW.name})/3`,
-        color: '#c084fc',
+        color: app.getNextComputedColor(0),
         sourceIds: [ph.chU.id, ph.chV.id, ph.chW.id],
       },
     ]);
@@ -1550,7 +1682,7 @@ function bindModals() {
         baseChannelId: ph.chU.id,
         values: derived.svmMag,
         expr: 'sqrt(Clarke_alpha^2 + Clarke_beta^2)',
-        color: '#34d399',
+        color: app.getNextComputedColor(0),
         sourceIds: [ph.chU.id, ph.chV.id, ph.chW.id],
       },
     ]);
@@ -1564,8 +1696,8 @@ function bindModals() {
   document.getElementById('shortcutsCloseTopBtn')?.addEventListener('click', closeShortcutsModal);
   document.getElementById('shortcutsCloseBtn')?.addEventListener('click', closeShortcutsModal);
 
-  // Generic close for modal backdrops
-  document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+  // Generic close for centered blocking modal backdrops (docked tool drawer panels ignore backdrop clicks)
+  document.querySelectorAll('.modal-overlay:not(.tool-dockable)').forEach((overlay) => {
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) {
         (overlay as HTMLElement).style.display = 'none';
@@ -2359,13 +2491,14 @@ function renderComparePreviewCanvas(
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
+  const themeCanvas = app.getThemePreset().canvas;
   ctx.save();
   ctx.scale(dpr, dpr);
-  ctx.fillStyle = '#080b0f';
+  ctx.fillStyle = themeCanvas.bg;
   ctx.fillRect(0, 0, w, h);
 
   // Subtle oscilloscope 10x8 grid
-  ctx.strokeStyle = '#151c26';
+  ctx.strokeStyle = themeCanvas.grid;
   ctx.lineWidth = 1;
   for (let gx = 1; gx < 10; gx++) {
     const x = (gx / 10) * w;
@@ -2469,7 +2602,7 @@ function renderComparePreviewCanvas(
   };
 
   // Draw Target baseline first
-  plotSeries(targetCh.v, targetCh.color || '#38bdf8', 1.8, false);
+  plotSeries(targetCh.v, targetCh.color || app.getRawColors()[0], 1.8, isComputedChannel(targetCh));
 
   // Draw each queued waveform in its assigned color
   let scaledCount = 0;
@@ -2477,7 +2610,7 @@ function renderComparePreviewCanvas(
   compareQueue.forEach((entry, idx) => {
     const color = entry.customColor || getCompareGroupTraceColor(themeId, idx + colorOffset, paletteMode);
     if (entry.computed?.alignedRefV) {
-      plotSeries(entry.computed.alignedRefV, color, 1.4, false);
+      plotSeries(entry.computed.alignedRefV, color, 1.4, isComputedChannel(entry.channel));
     }
     if (Math.abs((entry.timeScale || 1) - 1) > 1e-6) {
       scaledCount++;
@@ -3201,11 +3334,12 @@ function loadSynthetic3PhaseMotorData() {
     return ch;
   };
 
+  const rawPalette = app.getRawColors();
   const channels: Record<string, WaveformChannel> = {
-    ua: createChannel('ua', 'Ua (Phase A)', ua, OVERLAP_COLORS[0], 'V'),
-    ub: createChannel('ub', 'Ub (Phase B)', ub, OVERLAP_COLORS[1], 'V'),
-    uc: createChannel('uc', 'Uc (Phase C)', uc, OVERLAP_COLORS[2], 'V'),
-    ia: createChannel('ia', 'Ia (Current)', ia, OVERLAP_COLORS[3], 'A'),
+    ua: createChannel('ua', 'Ua (Phase A)', ua, rawPalette[0], 'V'),
+    ub: createChannel('ub', 'Ub (Phase B)', ub, rawPalette[1], 'V'),
+    uc: createChannel('uc', 'Uc (Phase C)', uc, rawPalette[2], 'V'),
+    ia: createChannel('ia', 'Ia (Current)', ia, rawPalette[3], 'A'),
   };
 
   const tab: TabState = {

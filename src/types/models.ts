@@ -52,6 +52,10 @@ export interface SelectedMeasurementItem {
   metric: MeasurementMetricKey;
 }
 
+export type ThemeId = 'obsidian' | 'midnight' | 'daylight';
+export type ChannelKind = 'raw' | 'computed';
+export type DerivedKind = 'math' | 'filter' | 'transform' | 'power' | 'diff' | 'ref';
+
 export interface WaveformChannel {
   id: string;
   name: string;
@@ -67,6 +71,10 @@ export interface WaveformChannel {
   dt: number | null; // Sampling interval in seconds
 
   isMath: boolean;
+  channelKind?: ChannelKind;
+  derivedKind?: DerivedKind;
+  derivedBadge?: string;
+  ltspiceStepLabel?: string;
   mathExpression?: string;
   sourceChannelIds: string[];
 

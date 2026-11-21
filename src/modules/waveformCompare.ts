@@ -9,6 +9,11 @@ import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 import { previewCsv, parseFullCsv } from '../parsers/csvParser';
 import { parseWfmBuffer } from '../parsers/wfmParser';
+import {
+  parseLtspiceRawBuffer,
+  isLtspiceExportText,
+  parseLtspiceText,
+} from '../parsers/ltspiceParser';
 
 export interface CompareGroupTheme {
   id: string;
@@ -569,8 +574,24 @@ export async function parseReferenceFileToChannels(
       channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean),
     };
   }
+  if (lower.endsWith('.raw')) {
+    const res = parseLtspiceRawBuffer(buf, colors);
+    return {
+      fileName: file.name,
+      fingerprint,
+      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean),
+    };
+  }
 
   const text = new TextDecoder().decode(buf);
+  if (lower.endsWith('.txt') && isLtspiceExportText(text)) {
+    const res = parseLtspiceText(text, colors);
+    return {
+      fileName: file.name,
+      fingerprint,
+      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean),
+    };
+  }
   const prev = previewCsv(text);
   const shouldResample = !!(prev.quality && !prev.quality.isUniformSampling);
   const parsed = parseFullCsv(text, {

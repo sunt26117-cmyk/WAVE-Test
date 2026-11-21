@@ -19,7 +19,7 @@
   <body class="h-full flex flex-col overflow-hidden bg-[#0c0f13] text-slate-200">
     <!-- Top Instrument Chassis Header & File Tabs -->
     <header class="flex items-center justify-between bg-[#0c0f13] border-b border-[#222933] px-3 h-10 shrink-0 gap-2">
-      <div class="flex items-center gap-3 overflow-x-auto min-w-0">
+      <div class="flex items-center gap-2.5 overflow-x-auto min-w-0">
         <div class="flex items-center gap-2 font-semibold text-xs tracking-wider uppercase text-slate-100 shrink-0">
           <svg class="w-4 h-4 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
@@ -31,65 +31,74 @@
       </div>
 
       <div class="flex items-center gap-1.5 shrink-0 text-xs">
-        <button id="loadBtn" class="flex items-center gap-1.5 px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm transition cursor-pointer">
+        <button id="loadBtn" class="flex items-center gap-1.5 px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Open CSV, WFM, LTspice .raw/.txt, or .graphx session">
           <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-          Open CSV / WFM
+          Open File
         </button>
-        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.graphx,.txt" multiple />
+        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.raw,.graphx,.txt" multiple />
 
-        <button id="saveSessionBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm transition cursor-pointer whitespace-nowrap" title="Save session (.graphx)">
-          Save Session
-        </button>
-
-        <div class="relative group">
-          <button class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm flex items-center gap-1 transition cursor-pointer whitespace-nowrap">
-            <span>Export</span>
-            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        <!-- LTspice Live Watch Strip -->
+        <div class="flex items-center gap-1 bg-[#161b22] border border-[#222933] rounded-sm px-1.5 py-0.5">
+          <button id="watchLtspiceBtn" type="button" class="px-1.5 py-0.5 hover:bg-[#1e2530] text-cyan-300 font-medium rounded-xs transition cursor-pointer whitespace-nowrap" title="Watch an LTspice .raw / .txt / .csv file and auto-reload when simulation reruns">
+            LTspice Watch
           </button>
-          <div class="absolute right-0 top-full pt-1 hidden group-hover:flex flex-col z-50 min-w-[195px]">
-            <div class="flex flex-col bg-[#161b22] border border-[#2c3543] rounded-sm shadow-xl py-1">
-              <button id="exportPngBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">PNG Screenshot (Ctrl+S)</button>
-              <button id="exportReportHtmlBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-emerald-300 cursor-pointer">Test Report (HTML / PDF)</button>
-              <button id="exportSvgBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">SVG Vector Plot</button>
-              <button id="exportCsvWaveformBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Full Waveform CSV</button>
-              <button id="openCropExportMenuBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-cyan-300 cursor-pointer">Crop Slice CSV / JSON...</button>
-              <button id="exportCsvSpectrumBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Spectrum CSV</button>
-              <div class="my-1 border-t border-[#222933]"></div>
-              <button id="exportStandaloneHtmlBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-cyan-300 font-semibold cursor-pointer">Offline App (.html)</button>
-            </div>
-          </div>
+          <button id="reloadLtspiceBtn" type="button" class="hidden px-1.5 py-0.5 bg-[#0c0f13] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-mono rounded-xs transition cursor-pointer whitespace-nowrap" title="Force reload watched LTspice file now">
+            ↻ Reload
+          </button>
+          <label id="ltspiceAutoWrap" class="hidden items-center gap-1 pl-1 text-[11px] text-slate-300 cursor-pointer whitespace-nowrap" title="Automatically reload canvas when LTspice finishes a new run">
+            <input type="checkbox" id="autoLtspiceChk" class="accent-cyan-400 cursor-pointer" checked />
+            <span>Auto</span>
+          </label>
+          <span id="ltspiceWatchBadge" class="hidden px-1.5 py-0.5 bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 font-mono text-[10px] rounded-xs whitespace-nowrap">LIVE</span>
         </div>
 
-        <button id="downloadOfflineTopBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-800/70 text-cyan-300 rounded-sm transition cursor-pointer whitespace-nowrap" title="Download single-file offline HTML app">
-          Offline HTML
-        </button>
-
-        <button id="screenshotTopBtn" class="flex items-center gap-1 px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="One-Click Composite PNG Screenshot (Ctrl+S or F12)">
-          <svg class="w-3.5 h-3.5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
-            <circle cx="12" cy="13" r="4"></circle>
-          </svg>
-          <span>Shot</span>
-        </button>
-
-        <button id="openBatchModalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Batch measure multiple files or folder">
-          Batch
-        </button>
-        <button id="openPresetModalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Save or apply analysis presets">
-          Presets
+        <button id="loadSampleSignalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] text-slate-200 rounded-sm border border-[#222933] transition cursor-pointer whitespace-nowrap" title="Load synthetic 3-phase BLDC motor waveform">
+          Demo 3-Ph
         </button>
 
         <div class="h-4 w-px bg-[#222933] mx-0.5"></div>
 
-        <button id="loadSampleSignalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] text-cyan-300 rounded-sm border border-[#222933] transition cursor-pointer whitespace-nowrap" title="Load synthetic 3-phase BLDC motor waveform">
-          Demo 3-Ph
-        </button>
-        <button id="testSuiteBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] text-emerald-400 rounded-sm border border-[#222933] transition cursor-pointer whitespace-nowrap" title="Run verification test suite">
-          Self-Test
-        </button>
-        <button id="openShortcutsModalBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 font-mono rounded-sm transition cursor-pointer whitespace-nowrap" title="Keyboard Shortcuts Reference">
-          ?
-        </button>
+        <!-- Theme Selector -->
+        <select id="themeSelect" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs font-medium cursor-pointer" title="Switch Oscilloscope Color Theme">
+          <option value="obsidian">Obsidian Scope</option>
+          <option value="midnight">Midnight Slate</option>
+          <option value="daylight">Daylight Lab</option>
+        </select>
+
+        <!-- Tools Click Dropdown -->
+        <div class="relative wvp-dropdown">
+          <button type="button" class="wvp-dropdown-trigger px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm flex items-center gap-1 transition cursor-pointer whitespace-nowrap">
+            <span>Tools</span>
+            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div class="wvp-dropdown-menu absolute right-0 top-full mt-1 hidden flex-col z-50 min-w-[175px] rounded-sm py-1">
+            <button id="openBatchModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Batch Measure...</button>
+            <button id="openPresetModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Analysis Presets...</button>
+            <button id="testSuiteBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-emerald-400 cursor-pointer">Algorithm Self-Test</button>
+            <div class="my-1 border-t border-[#222933]"></div>
+            <button id="openShortcutsModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-300 font-mono cursor-pointer">Shortcuts (?)</button>
+          </div>
+        </div>
+
+        <!-- Export Click Dropdown -->
+        <div class="relative wvp-dropdown">
+          <button type="button" class="wvp-dropdown-trigger px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm flex items-center gap-1 transition cursor-pointer whitespace-nowrap">
+            <span>Export</span>
+            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div class="wvp-dropdown-menu absolute right-0 top-full mt-1 hidden flex-col z-50 min-w-[205px] rounded-sm py-1">
+            <button id="exportPngBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">PNG Screenshot (Ctrl+S)</button>
+            <button id="exportReportHtmlBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-emerald-300 cursor-pointer">Test Report (HTML / PDF)</button>
+            <button id="exportSvgBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">SVG Vector Plot</button>
+            <button id="exportCsvWaveformBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Full Waveform CSV</button>
+            <button id="openCropExportMenuBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-cyan-300 cursor-pointer">Crop Slice CSV / JSON...</button>
+            <button id="exportCsvSpectrumBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Spectrum CSV</button>
+            <div class="my-1 border-t border-[#222933]"></div>
+            <button id="saveSessionBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Save Session (.graphx)</button>
+            <button id="exportStandaloneHtmlBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-cyan-300 font-semibold cursor-pointer">Offline App (.html)</button>
+          </div>
+        </div>
+
         <button id="togglePanelBtn" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm transition cursor-pointer whitespace-nowrap" title="Toggle right oscilloscope control panel">
           Hide Panel
         </button>
@@ -168,31 +177,34 @@
             </div>
           </div>
 
-          <!-- Row 2: Always-Visible Analysis, Measurement, Edit/Ref/Golden, Scan, Phase, Sync, Undo/Redo -->
+          <!-- Row 2: Clean Neutral Scope Actions + Analyze Menu -->
           <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1b212a]">
             <div class="flex flex-wrap items-center gap-1.5">
-              <button id="openMeasureModalBtn" class="flex items-center gap-1.5 px-2.5 py-0.5 bg-cyan-950/50 hover:bg-cyan-900/60 border border-cyan-500/60 text-cyan-200 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Select automated oscilloscope measurements">
+              <button id="openMeasureModalBtn" class="flex items-center gap-1.5 px-2.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Select automated oscilloscope measurements">
                 <span>Measure</span>
-                <span id="measureCountLabel" class="px-1 bg-[#0c0f13] border border-cyan-500/40 font-mono text-[10px] text-cyan-300 tabular-nums">0</span>
+                <span id="measureCountLabel" class="px-1 bg-[#0c0f13] border border-[#222933] font-mono text-[10px] text-cyan-300 tabular-nums">0</span>
               </button>
-              <button id="openCompareModalBtn" class="px-2.5 py-0.5 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-500/60 text-emerald-200 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Compare waveforms across files, tabs, or channels with time alignment, RMSE/Corr metrics, and Pass/Fail tolerance band">
+              <button id="openCompareModalBtn" class="px-2.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Compare waveforms across files, tabs, or channels">
                 Compare
               </button>
-              <button id="openPhaseModalBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Two-channel phase difference ΔΦ">
-                ΔΦ Phase
-              </button>
-              <button id="openBldcModalBtn" class="px-2.5 py-0.5 bg-orange-950/50 hover:bg-orange-900/60 border border-orange-500/60 text-orange-200 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="BLDC Motor Diagnostics: 3-Phase Balance, Hall 6-Step Commutation, PWM Dead-Time & Ringing, 6x Torque Ripple">
-                BLDC Diag
-              </button>
-              <button id="openAnomalyModalBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] hover:border-amber-500/60 text-amber-300 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Scan for over-voltage, sag, glitch, or missing edges">
-                Scan
-              </button>
-              <button id="openEditModalBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] hover:border-rose-500/50 text-rose-300 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Edit waveform, Golden Tolerance Band & Reference compare">
-                Edit / Ref
-              </button>
-              <button id="openCropExportBtn" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Export cropped time slice (CSV / JSON)">
-                Crop
-              </button>
+
+              <!-- Unified Analyze Dropdown -->
+              <div class="relative wvp-dropdown">
+                <button type="button" class="wvp-dropdown-trigger px-2.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-medium rounded-sm flex items-center gap-1 transition cursor-pointer whitespace-nowrap">
+                  <span>Analyze</span>
+                  <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div class="wvp-dropdown-menu absolute left-0 top-full mt-1 hidden flex-col z-50 min-w-[205px] rounded-sm py-1">
+                  <button id="openBldcModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">BLDC Diagnostics...</button>
+                  <button id="openPhaseModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Phase Diff ΔΦ...</button>
+                  <button id="openAnomalyModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Anomaly Scan...</button>
+                  <button id="openEditModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Edit / Golden Ref...</button>
+                  <div class="my-1 border-t border-[#222933]"></div>
+                  <button id="transformBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">3-Phase / Power Math...</button>
+                  <button id="motorBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Motor / RPM Estimator...</button>
+                  <button id="openCropExportBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Crop Slice Export...</button>
+                </div>
+              </div>
             </div>
 
             <div class="flex flex-wrap items-center gap-1.5">
@@ -234,11 +246,11 @@
             <div class="bg-[#12161c]/95 border border-[#222933] p-6 max-w-md text-center rounded-sm pointer-events-auto shadow-2xl">
               <div class="text-sm font-semibold text-slate-100 mb-1.5">Oscilloscope Graticule Ready</div>
               <p class="text-xs text-slate-400 mb-4 leading-relaxed">
-                Drop a CSV or WFM capture file onto the screen, press <kbd class="px-1.5 py-0.5 bg-[#0c0f13] border border-[#2c3543] font-mono text-slate-300">Ctrl+V</kbd> to paste CSV data, or launch the synthetic 3-phase motor capture.
+                Drop CSV, WFM, or LTspice (<span class="font-mono text-cyan-300">.raw / .txt</span>) captures here, press <kbd class="px-1.5 py-0.5 bg-[#0c0f13] border border-[#2c3543] font-mono text-slate-300">Ctrl+V</kbd> to paste CSV data, or launch the synthetic 3-phase motor capture.
               </p>
               <div class="flex items-center justify-center gap-2">
                 <button id="emptyLoadBtn" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold text-xs rounded-sm cursor-pointer">
-                  Open CSV / WFM
+                  Open CSV / WFM / RAW
                 </button>
                 <button id="emptyDemoBtn" class="px-3 py-1.5 bg-[#1a222d] hover:bg-[#243040] border border-[#2c3849] text-cyan-300 font-medium text-xs rounded-sm cursor-pointer">
                   Load 3-Phase BLDC Demo
@@ -274,15 +286,23 @@
             <button id="addMathBtn" class="px-2.5 py-1.5 bg-[#1d1729] hover:bg-[#2b2040] border border-purple-700/60 text-purple-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap">
               + Math
             </button>
-            <button id="transformBtn" class="px-2 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Clarke αβ, Park dq0 & Three-Phase Power P(t)">
-              3-Ph / Power
-            </button>
-            <button id="motorBtn" class="px-2 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm transition cursor-pointer whitespace-nowrap" title="Configure BLDC Harmonic Markers & RPM Estimate">
-              Motor / RPM
-            </button>
           </div>
         </div>
       </section>
+
+      <!-- Side-by-Side Non-Overlapping Tool Drawer -->
+      <aside id="toolDrawerContainer" class="tool-drawer relative hidden flex-col shrink-0 h-full text-xs overflow-hidden" style="width: 440px;">
+        <div id="toolDrawerResizeHandle" class="tool-drawer-resize-handle" title="Drag left/right to resize tool drawer"></div>
+        <div class="tool-drawer-header flex items-center justify-between gap-2 px-2.5 py-1.5 shrink-0">
+          <div id="toolDrawerTabs" class="flex items-center gap-1 overflow-x-auto min-w-0 flex-1"></div>
+          <div class="flex items-center gap-1 shrink-0">
+            <button id="toolDrawerSplitBtn" type="button" class="tool-drawer-split-btn px-2 py-0.5 border text-[10px] font-mono rounded-sm cursor-pointer" title="Show 2 open tools stacked without overlapping">Split 2</button>
+            <button id="toolDrawerCloseAllBtn" type="button" class="px-1.5 py-0.5 bg-[#0c0f13] hover:bg-red-950/50 border border-[#222933] text-[11px] font-mono text-slate-400 hover:text-red-300 rounded-sm cursor-pointer" title="Close all tool panels">✕</button>
+          </div>
+        </div>
+        <div id="toolDrawerBody" class="flex-1 overflow-y-auto min-h-0 flex flex-col"></div>
+        <div id="toolDrawerInactiveStage" class="hidden" aria-hidden="true"></div>
+      </aside>
 
       <!-- Right Oscilloscope Front-Panel Control Console -->
       <aside id="rightControlPanel" class="w-[340px] bg-[#12161c] border-l border-[#222933] flex flex-col shrink-0 overflow-y-auto h-full text-xs">
@@ -529,9 +549,9 @@
         T = --   V = --
       </div>
       <div class="hidden lg:flex items-center gap-3 text-[10px] text-slate-500 shrink-0">
-        <span>L-Drag: Pan</span>
+        <span>Y-Axis Drag: Offset</span>
+        <span>L-Drag: 2D Pan</span>
         <span>R-Drag: Zoom Box</span>
-        <span>DblClick: Fit</span>
         <span>Wheel: H-Zoom</span>
         <span>Shift+Wheel: V/div</span>
         <span>Ctrl+S: Shot</span>
@@ -599,7 +619,7 @@
     </div>
 
     <!-- Math Channel Modal -->
-    <div id="mathModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="mathModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5">
         <div class="flex justify-between items-center pb-2 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-purple-300 uppercase tracking-wider">+ Virtual Math Channel</h2>
@@ -659,7 +679,7 @@
     </div>
 
     <!-- Trigger Modal -->
-    <div id="triggerModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="triggerModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-sm w-full p-5">
         <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider mb-3">Edge Trigger Setup</h2>
         <div class="space-y-3 text-xs">
@@ -691,7 +711,7 @@
     </div>
 
     <!-- 3-Phase Transform & Power Modal (Clarke αβ | Park dq0 | Power P(t)) -->
-    <div id="transformModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="transformModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">3-Phase Motor &amp; Power Math</h2>
@@ -806,7 +826,7 @@
     </div>
 
     <!-- BLDC Motor Analysis & RPM Estimation Modal -->
-    <div id="motorModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="motorModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
         <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider mb-3">BLDC Motor Harmonics &amp; RPM Estimator</h2>
         <div class="space-y-3 text-xs">
@@ -854,7 +874,7 @@
     </div>
 
     <!-- Verification / Test Suite Modal -->
-    <div id="testSuiteModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="testSuiteModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-xl w-full p-5 max-h-[85vh] flex flex-col">
         <div class="flex justify-between items-center pb-2 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-emerald-400 uppercase tracking-wider">Algorithmic Verification & Self-Tests</h2>
@@ -868,7 +888,7 @@
     </div>
 
     <!-- On-Demand Automated Measurements Modal -->
-    <div id="measureModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="measureModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-2xl w-full p-5 flex flex-col max-h-[88vh]">
         <div class="flex justify-between items-center pb-3 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Automated Measurements Setup</h2>
@@ -912,7 +932,7 @@
     </div>
 
     <!-- Waveform Data Edit & Same-Screen Reference Modal -->
-    <div id="waveformEditModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="waveformEditModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-2xl w-full p-5 flex flex-col max-h-[90vh]">
         <div class="flex justify-between items-center pb-3 border-b border-[#222933] mb-3">
           <div>
@@ -1021,7 +1041,7 @@
     </div>
 
     <!-- Time-Range Crop Export Modal (CSV / JSON) -->
-    <div id="cropExportModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="cropExportModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">Crop Slice Export (CSV / JSON)</h2>
@@ -1053,7 +1073,7 @@
     </div>
 
     <!-- Two-Channel Phase Difference (ΔΦ) Modal -->
-    <div id="phaseModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="phaseModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-md w-full p-5">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Two-Channel Phase Difference (ΔΦ)</h2>
@@ -1090,7 +1110,7 @@
     </div>
 
     <!-- Automated Anomaly Scanner Modal -->
-    <div id="anomalyModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="anomalyModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-2xl w-full p-5 flex flex-col max-h-[88vh]">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-amber-300 uppercase tracking-wider">Automated Anomaly Scanner</h2>
@@ -1139,7 +1159,7 @@
     </div>
 
     <!-- Batch Multi-File / Folder Measurement Modal -->
-    <div id="batchModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="batchModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-4xl w-full p-5 flex flex-col max-h-[90vh]">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Batch Multi-File Measurement Suite</h2>
@@ -1150,7 +1170,7 @@
           <div class="md:col-span-2 flex items-center gap-1.5">
             <button id="batchPickFilesBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">Select Files...</button>
             <button id="batchPickFolderBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 rounded-sm cursor-pointer whitespace-nowrap">Select Folder</button>
-            <input id="batchFilesInput" type="file" multiple accept=".csv,.txt,.wfm" class="hidden" />
+            <input id="batchFilesInput" type="file" multiple accept=".csv,.txt,.wfm,.raw" class="hidden" />
             <input id="batchFolderInput" type="file" webkitdirectory directory multiple class="hidden" />
           </div>
           <div>
@@ -1198,7 +1218,7 @@
     </div>
 
     <!-- Workbench Analysis Presets Modal -->
-    <div id="presetModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="presetModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5 flex flex-col max-h-[85vh]">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">Test Templates &amp; Workbench Presets</h2>
@@ -1221,12 +1241,12 @@
     </div>
 
     <!-- Cross-File / Cross-Channel Multi-Waveform Group Compare Modal -->
-    <div id="compareModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="compareModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-5xl w-full p-5 flex flex-col max-h-[94vh]">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <div>
             <h2 class="text-sm font-semibold text-emerald-300 uppercase tracking-wider">Multi-Waveform Compare Group (Align, Scale &amp; Overlay)</h2>
-            <div class="text-[11px] font-mono text-slate-400 mt-0.5">Load multiple CSV/WFM files (auto-skips identical duplicates), align start/ms-vs-s step differences, and preview live.</div>
+            <div class="text-[11px] font-mono text-slate-400 mt-0.5">Load CSV/WFM/LTspice files (auto-skips identical duplicates), align start/ms-vs-s step differences, and preview live.</div>
           </div>
           <button id="compareCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
         </div>
@@ -1272,7 +1292,7 @@
                 <select id="cmpRefSelect" class="flex-1 min-w-[180px] bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono"></select>
                 <button id="cmpAddRefBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Add Channel</button>
                 <button id="cmpLoadFileBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Load File(s)...</button>
-                <input type="file" id="cmpRefFileInput" multiple class="hidden" accept=".csv,.wfm,.txt" />
+                <input type="file" id="cmpRefFileInput" multiple class="hidden" accept=".csv,.wfm,.raw,.txt" />
               </div>
             </div>
           </div>
@@ -1341,7 +1361,7 @@
     </div>
 
     <!-- BLDC Motor & Inverter Diagnostics Suite Modal -->
-    <div id="bldcModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="bldcModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-3xl w-full p-5 flex flex-col max-h-[90vh]">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <div>
@@ -1472,7 +1492,7 @@
     </div>
 
     <!-- Keyboard Shortcuts Cheat-Sheet Modal -->
-    <div id="shortcutsModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+    <div id="shortcutsModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <h2 class="text-sm font-semibold text-slate-100 uppercase tracking-wider">Oscilloscope Keyboard Shortcuts</h2>
@@ -1507,7 +1527,7 @@
           <polyline points="7 10 12 15 17 10"></polyline>
           <line x1="12" y1="15" x2="12" y2="3"></line>
         </svg>
-        <span class="block text-xl font-semibold mt-3 tracking-wide">Drop CSV, WFM, or .graphx Session</span>
+        <span class="block text-xl font-semibold mt-3 tracking-wide">Drop CSV, WFM, LTspice (.raw/.txt), or .graphx</span>
       </div>
     </div>
 

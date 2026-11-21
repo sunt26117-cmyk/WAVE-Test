@@ -6,7 +6,7 @@
  */
 
 export function setupDraggableModals(): void {
-  const overlays = Array.from(document.querySelectorAll('.modal-overlay')) as HTMLElement[];
+  const overlays = Array.from(document.querySelectorAll('.modal-overlay:not(.tool-dockable)')) as HTMLElement[];
   let topZ = 60;
 
   const bringToFront = (overlay: HTMLElement) => {
