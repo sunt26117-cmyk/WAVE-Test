@@ -128,7 +128,8 @@ export function computeMeasurements(
   channel: WaveformChannel,
   gate: MeasurementGate,
   viewIndices: { startIndex: number; endIndex: number },
-  cursors: CursorsState
+  cursors: CursorsState,
+  viewTimeBounds?: { tStart: number; tEnd: number }
 ): ChannelMeasurements {
   const t = channel.t;
   const v = channel.v;
@@ -172,8 +173,27 @@ export function computeMeasurements(
   let endIdx = totalN - 1;
 
   if (gate === 'view') {
-    startIdx = Math.max(0, Math.min(totalN - 1, viewIndices.startIndex));
-    endIdx = Math.max(startIdx, Math.min(totalN - 1, viewIndices.endIndex));
+    if (viewTimeBounds) {
+      let lo = 0;
+      let hi = totalN - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (t[mid] < viewTimeBounds.tStart) lo = mid + 1;
+        else hi = mid;
+      }
+      startIdx = lo;
+      lo = startIdx;
+      hi = totalN;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (t[mid] <= viewTimeBounds.tEnd) lo = mid + 1;
+        else hi = mid;
+      }
+      endIdx = Math.max(startIdx, Math.min(totalN - 1, lo - 1));
+    } else {
+      startIdx = Math.max(0, Math.min(totalN - 1, viewIndices.startIndex));
+      endIdx = Math.max(startIdx, Math.min(totalN - 1, viewIndices.endIndex));
+    }
   } else if (gate === 'cursors' && cursors.enabled && cursors.x1 !== null && cursors.x2 !== null) {
     const xMin = Math.min(cursors.x1, cursors.x2);
     const xMax = Math.max(cursors.x1, cursors.x2);

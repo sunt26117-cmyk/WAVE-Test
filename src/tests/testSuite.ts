@@ -57,6 +57,32 @@ import {
   analyzeTorqueAndCurrentRipple,
   computeBldcDerivedTraces,
 } from '../modules/bldcAnalysis';
+import { formatEng } from '../engine/canvasRenderer';
+import {
+  deconvolveThermalImpedance,
+  fosterToCauer,
+  cauerToSpice,
+  validateCauerSpiceNetlist,
+  simulateFosterZoh,
+  simulateCauerZoh,
+  computeLossWithDeskewAndEoss,
+} from '../modules/thermalEngine';
+import {
+  SOA_PRESETS,
+  cloneSoaPreset,
+  evaluateDynamicSoa,
+  addOrUpdateCustomSoaPreset,
+  deleteCustomSoaPreset,
+  getAllSoaPresets,
+} from '../modules/dynamicSoa';
+import {
+  DEFAULT_FOC_MODEL,
+  focModelToSpice,
+  validateFocSpiceNetlist,
+  computePhaseMosLosses,
+  simulateFoc6Mos,
+  runFocStallSweep,
+} from '../modules/focThermal';
 
 export interface TestResult {
   name: string;
@@ -1914,6 +1940,554 @@ export function runAllTests(): TestResult[] {
   } catch (err: any) {
     results.push({
       name: 'Three-Theme Calibration & Surface Contrast Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 29. formatEng Temperature SI-Prefix Exclusion Test
+  try {
+    const s1 = formatEng(0.5, '°C', 3);
+    const s2 = formatEng(120, 'K', 2);
+    const s3 = formatEng(-0.05, '°C', 2);
+    const s4 = formatEng(0.005, 'V', 2);
+    const passed = s1 === '0.500 °C' && s2 === '120.00 K' && s3 === '-0.05 °C' && s4 === '5.00 mV';
+    results.push({
+      name: 'formatEng Temperature SI-Prefix Exclusion Test',
+      passed,
+      message: `0.5°C="${s1}", 120K="${s2}", -0.05°C="${s3}", 5mV="${s4}"`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'formatEng Temperature SI-Prefix Exclusion Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 30. Relaxed LASSO Thermal Deconvolution: Heating, Cooling & Unbiased <1% Rth Test
+  try {
+    const rTrue = [0.18, 0.42, 0.85];
+    const tauTrue = [0.008, 0.12, 1.1];
+    const rSumTrue = rTrue.reduce((a, b) => a + b, 0);
+    const pStep = 50;
+    const tAmb = 25;
+
+    // 30a) Heating capture (0..5s, dt=0.5ms -> 10000 pts triggering Log-Binning)
+    const nH = 10000;
+    const dtH = 0.0005;
+    const tH = new Float64Array(nH);
+    const vH = new Float64Array(nH);
+    for (let i = 0; i < nH; i++) {
+      const ti = i * dtH;
+      tH[i] = ti;
+      let z = 0;
+      for (let k = 0; k < 3; k++) z += rTrue[k] * (1 - Math.exp(-ti / tauTrue[k]));
+      vH[i] = tAmb + pStep * z + 0.02 * Math.sin(i * 0.37);
+    }
+    const heatRes = deconvolveThermalImpedance(tH, vH, {
+      mode: 'heating',
+      powerW: pStep,
+      autoT0: false,
+      targetOrder: 3,
+    });
+    const heatRelErr = Math.abs(heatRes.totalRthFoster - rSumTrue) / rSumTrue;
+
+    // 30b) Cooling capture (Tj starts at 97.5°C, cools toward 25°C, t_blank=0.15ms)
+    const tjPeakTrue = tAmb + pStep * rSumTrue;
+    const vC = new Float64Array(nH);
+    for (let i = 0; i < nH; i++) {
+      const ti = i * dtH;
+      let z = 0;
+      for (let k = 0; k < 3; k++) z += rTrue[k] * (1 - Math.exp(-ti / tauTrue[k]));
+      vC[i] = tjPeakTrue - pStep * z;
+    }
+    const coolRes = deconvolveThermalImpedance(tH, vC, {
+      mode: 'cooling',
+      powerW: pStep,
+      autoT0: false,
+      tBlankSec: 0.00015,
+      targetOrder: 3,
+    });
+    const coolRelErr = Math.abs(coolRes.totalRthFoster - rSumTrue) / rSumTrue;
+
+    const passed =
+      heatRes.usedLogBinning &&
+      heatRes.mergedPoles.length <= 10 &&
+      heatRes.rSquared > 0.999 &&
+      heatRelErr < 0.01 &&
+      coolRes.rSquared > 0.995 &&
+      coolRelErr < 0.02 &&
+      Math.abs(coolRes.tJ0C - tjPeakTrue) < 1.0;
+    results.push({
+      name: 'Relaxed LASSO Thermal Deconvolution (Heating & Cooling <1% Rth)',
+      passed,
+      message: `heatRth=${heatRes.totalRthFoster.toFixed(4)} (err=${(heatRelErr * 100).toFixed(2)}%, R2=${heatRes.rSquared.toFixed(5)}), coolRth=${coolRes.totalRthFoster.toFixed(4)} (Tj0=${coolRes.tJ0C.toFixed(2)}C)`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Relaxed LASSO Thermal Deconvolution (Heating & Cooling <1% Rth)',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 31. Coarse 1s Step Data, Auto-t0=10s, Dynamic tau_min & Monotone Smooth Fit Test
+  try {
+    const nC = 131; // 0..130s at 1s interval
+    const tC = new Float64Array(nC);
+    const vC = new Float64Array(nC);
+    for (let i = 0; i < nC; i++) {
+      tC[i] = i * 1.0;
+      if (tC[i] < 10) {
+        vC[i] = 25.0;
+      } else {
+        const rel = tC[i] - 10;
+        const z = 0.35 * (1 - Math.exp(-rel / 4.0)) + 0.85 * (1 - Math.exp(-rel / 28.0));
+        vC[i] = 25.0 + 40.0 * z;
+      }
+    }
+    const res = deconvolveThermalImpedance(tC, vC, {
+      mode: 'heating',
+      powerW: 40,
+      autoT0: true,
+      targetOrder: 3,
+    });
+    let monotoneOk = true;
+    for (let i = 1; i < res.smoothTemp.length; i++) {
+      if (res.smoothTemp[i] + 1e-4 < res.smoothTemp[i - 1]) {
+        monotoneOk = false;
+        break;
+      }
+    }
+    const polesAboveTauMin = res.reducedFoster.every((p) => p.tau >= res.tauMinSec * 0.99);
+    const passed =
+      !res.usedLogBinning &&
+      Math.abs(res.t0Sec - 10.0) <= 1.0 &&
+      res.tauMinSec >= 0.5 &&
+      polesAboveTauMin &&
+      monotoneOk &&
+      res.rSquared > 0.995;
+    results.push({
+      name: 'Coarse 1s Capture, Auto-t0=10s, Dynamic tau_min & Monotone Smooth Fit Test',
+      passed,
+      message: `t0=${res.t0Sec.toFixed(1)}s, tauMin=${res.tauMinSec.toFixed(2)}s, monotone=${monotoneOk}, R2=${res.rSquared.toFixed(5)}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Coarse 1s Capture, Auto-t0=10s, Dynamic tau_min & Monotone Smooth Fit Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 32. Foster-to-Cauer Conservation & LTspice .subckt Grounding/Validation Test
+  try {
+    const fosterStages = [
+      { r: 0.12, c: 0.008, tau: 0.00096, layerLabel: '芯片/焊料 (<10ms)' },
+      { r: 0.28, c: 0.06, tau: 0.0168, layerLabel: '封装/基板 (10ms~1s)' },
+      { r: 0.45, c: 0.4, tau: 0.18, layerLabel: '封装/基板 (10ms~1s)' },
+      { r: 0.75, c: 2.2, tau: 1.65, layerLabel: 'PCB/散热器 (>1s)' },
+    ];
+    const conv = fosterToCauer(fosterStages);
+    const cauerStages = conv.cauer;
+    const relErr = conv.relErr;
+
+    const netlist = cauerToSpice(cauerStages, 25);
+    const validation = validateCauerSpiceNetlist(netlist, conv.totalRthCauer);
+
+    // Transient Foster vs Cauer ZOH equivalence test
+    const dtSim = 0.0005;
+    const nSim = 400;
+    const tSim = new Float64Array(nSim);
+    for (let i = 0; i < nSim; i++) tSim[i] = i * dtSim;
+    const pVec = new Float64Array(nSim).fill(40);
+    const fSim = simulateFosterZoh(tSim, pVec, fosterStages, 25);
+    const cSim = simulateCauerZoh(tSim, pVec, cauerStages, 25);
+    let maxStepDiff = 0;
+    for (let i = 0; i < nSim; i++) {
+      maxStepDiff = Math.max(maxStepDiff, Math.abs(fSim[i] - cSim[i]));
+    }
+    const zohOk = maxStepDiff < 0.1;
+
+    const passed = relErr < 1e-6 && validation.valid && zohOk;
+    results.push({
+      name: 'Foster-to-Cauer Conservation & LTspice .subckt Validation Test',
+      passed,
+      message: `relErr=${relErr.toExponential(2)}, spiceValid=${validation.valid}, ZOHmaxDiff=${maxStepDiff.toFixed(4)}°C`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Foster-to-Cauer Conservation & LTspice .subckt Validation Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 33. Loss Stripping (Deskew + Eoss), Closed-Loop Tj(t) & Dynamic SOA Audit Test
+  try {
+    // 33a) Switching burst with 20 ns probe skew on Ids
+    const nL = 2000;
+    const dtL = 2e-9; // 2 ns
+    const tL = new Float64Array(nL);
+    const vdsL = new Float32Array(nL);
+    const idsL = new Float32Array(nL);
+    const skewSec = 20e-9;
+    for (let i = 0; i < nL; i++) {
+      const ti = i * dtL;
+      tL[i] = ti;
+      const phaseV = ti % 1e-6;
+      const onV = phaseV >= 0.3e-6 && phaseV < 0.8e-6;
+      vdsL[i] = onV ? 0.2 : 48;
+
+      const tiSkewed = Math.max(0, ti - skewSec);
+      const phaseI = tiSkewed % 1e-6;
+      const onI = phaseI >= 0.3e-6 && phaseI < 0.8e-6;
+      idsL[i] = onI ? 20 : 0;
+    }
+    const mkSwCh = (id: string, unit: string, v: Float32Array): WaveformChannel => ({
+      id,
+      name: id,
+      unit,
+      color: '#22d3ee',
+      t: tL,
+      v,
+      visible: true,
+      vMin: -5,
+      vMax: 60,
+      coupling: 'DC',
+      inverted: false,
+      isMath: false,
+      sourceChannelIds: [],
+      fs: 1 / dtL,
+      dt: dtL,
+      metadata: analyzeSamplingQuality(tL),
+    });
+    const chVds = mkSwCh('vds', 'V', vdsL);
+    const chIds = mkSwCh('ids', 'A', idsL);
+    const stages = [
+      { r: 0.2, c: 0.002, tauEst: 0.0004, layerLabel: '芯片/焊料 (<10ms)' },
+      { r: 0.8, c: 0.05, tauEst: 0.04, layerLabel: '封装/基板 (10ms~1s)' },
+    ];
+
+    const lossUnaligned = computeLossWithDeskewAndEoss(chVds, chIds, stages, {
+      deskewNs: 0,
+      eossUj: 0,
+      rdsOn25Mohm: 10,
+      tempCoeffAlphaPerC: 0.0045,
+      tAmbC: 25,
+    });
+    const lossAligned = computeLossWithDeskewAndEoss(chVds, chIds, stages, {
+      deskewNs: -20,
+      eossUj: 10,
+      rdsOn25Mohm: 10,
+      tempCoeffAlphaPerC: 0.0045,
+      tAmbC: 25,
+    });
+    // Single turn-off edge window [0.75us .. 0.90us] verifies Eoss subtraction specifically
+    const lossSingleTurnOff = computeLossWithDeskewAndEoss(chVds, chIds, stages, {
+      deskewNs: -20,
+      eossUj: 10,
+      rdsOn25Mohm: 10,
+      tempCoeffAlphaPerC: 0.0045,
+      tAmbC: 25,
+      tStart: 0.75e-6,
+      tEnd: 0.90e-6,
+    });
+    const deskewReducedEnergy = lossAligned.energyDeskewedMj < lossUnaligned.energyRawMj;
+    const eossStrippedOk =
+      lossAligned.switchingEvents >= 6 &&
+      lossSingleTurnOff.energyStrippedMj < lossSingleTurnOff.energyDeskewedMj;
+    const tjRisesOk = lossAligned.tjMaxC >= 25.0;
+
+    // 33b) Dynamic SOA pass vs fail with exact worstIndex
+    const preset = cloneSoaPreset(SOA_PRESETS[0]); // 60V / 80A MOSFET
+    const tS = new Float64Array(200);
+    const vSafe = new Float32Array(200);
+    const iSafe = new Float32Array(200);
+    const vFail = new Float32Array(200);
+    const iFail = new Float32Array(200);
+    for (let i = 0; i < 200; i++) {
+      tS[i] = i * 1e-5; // 10us step -> 2ms total
+      vSafe[i] = 24;
+      iSafe[i] = 15;
+      vFail[i] = 24;
+      iFail[i] = 15;
+    }
+    // Inject SOA breakdown pulse at index 88..92 (50V @ 160A for >10us)
+    for (let k = 88; k <= 92; k++) {
+      vFail[k] = 52;
+      iFail[k] = 165;
+    }
+    const chVSafe = { ...chVds, t: tS, v: vSafe, dt: 1e-5, fs: 1e5, metadata: analyzeSamplingQuality(tS) };
+    const chISafe = { ...chIds, t: tS, v: iSafe, dt: 1e-5, fs: 1e5, metadata: analyzeSamplingQuality(tS) };
+    const chVFail = { ...chVSafe, v: vFail };
+    const chIFail = { ...chISafe, v: iFail };
+
+    const soaPass = evaluateDynamicSoa(chVSafe, chISafe, preset, { forcedPulseKey: '1ms' });
+    const soaFail = evaluateDynamicSoa(chVFail, chIFail, preset, { forcedPulseKey: '1ms' });
+    const soaOk =
+      soaPass.pass &&
+      !soaFail.pass &&
+      soaFail.violationCount >= 5 &&
+      soaFail.worstIndex !== null &&
+      soaFail.worstIndex >= 88 &&
+      soaFail.worstIndex <= 92;
+
+    const passed = deskewReducedEnergy && eossStrippedOk && tjRisesOk && soaOk;
+    results.push({
+      name: 'Loss Stripping (Deskew + Eoss), Closed-Loop Tj(t) & Dynamic SOA Test',
+      passed,
+      message: `E_raw=${lossUnaligned.energyRawMj.toFixed(4)}mJ -> E_deskew=${lossAligned.energyDeskewedMj.toFixed(4)}mJ, TurnOff_strip=${lossSingleTurnOff.energyStrippedMj.toFixed(4)}mJ < ${lossSingleTurnOff.energyDeskewedMj.toFixed(4)}mJ, SOA_pass=${soaPass.pass}, SOA_failIdx=${soaFail.worstIndex}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Loss Stripping (Deskew + Eoss), Closed-Loop Tj(t) & Dynamic SOA Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 37. Custom SOA Device CRUD & Boundary Evaluation Test
+  try {
+    const base = cloneSoaPreset(SOA_PRESETS[0]);
+    const added = addOrUpdateCustomSoaPreset(
+      {
+        ...base,
+        id: 'custom_test_sic_120v',
+        name: 'Custom SiC 120V/40A',
+        vdsMaxRated: 120,
+        curves: {
+          ...base.curves,
+          '1ms': [
+            { vds: 0.5, id: 40 },
+            { vds: 10, id: 40 },
+            { vds: 60, id: 12 },
+            { vds: 120, id: 4 },
+          ],
+        },
+      },
+      []
+    );
+    const updated = addOrUpdateCustomSoaPreset(
+      {
+        ...added.saved,
+        name: 'Custom SiC 120V/50A Updated',
+        vdsMaxRated: 125,
+      },
+      added.list
+    );
+    const allWithCustom = getAllSoaPresets(updated.list);
+    const hasCustomInMerged =
+      allWithCustom.length === SOA_PRESETS.length + 1 &&
+      allWithCustom.some((d) => d.id === updated.saved.id && d.isCustom && d.vdsMaxRated === 125);
+
+    // Evaluate against custom 1ms curve: (Vds=60V, Id=8A) passes; (Vds=60V, Id=20A) fails
+    const tC = new Float64Array(40);
+    const vPass = new Float32Array(40).fill(60);
+    const iPass = new Float32Array(40).fill(8);
+    const iFail = new Float32Array(40).fill(20);
+    for (let k = 0; k < 40; k++) tC[k] = k * 5e-5;
+    const metaC = analyzeSamplingQuality(tC);
+    const makeCh = (name: string, unit: string, v: Float32Array): WaveformChannel => ({
+      id: name,
+      name,
+      unit,
+      color: '#4fc3f7',
+      t: tC,
+      v,
+      visible: true,
+      vMin: -50,
+      vMax: 150,
+      coupling: 'DC',
+      inverted: false,
+      isMath: false,
+      sourceChannelIds: [],
+      dt: 5e-5,
+      fs: 20000,
+      metadata: metaC,
+    });
+    const chVC = makeCh('Vds_c', 'V', vPass);
+    const evalPass = evaluateDynamicSoa(chVC, makeCh('Ids_p', 'A', iPass), updated.saved, { forcedPulseKey: '1ms' });
+    const evalFail = evaluateDynamicSoa(chVC, makeCh('Ids_f', 'A', iFail), updated.saved, { forcedPulseKey: '1ms' });
+
+    const afterDelete = deleteCustomSoaPreset(updated.saved.id, updated.list);
+    const crudOk =
+      added.list.length === 1 &&
+      updated.list.length === 1 &&
+      hasCustomInMerged &&
+      evalPass.pass &&
+      !evalFail.pass &&
+      afterDelete.length === 0;
+
+    results.push({
+      name: 'Custom SOA Device CRUD & Evaluation Test',
+      passed: crudOk,
+      message: `MergedCount=${allWithCustom.length}, Pass(60V,8A)=${evalPass.pass}, Fail(60V,20A)=${!evalFail.pass}, AfterDelete=${afterDelete.length}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Custom SOA Device CRUD & Evaluation Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 38. Phase 2 BLDC FOC 6-MOS Symmetry, Current Sign Swap, DPWM1 Clamping, Stall 2*Irms^2 & 7-Port SPICE Test
+  try {
+    const fElec = 50; // 50Hz -> 20ms period
+    const nPerCycle = 400; // dt = 50us
+    const nCycles = 3; // 60ms exact integer cycles for clean cycle symmetry
+    const nFoc = nPerCycle * nCycles;
+    const dtFoc = 1 / (fElec * nPerCycle);
+    const iPk = 30;
+    const tF = new Float64Array(nFoc);
+    const iaArr = new Float32Array(nFoc);
+    const ibArr = new Float32Array(nFoc);
+    const icArr = new Float32Array(nFoc);
+    const vbusArr = new Float32Array(nFoc).fill(48);
+
+    for (let k = 0; k < nFoc; k++) {
+      const tk = k * dtFoc;
+      tF[k] = tk;
+      const th = 2 * Math.PI * fElec * tk;
+      iaArr[k] = iPk * Math.sin(th);
+      ibArr[k] = iPk * Math.sin(th - (2 * Math.PI) / 3);
+      icArr[k] = iPk * Math.sin(th + (2 * Math.PI) / 3);
+    }
+
+    const metaF = analyzeSamplingQuality(tF);
+    const mkFocCh = (name: string, unit: string, v: Float32Array): WaveformChannel => ({
+      id: name,
+      name,
+      unit,
+      color: '#4fc3f7',
+      t: tF,
+      v,
+      visible: true,
+      vMin: -50,
+      vMax: 60,
+      coupling: 'DC',
+      inverted: false,
+      isMath: false,
+      sourceChannelIds: [],
+      dt: dtFoc,
+      fs: 1 / dtFoc,
+      metadata: metaF,
+    });
+    const chIa = mkFocCh('Ia', 'A', iaArr);
+    const chIb = mkFocCh('Ib', 'A', ibArr);
+    const chIc = mkFocCh('Ic', 'A', icArr);
+    const chVbus = mkFocCh('Vbus', 'V', vbusArr);
+
+    const focMos = {
+      rdsOn25Mohm: 3.2,
+      tempCoeffAlphaPerC: 0.0045,
+      vsdV: 0.85,
+      eonPlusEoffUj: 85,
+      vRefV: 48,
+      iRefA: 30,
+      qrrNc: 45,
+    };
+
+    const resSvpwm = simulateFoc6Mos(
+      chIa,
+      chIb,
+      DEFAULT_FOC_MODEL,
+      focMos,
+      {
+        modulation: 'SVPWM',
+        fswHz: 30000,
+        tDeadNs: 200,
+        modDepthM: 1.0,
+        pfAngleDeg: 10,
+        tAmbC: 25,
+        vBusConstV: 48,
+      },
+      { icCh: chIc, vbusCh: chVbus }
+    );
+
+    const resDpwm1 = simulateFoc6Mos(
+      chIa,
+      chIb,
+      DEFAULT_FOC_MODEL,
+      focMos,
+      {
+        modulation: 'DPWM1',
+        fswHz: 30000,
+        tDeadNs: 200,
+        modDepthM: 1.0,
+        pfAngleDeg: 10,
+        tAmbC: 25,
+        vBusConstV: 48,
+      },
+      { icCh: chIc, vbusCh: chVbus }
+    );
+
+    // Symmetry across all 6 switches over integer electrical cycles
+    const pAvgs = resSvpwm.summaries.map((s) => s.pAvgW);
+    const pMeanAll = pAvgs.reduce((a, b) => a + b, 0) / 6;
+    const maxSymErrPct = Math.max(...pAvgs.map((p) => (Math.abs(p - pMeanAll) / Math.max(1e-6, pMeanAll)) * 100));
+    const symmetryOk = maxSymErrPct < 2.0;
+
+    // Sign reversal swap test: Ia > 0 vs Ia < 0
+    const lossPos = computePhaseMosLosses(+20, 0.7, 48, 60, 60, 'SVPWM', 30000, 200, focMos);
+    const lossNeg = computePhaseMosLosses(-20, 0.7, 48, 60, 60, 'SVPWM', 30000, 200, focMos);
+    const signSwapOk =
+      lossPos.pHighSw > 0 &&
+      lossPos.pLowSw === 0 &&
+      lossPos.pLowDead > 0 &&
+      lossPos.pHighDead === 0 &&
+      lossNeg.pLowSw > 0 &&
+      lossNeg.pHighSw === 0 &&
+      lossNeg.pHighDead > 0 &&
+      lossNeg.pLowDead === 0;
+
+    // DPWM1 60-deg clamp reduces total inverter loss vs SVPWM
+    const dpwm1SavingOk = resDpwm1.pInvMeanW < resSvpwm.pInvMeanW * 0.92;
+
+    // Locked-rotor stall sweep: high stall current to exceed Tj_limit=120C so tSafeSec & I^2*t exist, plus ~2*Irms^2 check
+    const stallRes = runFocStallSweep({
+      iPeakA: 135,
+      tjLimitC: 120,
+      tAmbC: 25,
+      modulation: 'SVPWM',
+      modDepthM: 0.85,
+      fswHz: 20000,
+      tDeadNs: 200,
+      mos: focMos,
+      model: DEFAULT_FOC_MODEL,
+      vBusV: 48,
+      horizonSec: 120,
+    });
+    const stallOk =
+      Math.abs(stallRes.phaseSquaredRatioAtWorst - 2.0) < 0.05 &&
+      !stallRes.steadySafe &&
+      stallRes.tSafeSec !== null &&
+      stallRes.tSafeSec > 0 &&
+      stallRes.i2tThresholdA2s !== null &&
+      stallRes.i2tThresholdA2s > 0;
+
+    // 7-port SPICE netlist validation
+    const focSpice = focModelToSpice(DEFAULT_FOC_MODEL, 25);
+    const focSpiceCheck = validateFocSpiceNetlist(focSpice);
+    const spiceOk =
+      focSpiceCheck.valid &&
+      focSpiceCheck.has7Ports &&
+      focSpiceCheck.allCapsGroundedTo0 &&
+      focSpiceCheck.noCapOnTamb &&
+      focSpiceCheck.hasSharedBoardNode &&
+      focSpiceCheck.hasDefensiveIc;
+
+    const passed = symmetryOk && signSwapOk && dpwm1SavingOk && stallOk && spiceOk;
+    results.push({
+      name: 'BLDC FOC 6-MOS Symmetry, Current Sign Swap, DPWM1 Clamping, Stall 2*Irms^2 & 7-Port SPICE Test',
+      passed,
+      message: `SymErr=${maxSymErrPct.toFixed(2)}%, P_SVPWM=${resSvpwm.pInvMeanW.toFixed(2)}W vs P_DPWM1=${resDpwm1.pInvMeanW.toFixed(2)}W, StallRatio=${stallRes.phaseSquaredRatioAtWorst.toFixed(3)}, tSafe=${stallRes.tSafeSec?.toFixed(3)}s, SPICE_valid=${focSpiceCheck.valid}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'BLDC FOC 6-MOS Symmetry, Current Sign Swap, DPWM1 Clamping, Stall 2*Irms^2 & 7-Port SPICE Test',
       passed: false,
       message: `Exception: ${err.message}`,
     });

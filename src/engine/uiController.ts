@@ -110,6 +110,7 @@ import {
 } from '../parsers/ltspiceParser';
 import { computeBufferFingerprint, computeTextFingerprint } from '../modules/waveformCompare';
 import { closeActiveToolDrawerItem } from '../modules/toolDrawer';
+import { analyzeSamplingQuality } from '../modules/qualityCheck';
 
 type DragMode =
   | null
@@ -3137,6 +3138,108 @@ export class OscilloscopeApp {
     }
   }
 
+  public injectThermalTraces(
+    specs: Array<{
+      replaceKey?: string;
+      name: string;
+      unit: string;
+      t?: Float64Array;
+      values: Float32Array;
+      color?: string;
+      badge?: string;
+      expr?: string;
+      sourceIds?: string[];
+      baseChannelId?: string;
+      pinMetrics?: MeasurementMetricKey[];
+    }>,
+    options?: {
+      separateView?: boolean;
+      toastMessage?: string;
+    }
+  ): string[] {
+    const tab = this.getActiveTab();
+    if (!tab || specs.length === 0) return [];
+
+    this.pushUndoSnapshot('Inject Thermal Trace(s)', true);
+    const createdIds: string[] = [];
+
+    specs.forEach((sp, idx) => {
+      const baseCh =
+        (sp.baseChannelId && tab.channels[sp.baseChannelId]) ||
+        tab.channels[tab.drawOrder[0]] ||
+        Object.values(tab.channels)[0];
+      if (!baseCh) return;
+
+      const traceId = sp.replaceKey ? `therm_${sp.replaceKey}` : `therm_${Date.now()}_${idx}`;
+      const existing = tab.channels[traceId];
+      const tArr = sp.t && sp.t.length === sp.values.length ? new Float64Array(sp.t) : baseCh.t;
+      const customMeta =
+        tArr !== baseCh.t ? analyzeSamplingQuality(tArr) : baseCh.metadata;
+      const dtVal =
+        tArr !== baseCh.t
+          ? customMeta.medianDt || customMeta.nominalDt || (tArr.length > 1 ? (tArr[tArr.length - 1] - tArr[0]) / (tArr.length - 1) : baseCh.dt)
+          : baseCh.dt;
+      const fsVal = dtVal !== null && dtVal > 0 ? 1 / dtVal : baseCh.fs;
+
+      const ch: WaveformChannel = {
+        ...baseCh,
+        id: traceId,
+        name: sp.name,
+        unit: sp.unit || '°C',
+        color: sp.color || existing?.color || this.getNextComputedColor(idx),
+        visible: true,
+        t: tArr,
+        v: new Float32Array(sp.values),
+        isMath: true,
+        channelKind: 'computed',
+        derivedKind: 'math',
+        derivedBadge: sp.badge || 'THM',
+        mathExpression: sp.expr || sp.name,
+        sourceChannelIds: sp.sourceIds || [],
+        coupling: 'DC',
+        inverted: false,
+        hasEdits: false,
+        refV: undefined,
+        fs: fsVal,
+        dt: dtVal,
+        metadata: customMeta,
+        voltsPerDiv: undefined,
+        vOffset: undefined,
+        vMin: -1,
+        vMax: 1,
+      };
+      fitChannelTo125(ch);
+      tab.channels[traceId] = ch;
+      if (!tab.drawOrder.includes(traceId)) {
+        tab.drawOrder.push(traceId);
+      }
+      createdIds.push(traceId);
+
+      if (sp.pinMetrics && sp.pinMetrics.length > 0) {
+        for (const metric of sp.pinMetrics) {
+          this.toggleMeasurementSelection(traceId, metric, true);
+        }
+      }
+    });
+
+    if (createdIds.length > 0) {
+      tab.plotMode = 'time';
+      if (options?.separateView) {
+        tab.separateView = true;
+      }
+      tab.activeChannelId = createdIds[createdIds.length - 1];
+      this.editVersion++;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
+      if (options?.toastMessage) {
+        this.showToast(options.toastMessage, 'info');
+      }
+    }
+    return createdIds;
+  }
+
   public analyzeChannelWithFFT(channelId: string): void {
     const tab = this.getActiveTab();
     if (!tab) return;
@@ -4218,7 +4321,16 @@ export class OscilloscopeApp {
     if (existing && existing.key === key) {
       return existing.value;
     }
-    const computed = computeMeasurements(ch, tab.measurementGate, tab.view, tab.cursors);
+    const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+    const hasCustomTime = primaryCh && ch.t !== primaryCh.t && ch.t.length !== primaryCh.t.length;
+    const viewBounds = hasCustomTime ? getTimeBoundsForView(tab, primaryCh) : undefined;
+    const computed = computeMeasurements(
+      ch,
+      tab.measurementGate,
+      tab.view,
+      tab.cursors,
+      viewBounds ? { tStart: viewBounds.tStart, tEnd: viewBounds.tEnd } : undefined
+    );
     this.measCache[ch.id] = { key, value: computed };
     return computed;
   }

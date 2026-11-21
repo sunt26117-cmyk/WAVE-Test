@@ -98,6 +98,12 @@ export const OVERLAP_COLORS = [
  */
 export function formatEng(v: number, unit: string = '', precision: number = 3): string {
   if (isNaN(v) || !isFinite(v)) return 'NaN';
+  const trimmedUnit = (unit || '').trim();
+  const isTemperatureUnit = /^(°C|℃|°F|K|degC|degK)$/i.test(trimmedUnit);
+  if (isTemperatureUnit) {
+    const cleanVal = Math.abs(v) < 1e-12 ? 0 : v;
+    return `${cleanVal.toFixed(precision)} ${trimmedUnit}`.trim();
+  }
   if (Math.abs(v) < 1e-15) return `${(0).toFixed(Math.min(precision, 2))} ${unit}`.trim();
 
   const prefixes = [
@@ -139,6 +145,35 @@ export function getPlotArea(width: number, height: number): PlotArea {
   };
 }
 
+export function findTimeIndexRange(
+  t: Float64Array,
+  tStart: number,
+  tEnd: number
+): { startIdx: number; endIdx: number } {
+  const n = t.length;
+  if (n === 0) return { startIdx: 0, endIdx: 0 };
+  if (tEnd < t[0] || tStart > t[n - 1]) return { startIdx: 0, endIdx: 0 };
+
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] < tStart) lo = mid + 1;
+    else hi = mid;
+  }
+  const startIdx = lo;
+
+  lo = startIdx;
+  hi = n;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] <= tEnd) lo = mid + 1;
+    else hi = mid;
+  }
+  const endIdx = Math.max(startIdx + 1, lo);
+  return { startIdx, endIdx };
+}
+
 /**
  * Computes consistent visible time window bounds for a tab/channel.
  */
@@ -146,7 +181,11 @@ export function getTimeBoundsForView(
   tab: TabState,
   ch?: WaveformChannel
 ): { tStart: number; tEnd: number; tSpan: number; dt: number } {
-  const baseCh = ch || tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+  const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+  const baseCh =
+    ch && primaryCh && (ch.t === primaryCh.t || ch.t.length === primaryCh.t.length)
+      ? ch
+      : primaryCh || ch;
   if (!baseCh || baseCh.t.length === 0) {
     return { tStart: 0, tEnd: 0.01, tSpan: 0.01, dt: 1e-4 };
   }
@@ -453,8 +492,18 @@ export function drawChannelWaveform(
   const isConditioned = ch.coupling === 'AC' || !!ch.inverted;
   const cachedMean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
 
-  const startIdx = Math.max(0, Math.min(totalN - 1, tab.view.startIndex));
-  const endIdx = Math.max(startIdx + 1, Math.min(totalN, tab.view.endIndex));
+  const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+  const usesPrimaryIndex = !primaryCh || ch.t === primaryCh.t || ch.t.length === primaryCh.t.length;
+  let startIdx: number;
+  let endIdx: number;
+  if (usesPrimaryIndex) {
+    startIdx = Math.max(0, Math.min(totalN - 1, tab.view.startIndex));
+    endIdx = Math.max(startIdx + 1, Math.min(totalN, tab.view.endIndex));
+  } else {
+    const rng = findTimeIndexRange(t, viewStartTime, viewStartTime + viewDuration);
+    startIdx = rng.startIdx;
+    endIdx = rng.endIdx;
+  }
   const pointsInView = endIdx - startIdx;
   if (pointsInView <= 0) return;
 
@@ -1822,12 +1871,20 @@ export function generateWaveformSVG(
     const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
     const rects = getSubplotRects(p, visibleChs, tab.separateView);
 
+    const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
     rects.forEach((rect) => {
       const ch = rect.channel;
       const area = rect.area;
       const { tStart, tSpan } = getTimeBoundsForView(tab, ch);
-      const startIdx = Math.max(0, tab.view.startIndex);
-      const endIdx = Math.min(ch.v.length, tab.view.endIndex);
+      const usesPrimaryIndex = !primaryCh || ch.t === primaryCh.t || ch.t.length === primaryCh.t.length;
+      const rng = usesPrimaryIndex
+        ? {
+            startIdx: Math.max(0, tab.view.startIndex),
+            endIdx: Math.min(ch.v.length, tab.view.endIndex),
+          }
+        : findTimeIndexRange(ch.t, tStart, tStart + tSpan);
+      const startIdx = rng.startIdx;
+      const endIdx = rng.endIdx;
       const step = Math.max(1, Math.floor((endIdx - startIdx) / 2000));
       const vRange = ch.vMax - ch.vMin || 1;
       const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;

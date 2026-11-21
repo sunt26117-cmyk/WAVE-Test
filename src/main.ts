@@ -43,6 +43,7 @@ import {
   analyzeTorqueAndCurrentRipple,
   computeBldcDerivedTraces,
 } from './modules/bldcAnalysis';
+import { initThermalWorkbench } from './modules/thermalWorkbench';
 
 let batchQueuedFiles: File[] = [];
 let lastBatchRows: BatchFileRow[] = [];
@@ -147,6 +148,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindToolbarActions();
   bindFrontPanelControls();
   bindModals();
+  initThermalWorkbench(app);
   setupDraggableModals();
 
   // Load 3-phase BLDC sample on startup for immediate interactive oscilloscope workspace

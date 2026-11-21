@@ -1,0 +1,165 @@
+下面为你把从 “一、FOC 占空比无传感器重构” 开始到后面的全部内容重新整理成完整、无截断、且已修正脚本参数坑的版本：
+
+一、补充一个 FOC 实测盲点：示波器没抓 PWM 占空比，怎么算上下管分配？
+
+在实验室用 4 通道示波器测 FOC 电机时，通常只能抓 Ia, Ib, Ic, Vbus，拿不到 MCU 内部计算的占空比 da, db,
+dc（直接测开关节点高频 PWM 又需要极高采样率且全是振铃）。
+
+可以把下面这段 占空比无传感器重构公式 补充到 THERMAL_SPEC.md 第 3.2 节里，让执行 AI 在没有导入占空比通道时自动合成：
+
+1.  利用现有软件的 Clarke 变换 从 Ia, Ib, Ic 算出电流矢量角
+    \theta_i(t) = \text{atan2}(I_\beta, I_\alpha)；
+2.  给定调制深度 m \in [0, 1.15] 和功率因数角 \phi（若同时测了相电压基波则自动由 \Delta\Phi 算出，否则支持用户填 m 与
+    \phi，电阻性低速近似 \phi \approx 0^\circ），电压矢量角 \theta_v(t) = \theta_i(t) + \phi；
+3.  生成三相参考波
+    u_a = m\cos(\theta_v),\; u_b = m\cos(\theta_v - \tfrac{2\pi}{3}),\; u_c = m\cos(\theta_v + \tfrac{2\pi}{3})，并注入零序分量：
+      - SVPWM（7 段连续调制）：
+        u_0 = -\frac{1}{2}\big(\max(u_a, u_b, u_c) + \min(u_a, u_b, u_c)\big)
+      - DPWM1（5 段 60° 钳位调制）：取绝对值最大相 k = \arg\max_x |u_x|，令
+        u_0 = \text{sign}(u_k) - u_k
+      - 最终各相高边占空比：
+        d_x(t) = \text{clamp}\big(0.5 + 0.5\,(u_x + u_0),\; 0,\; 1\big)
+
+这样哪怕示波器上只有电流探头和母线电压，也能精确区分高边/低边导通比，并真实算出 DPWM 钳位区间开关损耗清零 的降温效果。
+
+二、Python PyRth 基准夹具生成脚本（用于 < 1% 对齐验收）
+
+按验收标准（拿同一条温升曲线，PyRth 跑出的 \tau 谱和 JS 版对比，总热阻误差 < 1\%），你可以在本地跑一下这个脚本。
+
+顺手纠偏（对照 PyRth 1.3 官方源码/文档）：
+
+  - 参数默认值清单在 transient_defaults.py 中，其中包含 power_step、is_heating 等电源与加热/冷却控制键；
+  - lower_fit_limit 和 upper_fit_limit 是用于早期 \sqrt{t} 拟合的“时间区间（秒）”（如 1e-3 ~ 5e-3
+    s），不是温度上下限。
+
+# generate_pyrth_fixture.py
+# 依赖: pip install PyRth numpy
+import glob
+import json
+import os
+import numpy as np
+import PyRth
+
+OUT_DIR = "./pyrth_fixture_out"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 1. 打印你本地安装的 PyRth 默认参数键名（源自 transient_defaults.py，防止小版本差异）
+try:
+    from PyRth import transient_defaults
+    defaults = {
+        k: getattr(transient_defaults, k)
+        for k in dir(transient_defaults)
+        if not k.startswith("_")
+    }
+    print("=== PyRth transient_defaults 键名 ===")
+    print(list(defaults.keys()))
+except Exception as e:
+    print("Note: could not inspect transient_defaults:", e)
+
+# 2. 构造一条带微弱噪声的 3 阶热响应曲线（真值已知：总热阻 = 15.8 °C/W）
+true_R = [1.8, 5.2, 8.8]       # °C/W -> sum = 15.8
+true_tau = [0.05, 1.8, 35.0]   # s（模拟：封装/基板 -> PCB铺铜 -> 散热器/环境）
+P_step = 10.0                  # W
+T_amb = 25.0                   # °C
+
+# 构造覆盖 1ms ~ 180s 的典型测试时间轴
+t = np.unique(np.concatenate([
+    np.linspace(1e-3, 0.2, 200),
+    np.linspace(0.2, 5.0, 240),
+    np.linspace(5.0, 180.0, 350),
+]))
+rng = np.random.default_rng(42)
+zth_clean = sum(r * (1.0 - np.exp(-t / tau)) for r, tau in zip(true_R, true_tau))
+temp_noisy = T_amb + P_step * zth_clean + rng.normal(0.0, 0.08, size=t.shape)
+
+# 3. 构造 PyRth 官方标准的 "volt" 输入格式（线性 K 系数 -2 mV/°C）
+k_slope = -0.002
+v_0 = 0.700
+volt_data = np.column_stack([t, v_0 + k_slope * temp_noisy])
+
+calib_temps = np.array([20.0, 60.0, 100.0, 150.0, 200.0])
+calib_volts = v_0 + k_slope * calib_temps
+calib_data = np.column_stack([calib_temps, calib_volts])
+
+# 4. 分别用 PyRth 的 bayesian 与 lasso 跑一遍基准
+results = {}
+for mode in ["bayesian", "lasso"]:
+    label = f"bench_3stage_{mode}"
+    params = {
+        "data": volt_data,
+        "calib": calib_data,
+        "output_dir": OUT_DIR,
+        "label": label,
+        "input_mode": "volt",
+        "deconv_mode": mode,
+        "struc_method": "sobhy",
+        "power_step": P_step,
+        "is_heating": True,
+        "lower_fit_limit": 1e-3,   # 注意：这里是早期 √t 拟合的时间起点（秒）
+        "upper_fit_limit": 5e-3,   # 注意：这里是早期 √t 拟合的时间终点（秒）
+    }
+    if mode == "bayesian":
+        params["bay_steps"] = 1000
+
+    try:
+        ev = PyRth.Evaluation()
+        mod = ev.standard_module(params)
+        ev.save_as_csv()
+        csv_files = sorted(glob.glob(os.path.join(OUT_DIR, f"*{label}*.csv")))
+        results[mode] = {
+            "status": "ok",
+            "csv_files": csv_files,
+            "module_attrs": [a for a in dir(mod) if not a.startswith("_")],
+        }
+        print(f"[{mode}] 运行成功，导出 CSV:", csv_files)
+    except Exception as e:
+        print(f"[{mode}] 运行提示 ({e})，请核对上方打印的 transient_defaults 键名")
+        results[mode] = {"status": "error", "error": str(e)}
+
+# 5. 输出供 JS 端直接读取的基准夹具 JSON
+fixture = {
+    "description": "3-stage ground-truth + PyRth reference benchmark fixture",
+    "power_step_W": P_step,
+    "ambient_C": T_amb,
+    "ground_truth": {
+        "R_C_per_W": true_R,
+        "tau_s": true_tau,
+        "total_Rth": sum(true_R),
+    },
+    "time_s": t.tolist(),
+    "temp_C": temp_noisy.tolist(),
+    "pyrth_runs": results,
+}
+
+out_json = os.path.join(OUT_DIR, "pyrth_benchmark_fixture.json")
+with open(out_json, "w", encoding="utf-8") as f:
+    json.dump(fixture, f, indent=2)
+
+print("已生成夹具文件:", out_json)
+
+三、给执行 AI 的“两步走”启动提示词
+
+拿到 THERMAL_SPEC.md 和测试夹具后，建议分两轮发给执行 AI，一次一阶段，验收最稳：
+
+第一轮指令（先做 Phase 1 + 数值验收）
+
+请先阅读项目根目录的 `THERMAL_SPEC.md`，并检查 `src/` 下的 `thermalEngine.ts`、`src/engine/uiController.ts`、`src/main.ts` 及现有自检代码。
+
+本轮仅执行【Phase 1】：
+1. 在 `thermalEngine.ts` 中实现：对数分箱（含大步进跳过空箱与非均匀时间戳兼容）、动态 τ 上下限保护、列平衡的两阶段去偏 LASSO（坐标下降 + 自动 λ 选择 + 相邻峰质心合并 + 纯 NNLS 重拟合）、Heating/Cooling（含 √t 外推与 Auto t0）、阻抗域 2~6 阶降阶与 Cauer 网表导出（电容必须接节点 0）。
+2. 修复温度单位 °C/K 的 SI 词头格式化问题。
+3. 在 `src/modules/` 下实现 3 标签页热工作台 UI（Tab 1 含左控右图、Lin-t/Log-t 切换、τ谱/结构函数/残差切换、平滑曲线回注示波器；Tab 2 含 Deskew 与 Eoss 剥离；Tab 3 复用现有 SOA）。
+4. 补齐 Phase 1 的全部自检测试，并用 `pyrth_benchmark_fixture.json` 验证总热阻误差 < 1%。
+5. 跑通 `npm run build` 生成离线单文件 `waveform-viewer-pro.html`，汇报构建与自检结果，先不要开始 Phase 2。
+
+第二轮指令（Phase 1 验收全绿后再发）
+
+Phase 1 已验收通过。现在继续按 `THERMAL_SPEC.md` 第 3 节执行【Phase 2：BLDC FOC 6-MOS 热评估模块】：
+1. 新增 `src/modules/focThermal.ts`，实现“6管独立 ZthJC + 共享 Zth_board”星型耦合模型与 O(N) ZOH 闭环求解器，支持导出 7 端口 LTspice `.subckt INV_6MOS_THERM`。
+2. 实现直接从示波器 `Ia, Ib, Ic`（或仅 `Ia, Ib` 自动补算 `Ic`）+ `Vbus` 合成 6 颗 MOS 管的瞬时损耗与结温：
+   - 若未导入 PWM 占空比通道，利用 Clarke 变换电流矢量角与给定的调制深度/功率因数角重构 SVPWM / DPWM1 高边占空比 d_x(t)。
+   - 严格按电流符号区分同步整流与硬开关管：i_x > 0 时上管承担硬开关与 Qrr、下管承担死区体二极管损耗；i_x < 0 时角色对调；DPWM 60° 钳位扇区内开关与死区损耗置 0。
+   - 将 `Tj_AH..Tj_CL`（°C）及 `P_inv_total`（W）作为标准 Channel 注入主示波器，并展示每颗管的 Tj_avg、Tj_peak 与低频电周期结温纹波 ΔTj_ripple。
+3. 实现 FOC 堵转 / 零速扫角最坏热分析（Stall Sweep）：扫描电角度 0°~360°，定位最危险 MOS 管，计算稳态安全与否、升温至 Tj_limit 的安全堵转时间 t_safe（秒）及对应的固件 I²t 热保护阈值。
+4. 实现 SVPWM vs DPWM1 一键温升对比及载波频率 f_sw / 死区 t_dead 扫参权衡曲线。
+5. 将上述模块挂为热工作台弹窗的第 4 个标签页 `BLDC FOC 6-MOS 热评估`，补齐 Phase 2 自检（三相对称校验、电流反向角色对调校验、堵转 2×I_rms² 校验），并执行 `npm run build` 验证单文件 `waveform-viewer-pro.html` 打包通过。
