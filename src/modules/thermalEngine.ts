@@ -517,7 +517,7 @@ export function fosterToCauer(foster: FosterStage[]): {
   // Continued fraction from infinity (highest powers of u) -> Cauer ladder starting at TJ
   const trimHigh = (poly: DD[]): DD[] => {
     const out = [...poly];
-    while (out.length > 1 && Math.abs(out[out.length - 1].hi) < 1e-26) out.pop();
+    while (out.length > 1 && Math.abs(out[out.length - 1].hi) < 1e-30) out.pop();
     return out;
   };
 
@@ -541,7 +541,7 @@ export function fosterToCauer(foster: FosterStage[]): {
     // Now Z_rem(u) = den / YremNum -> both degree n-1-stage -> extract high ratio for R_k!
     const dLen = den.length;
     const yLen = YremNum.length;
-    if (yLen === 0 || Math.abs(YremNum[yLen - 1].hi) < 1e-28) break;
+    if (yLen === 0 || Math.abs(YremNum[yLen - 1].hi) < 1e-31) break;
 
     const rStage = ddDiv(den[dLen - 1], YremNum[yLen - 1]);
     const remZ: DD[] = [];
@@ -697,59 +697,106 @@ function reduceFosterOrder(
   targetOrder: number
 ): FosterStage[] {
   const N = Math.max(2, Math.min(6, Math.round(targetOrder)));
+  if (mergedPoles.length === 0) return [];
+
+  let reduced: FosterStage[] = [];
   if (mergedPoles.length <= N) {
-    return mergedPoles;
+    reduced = mergedPoles.map((p) => ({ ...p }));
+    reduced.sort((a, b) => a.tau - b.tau);
+  } else {
+    // Merge closest pairs weighted by reduced-resistance perturbation cost: (r1*r2/(r1+r2)) * |d(ln tau)|
+    let clusters = mergedPoles.map((p) => ({ r: p.r, logTau: Math.log(p.tau) }));
+    while (clusters.length > N) {
+      let bestIdx = 0;
+      let bestCost = Infinity;
+      for (let i = 0; i < clusters.length - 1; i++) {
+        const d = Math.abs(clusters[i + 1].logTau - clusters[i].logTau);
+        const r1 = clusters[i].r;
+        const r2 = clusters[i + 1].r;
+        const reducedR = (r1 * r2) / Math.max(1e-15, r1 + r2);
+        const cost = d * reducedR;
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestIdx = i;
+        }
+      }
+      const a = clusters[bestIdx];
+      const b = clusters[bestIdx + 1];
+      const rSum = a.r + b.r;
+      const logTau = rSum > 1e-15 ? (a.r * a.logTau + b.r * b.logTau) / rSum : 0.5 * (a.logTau + b.logTau);
+      clusters.splice(bestIdx, 2, { r: rSum, logTau });
+    }
+
+    const redTaus = clusters.map((c) => Math.exp(c.logTau));
+    const m = fitDt.length;
+    const A: Float64Array[] = new Array(m);
+    for (let i = 0; i < m; i++) {
+      const row = new Float64Array(redTaus.length);
+      for (let k = 0; k < redTaus.length; k++) {
+        row[k] = 1 - Math.exp(-fitDt[i] / redTaus[k]);
+      }
+      A[i] = row;
+    }
+    const rSolved = solveNNLS(A, fitZth);
+
+    for (let k = 0; k < redTaus.length; k++) {
+      if (rSolved[k] > 1e-9) {
+        const r = rSolved[k];
+        const tau = redTaus[k];
+        reduced.push({
+          r,
+          c: tau / r,
+          tau,
+          layerLabel: classifyThermalLayer(tau),
+        });
+      }
+    }
+    reduced.sort((a, b) => a.tau - b.tau);
   }
 
-  // Merge closest pairs weighted by reduced-resistance perturbation cost: (r1*r2/(r1+r2)) * |d(ln tau)|
-  let clusters = mergedPoles.map((p) => ({ r: p.r, logTau: Math.log(p.tau) }));
-  while (clusters.length > N) {
+  // Ensure exact targetOrder stages when NNLS drops collinear poles or fewer poles entered
+  let splitGuard = 0;
+  while (reduced.length < N && reduced.length >= 1 && splitGuard < 12) {
+    splitGuard++;
     let bestIdx = 0;
-    let bestCost = Infinity;
-    for (let i = 0; i < clusters.length - 1; i++) {
-      const d = Math.abs(clusters[i + 1].logTau - clusters[i].logTau);
-      const r1 = clusters[i].r;
-      const r2 = clusters[i + 1].r;
-      const reducedR = (r1 * r2) / Math.max(1e-15, r1 + r2);
-      const cost = d * reducedR;
-      if (cost < bestCost) {
-        bestCost = cost;
+    let bestScore = -1;
+    for (let i = 0; i < reduced.length; i++) {
+      const s = reduced[i];
+      const leftTau = i > 0 ? reduced[i - 1].tau : s.tau / 4;
+      const rightTau = i < reduced.length - 1 ? reduced[i + 1].tau : s.tau * 4;
+      const gapL = s.tau / Math.max(1e-12, leftTau);
+      const gapR = rightTau / Math.max(1e-12, s.tau);
+      const minGap = Math.min(gapL, gapR);
+      const headroom = Math.log(Math.max(1.03, minGap));
+      const score = s.r * (0.25 + headroom);
+      if (score > bestScore) {
+        bestScore = score;
         bestIdx = i;
       }
     }
-    const a = clusters[bestIdx];
-    const b = clusters[bestIdx + 1];
-    const rSum = a.r + b.r;
-    const logTau = rSum > 1e-15 ? (a.r * a.logTau + b.r * b.logTau) / rSum : 0.5 * (a.logTau + b.logTau);
-    clusters.splice(bestIdx, 2, { r: rSum, logTau });
+
+    const target = reduced[bestIdx];
+    const leftBound = bestIdx > 0 ? Math.sqrt(reduced[bestIdx - 1].tau * target.tau) : target.tau / 1.45;
+    const rightBound =
+      bestIdx < reduced.length - 1 ? Math.sqrt(target.tau * reduced[bestIdx + 1].tau) : target.tau * 1.45;
+    let tauA = Math.max(leftBound, target.tau / 1.15);
+    let tauB = Math.min(rightBound, target.tau * 1.15);
+    if (tauB <= tauA * 1.03) {
+      tauA = target.tau / 1.06;
+      tauB = target.tau * 1.06;
+    }
+
+    const rA = target.r * 0.55;
+    const rB = target.r * 0.45;
+    reduced.splice(
+      bestIdx,
+      1,
+      { r: rA, c: tauA / Math.max(1e-15, rA), tau: tauA, layerLabel: classifyThermalLayer(tauA) },
+      { r: rB, c: tauB / Math.max(1e-15, rB), tau: tauB, layerLabel: classifyThermalLayer(tauB) }
+    );
+    reduced.sort((a, b) => a.tau - b.tau);
   }
 
-  const redTaus = clusters.map((c) => Math.exp(c.logTau));
-  const m = fitDt.length;
-  const A: Float64Array[] = new Array(m);
-  for (let i = 0; i < m; i++) {
-    const row = new Float64Array(redTaus.length);
-    for (let k = 0; k < redTaus.length; k++) {
-      row[k] = 1 - Math.exp(-fitDt[i] / redTaus[k]);
-    }
-    A[i] = row;
-  }
-  const rSolved = solveNNLS(A, fitZth);
-
-  const reduced: FosterStage[] = [];
-  for (let k = 0; k < redTaus.length; k++) {
-    if (rSolved[k] > 1e-9) {
-      const r = rSolved[k];
-      const tau = redTaus[k];
-      reduced.push({
-        r,
-        c: tau / r,
-        tau,
-        layerLabel: classifyThermalLayer(tau),
-      });
-    }
-  }
-  reduced.sort((a, b) => a.tau - b.tau);
   return reduced;
 }
 
@@ -965,6 +1012,7 @@ export function deconvolveThermalImpedance(
   lambdaMax = Math.max(lambdaMax, 1e-9);
 
   // Automatic lambda selection via pathwise warm-started LASSO + Stage-2 Debiased L-curve
+  const requestedOrder = options.targetOrder !== undefined ? Math.max(2, Math.min(6, Math.round(options.targetOrder))) : 3;
   let selectedLambda = options.lambdaOverride ?? 0;
   let lassoWeights: Float64Array = new Float64Array(P);
 
@@ -1048,13 +1096,16 @@ export function deconvolveThermalImpedance(
     }
 
     const zSpan = Math.max(1e-9, Math.max(...fitZth) - Math.min(...fitZth));
+    const hasEnoughOrderCandidates = candK.some((k, li) => k >= requestedOrder && isFinite(candRmses[li]));
     let bestScore = Infinity;
     let bestIdx = 0;
     for (let li = 0; li < numLambdas; li++) {
       if (candK[li] === 0 || !isFinite(candRmses[li])) continue;
-      // Floor relative error at 0.05% full-scale so noiseless overfitting of >6 poles never beats clean sparse model
+      if (hasEnoughOrderCandidates && candK[li] < requestedOrder) continue;
       const relErr = Math.max(candRmses[li] / zSpan, 5e-4);
-      const score = Math.log(relErr * relErr) + 0.32 * candK[li];
+      const score = hasEnoughOrderCandidates
+        ? Math.log(relErr * relErr) + 0.08 * (candK[li] - requestedOrder)
+        : Math.log(relErr * relErr) + 0.32 * candK[li];
       if (score < bestScore) {
         bestScore = score;
         bestIdx = li;

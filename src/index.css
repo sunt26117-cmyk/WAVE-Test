@@ -390,7 +390,9 @@ html:not(.dark) body {
   color: var(--text-primary);
 }
 
+html:not(.dark) .bg-\[\#07090e\],
 html:not(.dark) .bg-\[\#0c0f13\],
+html:not(.dark) .bg-\[\#0d1117\],
 html:not(.dark) .bg-\[\#0e1217\] {
   background-color: var(--bg-well) !important;
 }
@@ -407,15 +409,23 @@ html:not(.dark) .bg-\[\#12161c\]\/95 {
 html:not(.dark) .bg-\[\#161b22\],
 html:not(.dark) .bg-\[\#1a222d\],
 html:not(.dark) .bg-\[\#162229\],
+html:not(.dark) .bg-\[\#132229\],
 html:not(.dark) .bg-\[\#1d1729\],
 html:not(.dark) .bg-\[\#1f2732\] {
   background-color: var(--bg-elevated) !important;
 }
 
+html:not(.dark) .bg-slate-800 {
+  background-color: #e2e8f0 !important;
+}
+
 html:not(.dark) .hover\:bg-\[\#1e2530\]:hover,
 html:not(.dark) .hover\:bg-\[\#243040\]:hover,
 html:not(.dark) .hover\:bg-\[\#1a222d\]:hover,
+html:not(.dark) .hover\:bg-\[\#1a222d\]\/60:hover,
+html:not(.dark) .hover\:bg-\[\#161b22\]\/80:hover,
 html:not(.dark) .hover\:bg-\[\#1d303a\]:hover,
+html:not(.dark) .hover\:bg-\[\#19303a\]:hover,
 html:not(.dark) .hover\:bg-\[\#2b2040\]:hover,
 html:not(.dark) .hover\:bg-\[\#161b22\]:hover {
   background-color: var(--bg-hover) !important;
@@ -425,14 +435,31 @@ html:not(.dark) .bg-\[\#222933\] {
   background-color: #cbd5e1 !important;
 }
 
+html:not(.dark) .bg-cyan-950\/35,
+html:not(.dark) .bg-cyan-950\/40,
 html:not(.dark) .bg-cyan-950\/50,
 html:not(.dark) .bg-cyan-950\/60 {
   background-color: rgba(2, 132, 199, 0.12) !important;
 }
 
+html:not(.dark) .hover\:bg-cyan-900\/70:hover {
+  background-color: rgba(2, 132, 199, 0.22) !important;
+}
+
+html:not(.dark) .bg-amber-950\/20,
+html:not(.dark) .bg-amber-950\/50,
+html:not(.dark) .bg-amber-950\/60 {
+  background-color: rgba(217, 119, 6, 0.12) !important;
+}
+
 html:not(.dark) .bg-emerald-950\/30,
-html:not(.dark) .bg-emerald-950\/60 {
+html:not(.dark) .bg-emerald-950\/60,
+html:not(.dark) .bg-emerald-950\/70 {
   background-color: rgba(5, 150, 105, 0.12) !important;
+}
+
+html:not(.dark) .hover\:bg-emerald-900\/70:hover {
+  background-color: rgba(5, 150, 105, 0.22) !important;
 }
 
 html:not(.dark) .bg-orange-950\/50,
@@ -440,18 +467,30 @@ html:not(.dark) .bg-orange-600\/20 {
   background-color: rgba(234, 88, 12, 0.12) !important;
 }
 
+html:not(.dark) .bg-rose-950\/25,
 html:not(.dark) .bg-rose-950\/50,
 html:not(.dark) .bg-rose-950\/60,
+html:not(.dark) .bg-rose-950\/70,
+html:not(.dark) .bg-rose-950\/80,
 html:not(.dark) .bg-red-950\/30,
 html:not(.dark) .bg-red-950\/50,
+html:not(.dark) .bg-red-950\/70,
 html:not(.dark) .bg-red-950\/80 {
-  background-color: rgba(220, 38, 38, 0.1) !important;
+  background-color: rgba(220, 38, 38, 0.11) !important;
+}
+
+html:not(.dark) .hover\:bg-rose-900\/70:hover,
+html:not(.dark) .hover\:bg-red-900\/60:hover {
+  background-color: rgba(220, 38, 38, 0.2) !important;
 }
 
 html:not(.dark) .border-\[\#222933\],
 html:not(.dark) .border-\[\#1b212a\],
 html:not(.dark) .border-\[\#1b222c\],
 html:not(.dark) .border-\[\#1f2732\],
+html:not(.dark) .border-\[\#1f2631\],
+html:not(.dark) .border-\[\#1d232d\],
+html:not(.dark) .border-\[\#1b2028\],
 html:not(.dark) .border-\[\#2c3543\],
 html:not(.dark) .border-\[\#2c3849\] {
   border-color: var(--border-subtle) !important;
@@ -463,12 +502,17 @@ html:not(.dark) .text-slate-200 {
   color: #0f172a !important;
 }
 
+html:not(.dark) .hover\:text-white:hover {
+  color: #0f172a !important;
+}
+
 html:not(.dark) .text-slate-300 {
   color: #334155 !important;
 }
 
 html:not(.dark) .text-slate-400,
-html:not(.dark) .text-slate-500 {
+html:not(.dark) .text-slate-500,
+html:not(.dark) .text-slate-600 {
   color: #64748b !important;
 }
 
@@ -495,6 +539,7 @@ html:not(.dark) .text-purple-300 {
   color: #6d28d9 !important;
 }
 
+html:not(.dark) .text-pink-300,
 html:not(.dark) .text-rose-200,
 html:not(.dark) .text-rose-300,
 html:not(.dark) .text-red-200,
@@ -525,7 +570,8 @@ html:not(.dark) #xyModeBtn.bg-cyan-600 {
 }
 
 html:not(.dark) input,
-html:not(.dark) select {
+html:not(.dark) select,
+html:not(.dark) textarea {
   color: #0f172a;
 }
 

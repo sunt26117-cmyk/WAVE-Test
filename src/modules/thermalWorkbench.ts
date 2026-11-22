@@ -325,6 +325,12 @@ export class ThermalWorkbenchController {
       this.runDeconvolution();
     });
 
+    document.getElementById('thermOrderSelect')?.addEventListener('change', () => {
+      if (this.lastDeconv) {
+        this.runDeconvolution();
+      }
+    });
+
     document.getElementById('thermLinTimeBtn')?.addEventListener('click', () => {
       this.timeScaleMode = 'lin';
       this.syncPlotButtons();
@@ -578,6 +584,43 @@ export class ThermalWorkbenchController {
     });
 
     window.addEventListener('resize', scheduleRedrawIfVisible);
+    window.addEventListener('wvp-theme-changed', scheduleRedrawIfVisible);
+  }
+
+  private getCanvasTheme() {
+    const preset = this.app.getThemePreset();
+    const c = preset.canvas;
+    const isLight = c.isLight;
+    return {
+      isLight,
+      bg: c.bg,
+      grid: c.grid,
+      frame: c.frame,
+      axisText: c.axisText,
+      titleText: isLight ? '#0f172a' : '#cbd5e1',
+      emptyText: isLight ? '#64748b' : '#64748b',
+      yellowDot: isLight ? 'rgba(180, 83, 9, 0.85)' : 'rgba(250, 204, 21, 0.82)',
+      yellow: isLight ? '#b45309' : '#facc15',
+      cyan: isLight ? '#0284c7' : '#22d3ee',
+      sky: isLight ? '#0369a1' : '#38bdf8',
+      skyFill: isLight ? 'rgba(2, 132, 199, 0.28)' : 'rgba(56, 189, 248, 0.35)',
+      green: isLight ? '#059669' : '#4ade80',
+      orange: isLight ? '#c2410c' : '#fb923c',
+      orangeStroke: isLight ? 'rgba(194, 65, 12, 0.85)' : 'rgba(251, 146, 60, 0.85)',
+      orangeMarker: isLight ? 'rgba(234, 88, 12, 0.72)' : 'rgba(251, 146, 60, 0.7)',
+      pink: isLight ? '#be185d' : '#f472b6',
+      purple: isLight ? '#6d28d9' : '#a78bfa',
+      rose: isLight ? '#e11d48' : '#fb7185',
+      red: isLight ? '#dc2626' : '#f43f5e',
+      redDashed: isLight ? 'rgba(220, 38, 38, 0.72)' : 'rgba(248, 113, 113, 0.75)',
+      dashedRef: isLight ? 'rgba(71, 85, 105, 0.45)' : 'rgba(148, 163, 184, 0.35)',
+      trajStroke: isLight ? 'rgba(51, 65, 85, 0.45)' : 'rgba(226, 232, 240, 0.45)',
+      trajDot: isLight ? 'rgba(2, 132, 199, 0.72)' : 'rgba(34, 211, 238, 0.65)',
+      tBoard: isLight ? '#475569' : '#94a3b8',
+      focColors: isLight
+        ? ['#be185d', '#e11d48', '#0284c7', '#2563eb', '#059669', '#d97706']
+        : ['#f472b6', '#fb7185', '#22d3ee', '#38bdf8', '#4ade80', '#facc15'],
+    };
   }
 
   private syncPlotButtons(): void {
@@ -724,12 +767,13 @@ export class ThermalWorkbenchController {
     if (!prep) return;
     const { ctx, w, h } = prep;
 
-    ctx.fillStyle = '#07090e';
+    const th = this.getCanvasTheme();
+    ctx.fillStyle = th.bg;
     ctx.fillRect(0, 0, w, h);
 
     const res = this.lastDeconv;
     if (!res || res.fitTimeRel.length === 0) {
-      ctx.fillStyle = '#64748b';
+      ctx.fillStyle = th.emptyText;
       ctx.font = '12px "IBM Plex Sans", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('Select Temperature/TSEP channel & click "Run Deconvolution"', w / 2, h / 2);
@@ -741,7 +785,7 @@ export class ThermalWorkbenchController {
     const ph = Math.max(20, h - pad.t - pad.b);
 
     // Subtle grid
-    ctx.strokeStyle = '#1b2330';
+    ctx.strokeStyle = th.grid;
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = pad.t + (ph * i) / 4;
@@ -757,7 +801,7 @@ export class ThermalWorkbenchController {
       ctx.lineTo(x, pad.t + ph);
       ctx.stroke();
     }
-    ctx.strokeStyle = '#334155';
+    ctx.strokeStyle = th.frame;
     ctx.strokeRect(pad.l, pad.t, pw, ph);
 
     if (this.timeScaleMode === 'lin') {
@@ -788,7 +832,7 @@ export class ThermalWorkbenchController {
       // t0 vertical marker
       if (res.t0Sec >= tMin && res.t0Sec <= tMax) {
         const xt0 = xOf(res.t0Sec);
-        ctx.strokeStyle = 'rgba(251, 146, 60, 0.7)';
+        ctx.strokeStyle = th.orangeMarker;
         ctx.setLineDash([4, 3]);
         ctx.beginPath();
         ctx.moveTo(xt0, pad.t);
@@ -798,7 +842,7 @@ export class ThermalWorkbenchController {
       }
 
       // Measured points (t0 + fitTimeRel)
-      ctx.fillStyle = 'rgba(250, 204, 21, 0.8)';
+      ctx.fillStyle = th.yellowDot;
       const step = Math.max(1, Math.floor(tAbsMeas.length / 400));
       for (let i = 0; i < tAbsMeas.length; i += step) {
         const px = xOf(res.t0Sec + tAbsMeas[i]);
@@ -807,7 +851,7 @@ export class ThermalWorkbenchController {
       }
 
       // 12x Smooth Fit Curve
-      ctx.strokeStyle = '#22d3ee';
+      ctx.strokeStyle = th.cyan;
       ctx.lineWidth = 2;
       ctx.beginPath();
       for (let i = 0; i < res.smoothAbsTime.length; i++) {
@@ -819,7 +863,7 @@ export class ThermalWorkbenchController {
       ctx.stroke();
 
       // Axis labels
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       for (let i = 0; i <= 4; i++) {
@@ -832,8 +876,8 @@ export class ThermalWorkbenchController {
         ctx.fillText(formatEng(tVal, 's', 2), pad.l + (pw * i) / 5, pad.t + ph + 16);
       }
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
-      ctx.fillText(`Lin-t: Measured (yellow) vs ${res.reducedCauer.length}-Stage Smooth Fit (cyan) · t0=${formatEng(res.t0Sec, 's', 2)}`, pad.l + 6, pad.t - 6);
+      ctx.fillStyle = th.titleText;
+      ctx.fillText(`Lin-t: Measured (amber) vs ${res.reducedCauer.length}-Stage Smooth Fit (blue) · t0=${formatEng(res.t0Sec, 's', 2)}`, pad.l + 6, pad.t - 6);
     } else {
       // Log-t: Plot Zth(Δt) (°C/W) vs log10(t - t0)
       const pts: Array<{ dt: number; zMeas: number; zPred: number }> = [];
@@ -861,12 +905,12 @@ export class ThermalWorkbenchController {
       const xOf = (dt: number) => pad.l + ((Math.log10(dt) - lxMin) / lxSpan) * pw;
       const yOf = (z: number) => pad.t + ph - (Math.max(0, z) / yMax) * ph;
 
-      ctx.fillStyle = 'rgba(250, 204, 21, 0.82)';
+      ctx.fillStyle = th.yellowDot;
       for (const p of pts) {
         ctx.fillRect(xOf(p.dt) - 1.5, yOf(p.zMeas) - 1.5, 3, 3);
       }
 
-      ctx.strokeStyle = '#22d3ee';
+      ctx.strokeStyle = th.cyan;
       ctx.lineWidth = 2;
       ctx.beginPath();
       pts.forEach((p, idx) => {
@@ -877,7 +921,7 @@ export class ThermalWorkbenchController {
       });
       ctx.stroke();
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       for (let i = 0; i <= 4; i++) {
@@ -890,7 +934,7 @@ export class ThermalWorkbenchController {
         ctx.fillText(formatEng(Math.pow(10, lx), 's', 1), pad.l + (pw * i) / 5, pad.t + ph + 16);
       }
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
+      ctx.fillStyle = th.titleText;
       ctx.fillText(`Log-t: Zth(Δt) [°C/W] vs Δt (s)`, pad.l + 6, pad.t - 6);
     }
   }
@@ -902,12 +946,13 @@ export class ThermalWorkbenchController {
     if (!prep) return;
     const { ctx, w, h } = prep;
 
-    ctx.fillStyle = '#07090e';
+    const th = this.getCanvasTheme();
+    ctx.fillStyle = th.bg;
     ctx.fillRect(0, 0, w, h);
 
     const res = this.lastDeconv;
     if (!res) {
-      ctx.fillStyle = '#64748b';
+      ctx.fillStyle = th.emptyText;
       ctx.font = '11px "IBM Plex Sans", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('Run deconvolution to inspect τ spectrum, Structure Function, or Residuals', w / 2, h / 2);
@@ -918,7 +963,7 @@ export class ThermalWorkbenchController {
     const pw = Math.max(20, w - pad.l - pad.r);
     const ph = Math.max(20, h - pad.t - pad.b);
 
-    ctx.strokeStyle = '#1b2330';
+    ctx.strokeStyle = th.grid;
     ctx.lineWidth = 1;
     for (let i = 0; i <= 3; i++) {
       const y = pad.t + (ph * i) / 3;
@@ -927,7 +972,7 @@ export class ThermalWorkbenchController {
       ctx.lineTo(pad.l + pw, y);
       ctx.stroke();
     }
-    ctx.strokeStyle = '#334155';
+    ctx.strokeStyle = th.frame;
     ctx.strokeRect(pad.l, pad.t, pw, ph);
 
     if (this.subPlotMode === 'spectrum') {
@@ -946,7 +991,7 @@ export class ThermalWorkbenchController {
       const yOfR = (r: number) => pad.t + ph - (r / maxR) * ph;
 
       // Dense sparse LASSO bins
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.35)';
+      ctx.fillStyle = th.skyFill;
       for (const b of bins) {
         if (b.r <= 0) continue;
         const x = xOfTau(b.tau);
@@ -958,13 +1003,13 @@ export class ThermalWorkbenchController {
       res.reducedFoster.forEach((p, idx) => {
         const x = xOfTau(p.tau);
         const y = yOfR(p.r);
-        ctx.strokeStyle = '#4ade80';
+        ctx.strokeStyle = th.green;
         ctx.lineWidth = 2.5;
         ctx.beginPath();
         ctx.moveTo(x, pad.t + ph);
         ctx.lineTo(x, y);
         ctx.stroke();
-        ctx.fillStyle = '#4ade80';
+        ctx.fillStyle = th.green;
         ctx.beginPath();
         ctx.arc(x, y, 3.5, 0, Math.PI * 2);
         ctx.fill();
@@ -973,7 +1018,7 @@ export class ThermalWorkbenchController {
         ctx.fillText(`τ${idx + 1}`, x, Math.max(pad.t + 10, y - 6));
       });
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       ctx.fillText(`${maxR.toFixed(3)}`, pad.l - 6, pad.t + 8);
@@ -984,7 +1029,7 @@ export class ThermalWorkbenchController {
         ctx.fillText(formatEng(Math.pow(10, lt), 's', 1), pad.l + (pw * i) / 4, pad.t + ph + 15);
       }
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
+      ctx.fillStyle = th.titleText;
       ctx.fillText(`Time-Constant Spectrum R(τ) [°C/W] · ${res.mergedPoles.length} merged -> ${res.reducedFoster.length} poles`, pad.l + 6, pad.t - 5);
     } else if (this.subPlotMode === 'structure') {
       const sf = res.structureFunction;
@@ -997,7 +1042,7 @@ export class ThermalWorkbenchController {
       const xOf = (r: number) => pad.l + (r / rMax) * pw;
       const yOf = (c: number) => pad.t + ph - ((Math.log10(Math.max(1e-7, c)) - lcMin) / lcSpan) * ph;
 
-      ctx.strokeStyle = '#a78bfa';
+      ctx.strokeStyle = th.purple;
       ctx.lineWidth = 2;
       ctx.beginPath();
       sf.forEach((pt, idx) => {
@@ -1011,17 +1056,17 @@ export class ThermalWorkbenchController {
       sf.forEach((pt, idx) => {
         const px = xOf(pt.rCum);
         const py = yOf(pt.cCum);
-        ctx.fillStyle = '#facc15';
+        ctx.fillStyle = th.yellow;
         ctx.beginPath();
         ctx.arc(px, py, 3.5, 0, Math.PI * 2);
         ctx.fill();
         ctx.font = '10px "JetBrains Mono", monospace';
-        ctx.fillStyle = '#cbd5e1';
+        ctx.fillStyle = th.titleText;
         ctx.textAlign = idx === sf.length - 1 ? 'right' : 'left';
         ctx.fillText(`N${idx + 1}`, px + (idx === sf.length - 1 ? -4 : 4), Math.max(pad.t + 10, py - 5));
       });
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       ctx.fillText(`1e${Math.round(lcMax)}`, pad.l - 6, pad.t + 8);
@@ -1031,7 +1076,7 @@ export class ThermalWorkbenchController {
         ctx.fillText(`${((rMax * i) / 4).toFixed(2)}`, pad.l + (pw * i) / 4, pad.t + ph + 15);
       }
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
+      ctx.fillStyle = th.titleText;
       ctx.fillText('Cumulative Structure Function: log10(CΣ [J/°C]) vs RΣ [°C/W]', pad.l + 6, pad.t - 5);
     } else {
       // Residual
@@ -1042,7 +1087,7 @@ export class ThermalWorkbenchController {
       maxAbs *= 1.15;
 
       const midY = pad.t + ph / 2;
-      ctx.strokeStyle = 'rgba(148,163,184,0.35)';
+      ctx.strokeStyle = th.dashedRef;
       ctx.setLineDash([4, 3]);
       ctx.beginPath();
       ctx.moveTo(pad.l, midY);
@@ -1050,7 +1095,7 @@ export class ThermalWorkbenchController {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      ctx.strokeStyle = '#fb7185';
+      ctx.strokeStyle = th.rose;
       ctx.lineWidth = 1.6;
       ctx.beginPath();
       for (let i = 0; i < r.length; i++) {
@@ -1061,13 +1106,13 @@ export class ThermalWorkbenchController {
       }
       ctx.stroke();
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       ctx.fillText(`+${maxAbs.toFixed(2)}°C`, pad.l - 6, pad.t + 8);
       ctx.fillText(`-${maxAbs.toFixed(2)}°C`, pad.l - 6, pad.t + ph);
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
+      ctx.fillStyle = th.titleText;
       ctx.fillText(`Fit Residual (T_meas − T_pred) · RMSE = ${res.rmseC.toFixed(3)} °C`, pad.l + 6, pad.t - 5);
     }
   }
@@ -1170,12 +1215,13 @@ export class ThermalWorkbenchController {
     if (!prep) return;
     const { ctx, w, h } = prep;
 
-    ctx.fillStyle = '#07090e';
+    const th = this.getCanvasTheme();
+    ctx.fillStyle = th.bg;
     ctx.fillRect(0, 0, w, h);
 
     const res = this.lastLossResult;
     if (!res || res.time.length < 2) {
-      ctx.fillStyle = '#64748b';
+      ctx.fillStyle = th.emptyText;
       ctx.font = '11px "IBM Plex Sans", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('Run Loss & Tj(t) to preview stripped P_loss(t) & closed-loop Tj(t).', w / 2, h / 2);
@@ -1186,7 +1232,7 @@ export class ThermalWorkbenchController {
     const pw = Math.max(20, w - pad.l - pad.r);
     const ph = Math.max(20, h - pad.t - pad.b);
 
-    ctx.strokeStyle = '#1b2330';
+    ctx.strokeStyle = th.grid;
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = pad.t + (ph * i) / 4;
@@ -1202,7 +1248,7 @@ export class ThermalWorkbenchController {
       ctx.lineTo(x, pad.t + ph);
       ctx.stroke();
     }
-    ctx.strokeStyle = '#334155';
+    ctx.strokeStyle = th.frame;
     ctx.strokeRect(pad.l, pad.t, pw, ph);
 
     const n = res.time.length;
@@ -1253,7 +1299,7 @@ export class ThermalWorkbenchController {
     const stride = Math.max(1, Math.floor(n / Math.max(200, Math.round(pw * 1.5))));
 
     // P_loss(t) trace (amber-orange, left Y-axis)
-    ctx.strokeStyle = 'rgba(251, 146, 60, 0.85)';
+    ctx.strokeStyle = th.orangeStroke;
     ctx.lineWidth = 1.3;
     ctx.beginPath();
     let startedP = false;
@@ -1291,7 +1337,7 @@ export class ThermalWorkbenchController {
     ctx.stroke();
 
     // Closed-loop Tj(t) trace (pink, right Y-axis)
-    ctx.strokeStyle = '#f472b6';
+    ctx.strokeStyle = th.pink;
     ctx.lineWidth = 2;
     ctx.beginPath();
     let startedTj = false;
@@ -1315,28 +1361,28 @@ export class ThermalWorkbenchController {
     // Axis tick labels
     ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'right';
-    ctx.fillStyle = '#fb923c';
+    ctx.fillStyle = th.orange;
     for (let i = 0; i <= 4; i++) {
       const pVal = pMax - (pSpan * i) / 4;
       ctx.fillText(`${pVal.toFixed(Math.abs(pVal) >= 100 ? 0 : 1)}W`, pad.l - 6, pad.t + (ph * i) / 4 + 3);
     }
 
     ctx.textAlign = 'left';
-    ctx.fillStyle = '#f472b6';
+    ctx.fillStyle = th.pink;
     for (let i = 0; i <= 4; i++) {
       const tjVal = tjMax - (tjSpan * i) / 4;
       ctx.fillText(`${tjVal.toFixed(1)}°C`, pad.l + pw + 6, pad.t + (ph * i) / 4 + 3);
     }
 
     ctx.textAlign = 'center';
-    ctx.fillStyle = '#94a3b8';
+    ctx.fillStyle = th.axisText;
     for (let i = 0; i <= 5; i++) {
       const tVal = tMin + (tSpan * i) / 5;
       ctx.fillText(formatEng(tVal, 's', 2), pad.l + (pw * i) / 5, pad.t + ph + 16);
     }
 
     ctx.textAlign = 'left';
-    ctx.fillStyle = '#cbd5e1';
+    ctx.fillStyle = th.titleText;
     ctx.fillText(
       `Pmean=${res.pLossMeanW.toFixed(2)} W · Tj_max=${res.tjMaxC.toFixed(2)} °C · SW Events=${res.switchingEvents}`,
       pad.l + 6,
@@ -1543,7 +1589,8 @@ export class ThermalWorkbenchController {
     if (!prep) return;
     const { ctx, w, h } = prep;
 
-    ctx.fillStyle = '#07090e';
+    const th = this.getCanvasTheme();
+    ctx.fillStyle = th.bg;
     ctx.fillRect(0, 0, w, h);
 
     const pad = { l: 54, r: 18, t: 22, b: 30 };
@@ -1558,7 +1605,7 @@ export class ThermalWorkbenchController {
     const yOf = (id: number) => pad.t + ph - ((Math.log10(Math.max(0.5, id)) - lyMin) / (lyMax - lyMin)) * ph;
 
     // Log grid decades
-    ctx.strokeStyle = '#1b2330';
+    ctx.strokeStyle = th.grid;
     ctx.lineWidth = 1;
     [0.1, 1, 10, 100].forEach((d) => {
       const gx = xOf(d);
@@ -1578,16 +1625,16 @@ export class ThermalWorkbenchController {
         ctx.stroke();
       }
     });
-    ctx.strokeStyle = '#334155';
+    ctx.strokeStyle = th.frame;
     ctx.strokeRect(pad.l, pad.t, pw, ph);
 
     // Plot SOA boundary curves
     const curveStyles: Array<[SoaPulseKey, string]> = [
-      ['10us', '#22d3ee'],
-      ['100us', '#38bdf8'],
-      ['1ms', '#4ade80'],
-      ['10ms', '#facc15'],
-      ['DC', '#fb923c'],
+      ['10us', th.cyan],
+      ['100us', th.sky],
+      ['1ms', th.green],
+      ['10ms', th.yellow],
+      ['DC', th.orange],
     ];
 
     curveStyles.forEach(([key, color]) => {
@@ -1613,7 +1660,7 @@ export class ThermalWorkbenchController {
 
     // BVDSS vertical line
     const xMaxV = xOf(this.soaCurveSet.vdsMaxRated);
-    ctx.strokeStyle = 'rgba(248, 113, 113, 0.7)';
+    ctx.strokeStyle = th.redDashed;
     ctx.setLineDash([4, 3]);
     ctx.beginPath();
     ctx.moveTo(xMaxV, pad.t);
@@ -1624,7 +1671,7 @@ export class ThermalWorkbenchController {
     // Operating trajectory
     if (this.lastSoaResult && this.lastSoaResult.trajectoryPoints.length > 0) {
       const traj = this.lastSoaResult.trajectoryPoints;
-      ctx.strokeStyle = 'rgba(226, 232, 240, 0.45)';
+      ctx.strokeStyle = th.trajStroke;
       ctx.lineWidth = 1.1;
       ctx.beginPath();
       traj.forEach((p, idx) => {
@@ -1638,14 +1685,14 @@ export class ThermalWorkbenchController {
       for (const p of traj) {
         const px = xOf(Math.max(0.1, p.vds));
         const py = yOf(Math.max(0.5, p.id));
-        ctx.fillStyle = p.violated ? '#f43f5e' : 'rgba(34, 211, 238, 0.65)';
+        ctx.fillStyle = p.violated ? th.red : th.trajDot;
         ctx.fillRect(px - (p.violated ? 2.5 : 1.2), py - (p.violated ? 2.5 : 1.2), p.violated ? 5 : 2.4, p.violated ? 5 : 2.4);
       }
 
       if (this.lastSoaResult.worstTime !== null) {
         const wx = xOf(Math.max(0.1, this.lastSoaResult.worstVds));
         const wy = yOf(Math.max(0.5, this.lastSoaResult.worstId));
-        ctx.strokeStyle = '#fb7185';
+        ctx.strokeStyle = th.rose;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(wx, wy, 6, 0, Math.PI * 2);
@@ -1653,7 +1700,7 @@ export class ThermalWorkbenchController {
       }
     }
 
-    ctx.fillStyle = '#94a3b8';
+    ctx.fillStyle = th.axisText;
     ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'center';
     [0.1, 1, 10, 100].forEach((d) => {
@@ -1666,7 +1713,7 @@ export class ThermalWorkbenchController {
       if (gy >= pad.t && gy <= pad.t + ph) ctx.fillText(`${d}A`, pad.l - 6, gy + 3);
     });
     ctx.textAlign = 'left';
-    ctx.fillStyle = '#cbd5e1';
+    ctx.fillStyle = th.titleText;
     ctx.fillText(`Log-Log Dynamic SOA (${this.soaCurveSet.name})`, pad.l + 6, pad.t - 6);
   }
 
@@ -2028,7 +2075,8 @@ export class ThermalWorkbenchController {
     const prep = prepareHiDpiCanvas(canvas);
     if (!prep) return;
     const { ctx, w, h } = prep;
-    ctx.fillStyle = '#07090e';
+    const th = this.getCanvasTheme();
+    ctx.fillStyle = th.bg;
     ctx.fillRect(0, 0, w, h);
 
     const pad = { l: 54, r: 18, t: 22, b: 28 };
@@ -2036,7 +2084,7 @@ export class ThermalWorkbenchController {
     const ph = Math.max(20, h - pad.t - pad.b);
 
     const drawGrid = () => {
-      ctx.strokeStyle = '#1b2330';
+      ctx.strokeStyle = th.grid;
       ctx.lineWidth = 1;
       for (let i = 0; i <= 4; i++) {
         const y = pad.t + (ph * i) / 4;
@@ -2052,7 +2100,7 @@ export class ThermalWorkbenchController {
         ctx.lineTo(x, pad.t + ph);
         ctx.stroke();
       }
-      ctx.strokeStyle = '#334155';
+      ctx.strokeStyle = th.frame;
       ctx.strokeRect(pad.l, pad.t, pw, ph);
     };
 
@@ -2062,7 +2110,7 @@ export class ThermalWorkbenchController {
       if (titleEl) titleEl.innerText = '6-MOS Coupled Junction Temperature Tj(t)';
       const sim = this.lastFocSim;
       if (!sim || sim.time.length < 2) {
-        ctx.fillStyle = '#64748b';
+        ctx.fillStyle = th.emptyText;
         ctx.font = '12px "IBM Plex Sans", sans-serif';
         ctx.textAlign = 'center';
         ctx.fillText('Click "Load FOC 3-Ph Demo" or "Run 6-MOS Coupled Tj(t)"', w / 2, h / 2);
@@ -2091,7 +2139,7 @@ export class ThermalWorkbenchController {
       const yOf = (v: number) => pad.t + ph - ((v - yMin) / (yMax - yMin)) * ph;
 
       // T_board dashed
-      ctx.strokeStyle = '#94a3b8';
+      ctx.strokeStyle = th.tBoard;
       ctx.setLineDash([4, 3]);
       ctx.lineWidth = 1.4;
       ctx.beginPath();
@@ -2105,7 +2153,7 @@ export class ThermalWorkbenchController {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      const colors = ['#f472b6', '#fb7185', '#22d3ee', '#38bdf8', '#4ade80', '#facc15'];
+      const colors = th.focColors;
       MOS_SWITCH_KEYS.forEach((key, idx) => {
         ctx.strokeStyle = colors[idx];
         ctx.lineWidth = key === sim.hottestKey ? 2.2 : 1.3;
@@ -2120,7 +2168,7 @@ export class ThermalWorkbenchController {
         ctx.stroke();
       });
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       for (let i = 0; i <= 4; i++) {
@@ -2132,13 +2180,13 @@ export class ThermalWorkbenchController {
         ctx.fillText(formatEng(t0 + (tSpan * i) / 5, 's', 2), pad.l + (pw * i) / 5, pad.t + ph + 15);
       }
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
+      ctx.fillStyle = th.titleText;
       ctx.fillText(`6-MOS Tj(t) + T_board (dashed) · Peak ${sim.hottestKey}=${sim.tjMaxGlobalC.toFixed(2)}°C`, pad.l + 6, pad.t - 6);
     } else if (this.focCanvasMode === 'stall') {
       if (titleEl) titleEl.innerText = 'Locked-Rotor Steady Max Tj vs Electrical Angle (0°..360°)';
       const st = this.lastFocStall;
       if (!st || st.anglesDeg.length === 0) {
-        ctx.fillStyle = '#64748b';
+        ctx.fillStyle = th.emptyText;
         ctx.font = '12px "IBM Plex Sans", sans-serif';
         ctx.textAlign = 'center';
         ctx.fillText('Click "Run Stall Sweep & I²t Protection" to inspect 0°..360° thermal hotspots', w / 2, h / 2);
@@ -2157,7 +2205,7 @@ export class ThermalWorkbenchController {
 
       // Tj_limit line
       if (tjLimit >= yMin && tjLimit <= yMax) {
-        ctx.strokeStyle = 'rgba(248, 113, 113, 0.8)';
+        ctx.strokeStyle = th.redDashed;
         ctx.setLineDash([4, 3]);
         ctx.beginPath();
         ctx.moveTo(pad.l, yOf(tjLimit));
@@ -2166,7 +2214,7 @@ export class ThermalWorkbenchController {
         ctx.setLineDash([]);
       }
 
-      ctx.strokeStyle = '#fb923c';
+      ctx.strokeStyle = th.orange;
       ctx.lineWidth = 2;
       ctx.beginPath();
       st.anglesDeg.forEach((deg, idx) => {
@@ -2178,12 +2226,12 @@ export class ThermalWorkbenchController {
       ctx.stroke();
 
       // Highlight worst angle
-      ctx.fillStyle = '#f43f5e';
+      ctx.fillStyle = th.red;
       ctx.beginPath();
       ctx.arc(xOf(st.worstAngleDeg), yOf(st.worstSteadyTjC), 5, 0, Math.PI * 2);
       ctx.fill();
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       for (let i = 0; i <= 4; i++) {
@@ -2194,13 +2242,13 @@ export class ThermalWorkbenchController {
         ctx.fillText(`${deg}°`, xOf(deg), pad.t + ph + 15);
       }
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
+      ctx.fillStyle = th.titleText;
       ctx.fillText(`Worst: ${st.worstSwitch} @ θ=${st.worstAngleDeg}° (${st.worstSteadyTjC.toFixed(1)}°C steady, ${st.phaseSquaredRatioAtWorst.toFixed(2)}× Irms²)`, pad.l + 6, pad.t - 6);
     } else {
       if (titleEl) titleEl.innerText = 'Carrier Frequency Trade-off: SVPWM vs DPWM1 Total Loss (W)';
       const sw = this.lastFocSweep;
       if (!sw || sw.fswListHz.length === 0) {
-        ctx.fillStyle = '#64748b';
+        ctx.fillStyle = th.emptyText;
         ctx.font = '12px "IBM Plex Sans", sans-serif';
         ctx.textAlign = 'center';
         ctx.fillText('Click "SVPWM vs DPWM1 扫频" to compare carrier frequency loss curves', w / 2, h / 2);
@@ -2235,10 +2283,10 @@ export class ThermalWorkbenchController {
         });
       };
 
-      drawSeries(sw.pMeanSvpwmByFsw, '#22d3ee');
-      drawSeries(sw.pMeanDpwm1ByFsw, '#4ade80');
+      drawSeries(sw.pMeanSvpwmByFsw, th.cyan);
+      drawSeries(sw.pMeanDpwm1ByFsw, th.green);
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = th.axisText;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'right';
       for (let i = 0; i <= 4; i++) {
@@ -2247,8 +2295,8 @@ export class ThermalWorkbenchController {
       ctx.textAlign = 'center';
       sw.fswListHz.forEach((f) => ctx.fillText(`${(f / 1000).toFixed(0)}k`, xOf(f), pad.t + ph + 15));
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#cbd5e1';
-      ctx.fillText('SVPWM (cyan) vs DPWM1 60°-Clamp (green) Inverter Total Loss [W] vs f_sw (Hz)', pad.l + 6, pad.t - 6);
+      ctx.fillStyle = th.titleText;
+      ctx.fillText('SVPWM (blue) vs DPWM1 60°-Clamp (green) Inverter Total Loss [W] vs f_sw (Hz)', pad.l + 6, pad.t - 6);
     }
   }
 

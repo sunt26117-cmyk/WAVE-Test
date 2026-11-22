@@ -11,6 +11,7 @@ import {
   openExcelWorkbookSession,
   recomputeExcelSheetPreview,
   applyExcelRulesToTargetSession,
+  syncExcelColumnRuleAcrossSheets,
   parseExcelSheetToChannels,
   releaseExcelWorkbookSession,
 } from '../parsers/excelParser';
@@ -173,6 +174,25 @@ class ExcelImportModalController {
       });
       this.render();
       this.onNotifyCb?.(`已将当前 Sheet 与表头规则应用到其余 ${updated} 个 Excel 文件。`, 'info');
+    });
+
+    document.getElementById('xlsSyncAllColsNowBtn')?.addEventListener('click', () => {
+      const s = this.getActiveSession();
+      const sh = this.getActiveSheet();
+      if (!s || !sh) return;
+      const count = syncExcelColumnRuleAcrossSheets(
+        this.sessions,
+        this.activeSessionIndex,
+        sh.sheetIndex,
+        { checkedOnly: true }
+      );
+      this.render();
+      this.onNotifyCb?.(
+        count > 0
+          ? `已将 [${sh.sheetName}] 的列规则同步到其余 ${count} 个已选 Sheet。`
+          : '没有其他需要更新的已选 Sheet。',
+        'info'
+      );
     });
 
     document.getElementById('xlsTabSeparateBtn')?.addEventListener('click', () => {
@@ -559,15 +579,18 @@ class ExcelImportModalController {
       const textBadge = col.isTextColumn
         ? '<span class="ml-1 px-1 bg-slate-800 text-slate-400 text-[9px] rounded-xs">TXT</span>'
         : '';
-      html += `<th class="p-1.5 border border-[#222933] text-left align-top min-w-[118px] ${thCls}">
+      html += `<th class="p-1.5 border border-[#222933] text-left align-top min-w-[132px] ${thCls}">
         <div class="flex items-center justify-between gap-1 mb-1">
           <span class="truncate max-w-[110px]" title="${col.header}">${col.colLetter}: ${col.header}</span>${textBadge}
         </div>
-        <select class="xls-col-role-sel w-full text-[10px] bg-[#0c0f13] border border-[#2c3543] rounded-xs px-1 py-0.5 text-slate-100 cursor-pointer" data-col="${cIdx}">
-          <option value="time" ${col.role === 'time' ? 'selected' : ''}>Time</option>
-          <option value="channel" ${col.role === 'channel' ? 'selected' : ''}>Channel</option>
-          <option value="ignore" ${col.role === 'ignore' ? 'selected' : ''}>Ignore</option>
-        </select>
+        <div class="flex items-center gap-1">
+          <select class="xls-col-role-sel flex-1 min-w-0 text-[10px] bg-[#0c0f13] border border-[#2c3543] rounded-xs px-1 py-0.5 text-slate-100 cursor-pointer" data-col="${cIdx}">
+            <option value="time" ${col.role === 'time' ? 'selected' : ''}>Time</option>
+            <option value="channel" ${col.role === 'channel' ? 'selected' : ''}>Channel</option>
+            <option value="ignore" ${col.role === 'ignore' ? 'selected' : ''}>Ignore</option>
+          </select>
+          <button type="button" class="xls-col-ignore-all px-1.5 py-0.5 text-[10px] bg-[#161b22] hover:bg-rose-950/70 border border-[#2c3543] hover:border-rose-500/60 text-slate-300 hover:text-rose-200 rounded-xs cursor-pointer shrink-0" data-col="${cIdx}" title="在所有已选 Sheet 中忽略此列 (Ignore across all checked sheets)">⊘全表</button>
+        </div>
       </th>`;
     });
     html += '</tr></thead><tbody>';
@@ -637,7 +660,44 @@ class ExcelImportModalController {
             });
           }
         }
+        const autoSync = (document.getElementById('xlsSyncColsAllSheetsChk') as HTMLInputElement | null)?.checked;
+        if (autoSync) {
+          syncExcelColumnRuleAcrossSheets(this.sessions, this.activeSessionIndex, sh.sheetIndex, {
+            columnIndex: colIdx,
+            checkedOnly: true,
+          });
+        }
         this.render();
+      });
+    });
+
+    wrap.querySelectorAll('.xls-col-ignore-all').forEach((btn) => {
+      btn.addEventListener('click', (e: any) => {
+        const colIdx = parseInt(e.currentTarget.dataset.col, 10);
+        const col = sh.columnMappings[colIdx];
+        if (!col) return;
+        col.role = 'ignore';
+        col.selected = false;
+        if (colIdx === sh.timeColIndex) {
+          sh.timeColIndex = -1;
+          recomputeExcelSheetPreview(session, sh.sheetIndex, {
+            timeColIndex: -1,
+            timeUnit: sh.timeUnit,
+            sampleRateOverrideHz: sh.sampleRateOverrideHz,
+            preserveColumnRoles: true,
+          });
+        }
+        const count = syncExcelColumnRuleAcrossSheets(
+          this.sessions,
+          this.activeSessionIndex,
+          sh.sheetIndex,
+          { columnIndex: colIdx, checkedOnly: true }
+        );
+        this.render();
+        this.onNotifyCb?.(
+          `已将列 "${col.header}" (${col.colLetter}) 在本表及 ${count} 个已选 Sheet 中设为 Ignore。`,
+          'info'
+        );
       });
     });
   }

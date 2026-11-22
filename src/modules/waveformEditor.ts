@@ -151,3 +151,39 @@ export function computeDiffSeries(ch: WaveformChannel): Float32Array | null {
   }
   return diff;
 }
+
+/**
+ * Applies a total horizontal time shift Δt (seconds) relative to the channel's original timebase.
+ * Never mutates shared Float64Array time buffers across channels.
+ */
+export function applyChannelTimeShift(ch: WaveformChannel, totalShiftSec: number): void {
+  if (!ch.t || ch.t.length === 0 || !isFinite(totalShiftSec)) return;
+  if (!ch.timeShiftBaseT || ch.timeShiftBaseT.length !== ch.t.length) {
+    ch.timeShiftBaseT = new Float64Array(ch.t);
+  }
+  const base = ch.timeShiftBaseT;
+  const n = base.length;
+  const nextT = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    nextT[i] = base[i] + totalShiftSec;
+  }
+  ch.t = nextT;
+  ch.timeShiftSec = totalShiftSec;
+}
+
+/**
+ * Resets a channel's horizontal time shift back to Δt = 0 using its original unshifted timebase.
+ */
+export function resetChannelTimeShift(ch: WaveformChannel): boolean {
+  const hadShift = Boolean(
+    (ch.timeShiftBaseT && ch.timeShiftBaseT.length === ch.t.length) ||
+      (ch.timeShiftSec && Math.abs(ch.timeShiftSec) > 0)
+  );
+  if (ch.timeShiftBaseT && ch.timeShiftBaseT.length === ch.t.length) {
+    ch.t = new Float64Array(ch.timeShiftBaseT);
+  }
+  ch.timeShiftSec = 0;
+  delete ch.timeShiftBaseT;
+  return hadShift;
+}
+

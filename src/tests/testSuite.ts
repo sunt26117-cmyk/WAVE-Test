@@ -32,6 +32,8 @@ import {
   applyLocalEdit,
   computeDiffSeries,
   revertChannelToReference,
+  applyChannelTimeShift,
+  resetChannelTimeShift,
 } from '../modules/waveformEditor';
 import {
   estimateElectricalAngleFromAlphaBeta,
@@ -68,6 +70,7 @@ import {
 import {
   createExcelWorkbookSessionFromBuffer,
   parseExcelSheetToChannels,
+  syncExcelColumnRuleAcrossSheets,
   releaseExcelWorkbookSession,
 } from '../parsers/excelParser';
 import {
@@ -2732,6 +2735,154 @@ export function runAllTests(): TestResult[] {
   } catch (err: any) {
     results.push({
       name: 'Multi-Sheet Excel Importer (Auto-Header, Col A, SSF.is_date vs Index, Text Filter & Cleanup)',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 41: Cauer Deconvolution Exact Order 5 & 6 (no ≤4 stage cap)
+  try {
+    const n = 1500;
+    const t = new Float64Array(n);
+    const temp = new Float64Array(n);
+    const powerW = 40;
+    const trueR = [0.06, 0.14, 0.25, 0.35, 0.55, 0.70];
+    const trueTau = [0.0004, 0.003, 0.02, 0.12, 0.8, 4.0];
+    for (let i = 0; i < n; i++) {
+      const dtStep = 0.0002 * Math.pow(1.007, i);
+      t[i] = i === 0 ? 0 : t[i - 1] + dtStep;
+      let zth = 0;
+      for (let k = 0; k < 6; k++) {
+        zth += trueR[k] * (1 - Math.exp(-t[i] / trueTau[k]));
+      }
+      temp[i] = 25 + powerW * zth;
+    }
+    const res5 = deconvolveThermalImpedance(t, temp, {
+      mode: 'heating',
+      powerW,
+      autoT0: false,
+      targetOrder: 5,
+    });
+    const res6 = deconvolveThermalImpedance(t, temp, {
+      mode: 'heating',
+      powerW,
+      autoT0: false,
+      targetOrder: 6,
+    });
+    const ord5Ok =
+      res5.reducedCauer.length === 5 &&
+      res5.spiceValidation.valid &&
+      res5.fosterCauerRelErr < 1e-4 &&
+      res5.rSquared > 0.99;
+    const ord6Ok =
+      res6.reducedCauer.length === 6 &&
+      res6.spiceValidation.valid &&
+      res6.fosterCauerRelErr < 1e-4 &&
+      res6.rSquared > 0.99;
+
+    results.push({
+      name: 'Cauer Deconvolution Exact Orders 5 & 6 (Pole Splitting + SPICE Parity)',
+      passed: ord5Ok && ord6Ok,
+      message: `5th(stages=${res5.reducedCauer.length}, err=${res5.fosterCauerRelErr.toExponential(2)}, R²=${res5.rSquared.toFixed(4)}), 6th(stages=${res6.reducedCauer.length}, err=${res6.fosterCauerRelErr.toExponential(2)}, R²=${res6.rSquared.toFixed(4)})`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Cauer Deconvolution Exact Orders 5 & 6 (Pole Splitting + SPICE Parity)',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 42: Excel Multi-Sheet Bulk Column Ignore Sync
+  try {
+    const wb = XLSX.utils.book_new();
+    const makeSheet = (statusColName: string) =>
+      XLSX.utils.aoa_to_sheet([
+        ['Time(s)', 'Vds', statusColName],
+        [0.0, 10, 1],
+        [0.1, 12, 0],
+        [0.2, 14, 1],
+      ]);
+    XLSX.utils.book_append_sheet(wb, makeSheet('AuxFlag'), 'Run1');
+    XLSX.utils.book_append_sheet(wb, makeSheet('AuxFlag'), 'Run2');
+    XLSX.utils.book_append_sheet(wb, makeSheet('AuxFlag'), 'Run3_Unchecked');
+    const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+    const sess = createExcelWorkbookSessionFromBuffer(buf, 'multi_sync.xlsx');
+    sess.sheets[0].selected = true;
+    sess.sheets[1].selected = true;
+    sess.sheets[2].selected = false;
+
+    sess.sheets[0].columnMappings[2].role = 'ignore';
+    sess.sheets[0].columnMappings[2].selected = false;
+    const syncedCount = syncExcelColumnRuleAcrossSheets([sess], 0, 0, {
+      columnIndex: 2,
+      checkedOnly: true,
+    });
+
+    const run2Ignored = sess.sheets[1].columnMappings[2].role === 'ignore';
+    const run3Preserved = sess.sheets[2].columnMappings[2].role === 'channel';
+    releaseExcelWorkbookSession(sess);
+
+    results.push({
+      name: 'Excel Multi-Sheet Bulk Column Ignore Sync (Checked Sheets Only)',
+      passed: syncedCount === 1 && run2Ignored && run3Preserved,
+      message: `syncedSheets=${syncedCount}, run2Ignored=${run2Ignored}, uncheckedPreserved=${run3Preserved}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Excel Multi-Sheet Bulk Column Ignore Sync (Checked Sheets Only)',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 43: Channel Δt Time Shift Isolation & Reset
+  try {
+    const sharedT = new Float64Array([0, 0.1, 0.2, 0.3]);
+    const ch1: WaveformChannel = {
+      id: 'c1',
+      name: 'CH1',
+      unit: 'V',
+      color: '#facc15',
+      visible: true,
+      t: sharedT,
+      v: new Float32Array([1, 2, 3, 4]),
+      fs: 10,
+      dt: 0.1,
+      metadata: analyzeSamplingQuality(sharedT),
+      isMath: false,
+      sourceChannelIds: [],
+      vMin: -5,
+      vMax: 5,
+    };
+    const ch2: WaveformChannel = {
+      ...ch1,
+      id: 'c2',
+      name: 'CH2',
+      t: sharedT,
+    };
+
+    applyChannelTimeShift(ch1, 0.05);
+    const ch1ShiftedOk =
+      Math.abs(ch1.t[0] - 0.05) < 1e-12 &&
+      Math.abs(ch1.t[3] - 0.35) < 1e-12 &&
+      ch1.timeShiftSec === 0.05;
+    const ch2Untouched = Math.abs(ch2.t[0]) < 1e-12 && Math.abs(ch2.t[3] - 0.3) < 1e-12;
+    const didReset = resetChannelTimeShift(ch1);
+    const ch1ResetOk =
+      didReset &&
+      Math.abs(ch1.t[0]) < 1e-12 &&
+      Math.abs(ch1.t[3] - 0.3) < 1e-12 &&
+      !ch1.timeShiftSec;
+
+    results.push({
+      name: 'Channel Δt Time Shift Buffer Isolation & Reset',
+      passed: ch1ShiftedOk && ch2Untouched && ch1ResetOk,
+      message: `shifted=${ch1ShiftedOk}, ch2Untouched=${ch2Untouched}, reset=${ch1ResetOk}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Channel Δt Time Shift Buffer Isolation & Reset',
       passed: false,
       message: `Exception: ${err.message}`,
     });

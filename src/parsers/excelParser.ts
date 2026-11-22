@@ -819,6 +819,109 @@ export function applyExcelRulesToTargetSession(
 }
 
 /**
+ * Syncs one column's role (or all columns from the active sheet) across all checked sheets
+ * in the active session and any other loaded workbook sessions.
+ * Matches by header name first (unless auto-generated Col A/B/...), falling back to column index.
+ * Returns the number of target sheets updated.
+ */
+export function syncExcelColumnRuleAcrossSheets(
+  sessions: ExcelWorkbookSession[],
+  sourceSessionIndex: number,
+  sourceSheetIndex: number,
+  opts?: { columnIndex?: number; checkedOnly?: boolean }
+): number {
+  const srcSession = sessions[sourceSessionIndex];
+  const srcSheet = srcSession?.sheets[sourceSheetIndex];
+  if (!srcSession || !srcSheet) return 0;
+
+  const colIndices =
+    opts?.columnIndex !== undefined
+      ? [opts.columnIndex]
+      : srcSheet.columnMappings.map((_, i) => i);
+  const checkedOnly = opts?.checkedOnly !== false;
+  let updatedSheets = 0;
+
+  sessions.forEach((tgtSession, sIdx) => {
+    tgtSession.sheets.forEach((tgtSheet, tIdx) => {
+      if (sIdx === sourceSessionIndex && tIdx === sourceSheetIndex) return;
+      if (checkedOnly && !tgtSheet.selected) return;
+
+      let sheetTouched = false;
+      let needsRecompute = false;
+
+      for (const cIdx of colIndices) {
+        const srcCol = srcSheet.columnMappings[cIdx];
+        if (!srcCol) continue;
+
+        const normHeader = (srcCol.header || '').trim().toLowerCase();
+        const isFallbackHeader = !normHeader || /^col\s+[a-z]+$/i.test(normHeader);
+        let tgtCol = !isFallbackHeader
+          ? tgtSheet.columnMappings.find(
+              (c) => (c.header || '').trim().toLowerCase() === normHeader
+            )
+          : undefined;
+        if (!tgtCol) {
+          tgtCol = tgtSheet.columnMappings[srcCol.index];
+        }
+        if (!tgtCol) continue;
+
+        if (srcCol.role === 'ignore') {
+          if (tgtCol.role !== 'ignore' || tgtCol.selected) {
+            tgtCol.role = 'ignore';
+            tgtCol.selected = false;
+            sheetTouched = true;
+          }
+          if (tgtSheet.timeColIndex === tgtCol.index) {
+            tgtSheet.timeColIndex = -1;
+            needsRecompute = true;
+            sheetTouched = true;
+          }
+        } else if (srcCol.role === 'time') {
+          if (tgtSheet.timeColIndex !== tgtCol.index || tgtCol.role !== 'time') {
+            tgtSheet.timeColIndex = tgtCol.index;
+            tgtSheet.columnMappings.forEach((m) => {
+              if (m.index === tgtCol!.index) {
+                m.role = 'time';
+                m.selected = false;
+              } else if (m.role === 'time') {
+                m.role = m.isTextColumn ? 'ignore' : 'channel';
+                m.selected = m.role === 'channel';
+              }
+            });
+            needsRecompute = true;
+            sheetTouched = true;
+          }
+        } else if (srcCol.role === 'channel' && !tgtCol.isTextColumn) {
+          if (tgtSheet.timeColIndex === tgtCol.index) {
+            tgtSheet.timeColIndex = -1;
+            needsRecompute = true;
+            sheetTouched = true;
+          }
+          if (tgtCol.role !== 'channel' || !tgtCol.selected) {
+            tgtCol.role = 'channel';
+            tgtCol.selected = true;
+            sheetTouched = true;
+          }
+        }
+      }
+
+      if (needsRecompute) {
+        recomputeExcelSheetPreview(tgtSession, tgtSheet.sheetIndex, {
+          timeColIndex: tgtSheet.timeColIndex,
+          timeUnit: tgtSheet.timeUnit,
+          sampleRateOverrideHz: tgtSheet.sampleRateOverrideHz,
+          preserveColumnRoles: true,
+        });
+      }
+      if (sheetTouched) updatedSheets++;
+    });
+  });
+
+  return updatedSheets;
+}
+
+
+/**
  * Extracts full-resolution WaveformChannels for a single checked sheet from the active workbook.
  * Automatically skips all-NaN columns and normalizes Excel serial dates / clock strings to relative seconds (t[0] = 0).
  */

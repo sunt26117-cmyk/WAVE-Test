@@ -153,8 +153,6 @@ window.addEventListener('DOMContentLoaded', () => {
   initThermalWorkbench(app);
   setupDraggableModals();
 
-  // Load 3-phase BLDC sample on startup for immediate interactive oscilloscope workspace
-  loadSynthetic3PhaseMotorData();
   syncLtspiceWatchUI();
 
   const testResults = runAllTests();
@@ -167,7 +165,6 @@ function bindToolbarActions() {
   const triggerOpen = () => fileInput?.click();
   document.getElementById('loadBtn')?.addEventListener('click', triggerOpen);
   document.getElementById('emptyLoadBtn')?.addEventListener('click', triggerOpen);
-  document.getElementById('emptyDemoBtn')?.addEventListener('click', () => loadSynthetic3PhaseMotorData());
 
   fileInput?.addEventListener('change', (e: any) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -395,7 +392,6 @@ function bindToolbarActions() {
   document.getElementById('exportStandaloneHtmlBtn')?.addEventListener('click', triggerOfflineHtmlDownload);
   document.getElementById('saveSessionBtn')?.addEventListener('click', () => app.saveSessionFile());
   document.getElementById('testSuiteBtn')?.addEventListener('click', () => openTestSuiteModal());
-  document.getElementById('loadSampleSignalBtn')?.addEventListener('click', () => loadSynthetic3PhaseMotorData());
 }
 
 function bindFrontPanelControls() {
@@ -934,6 +930,79 @@ function bindModals() {
   document.getElementById('goldenCaptureBtn')?.addEventListener('click', () => {
     syncGoldenFromUI(true);
     app.showToast('Captured current waveform as Golden Tolerance Reference.', 'info');
+  });
+
+  // Real-Time Proportional Δt Shift Controls inside Edit/Ref Modal
+  const getCheckedShiftIds = (tab: TabState): string[] => {
+    const ids: string[] = [];
+    document.querySelectorAll('#editShiftChannelsList .edit-shift-ch-chk:checked').forEach((el) => {
+      const id = (el as HTMLInputElement).value;
+      if (id && tab.channels[id]) ids.push(id);
+    });
+    if (ids.length === 0) {
+      const fallback = (document.getElementById('editModalChannelSelect') as HTMLSelectElement)?.value || tab.activeChannelId || tab.drawOrder[0];
+      if (fallback && tab.channels[fallback]) ids.push(fallback);
+    }
+    return ids;
+  };
+  let shiftUndoPushedForDrag = false;
+  const shiftSlider = document.getElementById('editTimeShiftSlider') as HTMLInputElement | null;
+  shiftSlider?.addEventListener('pointerdown', () => { shiftUndoPushedForDrag = false; });
+  shiftSlider?.addEventListener('keydown', () => { shiftUndoPushedForDrag = false; });
+  shiftSlider?.addEventListener('input', () => {
+    const tab = app.getActiveTab();
+    if (!tab || !shiftSlider) return;
+    const ids = getCheckedShiftIds(tab);
+    if (ids.length === 0) return;
+    const pct = parseFloat(shiftSlider.value) || 0;
+    const primaryCh = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
+    const tView = primaryCh ? getTimeBoundsForView(tab, primaryCh).tSpan : 0;
+    const shiftSec = (pct / 100) * tView;
+    app.setChannelsTimeShift(ids, shiftSec, !shiftUndoPushedForDrag);
+    shiftUndoPushedForDrag = true;
+    syncEditTimeShiftUI(tab, false);
+  });
+  shiftSlider?.addEventListener('change', () => { shiftUndoPushedForDrag = false; });
+  document.getElementById('editTimeShiftResetBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    const ids = getCheckedShiftIds(tab);
+    if (ids.length === 0) return;
+    app.resetChannelsTimeShift(ids, true);
+    if (shiftSlider) shiftSlider.value = '0';
+    syncEditTimeShiftUI(tab, true);
+  });
+  document.getElementById('editShiftSelCompareBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    const cmpIds = tab.drawOrder.filter((id) => {
+      const c = tab.channels[id];
+      return c && (c.compareRole === 'ref' || id.startsWith('cmp_'));
+    });
+    const targets = new Set(cmpIds.length > 0 ? cmpIds : [tab.activeChannelId || tab.drawOrder[0]]);
+    document.querySelectorAll('#editShiftChannelsList .edit-shift-ch-chk').forEach((el) => {
+      const inp = el as HTMLInputElement;
+      inp.checked = targets.has(inp.value);
+    });
+    syncEditTimeShiftUI(tab, true);
+  });
+  document.getElementById('editShiftSelActiveBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    const activeId = (document.getElementById('editModalChannelSelect') as HTMLSelectElement)?.value || tab.activeChannelId || tab.drawOrder[0];
+    document.querySelectorAll('#editShiftChannelsList .edit-shift-ch-chk').forEach((el) => {
+      const inp = el as HTMLInputElement;
+      inp.checked = inp.value === activeId;
+    });
+    syncEditTimeShiftUI(tab, true);
+  });
+  document.getElementById('editShiftSelAllBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    document.querySelectorAll('#editShiftChannelsList .edit-shift-ch-chk').forEach((el) => {
+      (el as HTMLInputElement).checked = true;
+    });
+    syncEditTimeShiftUI(tab, true);
   });
 
   // Crop Export Modal
@@ -1911,8 +1980,69 @@ function openWaveformEditModal(tab: TabState) {
     });
   }
 
+  const shiftBox = document.getElementById('editShiftChannelsList');
+  if (shiftBox) {
+    const hasCompareRef = tab.drawOrder.some((id) => {
+      const c = tab.channels[id];
+      return c && (c.compareRole === 'ref' || id.startsWith('cmp_ref_'));
+    });
+    shiftBox.innerHTML = '';
+    tab.drawOrder.forEach((id, idx) => {
+      const ch = tab.channels[id];
+      if (!ch) return;
+      const defaultChecked = hasCompareRef
+        ? ch.compareRole === 'ref' || id.startsWith('cmp_ref_')
+        : id === (tab.activeChannelId || tab.drawOrder[0]);
+      const lbl = document.createElement('label');
+      lbl.className = 'flex items-center gap-1.5 px-2 py-0.5 bg-[#0c0f13] border border-[#222933] rounded-xs cursor-pointer text-[11px] font-mono';
+      lbl.innerHTML = `
+        <input type="checkbox" class="edit-shift-ch-chk accent-cyan-400 cursor-pointer" value="${id}" ${defaultChecked ? 'checked' : ''} />
+        <span class="w-2 h-2 rounded-xs shrink-0" style="background:${ch.color}"></span>
+        <span class="text-slate-200 truncate max-w-[140px]">${ch.isMath ? '' : `CH${idx + 1}: `}${ch.name}</span>
+        <span class="edit-shift-ch-dt text-[10px] text-cyan-300 tabular-nums" data-dt-id="${id}"></span>
+      `;
+      lbl.querySelector('.edit-shift-ch-chk')?.addEventListener('change', () => {
+        syncEditTimeShiftUI(tab, true);
+      });
+      shiftBox.appendChild(lbl);
+    });
+  }
+
   syncWaveformEditModalState(tab);
   modal.style.display = 'flex';
+}
+
+function syncEditTimeShiftUI(tab: TabState, updateSliderValue: boolean = true) {
+  document.querySelectorAll('#editShiftChannelsList .edit-shift-ch-dt').forEach((el) => {
+    const id = el.getAttribute('data-dt-id') || '';
+    const ch = tab.channels[id];
+    const dt = ch?.timeShiftSec || 0;
+    (el as HTMLElement).innerText = Math.abs(dt) > 1e-18 ? `Δt=${formatEng(dt, 's', 2)}` : '0s';
+  });
+
+  const primaryCh = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
+  const tView = primaryCh ? getTimeBoundsForView(tab, primaryCh).tSpan : 0;
+
+  let refShiftSec = 0;
+  const checkedFirst = document.querySelector('#editShiftChannelsList .edit-shift-ch-chk:checked') as HTMLInputElement | null;
+  if (checkedFirst && tab.channels[checkedFirst.value]) {
+    refShiftSec = tab.channels[checkedFirst.value].timeShiftSec || 0;
+  }
+
+  const slider = document.getElementById('editTimeShiftSlider') as HTMLInputElement | null;
+  let pct = tView > 1e-18 ? (refShiftSec / tView) * 100 : 0;
+  pct = Math.max(-100, Math.min(100, pct));
+  if (updateSliderValue && slider) {
+    slider.value = pct.toFixed(1);
+  } else if (slider) {
+    pct = parseFloat(slider.value) || 0;
+  }
+
+  const readout = document.getElementById('editTimeShiftReadout');
+  if (readout) {
+    const effectiveShift = updateSliderValue ? refShiftSec : (pct / 100) * tView;
+    readout.innerText = `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}% · ${formatEng(effectiveShift, 's', 2)} (T_view = ${formatEng(tView, 's', 2)})`;
+  }
 }
 
 function syncWaveformEditModalState(tab: TabState) {
@@ -1982,6 +2112,8 @@ function syncWaveformEditModalState(tab: TabState) {
       gReadout.className = 'font-mono text-[11px] text-red-400 font-semibold tabular-nums';
     }
   }
+
+  syncEditTimeShiftUI(tab, true);
 }
 
 function openCropExportModal(tab: TabState) {
@@ -2680,8 +2812,8 @@ function recomputeComparePanel(tab: TabState) {
         </select>
       </td>
       <td class="p-1.5">
-        <div class="flex items-center gap-1">
-          <input type="number" step="any" class="cmp-row-shift w-20 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" value="${Number((entry.timeShiftSec || 0).toPrecision(5))}" />
+        <div class="flex items-center gap-1.5">
+          <span class="text-slate-300 tabular-nums min-w-[64px]">${formatEng(entry.timeShiftSec || 0, 's', 2)}</span>
           <button type="button" class="cmp-row-xcorr px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-amber-300 rounded-xs cursor-pointer" title="Auto XCorr align this trace">Auto</button>
         </div>
       </td>
@@ -2719,11 +2851,6 @@ function recomputeComparePanel(tab: TabState) {
         const parsedScale = parseFloat(val);
         entry.timeScale = isFinite(parsedScale) && parsedScale > 0 ? parsedScale : 1;
       }
-      recomputeComparePanel(tab);
-    });
-    tr.querySelector('.cmp-row-shift')?.addEventListener('change', (e: any) => {
-      const v = parseFloat(e.target.value);
-      entry.timeShiftSec = isFinite(v) ? v : 0;
       recomputeComparePanel(tab);
     });
     tr.querySelector('.cmp-row-xcorr')?.addEventListener('click', () => {
@@ -3188,123 +3315,4 @@ function renderBldcRipple(tab: TabState) {
   `;
 }
 
-/**
- * Generates synthetic 3-Phase BLDC motor data with clean 1-2-5 oscilloscope scaling.
- */
-function loadSynthetic3PhaseMotorData() {
-  const fs = 100000; // 100 kS/s
-  const duration = 0.05; // 50 ms
-  const n = Math.round(fs * duration);
-  const fe = 200; // 200 Hz electrical frequency
 
-  const t = new Float64Array(n);
-  const ua = new Float32Array(n);
-  const ub = new Float32Array(n);
-  const uc = new Float32Array(n);
-  const ia = new Float32Array(n);
-
-  for (let i = 0; i < n; i++) {
-    t[i] = i / fs;
-    const angle = 2 * Math.PI * fe * t[i];
-    const v5th = 1.4 * Math.sin(5 * angle);
-    ua[i] = 24.0 * Math.sin(angle) + v5th;
-    ub[i] = 24.0 * Math.sin(angle - (2 * Math.PI) / 3) + v5th;
-    uc[i] = 24.0 * Math.sin(angle + (2 * Math.PI) / 3) + v5th;
-    ia[i] = 8.0 * Math.sin(angle - 0.2);
-  }
-
-  const createChannel = (id: string, name: string, data: Float32Array, color: string, unit: string): WaveformChannel => {
-    const ch: WaveformChannel = {
-      id,
-      name,
-      unit,
-      color,
-      visible: true,
-      t,
-      v: data,
-      fs,
-      dt: 1 / fs,
-      isMath: false,
-      sourceChannelIds: [],
-      coupling: 'DC',
-      inverted: false,
-      metadata: {
-        originalSampleCount: n,
-        originalTimeStart: 0,
-        originalTimeEnd: t[n - 1],
-        isUniformSampling: true,
-        nominalDt: 1 / fs,
-        medianDt: 1 / fs,
-        meanDt: 1 / fs,
-        minDt: 1 / fs,
-        maxDt: 1 / fs,
-        jitterRms: 0,
-        jitterMax: 0,
-        droppedSamples: 0,
-        invalidSamples: 0,
-        sampleRate: fs,
-        qualityStatus: 'uniform',
-        gapCount: 0,
-        gapIndices: [],
-      },
-      vMin: -40,
-      vMax: 40,
-    };
-    fitChannelTo125(ch);
-    return ch;
-  };
-
-  const rawPalette = app.getRawColors();
-  const channels: Record<string, WaveformChannel> = {
-    ua: createChannel('ua', 'Ua (Phase A)', ua, rawPalette[0], 'V'),
-    ub: createChannel('ub', 'Ub (Phase B)', ub, rawPalette[1], 'V'),
-    uc: createChannel('uc', 'Uc (Phase C)', uc, rawPalette[2], 'V'),
-    ia: createChannel('ia', 'Ia (Current)', ia, rawPalette[3], 'A'),
-  };
-
-  const tab: TabState = {
-    id: `tab_synthetic_${Date.now()}`,
-    fileName: 'BLDC_3Phase_Drive_Sample.csv',
-    channels,
-    drawOrder: ['ua', 'ub', 'uc', 'ia'],
-    view: { startIndex: 0, endIndex: Math.min(n, 2000) },
-    cursors: {
-      enabled: true,
-      mode: 'xy',
-      x1: 0.004,
-      x2: 0.009,
-      y1: 24.0,
-      y2: -24.0,
-      trackingChannel: 'ua',
-    },
-    annotations: [],
-    annotationMode: false,
-    annotationsVisible: true,
-    isOverlap: false,
-    plotMode: 'time',
-    renderMode: 'vector',
-    decimationMode: 'minmax',
-    fftOptions: {
-      range: 'view',
-      window: 'hann',
-      scale: 'db',
-      zeroPadding: 2,
-      removeDC: true,
-    },
-    motorConfig: { rpm: 3000, polePairs: 4, enabled: true },
-    triggerConfig: {
-      enabled: true,
-      channelId: 'ua',
-      type: 'rising',
-      level: 0,
-      positionPercent: 50,
-    },
-    measurementGate: 'view',
-    selectedMeasurements: [],
-    separateView: false,
-    activeChannelId: 'ua',
-    activeTool: 'pan',
-  };
-
-  app.addTab(tab);
-}

@@ -91,6 +91,10 @@ export interface WaveformChannel {
   showRef?: boolean;
   showDiff?: boolean;
 
+  // Real-time interactive horizontal time shift Δt relative to immutable timeShiftBaseT
+  timeShiftSec?: number;
+  timeShiftBaseT?: Float64Array;
+
   // Vertical scaling limits (8 divisions total: vMin = -4*voltsPerDiv - vOffset, vMax = +4*voltsPerDiv - vOffset)
   vMin: number;
   vMax: number;

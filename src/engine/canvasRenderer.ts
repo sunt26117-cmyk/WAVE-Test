@@ -374,25 +374,26 @@ export function getTimeBoundsForView(
   ch?: WaveformChannel
 ): { tStart: number; tEnd: number; tSpan: number; dt: number } {
   const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
-  const baseCh =
-    ch && primaryCh && (ch.t === primaryCh.t || ch.t.length === primaryCh.t.length)
-      ? ch
-      : primaryCh || ch;
-  if (!baseCh || baseCh.t.length === 0) {
+  const refCh = primaryCh || ch;
+  if (!refCh || refCh.t.length === 0) {
     return { tStart: 0, tEnd: 0.01, tSpan: 0.01, dt: 1e-4 };
   }
-  const n = baseCh.t.length;
-  const dt = baseCh.dt || (n > 1 ? (baseCh.t[n - 1] - baseCh.t[0]) / (n - 1) : 1e-4);
+  const refT =
+    refCh.timeShiftBaseT && refCh.timeShiftBaseT.length === refCh.t.length
+      ? refCh.timeShiftBaseT
+      : refCh.t;
+  const n = refT.length;
+  const dt = refCh.dt || (n > 1 ? (refT[n - 1] - refT[0]) / (n - 1) : 1e-4);
   const sIdx = Math.max(0, Math.min(n - 1, tab.view.startIndex));
-  const tStart = baseCh.t[sIdx];
+  const tStart = refT[sIdx];
   const eIdx = Math.max(sIdx + 1, tab.view.endIndex);
   let tEnd: number;
   if (eIdx < n) {
-    tEnd = baseCh.t[eIdx];
+    tEnd = refT[eIdx];
   } else if (eIdx === n && n >= 2) {
-    tEnd = baseCh.t[n - 1];
+    tEnd = refT[n - 1];
   } else {
-    tEnd = baseCh.t[n - 1] + (eIdx - n + 1) * dt;
+    tEnd = refT[n - 1] + (eIdx - n + 1) * dt;
   }
   const tSpan = Math.max(dt * 1e-3, tEnd - tStart);
   return { tStart, tEnd, tSpan, dt };
@@ -685,7 +686,10 @@ export function drawChannelWaveform(
   const cachedMean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
 
   const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
-  const usesPrimaryIndex = !primaryCh || ch.t === primaryCh.t || ch.t.length === primaryCh.t.length;
+  const usesPrimaryIndex =
+    !primaryCh ||
+    (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec) ||
+    (!ch.timeShiftSec && !primaryCh.timeShiftSec && ch.t.length === primaryCh.t.length);
   let startIdx: number;
   let endIdx: number;
   if (usesPrimaryIndex) {
@@ -2102,7 +2106,10 @@ export function generateWaveformSVG(
         parts.push(`<rect x="${area.x}" y="${area.y}" width="${area.width}" height="${area.height}" fill="none" stroke="${theme.frame || '#334155'}" stroke-width="1"/>`);
       }
       const { tStart, tSpan } = getTimeBoundsForView(tab, ch);
-      const usesPrimaryIndex = !primaryCh || ch.t === primaryCh.t || ch.t.length === primaryCh.t.length;
+      const usesPrimaryIndex =
+        !primaryCh ||
+        (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec) ||
+        (!ch.timeShiftSec && !primaryCh.timeShiftSec && ch.t.length === primaryCh.t.length);
       const rng = usesPrimaryIndex
         ? {
             startIdx: Math.max(0, tab.view.startIndex),

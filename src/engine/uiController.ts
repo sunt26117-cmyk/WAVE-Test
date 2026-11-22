@@ -80,6 +80,8 @@ import {
   applyGlobalEdit,
   applyLocalEdit,
   revertChannelToReference,
+  applyChannelTimeShift,
+  resetChannelTimeShift,
   GlobalEditOp,
   LocalEditOp,
 } from '../modules/waveformEditor';
@@ -211,6 +213,9 @@ export class OscilloscopeApp {
         showDiff?: boolean;
         v?: Float32Array;
         refV?: Float32Array;
+        t?: Float64Array;
+        timeShiftSec?: number;
+        timeShiftBaseT?: Float64Array;
       }
     >;
   }> = [];
@@ -300,6 +305,7 @@ export class OscilloscopeApp {
     this.renderTabsBar();
     this.renderSidebar();
     this.draw();
+    window.dispatchEvent(new CustomEvent('wvp-theme-changed', { detail: { themeId: preset.id } }));
   }
 
   public showToast(message: string, level: 'info' | 'warn' | 'error' = 'info'): void {
@@ -418,6 +424,9 @@ export class OscilloscopeApp {
         showDiff: ch.showDiff,
         v: includeData ? new Float32Array(ch.v) : undefined,
         refV: includeData && ch.refV ? new Float32Array(ch.refV) : undefined,
+        t: includeData ? new Float64Array(ch.t) : undefined,
+        timeShiftSec: ch.timeShiftSec,
+        timeShiftBaseT: includeData && ch.timeShiftBaseT ? new Float64Array(ch.timeShiftBaseT) : undefined,
       };
     }
     return {
@@ -458,6 +467,9 @@ export class OscilloscopeApp {
       ch.showDiff = st.showDiff;
       if (st.v) ch.v = new Float32Array(st.v);
       if (st.refV) ch.refV = new Float32Array(st.refV);
+      if (st.t) ch.t = new Float64Array(st.t);
+      ch.timeShiftSec = st.timeShiftSec;
+      ch.timeShiftBaseT = st.timeShiftBaseT ? new Float64Array(st.timeShiftBaseT) : undefined;
     }
 
     this.editVersion++;
@@ -925,6 +937,58 @@ export class OscilloscopeApp {
     }
   }
 
+  public setChannelsTimeShift(
+    channelIds: string[],
+    shiftSec: number,
+    pushUndo: boolean = false
+  ): void {
+    const tab = this.getActiveTab();
+    if (!tab || channelIds.length === 0) return;
+    if (pushUndo) {
+      this.pushUndoSnapshot('Time Shift Δt', true);
+    }
+    let changed = false;
+    for (const id of channelIds) {
+      const ch = tab.channels[id];
+      if (!ch) continue;
+      applyChannelTimeShift(ch, shiftSec);
+      changed = true;
+    }
+    if (!changed) return;
+    this.editVersion++;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+  }
+
+  public resetChannelsTimeShift(channelIds: string[], pushUndo: boolean = true): void {
+    const tab = this.getActiveTab();
+    if (!tab || channelIds.length === 0) return;
+    if (pushUndo) {
+      this.pushUndoSnapshot('Reset Time Shift Δt', true);
+    }
+    let anyReset = false;
+    for (const id of channelIds) {
+      const ch = tab.channels[id];
+      if (!ch) continue;
+      if (resetChannelTimeShift(ch)) anyReset = true;
+    }
+    if (!anyReset) {
+      if (pushUndo) {
+        this.undoStack.pop();
+        this.updateUndoRedoButtons();
+      }
+      return;
+    }
+    this.editVersion++;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+    this.showToast(`Reset Δt = 0 for ${channelIds.length} channel(s).`, 'info');
+  }
+
   public getGoldenEvaluation(tab: TabState): GoldenEvaluationResult | null {
     const gb = tab.goldenBand;
     if (!gb || !gb.enabled) return null;
@@ -1085,7 +1149,7 @@ export class OscilloscopeApp {
         unit: targetCh.unit || 'V',
         color: this.theme.isLight ? '#475569' : '#94a3b8',
         visible: true,
-        t: targetCh.t,
+        t: new Float64Array(targetCh.t),
         v: new Float32Array(alignedRefV),
         isMath: true,
         channelKind: 'computed',
@@ -1131,7 +1195,7 @@ export class OscilloscopeApp {
         unit: targetCh.unit || 'V',
         color: this.theme.isLight ? '#e11d48' : '#fb7185',
         visible: true,
-        t: targetCh.t,
+        t: new Float64Array(targetCh.t),
         v: new Float32Array(diffV),
         isMath: true,
         channelKind: 'computed',
@@ -1255,7 +1319,7 @@ export class OscilloscopeApp {
           unit: targetCh.unit || 'V',
           color: item.color,
           visible: true,
-          t: targetCh.t,
+          t: new Float64Array(targetCh.t),
           v: new Float32Array(item.alignedRefV),
           isMath: true,
           channelKind: 'computed',
@@ -1306,7 +1370,7 @@ export class OscilloscopeApp {
           unit: targetCh.unit || 'V',
           color: item.color,
           visible: true,
-          t: targetCh.t,
+          t: new Float64Array(targetCh.t),
           v: new Float32Array(item.diffV),
           isMath: true,
           channelKind: 'computed',
