@@ -129,19 +129,211 @@ export function formatEng(v: number, unit: string = '', precision: number = 3): 
 }
 
 /**
+ * Measures rendered axis tick width using Canvas 2D metrics when available,
+ * or an accurate JetBrains Mono 10.5px fallback width in headless environments.
+ */
+function measureAxisTextWidth(text: string, ctx?: CanvasRenderingContext2D | null): number {
+  if (!text) return 0;
+  if (ctx && typeof ctx.measureText === 'function') {
+    return ctx.measureText(text).width;
+  }
+  return text.length * 6.5;
+}
+
+/**
+ * Applies 8px step upward quantization and shrink hysteresis to prevent horizontal
+ * grid jitter when pan/zoom causes tick strings to fluctuate slightly in width.
+ */
+export function applyLeftMarginHysteresis(
+  rawRequiredPx: number,
+  prevMarginPx?: number,
+  shrinkThresholdPx: number = 16
+): number {
+  const safeRaw = isFinite(rawRequiredPx) ? rawRequiredPx : 76;
+  const quantized = safeRaw <= 76 ? 76 : Math.ceil(safeRaw / 8) * 8;
+  if (prevMarginPx === undefined || !isFinite(prevMarginPx) || prevMarginPx < 76) {
+    return quantized;
+  }
+  if (quantized > prevMarginPx) {
+    return quantized;
+  }
+  if (quantized < prevMarginPx && prevMarginPx - safeRaw >= shrinkThresholdPx) {
+    return quantized;
+  }
+  return prevMarginPx;
+}
+
+/**
+ * Computes the unquantized minimum left gutter width required so Y-axis ticks,
+ * GND flags, and the leftmost X-axis tick never clip on the left canvas boundary.
+ * In Time Separate mode, evaluates ALL visible channels to compute a single global maximum.
+ */
+export function computeRequiredLeftMargin(
+  tab: TabState | undefined | null,
+  options?: {
+    cachedSpectrum?: SpectrumResult | null;
+    ctx?: CanvasRenderingContext2D | null;
+  }
+): number {
+  if (!tab || tab.drawOrder.length === 0) return 76;
+
+  const ctx = options?.ctx || null;
+  const cachedSpectrum = options?.cachedSpectrum || null;
+  let restoredCtx = false;
+  if (ctx && typeof ctx.save === 'function') {
+    ctx.save();
+    ctx.font = '10.5px "JetBrains Mono", monospace';
+    restoredCtx = true;
+  }
+
+  try {
+    const gndFlagWidth = tab.plotMode === 'time' ? 18 : 0;
+    const gndPad = 8;
+    let maxTickRequired = 76;
+    let leftmostXLabel = '';
+
+    if (tab.plotMode === 'frequency') {
+      const targetId = tab.selectedFftChannelId || tab.drawOrder[0];
+      const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
+      const minF = Math.max(0, tab.view.fMin ?? 0);
+      leftmostXLabel = formatEng(minF, 'Hz', 2);
+
+      const scaleMode = tab.fftOptions.scale;
+      const yMin =
+        scaleMode === 'magnitude'
+          ? cachedSpectrum?.magYMin ?? 0
+          : cachedSpectrum?.dbYMin ?? cachedSpectrum?.yMin ?? -120;
+      const yMax =
+        scaleMode === 'magnitude'
+          ? cachedSpectrum?.magYMax ?? 1
+          : cachedSpectrum?.dbYMax ?? cachedSpectrum?.yMax ?? 20;
+      const ySpan = Math.max(0.1, yMax - yMin);
+
+      for (let j = 0; j <= VERTICAL_DIVISIONS; j++) {
+        const val = yMax - (j / VERTICAL_DIVISIONS) * ySpan;
+        const lbl =
+          scaleMode === 'magnitude'
+            ? formatEng(val, targetCh?.unit || 'V', 2)
+            : `${val.toFixed(0)} dB`;
+        const w = measureAxisTextWidth(lbl, ctx);
+        maxTickRequired = Math.max(maxTickRequired, w + 16);
+      }
+    } else if (tab.plotMode === 'xy') {
+      const xCh = tab.channels[tab.xyConfig?.xChannelId || tab.drawOrder[0]];
+      const yCh = tab.channels[tab.xyConfig?.yChannelId || tab.drawOrder[1] || tab.drawOrder[0]];
+      if (xCh && yCh) {
+        const bounds = getXYPlotBounds(tab, xCh, yCh);
+        leftmostXLabel = formatEng(bounds.xMin, xCh.unit, 2);
+        const ySpan = Math.max(1e-9, bounds.yMax - bounds.yMin);
+        for (let j = 0; j <= VERTICAL_DIVISIONS; j++) {
+          const val = bounds.yMax - (j / VERTICAL_DIVISIONS) * ySpan;
+          const lbl = formatEng(val, yCh.unit, 2);
+          const w = measureAxisTextWidth(lbl, ctx);
+          maxTickRequired = Math.max(maxTickRequired, w + 18);
+        }
+      }
+    } else {
+      const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+      const { tStart } = getTimeBoundsForView(tab, primaryCh);
+      leftmostXLabel = formatEng(tStart, 's', 2);
+
+      const visibleChs = tab.drawOrder
+        .map((id) => tab.channels[id])
+        .filter((c) => c && c.visible);
+
+      if (tab.separateView && visibleChs.length > 1) {
+        // Global maximum across ALL visible channels keeps vertical gridlines & cursors aligned
+        for (const ch of visibleChs) {
+          ensureChannelScaleOffset(ch);
+          syncChannelBoundsFromScaleOffset(ch);
+          const vMin = ch.vMin;
+          const vMax = ch.vMax;
+          const vSpan = vMax - vMin || 1;
+          const ticks = 4;
+          for (let j = 0; j <= ticks; j++) {
+            const val = vMax - (j / ticks) * vSpan;
+            const lbl = formatEng(val, ch.unit, 1);
+            const w = measureAxisTextWidth(lbl, ctx);
+            maxTickRequired = Math.max(maxTickRequired, w + 28);
+          }
+        }
+      } else {
+        const targetId =
+          tab.activeChannelId ||
+          tab.selectedMeasurementChannelId ||
+          visibleChs[0]?.id ||
+          tab.drawOrder[0];
+        const activeCh = tab.channels[targetId] || visibleChs[0] || primaryCh;
+        if (activeCh) {
+          ensureChannelScaleOffset(activeCh);
+          syncChannelBoundsFromScaleOffset(activeCh);
+          const vMin = activeCh.vMin;
+          const vMax = activeCh.vMax;
+          const vSpan = vMax - vMin;
+          for (let j = 0; j <= VERTICAL_DIVISIONS; j++) {
+            const v = vMax - (j / VERTICAL_DIVISIONS) * vSpan;
+            const lbl = formatEng(v, activeCh.unit, 2);
+            const w = measureAxisTextWidth(lbl, ctx);
+            maxTickRequired = Math.max(maxTickRequired, w + 30);
+          }
+        }
+      }
+    }
+
+    const leftmostXHalf = Math.ceil(measureAxisTextWidth(leftmostXLabel, ctx) / 2) + 4;
+    return Math.max(76, maxTickRequired, gndFlagWidth + gndPad, leftmostXHalf);
+  } finally {
+    if (restoredCtx && ctx && typeof ctx.restore === 'function') {
+      ctx.restore();
+    }
+  }
+}
+
+/**
  * Calculates responsive plot area margins based on visible axes & handle gutters.
  */
-export function getPlotArea(width: number, height: number): PlotArea {
-  const left = 76;
+export function getPlotArea(width: number, height: number, leftMargin: number = 76): PlotArea {
+  const safeLeft = Math.max(76, Math.min(Math.max(76, Math.floor(width * 0.4)), Math.round(leftMargin)));
   const right = 24;
   const top = 24;
   const bottom = 32;
 
   return {
-    x: left,
+    x: safeLeft,
     y: top,
-    width: Math.max(10, width - left - right),
+    width: Math.max(10, width - safeLeft - right),
     height: Math.max(10, height - top - bottom),
+  };
+}
+
+/**
+ * Computes dynamic, jitter-damped PlotArea for a given TabState and canvas dimensions.
+ */
+export function getDynamicPlotArea(
+  tab: TabState | undefined | null,
+  width: number,
+  height: number,
+  options?: {
+    cachedSpectrum?: SpectrumResult | null;
+    ctx?: CanvasRenderingContext2D | null;
+    prevLeftMargin?: number;
+    shrinkThresholdPx?: number;
+  }
+): { plotArea: PlotArea; leftMargin: number; rawRequiredMargin: number } {
+  const rawRequiredMargin = computeRequiredLeftMargin(tab, {
+    cachedSpectrum: options?.cachedSpectrum,
+    ctx: options?.ctx,
+  });
+  const stabilized = applyLeftMarginHysteresis(
+    rawRequiredMargin,
+    options?.prevLeftMargin,
+    options?.shrinkThresholdPx ?? 16
+  );
+  const plotArea = getPlotArea(width, height, stabilized);
+  return {
+    plotArea,
+    leftMargin: plotArea.x,
+    rawRequiredMargin,
   };
 }
 
@@ -1802,6 +1994,14 @@ function minFreqSafe(minF: number, maxF: number): number {
   return maxF > minF ? minF : 0;
 }
 
+function escapeSvgText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 /**
  * Generates an accurate SVG string of the current oscilloscope waveform/spectrum view.
  */
@@ -1812,10 +2012,12 @@ export function generateWaveformSVG(
   theme: RenderTheme = DEFAULT_THEME,
   cachedSpectrum?: SpectrumResult | null
 ): string {
-  const p = getPlotArea(width, height);
+  const { plotArea: p } = getDynamicPlotArea(tab, width, height, { cachedSpectrum });
+  const fontStack = `'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+  const textStyle = `font-family:${fontStack};font-size:10.5px;font-variant-numeric:tabular-nums;`;
   const parts: string[] = [];
   parts.push(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="background:${theme.bg};font-family:'JetBrains Mono',monospace;">`
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="background:${theme.bg};font-family:${fontStack};font-variant-numeric:tabular-nums;">`
   );
   parts.push(
     `<rect x="${p.x}" y="${p.y}" width="${p.width}" height="${p.height}" fill="${theme.bg}" stroke="${theme.frame || '#334155'}" stroke-width="1"/>`
@@ -1832,6 +2034,8 @@ export function generateWaveformSVG(
   }
 
   if (tab.plotMode === 'frequency' && cachedSpectrum) {
+    const targetId = tab.selectedFftChannelId || tab.drawOrder[0];
+    const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
     const freqs = cachedSpectrum.frequencies;
     const scaleMode = tab.fftOptions.scale;
     const vals = scaleMode === 'db' ? cachedSpectrum.dbValues : cachedSpectrum.magnitudes;
@@ -1867,6 +2071,25 @@ export function generateWaveformSVG(
       pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
     }
     parts.push(`<polyline fill="none" stroke="${theme.cursor}" stroke-width="1.5" points="${pts.join(' ')}"/>`);
+
+    // SVG Frequency X/Y axis ticks
+    for (let i = 0; i <= HORIZONTAL_DIVISIONS; i++) {
+      const f = minF + (i / HORIZONTAL_DIVISIONS) * fSpan;
+      const x = p.x + (i * p.width) / HORIZONTAL_DIVISIONS;
+      const anchor = i === 0 ? 'start' : i === HORIZONTAL_DIVISIONS ? 'end' : 'middle';
+      parts.push(
+        `<text x="${x.toFixed(1)}" y="${(p.y + p.height + 18).toFixed(1)}" fill="${theme.axisText}" text-anchor="${anchor}" style="${textStyle}">${escapeSvgText(formatEng(f, 'Hz', 2))}</text>`
+      );
+    }
+    for (let j = 0; j <= VERTICAL_DIVISIONS; j++) {
+      const val = yMax - (j / VERTICAL_DIVISIONS) * ySpan;
+      const y = p.y + (j * p.height) / VERTICAL_DIVISIONS;
+      const lbl =
+        scaleMode === 'magnitude' ? formatEng(val, targetCh?.unit || 'V', 2) : `${val.toFixed(0)} dB`;
+      parts.push(
+        `<text x="${(p.x - 8).toFixed(1)}" y="${(y + 3).toFixed(1)}" fill="${theme.axisText}" text-anchor="end" style="${textStyle}">${escapeSvgText(lbl)}</text>`
+      );
+    }
   } else {
     const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
     const rects = getSubplotRects(p, visibleChs, tab.separateView);
@@ -1875,6 +2098,9 @@ export function generateWaveformSVG(
     rects.forEach((rect) => {
       const ch = rect.channel;
       const area = rect.area;
+      if (tab.separateView && visibleChs.length > 1) {
+        parts.push(`<rect x="${area.x}" y="${area.y}" width="${area.width}" height="${area.height}" fill="none" stroke="${theme.frame || '#334155'}" stroke-width="1"/>`);
+      }
       const { tStart, tSpan } = getTimeBoundsForView(tab, ch);
       const usesPrimaryIndex = !primaryCh || ch.t === primaryCh.t || ch.t.length === primaryCh.t.length;
       const rng = usesPrimaryIndex
@@ -1920,7 +2146,55 @@ export function generateWaveformSVG(
         : '';
       const opacityAttr = computed && ch.id !== tab.activeChannelId ? ' stroke-opacity="0.88"' : '';
       parts.push(`<polyline fill="none" stroke="${ch.color}"${dashAttr}${opacityAttr} stroke-width="1.5" points="${pts.join(' ')}"/>`);
+
+      if (tab.separateView && visibleChs.length > 1) {
+        const vMin = ch.vMin;
+        const vMax = ch.vMax;
+        const vSpan = vMax - vMin || 1;
+        const ticks = area.height >= 120 ? 4 : 2;
+        for (let j = 0; j <= ticks; j++) {
+          const val = vMax - (j / ticks) * vSpan;
+          const y = area.y + (j * area.height) / ticks;
+          parts.push(
+            `<text x="${(area.x - 20).toFixed(1)}" y="${(y + 3).toFixed(1)}" fill="${ch.color}" text-anchor="end" style="${textStyle}">${escapeSvgText(formatEng(val, ch.unit, 1))}</text>`
+          );
+        }
+      }
     });
+
+    // SVG Time X-axis labels + Overlap Y-axis labels
+    if (primaryCh) {
+      const { tStart, tSpan } = getTimeBoundsForView(tab, primaryCh);
+      for (let i = 0; i <= HORIZONTAL_DIVISIONS; i++) {
+        const t = tStart + (i / HORIZONTAL_DIVISIONS) * tSpan;
+        const x = p.x + (i * p.width) / HORIZONTAL_DIVISIONS;
+        const anchor = i === 0 ? 'start' : i === HORIZONTAL_DIVISIONS ? 'end' : 'middle';
+        parts.push(
+          `<text x="${x.toFixed(1)}" y="${(p.y + p.height + 18).toFixed(1)}" fill="${theme.axisText}" text-anchor="${anchor}" style="${textStyle}">${escapeSvgText(formatEng(t, 's', 2))}</text>`
+        );
+      }
+    }
+
+    if (!tab.separateView || visibleChs.length <= 1) {
+      const targetId =
+        tab.activeChannelId ||
+        tab.selectedMeasurementChannelId ||
+        visibleChs[0]?.id ||
+        tab.drawOrder[0];
+      const activeCh = tab.channels[targetId] || visibleChs[0] || primaryCh;
+      if (activeCh) {
+        ensureChannelScaleOffset(activeCh);
+        syncChannelBoundsFromScaleOffset(activeCh);
+        const vSpan = activeCh.vMax - activeCh.vMin;
+        for (let j = 0; j <= VERTICAL_DIVISIONS; j++) {
+          const v = activeCh.vMax - (j / VERTICAL_DIVISIONS) * vSpan;
+          const y = p.y + (j * p.height) / VERTICAL_DIVISIONS;
+          parts.push(
+            `<text x="${(p.x - 22).toFixed(1)}" y="${(y + 3).toFixed(1)}" fill="${activeCh.color}" text-anchor="end" style="${textStyle}">${escapeSvgText(formatEng(v, activeCh.unit, 2))}</text>`
+          );
+        }
+      }
+    }
   }
 
   parts.push('</svg>');

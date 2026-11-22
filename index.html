@@ -31,11 +31,11 @@
       </div>
 
       <div class="flex items-center gap-1.5 shrink-0 text-xs">
-        <button id="loadBtn" class="flex items-center gap-1.5 px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Open CSV, WFM, LTspice .raw/.txt, or .graphx session">
+        <button id="loadBtn" class="flex items-center gap-1.5 px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm transition cursor-pointer whitespace-nowrap" title="Open CSV, Excel (.xlsx/.xls), WFM, LTspice .raw/.txt, or .graphx session">
           <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
           Open File
         </button>
-        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.raw,.graphx,.txt" multiple />
+        <input type="file" id="fileInput" class="hidden" accept=".csv,.wfm,.raw,.graphx,.txt,.xlsx,.xls,.xlsm,.xlsb" multiple />
 
         <!-- LTspice Live Watch Strip -->
         <div class="flex items-center gap-1 bg-[#161b22] border border-[#222933] rounded-sm px-1.5 py-0.5">
@@ -572,6 +572,112 @@
       </div>
     </div>
 
+    <!-- Multi-Sheet Excel (.xlsx / .xls) Import Modal -->
+    <div id="excelImportModal" class="modal-overlay fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-6xl w-full p-5 flex flex-col max-h-[92vh]">
+        <div class="flex items-center justify-between gap-3 pb-2.5 border-b border-[#222933] mb-3 shrink-0">
+          <div class="min-w-0">
+            <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-wider">Excel Multi-Sheet Workbook Importer (.xlsx / .xls)</h2>
+            <div id="xlsModalSubtitle" class="text-[11px] font-mono text-slate-400 truncate mt-0.5">--</div>
+          </div>
+          <button id="xlsCloseTopBtn" type="button" class="text-slate-400 hover:text-white text-base cursor-pointer shrink-0">✕</button>
+        </div>
+
+        <!-- Unified Multi-Workbook Selector Strip (Visible when >= 2 Excel files in Batch/Open) -->
+        <div id="xlsMultiFileBar" class="hidden flex-wrap items-center justify-between gap-2 px-2.5 py-2 mb-3 bg-[#0c0f13] border border-[#222933] rounded-sm text-xs shrink-0">
+          <div class="flex items-center gap-1.5 overflow-x-auto min-w-0">
+            <span class="text-[11px] font-semibold text-slate-400 shrink-0">Workbooks:</span>
+            <div id="xlsFilePillsWrap" class="flex items-center gap-1.5"></div>
+          </div>
+          <button id="xlsApplyRulesBatchBtn" type="button" class="px-2.5 py-1 bg-cyan-950/60 hover:bg-cyan-900/70 border border-cyan-500/60 text-cyan-200 font-medium rounded-xs text-[11px] cursor-pointer whitespace-nowrap shrink-0">
+            将当前 Sheet 与表头规则应用到其余文件
+          </button>
+        </div>
+
+        <!-- Main Two-Column Body: Left Sheet Checklist + Right Bounded Preview Inspector -->
+        <div class="flex-1 flex flex-col md:flex-row gap-3 min-h-0 overflow-hidden">
+          <!-- Left Sheet Checklist -->
+          <div class="w-full md:w-64 shrink-0 bg-[#080b0f] border border-[#222933] rounded-sm p-2.5 flex flex-col min-h-[160px] max-h-[260px] md:max-h-none">
+            <div class="flex items-center justify-between gap-1 pb-2 mb-2 border-b border-[#222933]">
+              <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-300">Sheets</span>
+              <span id="xlsCheckedCountBadge" class="font-mono text-[10px] text-cyan-300 tabular-nums">0 selected</span>
+            </div>
+            <div class="flex items-center gap-1 mb-2 text-[10px] font-mono">
+              <button id="xlsSheetsAllBtn" type="button" class="flex-1 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer">All</button>
+              <button id="xlsSheetsNumericBtn" type="button" class="flex-1 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-xs cursor-pointer">Numeric</button>
+              <button id="xlsSheetsNoneBtn" type="button" class="flex-1 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-400 rounded-xs cursor-pointer">None</button>
+            </div>
+            <div id="xlsSheetsList" class="flex-1 overflow-y-auto space-y-1.5 pr-0.5"></div>
+          </div>
+
+          <!-- Right Sheet Inspector -->
+          <div class="flex-1 flex flex-col min-w-0 min-h-0">
+            <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 mb-2.5 space-y-2 text-xs shrink-0">
+              <div class="grid grid-cols-2 lg:grid-cols-4 gap-2.5 items-end">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <label class="text-[10px] text-slate-400 uppercase">Header Row</label>
+                    <label class="flex items-center gap-1 text-[10px] text-slate-300 cursor-pointer">
+                      <input id="xlsHeaderNoneChk" type="checkbox" class="accent-cyan-400 cursor-pointer" />
+                      <span>None (Col A..)</span>
+                    </label>
+                  </div>
+                  <input id="xlsHeaderRowInput" type="number" min="1" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 font-mono text-white disabled:opacity-45" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 uppercase mb-1">First Data Row</label>
+                  <input id="xlsFirstDataRowInput" type="number" min="1" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 font-mono text-white" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 uppercase mb-1">Time Column Unit</label>
+                  <select id="xlsTimeUnitSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 font-mono text-white disabled:opacity-45">
+                    <option value="s">Seconds (s)</option>
+                    <option value="ms">Milliseconds (ms)</option>
+                    <option value="us">Microseconds (µs)</option>
+                    <option value="ns">Nanoseconds (ns)</option>
+                    <option value="ps">Picoseconds (ps)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 uppercase mb-1">Sample Rate Override</label>
+                  <div class="flex items-center gap-1">
+                    <select id="xlsSampleRateSelect" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 font-mono text-white">
+                      <option value="auto">Auto (Time Col)</option>
+                      <option value="1000">1 kSa/s</option>
+                      <option value="10000">10 kSa/s</option>
+                      <option value="100000">100 kSa/s</option>
+                      <option value="1000000">1 MSa/s</option>
+                      <option value="custom">Custom Hz...</option>
+                    </select>
+                    <input id="xlsCustomRateInput" type="number" step="any" min="0.001" placeholder="Hz" class="hidden w-20 bg-[#12161c] border border-cyan-600/60 rounded-xs px-1.5 py-1 font-mono text-white" />
+                  </div>
+                </div>
+              </div>
+              <div id="xlsAuditBanner" class="flex flex-wrap items-center gap-4 pt-2 border-t border-[#222933] font-mono text-[11px] text-slate-300 tabular-nums"></div>
+            </div>
+
+            <div id="xlsPreviewTableWrap" class="flex-1 overflow-auto border border-[#222933] rounded-sm bg-[#0c0f13] min-h-[200px]"></div>
+          </div>
+        </div>
+
+        <!-- Bottom Action Bar -->
+        <div class="flex flex-wrap items-center justify-between gap-2 pt-3 mt-3 border-t border-[#222933] shrink-0 text-xs">
+          <div class="flex flex-wrap items-center gap-2.5">
+            <div id="xlsTabModeToggleWrap" class="flex bg-[#0c0f13] p-0.5 border border-[#222933] rounded-sm">
+              <button id="xlsTabSeparateBtn" type="button" class="px-2.5 py-1 rounded-xs bg-cyan-600 text-slate-950 font-semibold cursor-pointer">Separate Tabs</button>
+              <button id="xlsTabMergeBtn" type="button" class="px-2.5 py-1 rounded-xs text-slate-300 hover:text-white cursor-pointer">Merge Tab</button>
+            </div>
+            <span id="xlsFooterContextHint" class="text-[11px] text-slate-400">每个勾选的 Sheet 将打开为独立标签页</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="xlsCancelBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Cancel</button>
+            <button id="xlsLoadOriginalBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">Load Original</button>
+            <button id="xlsPrimaryConfirmBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Load + Resample</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Math Channel Modal -->
     <div id="mathModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-lg w-full p-5">
@@ -1092,7 +1198,7 @@
           <div class="md:col-span-2 flex items-center gap-1.5">
             <button id="batchPickFilesBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">Select Files...</button>
             <button id="batchPickFolderBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 rounded-sm cursor-pointer whitespace-nowrap">Select Folder</button>
-            <input id="batchFilesInput" type="file" multiple accept=".csv,.txt,.wfm,.raw" class="hidden" />
+            <input id="batchFilesInput" type="file" multiple accept=".csv,.txt,.wfm,.raw,.xlsx,.xls,.xlsm,.xlsb" class="hidden" />
             <input id="batchFolderInput" type="file" webkitdirectory directory multiple class="hidden" />
           </div>
           <div>
@@ -1214,7 +1320,7 @@
                 <select id="cmpRefSelect" class="flex-1 min-w-[180px] bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono"></select>
                 <button id="cmpAddRefBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Add Channel</button>
                 <button id="cmpLoadFileBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Load File(s)...</button>
-                <input type="file" id="cmpRefFileInput" multiple class="hidden" accept=".csv,.wfm,.raw,.txt" />
+                <input type="file" id="cmpRefFileInput" multiple class="hidden" accept=".csv,.wfm,.raw,.txt,.xlsx,.xls,.xlsm,.xlsb" />
               </div>
             </div>
           </div>
@@ -2005,7 +2111,7 @@
           <polyline points="7 10 12 15 17 10"></polyline>
           <line x1="12" y1="15" x2="12" y2="3"></line>
         </svg>
-        <span class="block text-xl font-semibold mt-3 tracking-wide">Drop CSV, WFM, LTspice (.raw/.txt), or .graphx</span>
+        <span class="block text-xl font-semibold mt-3 tracking-wide">Drop CSV, Excel (.xlsx/.xls), WFM, LTspice (.raw/.txt), or .graphx</span>
       </div>
     </div>
 

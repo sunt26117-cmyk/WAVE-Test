@@ -57,7 +57,19 @@ import {
   analyzeTorqueAndCurrentRipple,
   computeBldcDerivedTraces,
 } from '../modules/bldcAnalysis';
-import { formatEng } from '../engine/canvasRenderer';
+import * as XLSX from 'xlsx';
+import {
+  formatEng,
+  computeRequiredLeftMargin,
+  applyLeftMarginHysteresis,
+  getDynamicPlotArea,
+  generateWaveformSVG,
+} from '../engine/canvasRenderer';
+import {
+  createExcelWorkbookSessionFromBuffer,
+  parseExcelSheetToChannels,
+  releaseExcelWorkbookSession,
+} from '../parsers/excelParser';
 import {
   deconvolveThermalImpedance,
   fosterToCauer,
@@ -2488,6 +2500,238 @@ export function runAllTests(): TestResult[] {
   } catch (err: any) {
     results.push({
       name: 'BLDC FOC 6-MOS Symmetry, Current Sign Swap, DPWM1 Clamping, Stall 2*Irms^2 & 7-Port SPICE Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 39. Dynamic Y-Axis Margin, Separate Global Alignment, Anti-Jitter Hysteresis & SVG Font Test
+  try {
+    const nY = 64;
+    const tY = new Float64Array(nY);
+    const vShort = new Float32Array(nY);
+    const vLong = new Float32Array(nY);
+    for (let i = 0; i < nY; i++) {
+      tY[i] = i * 1e-3;
+      vShort[i] = Math.sin(i * 0.2);
+      vLong[i] = -124.5 - 25 * Math.sin(i * 0.2);
+    }
+    const metaY = analyzeSamplingQuality(tY);
+    const chShort: WaveformChannel = {
+      id: 'y_short',
+      name: 'CH1',
+      unit: 'V',
+      color: '#facc15',
+      visible: true,
+      t: tY,
+      v: vShort,
+      fs: 1000,
+      dt: 1e-3,
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: metaY,
+      vMin: -2,
+      vMax: 2,
+      voltsPerDiv: 0.5,
+      vOffset: 0,
+    };
+    const chLong: WaveformChannel = {
+      id: 'y_long',
+      name: 'Tj_Hot',
+      unit: '°C',
+      color: '#22d3ee',
+      visible: true,
+      t: tY,
+      v: vLong,
+      fs: 1000,
+      dt: 1e-3,
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: metaY,
+      vMin: -160,
+      vMax: -80,
+      voltsPerDiv: 10,
+      vOffset: 120,
+    };
+
+    const yTab: TabState = {
+      id: 'dyn_y_tab',
+      fileName: 'dyn_y.csv',
+      channels: { y_short: chShort, y_long: chLong },
+      drawOrder: ['y_short', 'y_long'],
+      activeChannelId: 'y_short',
+      view: { startIndex: 0, endIndex: nY },
+      cursors: { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null },
+      annotations: [],
+      annotationMode: false,
+      annotationsVisible: true,
+      isOverlap: true,
+      plotMode: 'time',
+      fftOptions: { range: 'entire', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+      motorConfig: { rpm: null, polePairs: null, enabled: false },
+      triggerConfig: { enabled: false, channelId: 'y_short', type: 'rising', level: 0, positionPercent: 50 },
+      measurementGate: 'view',
+      separateView: true,
+    };
+
+    // Separate mode must inspect ALL visible channels and align all subplot x coords
+    const sepRaw = computeRequiredLeftMargin(yTab);
+    const { plotArea: sepPlot, leftMargin: sepMargin } = getDynamicPlotArea(yTab, 900, 480);
+    const sepRects = getSubplotRects(sepPlot, [chShort, chLong], true);
+    const alignedSubplotsOk =
+      sepMargin > 76 &&
+      sepMargin % 8 === 0 &&
+      sepRects.length === 2 &&
+      sepRects[0].area.x === sepRects[1].area.x &&
+      sepRects[0].area.x === sepMargin;
+
+    // Anti-jitter hysteresis: expand immediately, hold when shrink < 16px, shrink when >= 16px
+    const expanded = applyLeftMarginHysteresis(101, 76); // snaps to 104
+    const heldDuringJitter = applyLeftMarginHysteresis(95, expanded); // diff = 104 - 95 = 9 < 16 -> holds 104
+    const shrunkAfterBand = applyLeftMarginHysteresis(84, expanded); // diff = 104 - 84 = 20 >= 16 -> drops to 88
+    const hysteresisOk = expanded === 104 && heldDuringJitter === 104 && shrunkAfterBand === 88;
+
+    // SVG export must include JetBrains Mono + tabular-nums + dynamic left margin
+    const svg = generateWaveformSVG(yTab, 900, 480);
+    const svgOk =
+      svg.includes('JetBrains Mono') &&
+      svg.includes('tabular-nums') &&
+      svg.includes(`<rect x="${sepMargin}"`);
+
+    const passed = alignedSubplotsOk && hysteresisOk && svgOk;
+    results.push({
+      name: 'Dynamic Y-Axis Margin, Separate Alignment, Anti-Jitter & SVG Font Test',
+      passed,
+      message: `sepRaw=${sepRaw.toFixed(1)}px->${sepMargin}px, hyst=${expanded}->${heldDuringJitter}->${shrunkAfterBand}, svgTabular=${svgOk}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Dynamic Y-Axis Margin, Separate Alignment, Anti-Jitter & SVG Font Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // 40. Multi-Sheet Excel Importer (Auto-Header, Col A Fallback, SSF.is_date vs Index, Text Filter & Cleanup)
+  try {
+    const wb = XLSX.utils.book_new();
+
+    // Sheet 1: No title row; row 0 is header (firstDataRow - 1), includes mixed text columns
+    const ws1 = XLSX.utils.aoa_to_sheet([
+      ['Time_ms', 'Vbus', 'Mode', 'Pass/Fail'],
+      [0, 48.1, 'BUCK', 'PASS'],
+      [1, 48.3, 'BUCK', 'PASS'],
+      [2, 47.9, 'BUCK', 'PASS'],
+      [3, 48.0, 'HOLD', 'PASS'],
+    ]);
+    XLSX.utils.book_append_sheet(wb, ws1, 'BenchData');
+
+    // Sheet 2: Headerless numeric table starting directly on row 0 -> Col A, Col B fallback
+    const ws2 = XLSX.utils.aoa_to_sheet([
+      [0.0, 1.5, -2.0],
+      [0.01, 2.5, -1.0],
+      [0.02, 3.5, 0.0],
+    ]);
+    XLSX.utils.book_append_sheet(wb, ws2, 'Headerless');
+
+    // Sheet 3: Real Excel serial date-formatted column (cell.z = 'yyyy-mm-dd hh:mm:ss') -> relative seconds t0=0
+    const ws3: XLSX.WorkSheet = {
+      '!ref': 'A1:B4',
+      A1: { t: 's', v: 'Timestamp' },
+      B1: { t: 's', v: 'Temp' },
+      A2: { t: 'n', v: 46348.5, z: 'yyyy-mm-dd hh:mm:ss' },
+      B2: { t: 'n', v: 25.0 },
+      A3: { t: 'n', v: 46348.5 + 1 / 86400, z: 'yyyy-mm-dd hh:mm:ss' },
+      B3: { t: 'n', v: 26.5 },
+      A4: { t: 'n', v: 46348.5 + 2 / 86400, z: 'yyyy-mm-dd hh:mm:ss' },
+      B4: { t: 'n', v: 28.0 },
+    };
+    XLSX.utils.book_append_sheet(wb, ws3, 'ExcelDateLog');
+
+    // Sheet 4: Ordinary incrementing index column (NO date format) -> must stay numeric, NOT excel-date
+    const ws4 = XLSX.utils.aoa_to_sheet([
+      ['SampleIdx', 'Vout'],
+      [1, 5.0],
+      [2, 5.1],
+      [3, 5.2],
+      [4, 5.3],
+    ]);
+    XLSX.utils.book_append_sheet(wb, ws4, 'IndexOnly');
+
+    // Sheet 5: Pure text notes sheet -> auto-unchecked
+    const ws5 = XLSX.utils.aoa_to_sheet([
+      ['Test Engineer', 'Note'],
+      ['Alice', 'Dry run only'],
+    ]);
+    XLSX.utils.book_append_sheet(wb, ws5, 'Notes');
+
+    const xlsBuf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+    const session = createExcelWorkbookSessionFromBuffer(xlsBuf, 'lab_capture.xlsx');
+
+    const s1 = session.sheets[0];
+    const s2 = session.sheets[1];
+    const s3 = session.sheets[2];
+    const s4 = session.sheets[3];
+    const s5 = session.sheets[4];
+
+    const s1AutoHeaderOk =
+      s1.detectedFirstDataRow === 1 &&
+      s1.detectedHeaderRow === 0 &&
+      s1.timeColIndex === 0 &&
+      s1.timeUnit === 'ms' &&
+      s1.columnMappings[2].isTextColumn &&
+      s1.columnMappings[2].role === 'ignore' &&
+      s1.columnMappings[3].isTextColumn &&
+      s1.columnMappings[3].role === 'ignore';
+
+    const s2HeaderlessOk =
+      s2.detectedFirstDataRow === 0 &&
+      s2.detectedHeaderRow === null &&
+      s2.columnMappings[0].header === 'Col A' &&
+      s2.columnMappings[1].header === 'Col B';
+
+    const parsed1 = parseExcelSheetToChannels(session, 0, { resample: false, colors: ['#22d3ee'] });
+    const parsed3 = parseExcelSheetToChannels(session, 2, { resample: false, colors: ['#4ade80'] });
+    const parsed4 = parseExcelSheetToChannels(session, 3, { resample: false, colors: ['#facc15'] });
+
+    const ch1 = parsed1.channels[parsed1.drawOrder[0]];
+    const ch3 = parsed3.channels[parsed3.drawOrder[0]];
+    const dateConversionOk =
+      s3.timeSourceKind === 'excel-date' &&
+      Math.abs(ch3.t[0]) < 1e-9 &&
+      Math.abs(ch3.t[1] - 1.0) < 1e-4 &&
+      Math.abs(ch3.t[2] - 2.0) < 1e-4;
+
+    const indexNotDateOk =
+      s4.timeSourceKind === 'numeric' &&
+      parsed4.drawOrder.length === 1 &&
+      Math.abs(parsed4.channels[parsed4.drawOrder[0]].t[0] - 1.0) < 1e-6;
+
+    const textFilterAndNotesOk =
+      parsed1.drawOrder.length === 1 &&
+      Math.abs(ch1.t[2] - 0.002) < 1e-9 &&
+      !s5.hasNumericData &&
+      !s5.selected;
+
+    releaseExcelWorkbookSession(session);
+    const releasedOk = session.released && session.workbook === null && session.sheets.length === 0;
+
+    const passed =
+      s1AutoHeaderOk &&
+      s2HeaderlessOk &&
+      dateConversionOk &&
+      indexNotDateOk &&
+      textFilterAndNotesOk &&
+      releasedOk;
+
+    results.push({
+      name: 'Multi-Sheet Excel Importer (Auto-Header, Col A, SSF.is_date vs Index, Text Filter & Cleanup)',
+      passed,
+      message: `hdr=${s1AutoHeaderOk}, colA=${s2HeaderlessOk}, dateRelSec=${dateConversionOk}, idxNotDate=${indexNotDateOk}, textSkip=${textFilterAndNotesOk}, released=${releasedOk}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Multi-Sheet Excel Importer (Auto-Header, Col A, SSF.is_date vs Index, Text Filter & Cleanup)',
       passed: false,
       message: `Exception: ${err.message}`,
     });

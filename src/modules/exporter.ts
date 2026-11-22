@@ -10,7 +10,7 @@ import {
 import {
   RenderTheme,
   DEFAULT_THEME,
-  getPlotArea,
+  getDynamicPlotArea,
   drawGrid,
   drawChannelWaveform,
   drawGndMarkers,
@@ -266,7 +266,10 @@ function buildCompositeScopePngInternal(
   // Draw Graticule & Waveforms translated below header
   ctx.save();
   ctx.translate(0, headerH);
-  const p = getPlotArea(w, plotH);
+  const { plotArea: p } = getDynamicPlotArea(tab, w, plotH, {
+    cachedSpectrum,
+    ctx,
+  });
 
   if (tab.plotMode === 'frequency') {
     drawGrid(ctx, p, theme, 10, 8, false);

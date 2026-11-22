@@ -44,6 +44,8 @@ import {
   computeBldcDerivedTraces,
 } from './modules/bldcAnalysis';
 import { initThermalWorkbench } from './modules/thermalWorkbench';
+import { isExcelFileName } from './parsers/excelParser';
+import { excelImportModal } from './modules/excelImportModal';
 
 let batchQueuedFiles: File[] = [];
 let lastBatchRows: BatchFileRow[] = [];
@@ -1022,12 +1024,15 @@ function bindModals() {
     const tab = app.getActiveTab();
     const targetCh = tab ? getCompareTargetChannel(tab) : null;
 
+    const excelFiles = files.filter((f) => isExcelFileName(f.name));
+    const standardFiles = files.filter((f) => !isExcelFileName(f.name));
+
     let addedCount = 0;
     let skippedDupCount = 0;
     let reusedTabCount = 0;
     let firstExtKey = '';
 
-    for (const file of files) {
+    for (const file of standardFiles) {
       try {
         const fp = await computeFileFingerprint(file);
 
@@ -1139,10 +1144,67 @@ function bindModals() {
       if (reusedTabCount > 0) parts.push(`复用已打开标签页 ${reusedTabCount} 条`);
       if (skippedDupCount > 0) parts.push(`跳过重复文件 ${skippedDupCount} 个`);
       app.showToast(parts.join(' · '), 'info');
-    } else if (skippedDupCount > 0) {
+    } else if (skippedDupCount > 0 && excelFiles.length === 0) {
       app.showToast(`检测到 ${skippedDupCount} 个完全相同的文件（文件名+内容一致），已自动跳过重复加载。`, 'warn');
-    } else if (addedCount === 0) {
+    } else if (addedCount === 0 && excelFiles.length === 0) {
       app.showToast('No waveform channels found in selected file(s).', 'warn');
+    }
+
+    if (excelFiles.length > 0) {
+      void excelImportModal.open({
+        mode: 'compare',
+        files: excelFiles,
+        colors: app.getRawColors(),
+        onConfirm: (res) => {
+          const activeTab = app.getActiveTab();
+          const tgt = activeTab ? getCompareTargetChannel(activeTab) : targetCh;
+          let xlsAdded = 0;
+          let xlsFirstKey = '';
+
+          for (const item of res.items) {
+            const shortFile = item.fileName.replace(/\.[^.]+$/, '');
+            item.drawOrder.forEach((cid, idx) => {
+              const ch = item.channels[cid];
+              if (!ch) return;
+              const entryFp = `${item.fingerprint}::${item.sheetName}::${ch.id}`;
+              if (compareQueue.some((q) => q.fingerprint === entryFp)) return;
+              const refId = `ext_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${idx}`;
+              const refKey = `ext:${refId}`;
+              const label =
+                item.drawOrder.length > 1
+                  ? `${shortFile}[${item.sheetName}]:${ch.name}`
+                  : `${shortFile}[${item.sheetName}]`;
+
+              externalCompareRefs.unshift({
+                id: refId,
+                label: `[Excel: ${item.fileName} / ${item.sheetName}] ${ch.name} (${ch.unit || 'V'})`,
+                channel: ch,
+                fingerprint: entryFp,
+              });
+              const entry: CompareQueueEntry = {
+                id: refId,
+                sourceKey: refKey,
+                label,
+                channel: ch,
+                timeShiftSec: 0,
+                timeScale: 1,
+                fingerprint: entryFp,
+              };
+              applyAutoAlignToEntry(tgt, entry, false);
+              compareQueue.push(entry);
+              if (!xlsFirstKey) xlsFirstKey = refKey;
+              xlsAdded++;
+            });
+          }
+
+          if (activeTab && xlsAdded > 0) {
+            populateCompareDropdowns(activeTab, xlsFirstKey || undefined);
+            recomputeComparePanel(activeTab);
+            app.showToast(`已从 Excel 加入 ${xlsAdded} 条波形到对比组。`, 'info');
+          }
+        },
+        onNotify: (msg, level) => app.showToast(msg, level),
+      });
     }
   });
 
@@ -1364,7 +1426,7 @@ function bindModals() {
   document.getElementById('batchPickFolderBtn')?.addEventListener('click', () => batchFolderInp?.click());
   const onBatchFilesSelected = (list: FileList | null) => {
     if (!list) return;
-    batchQueuedFiles = Array.from(list).filter((f) => /\.(csv|txt|wfm|raw)$/i.test(f.name));
+    batchQueuedFiles = Array.from(list).filter((f) => /\.(csv|txt|wfm|raw|xlsx|xls|xlsm|xlsb)$/i.test(f.name));
     const lbl = document.getElementById('batchFileCountLabel');
     if (lbl) lbl.innerText = `${batchQueuedFiles.length} supported file(s) queued.`;
   };
@@ -1372,27 +1434,55 @@ function bindModals() {
   batchFolderInp?.addEventListener('change', () => onBatchFilesSelected(batchFolderInp.files));
   document.getElementById('batchRunBtn')?.addEventListener('click', async () => {
     if (batchQueuedFiles.length === 0) {
-      app.showToast('Select CSV/WFM files or a folder first.', 'warn');
+      app.showToast('Select CSV/Excel/WFM files or a folder first.', 'warn');
       return;
     }
     const chIdx = Math.max(0, (parseInt((document.getElementById('batchChIndexInput') as HTMLInputElement)?.value || '1', 10) || 1) - 1);
     const ruleMetric = ((document.getElementById('batchRuleMetricSelect') as HTMLSelectElement)?.value || '') as MeasurementMetricKey | '';
     const minV = parseFloat((document.getElementById('batchMinLimitInput') as HTMLInputElement)?.value || '');
     const maxV = parseFloat((document.getElementById('batchMaxLimitInput') as HTMLInputElement)?.value || '');
+    const thresholds = ruleMetric
+      ? {
+          metric: ruleMetric,
+          minLimit: isFinite(minV) ? minV : null,
+          maxLimit: isFinite(maxV) ? maxV : null,
+        }
+      : undefined;
+
     const lbl = document.getElementById('batchFileCountLabel');
+    const excelFiles = batchQueuedFiles.filter((f) => isExcelFileName(f.name));
+    const standardFiles = batchQueuedFiles.filter((f) => !isExcelFileName(f.name));
+
+    if (excelFiles.length > 0) {
+      await excelImportModal.open({
+        mode: 'batch',
+        files: excelFiles,
+        colors: ['#facc15', '#22d3ee', '#f472b6', '#4ade80'],
+        onConfirm: async (res) => {
+          if (lbl) lbl.innerText = `Analyzing ${standardFiles.length + res.items.length} file(s)/sheet(s)...`;
+          lastBatchRows = await runBatchAnalysisOnFiles(
+            standardFiles,
+            chIdx,
+            BATCH_EXPORT_METRICS,
+            'entire',
+            thresholds,
+            res.items
+          );
+          if (lbl) lbl.innerText = `Completed: ${lastBatchRows.length} item(s).`;
+          renderBatchTable(lastBatchRows);
+        },
+        onNotify: (msg, level) => app.showToast(msg, level),
+      });
+      return;
+    }
+
     if (lbl) lbl.innerText = `Analyzing ${batchQueuedFiles.length} files...`;
     lastBatchRows = await runBatchAnalysisOnFiles(
       batchQueuedFiles,
       chIdx,
       BATCH_EXPORT_METRICS,
       'entire',
-      ruleMetric
-        ? {
-            metric: ruleMetric,
-            minLimit: isFinite(minV) ? minV : null,
-            maxLimit: isFinite(maxV) ? maxV : null,
-          }
-        : undefined
+      thresholds
     );
     if (lbl) lbl.innerText = `Completed: ${lastBatchRows.length} file(s).`;
     renderBatchTable(lastBatchRows);

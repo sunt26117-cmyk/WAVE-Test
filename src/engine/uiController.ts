@@ -29,6 +29,7 @@ import {
   DEFAULT_THEME,
   isComputedChannel,
   getPlotArea,
+  getDynamicPlotArea,
   getTimeBoundsForView,
   resolveCursorMode,
   getChannelPlotArea,
@@ -111,6 +112,13 @@ import {
 import { computeBufferFingerprint, computeTextFingerprint } from '../modules/waveformCompare';
 import { closeActiveToolDrawerItem } from '../modules/toolDrawer';
 import { analyzeSamplingQuality } from '../modules/qualityCheck';
+import {
+  isExcelFileName,
+  openExcelWorkbookSession,
+  parseExcelSheetToChannels,
+  releaseExcelWorkbookSession,
+} from '../parsers/excelParser';
+import { excelImportModal, ExcelImportedSheetPayload } from '../modules/excelImportModal';
 
 type DragMode =
   | null
@@ -166,6 +174,9 @@ export class OscilloscopeApp {
   private pendingCsvText: string = '';
   private pendingCsvPreview: CsvPreviewInfo | null = null;
   private pendingFileName: string = '';
+
+  // Per-tab anti-jitter dynamic Y-axis margin cache
+  private tabLeftMarginCache: Map<string, { margin: number; layoutKey: string }> = new Map();
 
   // Pending text annotation coordinate
   private pendingAnnotationCoord: { time: number; voltage: number; channelId: string } | null = null;
@@ -1434,6 +1445,30 @@ export class OscilloscopeApp {
     this.draw();
   }
 
+  private getTabPlotArea(
+    tab: TabState | undefined | null,
+    width: number,
+    height: number,
+    updateCache: boolean = true
+  ): PlotArea {
+    if (!tab || tab.drawOrder.length === 0) {
+      return getPlotArea(width, height);
+    }
+    const visCount = tab.drawOrder.filter((id) => tab.channels[id]?.visible).length;
+    const layoutKey = `${tab.plotMode}|${tab.separateView ? 'sep' : 'ov'}|${tab.activeChannelId || ''}|${tab.selectedFftChannelId || ''}|${visCount}`;
+    const prevEntry = this.tabLeftMarginCache.get(tab.id);
+    const prevLeftMargin = prevEntry && prevEntry.layoutKey === layoutKey ? prevEntry.margin : undefined;
+    const { plotArea, leftMargin } = getDynamicPlotArea(tab, width, height, {
+      cachedSpectrum: this.cachedSpectrum,
+      ctx: this.ctx,
+      prevLeftMargin,
+    });
+    if (updateCache || !prevEntry || prevEntry.layoutKey !== layoutKey) {
+      this.tabLeftMarginCache.set(tab.id, { margin: leftMargin, layoutKey });
+    }
+    return plotArea;
+  }
+
   // --- Rendering Pipeline ---
   public draw(): void {
     const dpr = window.devicePixelRatio || 1;
@@ -1443,19 +1478,20 @@ export class OscilloscopeApp {
     this.ctx.clearRect(0, 0, width, height);
 
     const tab = this.getActiveTab();
-    const p = getPlotArea(width, height);
-    const emptyOverlay = document.getElementById('emptyScopeOverlay');
-
     if (!tab || tab.drawOrder.length === 0) {
+      const p = getPlotArea(width, height);
       drawGrid(this.ctx, p, this.theme);
+      const emptyOverlay = document.getElementById('emptyScopeOverlay');
       if (emptyOverlay) emptyOverlay.style.display = 'flex';
       this.updateStatusBar();
       this.updateScreenTelemetry();
       return;
     }
 
+    const emptyOverlay = document.getElementById('emptyScopeOverlay');
     if (emptyOverlay) emptyOverlay.style.display = 'none';
     this.ensureTabDefaults(tab);
+    const p = this.getTabPlotArea(tab, width, height, true);
 
     if (tab.plotMode === 'frequency') {
       drawGrid(this.ctx, p, this.theme, 10, 8, false);
@@ -1645,7 +1681,7 @@ export class OscilloscopeApp {
         const rect = this.canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
-        const p = getPlotArea(rect.width, rect.height);
+        const p = this.getTabPlotArea(tab, rect.width, rect.height, false);
         if (x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
           const hit = this.findSubplotAtPoint(tab, p, y);
           const targetCh = tab.separateView && hit ? hit.channel : tab.channels[tab.activeChannelId || ''] || hit?.channel;
@@ -1724,6 +1760,10 @@ export class OscilloscopeApp {
 
       // Close active docked drawer tab or blocking modal on Escape even if focus is inside an input
       if (key === 'ESCAPE') {
+        if (excelImportModal.isOpen()) {
+          excelImportModal.closeAndRelease(true);
+          return;
+        }
         if (closeActiveToolDrawerItem()) return;
         let closedModal = false;
         document.querySelectorAll('.modal-overlay:not(.tool-dockable)').forEach((overlay) => {
@@ -1834,7 +1874,7 @@ export class OscilloscopeApp {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    const p = getPlotArea(rect.width, rect.height);
+    const p = this.getTabPlotArea(tab, rect.width, rect.height, false);
 
     // 1. Check Left GND Handles (interactive vertical offset drag)
     const gndHandles = getGndHandlePositions(p, tab);
@@ -2018,7 +2058,7 @@ export class OscilloscopeApp {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    const p = getPlotArea(rect.width, rect.height);
+    const p = this.getTabPlotArea(tab, rect.width, rect.height, false);
 
     if (this.dragState) {
       if (this.dragState.type === 'gnd') {
@@ -2245,7 +2285,7 @@ export class OscilloscopeApp {
     if (!tab) return;
 
     const dpr = window.devicePixelRatio || 1;
-    const p = getPlotArea(this.canvas.width / dpr, this.canvas.height / dpr);
+    const p = this.getTabPlotArea(tab, this.canvas.width / dpr, this.canvas.height / dpr, false);
 
     if (currentDrag.type === 'areaZoom') {
       const x1 = Math.min(currentDrag.start.x, currentDrag.end.x);
@@ -2313,7 +2353,7 @@ export class OscilloscopeApp {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    const p = getPlotArea(rect.width, rect.height);
+    const p = this.getTabPlotArea(tab, rect.width, rect.height, false);
 
     // Wheel on Left Y-Axis gutter OR Shift+Wheel OR Alt+Wheel -> 1-2-5 Vertical V/div step
     if (tab.plotMode === 'time' && (x < p.x || e.shiftKey || e.altKey)) {
@@ -2427,6 +2467,46 @@ export class OscilloscopeApp {
   public async openFileDirectInTab(file: File): Promise<string | null> {
     const ext = file.name.split('.').pop()?.toLowerCase();
     const colors = this.getRawColors();
+
+    if (isExcelFileName(file.name)) {
+      let session: Awaited<ReturnType<typeof openExcelWorkbookSession>> | null = null;
+      try {
+        session = await openExcelWorkbookSession(file);
+        const sel = session.sheets.filter((s) => s.selected);
+        if (sel.length === 0) return null;
+        const parsed = parseExcelSheetToChannels(session, sel[0].sheetIndex, {
+          resample: !!(sel[0].quality && !sel[0].quality.isUniformSampling),
+          colors,
+        });
+        this.markRawChannelsAndFit(parsed.channels);
+        const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+        const tabId = `tab_${Date.now()}_${Math.random()}`;
+        this.addTab({
+          id: tabId,
+          fileName: sel.length > 1 || session.sheets.length > 1 ? `${file.name} [${parsed.sheetName}]` : file.name,
+          fileFingerprint: `${session.fingerprint}::${parsed.sheetName}`,
+          channels: parsed.channels,
+          drawOrder: parsed.drawOrder,
+          view: { startIndex: 0, endIndex: totalPoints },
+          cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
+          annotations: [],
+          annotationMode: false,
+          annotationsVisible: true,
+          isOverlap: false,
+          plotMode: 'time',
+          fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+          motorConfig: { rpm: null, polePairs: null, enabled: false },
+          triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
+          measurementGate: 'view',
+          separateView: false,
+          activeChannelId: parsed.drawOrder[0],
+          activeTool: 'pan',
+        });
+        return tabId;
+      } finally {
+        releaseExcelWorkbookSession(session);
+      }
+    }
 
     if (ext === 'wfm' || ext === 'raw') {
       const buf = await file.arrayBuffer();
@@ -2639,10 +2719,143 @@ export class OscilloscopeApp {
     }
   }
 
-  // --- File Handling (CSV, WFM, LTspice .raw / .txt, .graphx Session) ---
+  private createTabFromExcelPayloads(
+    items: ExcelImportedSheetPayload[],
+    disposition: 'separate' | 'merge'
+  ): void {
+    const colors = this.getRawColors();
+    if (disposition === 'merge' && items.length > 1) {
+      const mergedChannels: Record<string, WaveformChannel> = {};
+      const mergedDrawOrder: string[] = [];
+      let maxPts = 0;
+
+      items.forEach((item) => {
+        item.drawOrder.forEach((cid) => {
+          const ch = item.channels[cid];
+          if (!ch) return;
+          const idx = mergedDrawOrder.length;
+          const newId = `${cid}_m${idx}`;
+          const cloned: WaveformChannel = {
+            ...ch,
+            id: newId,
+            name: `[${item.sheetName}] ${ch.name}`,
+            color: colors[idx % colors.length] || ch.color,
+          };
+          mergedChannels[newId] = cloned;
+          mergedDrawOrder.push(newId);
+          if (cloned.v.length > maxPts) maxPts = cloned.v.length;
+        });
+      });
+
+      if (mergedDrawOrder.length === 0) return;
+      this.markRawChannelsAndFit(mergedChannels);
+      const uniqueFiles = Array.from(new Set(items.map((it) => it.fileName)));
+      const tabTitle =
+        uniqueFiles.length === 1
+          ? `${uniqueFiles[0]} (${items.length} sheets)`
+          : `${uniqueFiles[0]} +${uniqueFiles.length - 1} (${items.length} sheets)`;
+
+      this.addTab({
+        id: `tab_${Date.now()}_${Math.random()}`,
+        fileName: tabTitle,
+        fileFingerprint: items.map((it) => `${it.fingerprint}::${it.sheetName}`).join('|'),
+        channels: mergedChannels,
+        drawOrder: mergedDrawOrder,
+        view: { startIndex: 0, endIndex: Math.max(2, maxPts) },
+        cursors: {
+          enabled: false,
+          mode: 'off',
+          x1: null,
+          x2: null,
+          y1: null,
+          y2: null,
+          trackingChannel: mergedDrawOrder[0] || null,
+        },
+        annotations: [],
+        annotationMode: false,
+        annotationsVisible: true,
+        isOverlap: false,
+        plotMode: 'time',
+        fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+        motorConfig: { rpm: null, polePairs: null, enabled: false },
+        triggerConfig: {
+          enabled: false,
+          channelId: mergedDrawOrder[0],
+          type: 'rising',
+          level: 0,
+          positionPercent: 50,
+        },
+        measurementGate: 'view',
+        separateView: false,
+        activeChannelId: mergedDrawOrder[0],
+        activeTool: 'pan',
+      });
+      this.showToast(`已合并导入 ${items.length} 个 Sheet (${mergedDrawOrder.length} 条通道)`, 'info');
+      return;
+    }
+
+    for (const item of items) {
+      this.markRawChannelsAndFit(item.channels);
+      const totalPoints = Object.values(item.channels)[0]?.v.length || 1000;
+      const tabName = `${item.fileName} [${item.sheetName}]`;
+      this.addTab({
+        id: `tab_${Date.now()}_${Math.random()}`,
+        fileName: tabName,
+        fileFingerprint: `${item.fingerprint}::${item.sheetName}`,
+        channels: item.channels,
+        drawOrder: item.drawOrder,
+        view: { startIndex: 0, endIndex: totalPoints },
+        cursors: {
+          enabled: false,
+          mode: 'off',
+          x1: null,
+          x2: null,
+          y1: null,
+          y2: null,
+          trackingChannel: item.drawOrder[0] || null,
+        },
+        annotations: [],
+        annotationMode: false,
+        annotationsVisible: true,
+        isOverlap: false,
+        plotMode: 'time',
+        fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+        motorConfig: { rpm: null, polePairs: null, enabled: false },
+        triggerConfig: {
+          enabled: false,
+          channelId: item.drawOrder[0],
+          type: 'rising',
+          level: 0,
+          positionPercent: 50,
+        },
+        measurementGate: 'view',
+        separateView: false,
+        activeChannelId: item.drawOrder[0],
+        activeTool: 'pan',
+      });
+    }
+    this.showToast(`已打开 ${items.length} 个 Excel 工作表标签页`, 'info');
+  }
+
+  // --- File Handling (CSV, Excel, WFM, LTspice .raw / .txt, .graphx Session) ---
   public handleFiles(files: File[]): void {
     const colors = this.getRawColors();
-    for (const file of files) {
+    const excelFiles = files.filter((f) => isExcelFileName(f.name));
+    const standardFiles = files.filter((f) => !isExcelFileName(f.name));
+
+    if (excelFiles.length > 0) {
+      void excelImportModal.open({
+        mode: 'main',
+        files: excelFiles,
+        colors,
+        onConfirm: (res) => {
+          this.createTabFromExcelPayloads(res.items, res.tabDisposition);
+        },
+        onNotify: (msg, level) => this.showToast(msg, level),
+      });
+    }
+
+    for (const file of standardFiles) {
       const ext = file.name.split('.').pop()?.toLowerCase();
       if (ext === 'graphx') {
         const reader = new FileReader();
