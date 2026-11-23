@@ -25,11 +25,13 @@ import {
   drawOverlapTraceLegend,
   drawCompareGroupLegend,
   formatEng,
+  getTimeBoundsForView,
 } from '../engine/canvasRenderer';
 import { getSubplotRects, getTimebaseInfo } from './oscilloscopeScale';
 import { computeBLDCHarmonics } from './fft';
-import { computeMeasurements } from './measurements';
+import { computeMeasurements, evaluateCustomMeasurement } from './measurements';
 import { evaluateGoldenTolerance } from './anomalyScanner';
+import { escapeCsvCell } from '../utils/html';
 
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${n}`;
@@ -84,23 +86,47 @@ export function exportCroppedWaveformCSV(
     throw new Error('No samples found in the selected time range.');
   }
 
+  const sampleAt = (ch: (typeof selected)[number], time: number): number => {
+    const n = Math.min(ch.t.length, ch.v.length);
+    if (n === 0 || !isFinite(time)) return NaN;
+    if (time < ch.t[0] || time > ch.t[n - 1]) return NaN;
+    if (n === 1) return ch.v[0];
+    let lo = 0;
+    let hi = n - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (ch.t[mid] <= time) lo = mid;
+      else hi = mid;
+    }
+    const t0 = ch.t[lo];
+    const t1 = ch.t[hi];
+    const v0 = ch.v[lo];
+    const v1 = ch.v[hi];
+    if (!isFinite(v0) || !isFinite(v1)) return NaN;
+    const dt = t1 - t0;
+    if (dt <= 1e-18) return v0;
+    return v0 + ((time - t0) / dt) * (v1 - v0);
+  };
+
   const headers: string[] = ['Time(s)'];
   for (const ch of selected) {
-    headers.push(`"${ch.name} (${ch.unit})"`);
+    headers.push(escapeCsvCell(`${ch.name} (${ch.unit})`));
     if (ch.refV && ch.hasEdits) {
-      headers.push(`"${ch.name}_Ref (${ch.unit})"`);
+      headers.push(escapeCsvCell(`${ch.name}_Ref (${ch.unit})`));
     }
   }
 
   const lines: string[] = [headers.join(',')];
   for (let i = iStart; i < iEnd; i++) {
-    const cols: string[] = [baseCh.t[i].toPrecision(12)];
+    const ti = baseCh.t[i];
+    const cols: string[] = [ti.toPrecision(12)];
     for (const ch of selected) {
-      const val = i < ch.v.length ? ch.v[i] : NaN;
-      cols.push(isFinite(val) ? val.toPrecision(7) : 'NaN');
+      const sameGrid = ch === baseCh || (ch.t === baseCh.t && !ch.timeShiftSec && !baseCh.timeShiftSec);
+      const val = sameGrid ? (i < ch.v.length ? ch.v[i] : NaN) : sampleAt(ch, ti);
+      cols.push(isFinite(val) ? val.toPrecision(7) : '');
       if (ch.refV && ch.hasEdits) {
         const refVal = i < ch.refV.length ? ch.refV[i] : NaN;
-        cols.push(isFinite(refVal) ? refVal.toPrecision(7) : 'NaN');
+        cols.push(isFinite(refVal) ? refVal.toPrecision(7) : '');
       }
     }
     lines.push(cols.join(','));
@@ -198,14 +224,38 @@ function buildCompositeScopePngInternal(
   // Pre-compute measurements for checked cards
   const selectedItems = tab.selectedMeasurements || [];
   const measByChannel: Record<string, ChannelMeasurements> = {};
+  const customValuesByChannel: Record<string, Record<string, number | null>> = {};
+  const viewBounds = getTimeBoundsForView(tab);
   if (selectedItems.length > 0) {
     const seen = new Set<string>();
     for (const item of selectedItems) {
-      if (seen.has(item.channelId)) continue;
-      seen.add(item.channelId);
       const ch = tab.channels[item.channelId];
-      if (ch) {
-        measByChannel[item.channelId] = computeMeasurements(ch, tab.measurementGate, tab.view, tab.cursors);
+      if (!ch) continue;
+      if (!seen.has(item.channelId)) {
+        seen.add(item.channelId);
+        measByChannel[item.channelId] = computeMeasurements(
+          ch,
+          tab.measurementGate,
+          tab.view,
+          tab.cursors,
+          viewBounds
+        );
+      }
+      if (typeof item.metric === 'string' && item.metric.startsWith('custom:')) {
+        const customId = item.metric.slice(7);
+        const def = (tab.customMeasurements || []).find((d) => d.id === customId);
+        if (def) {
+          if (!customValuesByChannel[item.channelId]) customValuesByChannel[item.channelId] = {};
+          customValuesByChannel[item.channelId][customId] = evaluateCustomMeasurement(
+            def,
+            ch,
+            measByChannel[item.channelId],
+            tab.measurementGate,
+            tab.view,
+            tab.cursors,
+            viewBounds
+          );
+        }
       }
     }
   }
@@ -325,7 +375,15 @@ function buildCompositeScopePngInternal(
     ctx.moveTo(0, headerH + plotH + 0.5);
     ctx.lineTo(w, headerH + plotH + 0.5);
     ctx.stroke();
-    drawMeasurementStripOnCanvas(ctx, tab, w, headerH + plotH, measByChannel, theme);
+    drawMeasurementStripOnCanvas(
+      ctx,
+      tab,
+      w,
+      headerH + plotH,
+      measByChannel,
+      theme,
+      customValuesByChannel
+    );
   }
 
   const filename = buildScreenshotFilename();

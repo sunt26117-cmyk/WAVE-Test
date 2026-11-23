@@ -299,13 +299,14 @@ export function computeTwoChannelPhaseDiff(
 
 export interface PowerSummary {
   avgPowerW: number;
+  avgDissipationW: number;
   peakPowerW: number;
   energyJ: number;
   durationSec: number;
 }
 
 /**
- * Computes active average power, peak power, and trapezoidal energy integral ∫ P(t) dt.
+ * Computes signed active average power, non-negative dissipation mean ∫|P(t)|dt/T, peak power, and trapezoidal energy integral ∫ P(t) dt.
  */
 export function computePowerSummary(
   t: Float64Array,
@@ -314,15 +315,16 @@ export function computePowerSummary(
   tEnd?: number
 ): PowerSummary {
   const n = Math.min(t.length, p.length);
-  if (n < 2) return { avgPowerW: 0, peakPowerW: 0, energyJ: 0, durationSec: 0 };
+  if (n < 2) return { avgPowerW: 0, avgDissipationW: 0, peakPowerW: 0, energyJ: 0, durationSec: 0 };
 
   let i0 = 0;
   let i1 = n - 1;
   if (tStart !== undefined) while (i0 < n && t[i0] < tStart) i0++;
   if (tEnd !== undefined) while (i1 > i0 && t[i1] > tEnd) i1--;
-  if (i1 <= i0) return { avgPowerW: 0, peakPowerW: 0, energyJ: 0, durationSec: 0 };
+  if (i1 <= i0) return { avgPowerW: 0, avgDissipationW: 0, peakPowerW: 0, energyJ: 0, durationSec: 0 };
 
   let energy = 0;
+  let dissipationEnergy = 0;
   let peak = 0;
   let dur = 0;
 
@@ -332,6 +334,15 @@ export function computePowerSummary(
     const dt = t[i] - t[i - 1];
     if (isFinite(p0) && isFinite(p1) && isFinite(dt) && dt > 0) {
       energy += 0.5 * (p0 + p1) * dt;
+      if ((p0 >= 0 && p1 >= 0) || (p0 <= 0 && p1 <= 0)) {
+        dissipationEnergy += 0.5 * (Math.abs(p0) + Math.abs(p1)) * dt;
+      } else {
+        const a0 = Math.abs(p0);
+        const a1 = Math.abs(p1);
+        const denom = a0 + a1;
+        const frac = denom > 1e-18 ? a0 / denom : 0.5;
+        dissipationEnergy += 0.5 * a0 * (dt * frac) + 0.5 * a1 * (dt * (1 - frac));
+      }
       dur += dt;
       if (Math.abs(p0) > Math.abs(peak)) peak = p0;
       if (Math.abs(p1) > Math.abs(peak)) peak = p1;
@@ -340,6 +351,7 @@ export function computePowerSummary(
 
   return {
     avgPowerW: dur > 0 ? energy / dur : 0,
+    avgDissipationW: dur > 0 ? dissipationEnergy / dur : 0,
     peakPowerW: peak,
     energyJ: energy,
     durationSec: dur,

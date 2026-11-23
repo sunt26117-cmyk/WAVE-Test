@@ -174,6 +174,72 @@ export function fitChannelTo125(ch: WaveformChannel): void {
 }
 
 /**
+ * Computes global min/max index bounds (relative to the primary channel's grid)
+ * across all channels in a tab, supporting negative indices and extended end indices
+ * when Compare/shifted traces span beyond the primary waveform.
+ */
+export function getTabGlobalIndexBounds(tab: TabState): {
+  minIdx: number;
+  maxIdx: number;
+  tMin: number;
+  tMax: number;
+} {
+  const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+  if (!primaryCh || primaryCh.t.length === 0) {
+    return { minIdx: 0, maxIdx: 0, tMin: 0, tMax: 0.01 };
+  }
+
+  const refT =
+    primaryCh.timeShiftBaseT && primaryCh.timeShiftBaseT.length === primaryCh.t.length
+      ? primaryCh.timeShiftBaseT
+      : primaryCh.t;
+  const n = refT.length;
+  const dt = primaryCh.dt || (n > 1 ? (refT[n - 1] - refT[0]) / (n - 1) : 1e-4);
+  const safeDt = dt > 0 && isFinite(dt) ? dt : 1e-4;
+
+  let globalTMin = refT[0];
+  let globalTMax = refT[n - 1];
+
+  for (const id of tab.drawOrder) {
+    const ch = tab.channels[id];
+    if (!ch || !ch.t || ch.t.length === 0) continue;
+    const t0 = ch.t[0];
+    const t1 = ch.t[ch.t.length - 1];
+    if (isFinite(t0) && t0 < globalTMin) globalTMin = t0;
+    if (isFinite(t1) && t1 > globalTMax) globalTMax = t1;
+  }
+
+  const minIdx = globalTMin < refT[0] ? Math.floor((globalTMin - refT[0]) / safeDt) : 0;
+  const extraRight =
+    globalTMax > refT[n - 1] ? Math.ceil((globalTMax - refT[n - 1]) / safeDt) : 0;
+  const maxIdx = Math.max(primaryCh.v.length, n + extraRight);
+
+  return {
+    minIdx,
+    maxIdx,
+    tMin: globalTMin,
+    tMax: globalTMax,
+  };
+}
+
+/**
+ * Automatically extends tab.view bounds so the longest / widest waveform fits cleanly.
+ */
+export function extendTabViewToLongestChannel(tab: TabState): boolean {
+  const bounds = getTabGlobalIndexBounds(tab);
+  let changed = false;
+  if (bounds.minIdx < tab.view.startIndex) {
+    tab.view.startIndex = bounds.minIdx;
+    changed = true;
+  }
+  if (bounds.maxIdx > tab.view.endIndex) {
+    tab.view.endIndex = bounds.maxIdx;
+    changed = true;
+  }
+  return changed;
+}
+
+/**
  * Computes horizontal timebase parameters for the active tab (10 horizontal divisions).
  */
 export function getTimebaseInfo(tab: TabState): {
@@ -186,7 +252,7 @@ export function getTimebaseInfo(tab: TabState): {
   visiblePoints: number;
   totalPoints: number;
 } {
-  const primaryCh = tab.channels[tab.drawOrder[0]];
+  const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
   if (!primaryCh || primaryCh.t.length === 0) {
     return {
       secPerDiv: 1e-3,
@@ -200,20 +266,39 @@ export function getTimebaseInfo(tab: TabState): {
     };
   }
 
-  const n = primaryCh.t.length;
-  const dt = primaryCh.dt || (n > 1 ? (primaryCh.t[n - 1] - primaryCh.t[0]) / (n - 1) : 1e-4);
-  const totalPoints = primaryCh.v.length;
-  const startIdx = Math.max(0, Math.min(n - 1, tab.view.startIndex));
-  const endIdx = Math.max(startIdx + 1, Math.min(totalPoints, tab.view.endIndex));
+  const refT =
+    primaryCh.timeShiftBaseT && primaryCh.timeShiftBaseT.length === primaryCh.t.length
+      ? primaryCh.timeShiftBaseT
+      : primaryCh.t;
+  const n = refT.length;
+  const dt = primaryCh.dt || (n > 1 ? (refT[n - 1] - refT[0]) / (n - 1) : 1e-4);
+  const bounds = getTabGlobalIndexBounds(tab);
+  const totalPoints = Math.max(primaryCh.v.length, bounds.maxIdx - bounds.minIdx);
+
+  const startIdx = tab.view.startIndex;
+  const endIdx = Math.max(startIdx + 1, tab.view.endIndex);
   const visiblePoints = Math.max(1, endIdx - startIdx);
 
-  const tStartSec = primaryCh.t[startIdx];
-  const tEndSec =
-    endIdx < n
-      ? primaryCh.t[endIdx]
-      : n >= 2
-      ? primaryCh.t[n - 1]
-      : primaryCh.t[0] + dt;
+  let tStartSec: number;
+  if (startIdx < 0) {
+    tStartSec = refT[0] + startIdx * dt;
+  } else if (startIdx < n) {
+    tStartSec = refT[startIdx];
+  } else {
+    tStartSec = refT[n - 1] + (startIdx - n + 1) * dt;
+  }
+
+  let tEndSec: number;
+  if (endIdx <= 0) {
+    tEndSec = refT[0] + endIdx * dt;
+  } else if (endIdx < n) {
+    tEndSec = refT[endIdx];
+  } else if (n >= 2) {
+    tEndSec = refT[n - 1] + (endIdx - n) * dt;
+  } else {
+    tEndSec = refT[0] + endIdx * dt;
+  }
+
   const totalSpanSec = Math.max(dt * 1e-3, tEndSec - tStartSec);
   const secPerDiv = totalSpanSec / HORIZONTAL_DIVISIONS;
 
@@ -233,29 +318,37 @@ export function getTimebaseInfo(tab: TabState): {
  * Steps the horizontal timebase in 1-2-5 sequence around the view center.
  */
 export function stepTimebase125(tab: TabState, direction: 1 | -1): ViewState {
-  const primaryCh = tab.channels[tab.drawOrder[0]];
+  const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
   if (!primaryCh || primaryCh.v.length < 2) return tab.view;
 
-  const n = primaryCh.t.length;
-  const dt = primaryCh.dt || (n > 1 ? (primaryCh.t[n - 1] - primaryCh.t[0]) / (n - 1) : 1e-4);
-  const totalN = primaryCh.v.length;
-  const minSpanPts = Math.min(totalN, 2);
+  const refT =
+    primaryCh.timeShiftBaseT && primaryCh.timeShiftBaseT.length === primaryCh.t.length
+      ? primaryCh.timeShiftBaseT
+      : primaryCh.t;
+  const n = refT.length;
+  const dt = primaryCh.dt || (n > 1 ? (refT[n - 1] - refT[0]) / (n - 1) : 1e-4);
+  const bounds = getTabGlobalIndexBounds(tab);
+  const totalSpanBounds = Math.max(2, bounds.maxIdx - bounds.minIdx);
+  const minSpanPts = Math.min(totalSpanBounds, 2);
   const curSpanPts = Math.max(minSpanPts, tab.view.endIndex - tab.view.startIndex);
   const curSecPerDiv = (curSpanPts * dt) / HORIZONTAL_DIVISIONS;
   const nextSecPerDiv = stepScale125(curSecPerDiv, direction);
-  const nextSpanPts = Math.max(minSpanPts, Math.min(totalN, Math.round((nextSecPerDiv * HORIZONTAL_DIVISIONS) / dt)));
+  const nextSpanPts = Math.max(
+    minSpanPts,
+    Math.min(totalSpanBounds, Math.round((nextSecPerDiv * HORIZONTAL_DIVISIONS) / dt))
+  );
 
   const centerIdx = (tab.view.startIndex + tab.view.endIndex) / 2;
   let newStart = Math.round(centerIdx - nextSpanPts / 2);
   let newEnd = newStart + nextSpanPts;
 
-  if (newStart < 0) {
-    newStart = 0;
-    newEnd = Math.min(totalN, nextSpanPts);
+  if (newStart < bounds.minIdx) {
+    newStart = bounds.minIdx;
+    newEnd = Math.min(bounds.maxIdx, bounds.minIdx + nextSpanPts);
   }
-  if (newEnd > totalN) {
-    newEnd = totalN;
-    newStart = Math.max(0, totalN - nextSpanPts);
+  if (newEnd > bounds.maxIdx) {
+    newEnd = bounds.maxIdx;
+    newStart = Math.max(bounds.minIdx, bounds.maxIdx - nextSpanPts);
   }
 
   return {
@@ -269,22 +362,22 @@ export function stepTimebase125(tab: TabState, direction: 1 | -1): ViewState {
  * Pans horizontal view by a fractional number of divisions (e.g. -1 or +1).
  */
 export function panHorizontalDivs(tab: TabState, divs: number): ViewState {
-  const primaryCh = tab.channels[tab.drawOrder[0]];
+  const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
   if (!primaryCh || primaryCh.v.length < 2) return tab.view;
 
-  const totalN = primaryCh.v.length;
-  const spanPts = tab.view.endIndex - tab.view.startIndex;
+  const bounds = getTabGlobalIndexBounds(tab);
+  const spanPts = Math.max(2, tab.view.endIndex - tab.view.startIndex);
   const shiftPts = Math.round((spanPts / HORIZONTAL_DIVISIONS) * divs);
 
   let newStart = tab.view.startIndex + shiftPts;
   let newEnd = tab.view.endIndex + shiftPts;
 
-  if (newStart < 0) {
-    newStart = 0;
-    newEnd = Math.min(totalN, spanPts);
-  } else if (newEnd > totalN) {
-    newEnd = totalN;
-    newStart = Math.max(0, totalN - spanPts);
+  if (newStart < bounds.minIdx) {
+    newStart = bounds.minIdx;
+    newEnd = Math.min(bounds.maxIdx, bounds.minIdx + spanPts);
+  } else if (newEnd > bounds.maxIdx) {
+    newEnd = bounds.maxIdx;
+    newStart = Math.max(bounds.minIdx, bounds.maxIdx - spanPts);
   }
 
   return {

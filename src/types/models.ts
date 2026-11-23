@@ -23,6 +23,12 @@ export interface SamplingMetadata {
   qualityStatus: TimeQualityStatus;
   gapCount: number;
   gapIndices: number[];
+  signalNanCount?: number;
+  duplicateTimeCount?: number;
+  nonMonotonicCount?: number;
+  rawGapCount?: number;
+  resampledFromNonUniform?: boolean;
+  syntheticClockUsed?: boolean;
 }
 
 export type ChannelCoupling = 'DC' | 'AC';
@@ -34,6 +40,7 @@ export type MeasurementMetricKey =
   | 'min'
   | 'vpp'
   | 'average'
+  | 'absAverage'
   | 'rms'
   | 'vtop'
   | 'vbase'
@@ -44,12 +51,25 @@ export type MeasurementMetricKey =
   | 'fallTime'
   | 'posWidth'
   | 'negWidth'
-  | 'dutyCycle';
+  | 'dutyCycle'
+  | 'maxDutyCycle'
+  | 'minDutyCycle';
+
+export type CustomMeasurementUnitType = 'signal' | 'percent' | 'freq' | 'time' | 'ratio' | 'custom';
+
+export interface CustomMeasurementDefinition {
+  id: string;
+  label: string;
+  shortLabel: string;
+  expression: string;
+  unitType: CustomMeasurementUnitType;
+  customUnit?: string;
+}
 
 export interface SelectedMeasurementItem {
   id: string;
   channelId: string;
-  metric: MeasurementMetricKey;
+  metric: MeasurementMetricKey | string;
 }
 
 export type ThemeId = 'obsidian' | 'midnight' | 'daylight';
@@ -147,7 +167,7 @@ export interface WorkbenchPreset {
   decimationMode: DecimationMode;
   measurementGate: MeasurementGate;
   mathDefs: Array<{ name: string; expr: string; color: string }>;
-  selectedMetricsByIndex: Array<{ chIdx: number; metric: MeasurementMetricKey }>;
+  selectedMetricsByIndex: Array<{ chIdx: number; metric: MeasurementMetricKey | string }>;
   triggerRule?: { chIdx: number; type: TriggerType; positionPercent: number };
 }
 
@@ -203,6 +223,8 @@ export interface SpectrumResult {
   magYMin?: number;
   magYMax?: number;
   cappedWarning?: string;
+  sourceUnit?: string;
+  nonUniformWarning?: string;
 }
 
 export interface MotorConfig {
@@ -236,6 +258,7 @@ export interface ChannelMeasurements {
   max: number | null;
   min: number | null;
   average: number | null;
+  absAverage: number | null;
   rms: number | null;
   vpp: number | null;
   peak: number | null;
@@ -248,6 +271,8 @@ export interface ChannelMeasurements {
   period: number | null;
   frequency: number | null;
   dutyCycle: number | null; // %
+  maxDutyCycle: number | null; // %
+  minDutyCycle: number | null; // %
   riseTime: number | null; // s (10% to 90%)
   fallTime: number | null; // s (90% to 10%)
   posWidth: number | null; // s (+Width at 50%)
@@ -309,6 +334,7 @@ export interface TabState {
   triggerConfig: TriggerConfig;
   measurementGate: MeasurementGate;
   selectedMeasurements?: SelectedMeasurementItem[];
+  customMeasurements?: CustomMeasurementDefinition[];
   separateView: boolean;
   selectedMeasurementChannelId?: string;
   selectedFftChannelId?: string;

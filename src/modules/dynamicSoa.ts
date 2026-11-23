@@ -6,6 +6,7 @@
 
 import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
+import { parseSiUnitScale } from './thermalEngine';
 
 export type SoaPulseKey = 'DC' | '10ms' | '1ms' | '100us' | '10us';
 
@@ -313,14 +314,59 @@ export function evaluateDynamicSoa(
   curveSet: SoaCurveSet,
   opts?: { tStart?: number; tEnd?: number; forcedPulseKey?: SoaPulseKey | 'auto' }
 ): DynamicSoaResult {
-  const n = Math.min(vdsCh.t.length, vdsCh.v.length, idsCh.v.length);
+  const nV = Math.min(vdsCh.t.length, vdsCh.v.length);
+  const nI = Math.min(idsCh.t.length, idsCh.v.length);
+  if (nV === 0 || nI === 0) {
+    return {
+      pass: true,
+      totalSamples: 0,
+      violationCount: 0,
+      maxUtilizationPct: 0,
+      minMarginPct: 100,
+      worstIndex: null,
+      worstTime: null,
+      worstVds: 0,
+      worstId: 0,
+      worstPulseWidthSec: 1e-3,
+      trajectoryPoints: [],
+    };
+  }
+
   let i0 = 0;
-  let i1 = n - 1;
-  if (opts?.tStart !== undefined) while (i0 < n && vdsCh.t[i0] < opts.tStart) i0++;
+  let i1 = nV - 1;
+  if (opts?.tStart !== undefined) while (i0 < nV && vdsCh.t[i0] < opts.tStart) i0++;
   if (opts?.tEnd !== undefined) while (i1 > i0 && vdsCh.t[i1] > opts.tEnd) i1--;
 
+  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name);
+  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name);
   const mV = vdsCh.coupling === 'AC' ? computeChannelMean(vdsCh) : 0;
   const mI = idsCh.coupling === 'AC' ? computeChannelMean(idsCh) : 0;
+
+  const sameTimebase =
+    nV === nI &&
+    (vdsCh.t === idsCh.t ||
+      (Math.abs(vdsCh.t[0] - idsCh.t[0]) <= 1e-15 &&
+        Math.abs(vdsCh.t[nV >> 1] - idsCh.t[nI >> 1]) <= 1e-15 &&
+        Math.abs(vdsCh.t[nV - 1] - idsCh.t[nI - 1]) <= 1e-15));
+
+  const sampleIdsAt = (targetT: number, fallbackIdx: number): number => {
+    if (sameTimebase) return getChannelDisplayValue(idsCh, fallbackIdx, mI) * iScale;
+    const tArr = idsCh.t;
+    if (targetT <= tArr[0]) return getChannelDisplayValue(idsCh, 0, mI) * iScale;
+    if (targetT >= tArr[nI - 1]) return getChannelDisplayValue(idsCh, nI - 1, mI) * iScale;
+    let lo = 0;
+    let hi = nI - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (tArr[mid] <= targetT) lo = mid;
+      else hi = mid;
+    }
+    const dt = tArr[hi] - tArr[lo];
+    const frac = dt > 1e-18 ? (targetT - tArr[lo]) / dt : 0;
+    const v0 = getChannelDisplayValue(idsCh, lo, mI) * iScale;
+    const v1 = getChannelDisplayValue(idsCh, hi, mI) * iScale;
+    return v0 + frac * (v1 - v0);
+  };
 
   const len = Math.max(0, i1 - i0 + 1);
   if (len === 0) {
@@ -339,13 +385,20 @@ export function evaluateDynamicSoa(
     };
   }
 
-  // Estimate contiguous pulse widths where instantaneous |V*I| > 5% of peak power (or |I| > 10% peak)
+  const vArr = new Float64Array(len);
+  const iArr = new Float64Array(len);
   let maxAbsI = 0;
-  for (let i = i0; i <= i1; i++) {
-    const ai = Math.abs(getChannelDisplayValue(idsCh, i, mI));
-    if (ai > maxAbsI) maxAbsI = ai;
+  for (let k = 0; k < len; k++) {
+    const idx = i0 + k;
+    const vv = getChannelDisplayValue(vdsCh, idx, mV) * vScale;
+    const ii = sampleIdsAt(vdsCh.t[idx], idx);
+    vArr[k] = isFinite(vv) ? Math.abs(vv) : 0;
+    iArr[k] = isFinite(ii) ? Math.abs(ii) : 0;
+    if (iArr[k] > maxAbsI) maxAbsI = iArr[k];
   }
-  const activeThreshI = Math.max(0.25, maxAbsI * 0.1);
+
+  // Estimate contiguous pulse widths where |I| > max(1 mA, 10% peak)
+  const activeThreshI = Math.max(1e-3, maxAbsI * 0.1);
   const pulseWidthForIdx = new Float64Array(len);
   const forcedDur =
     opts?.forcedPulseKey && opts.forcedPulseKey !== 'auto'
@@ -357,9 +410,7 @@ export function evaluateDynamicSoa(
   } else {
     let segStart = -1;
     for (let k = 0; k < len; k++) {
-      const idx = i0 + k;
-      const ai = Math.abs(getChannelDisplayValue(idsCh, idx, mI));
-      const isAct = ai >= activeThreshI;
+      const isAct = iArr[k] >= activeThreshI;
       if (isAct && segStart === -1) segStart = k;
       if ((!isAct || k === len - 1) && segStart !== -1) {
         const endK = isAct ? k : k - 1;
@@ -384,8 +435,8 @@ export function evaluateDynamicSoa(
 
   for (let k = 0; k < len; k++) {
     const idx = i0 + k;
-    const vAbs = Math.abs(getChannelDisplayValue(vdsCh, idx, mV));
-    const iAbs = Math.abs(getChannelDisplayValue(idsCh, idx, mI));
+    const vAbs = vArr[k];
+    const iAbs = iArr[k];
     const pw = pulseWidthForIdx[k];
     const limitId = getSoaMaxId(curveSet, vAbs, pw);
 

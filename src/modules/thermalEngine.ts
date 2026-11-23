@@ -17,6 +17,7 @@ import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 
 export type ThermalInputMode = 'heating' | 'cooling';
+export type ThermalPathMode = 'junction_ambient' | 'pad_ambient';
 
 export interface FosterStage {
   r: number; // °C/W
@@ -45,9 +46,11 @@ export interface ThermalDeconvOptions {
   tEnd?: number;
   autoT0?: boolean;
   tBlankSec?: number;
-  targetOrder?: number; // 2..6
+  targetOrder?: number; // 1..8
   tAmbOverride?: number;
   lambdaOverride?: number;
+  thermalPathMode?: ThermalPathMode;
+  padSpreadRthCPerW?: number;
 }
 
 export interface ThermalSpectrumBin {
@@ -55,11 +58,38 @@ export interface ThermalSpectrumBin {
   r: number;
 }
 
+export type ThermalFitStatus = 'valid' | 'reduced' | 'failed';
+
+export interface ThermalPhysicsCheck {
+  key: 'rc_bounds' | 'stage_effectiveness' | 'tau_separation' | 'rth_credibility' | 'cauer_parity' | 'fit_quality';
+  label: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ThermalPhysicsAudit {
+  status: ThermalFitStatus;
+  passed: boolean;
+  requestedOrder: number;
+  effectiveOrder: number;
+  orderReduced: boolean;
+  refitCount: number;
+  extrapolationRatio: number;
+  measuredSpanC: number;
+  zMeasuredEnd: number;
+  checks: ThermalPhysicsCheck[];
+  rejectedReasons: string[];
+  summary: string;
+}
+
 export interface ThermalDeconvResult {
   mode: ThermalInputMode;
+  thermalPathMode: ThermalPathMode;
+  padSpreadRthCPerW: number;
   powerW: number;
   t0Sec: number;
   tBaseC: number;
+  tAmbC: number;
   tJ0C: number;
   tauMinSec: number;
   tauMaxSec: number;
@@ -96,11 +126,13 @@ export interface ThermalDeconvResult {
   rmseC: number;
   spiceNetlist: string;
   spiceValidation: SpiceValidationResult;
+  physicsAudit: ThermalPhysicsAudit;
 }
 
 export interface SpiceValidationResult {
   valid: boolean;
   errors: string[];
+  heatNodeName: string;
   allCapsGroundedTo0: boolean;
   firstCapAtTJ: boolean;
   noCapOnTamb: boolean;
@@ -134,7 +166,79 @@ export interface LossSimulationResult {
   switchingEvents: number;
 }
 
-export function classifyThermalLayer(tauSec: number): string {
+export interface ViPowerOptions {
+  tStart?: number;
+  tEnd?: number;
+  stepOnsetTimeSec?: number;
+  useAbsPower?: boolean;
+}
+
+export interface ViPowerResult {
+  time: Float64Array;
+  powerW: Float32Array;
+  pGateMeanW: number;
+  pStepActiveW: number;
+  pPeakW: number;
+  energyJ: number;
+  activeFraction: number;
+  vMeanV: number;
+  iMeanA: number;
+  vUnitScale: number;
+  iUnitScale: number;
+  sampleCount: number;
+}
+
+export function parseSiUnitScale(
+  unit: string | undefined,
+  expectedKind: 'V' | 'A' | 'W',
+  channelNameFallback?: string
+): number {
+  const checkStr = (rawStr: string | undefined): number | null => {
+    const raw = (rawStr || '').trim();
+    if (!raw) return null;
+    const normalized = raw.replace(/μ/g, 'u').replace(/µ/g, 'u');
+    const k = expectedKind.toLowerCase();
+    const m = normalized.match(new RegExp(`^(u|n|m|k|meg|m)?\\s*(${k}|volt|volts|amp|amps|watt|watts)$`, 'i'));
+    if (!m) {
+      if (new RegExp(`^u${k}`, 'i').test(normalized)) return 1e-6;
+      if (new RegExp(`^n${k}`, 'i').test(normalized)) return 1e-9;
+      if (new RegExp(`^m${k}`, 'i').test(normalized)) return 1e-3;
+      if (new RegExp(`^k${k}`, 'i').test(normalized)) return 1e3;
+      return null;
+    }
+    const pfx = m[1] || '';
+    if (pfx === 'u' || pfx === 'U') return 1e-6;
+    if (pfx === 'n' || pfx === 'N') return 1e-9;
+    if (pfx === 'm') return 1e-3;
+    if (pfx === 'M' || pfx.toLowerCase() === 'meg') {
+      return pfx.toLowerCase() === 'meg' ? 1e6 : 1e-3;
+    }
+    if (pfx === 'k' || pfx === 'K') return 1e3;
+    return 1;
+  };
+
+  // If unit matches expectedKind directly (e.g. 'mA' for 'A'), use it;
+  // otherwise if unit is empty or generic default 'V' while expectedKind is 'A'/'W', inspect bracketed unit in channelName!
+  const direct = checkStr(unit);
+  if (direct !== null && (direct !== 1 || new RegExp(`^(${expectedKind}|volt|amp|watt)`, 'i').test((unit || '').trim()))) {
+    return direct;
+  }
+  if (channelNameFallback) {
+    const br = channelNameFallback.match(/[\(\[\{]\s*([µμunmk]?[VAW])\s*[\)\]\}]/i);
+    if (br) {
+      const fromName = checkStr(br[1]);
+      if (fromName !== null) return fromName;
+    }
+  }
+  return direct ?? 1;
+}
+
+export function classifyThermalLayer(tauSec: number, pathMode: ThermalPathMode = 'junction_ambient'): string {
+  if (pathMode === 'pad_ambient') {
+    if (!isFinite(tauSec) || tauSec < 0.05) return '焊盘/局部铜箔 (<50ms)';
+    if (tauSec <= 2.0) return 'PCB 铺铜扩散 (50ms~2s)';
+    return 'PCB 板级对流/环境 (>2s)';
+  }
   if (!isFinite(tauSec) || tauSec < 0.01) return '芯片/焊料 (<10ms)';
   if (tauSec <= 1.0) return '封装/基板 (10ms~1s)';
   return 'PCB/散热器 (>1s)';
@@ -200,7 +304,13 @@ export function detectThermalStepOnset(
     const dev = sign * (temp[i] - tBaseLead);
     const devNext = sign * (temp[i + 1] - tBaseLead);
     if (dev > thresh && devNext > thresh) {
-      const onsetIdx = Math.max(0, i - 1);
+      // Backtrack cleanly to the foot of the step so slow steps don't miss early samples
+      const footThresh = Math.max(2.5 * leadMad, 0.004 * totalSpan);
+      let footIdx = i;
+      while (footIdx > 0 && sign * (temp[footIdx] - tBaseLead) > footThresh) {
+        footIdx--;
+      }
+      const onsetIdx = Math.max(0, footIdx);
       // Refine tBase as exact mean of pre-onset baseline [0..onsetIdx]
       let sumPre = 0;
       let cntPre = 0;
@@ -408,152 +518,168 @@ function solveNonNegLassoCD(
 }
 
 /**
- * Compact Double-Double arithmetic helpers for ill-conditioned higher-order Foster->Cauer division.
+ * 240-digit BigInt fixed-point helpers for unconditionally stable higher-order Foster->Cauer expansion.
+ * Monomial polynomial division in IEEE-754 float64/double-double loses precision around order >= 6;
+ * 240 decimal digits eliminate catastrophic cancellation for any practical RC network order.
  */
-interface DD {
-  hi: number;
-  lo: number;
+const FP_EXP = 240;
+const FP_SCALE = 10n ** BigInt(FP_EXP);
+const FP_TRIM_EPS = 10n ** 60n; // |x| < 1e-180 treated as exact cancellation zero
+
+function toFP(x: number): bigint {
+  if (!Number.isFinite(x) || x === 0) return 0n;
+  const s = x.toExponential(16);
+  const [mant, expStr] = s.split('e');
+  const exp = parseInt(expStr, 10);
+  const neg = mant.startsWith('-');
+  const clean = (neg ? mant.slice(1) : mant).replace('.', '');
+  const fracDigits = 16;
+  const shift = FP_EXP + exp - fracDigits;
+  let val = BigInt(clean);
+  if (shift >= 0) val *= 10n ** BigInt(shift);
+  else val /= 10n ** BigInt(-shift);
+  return neg ? -val : val;
 }
-function ddFrom(x: number): DD {
-  return { hi: x, lo: 0 };
+
+function fpMul(a: bigint, b: bigint): bigint {
+  return (a * b) / FP_SCALE;
 }
-function ddQuickTwoSum(a: number, b: number): DD {
-  const s = a + b;
-  const e = b - (s - a);
-  return { hi: s, lo: e };
+
+function fpDiv(a: bigint, b: bigint): bigint {
+  return b === 0n ? 0n : (a * FP_SCALE) / b;
 }
-function ddAdd(a: DD, b: DD): DD {
-  const s = a.hi + b.hi;
-  const v = s - a.hi;
-  const e = (a.hi - (s - v)) + (b.hi - v) + a.lo + b.lo;
-  return ddQuickTwoSum(s, e);
-}
-function ddSub(a: DD, b: DD): DD {
-  return ddAdd(a, { hi: -b.hi, lo: -b.lo });
-}
-function ddMul(a: DD, b: DD): DD {
-  const SPLIT = 134217729; // 2^27 + 1
-  const c1 = SPLIT * a.hi;
-  const ah = c1 - (c1 - a.hi);
-  const al = a.hi - ah;
-  const c2 = SPLIT * b.hi;
-  const bh = c2 - (c2 - b.hi);
-  const bl = b.hi - bh;
-  const p = a.hi * b.hi;
-  const err = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
-  const lo = err + a.hi * b.lo + a.lo * b.hi;
-  return ddQuickTwoSum(p, lo);
-}
-function ddDiv(a: DD, b: DD): DD {
-  const q1 = a.hi / b.hi;
-  const r = ddSub(a, ddMul(ddFrom(q1), b));
-  const q2 = r.hi / b.hi;
-  return ddQuickTwoSum(q1, q2);
+
+function fromFP(a: bigint): number {
+  if (a === 0n) return 0;
+  const neg = a < 0n;
+  const abs = neg ? -a : a;
+  const str = abs.toString();
+  const sig = str.slice(0, 20);
+  const exp = str.length - FP_EXP - sig.length;
+  const v = Number(sig) * Math.pow(10, exp);
+  return neg ? -v : v;
 }
 
 /**
  * Converts a Foster RC network (parallel pairs in series) to an equivalent Cauer ladder
- * using time-scale normalization + double-double Euclidean continued fraction expansion.
+ * using time-scale normalization + 240-digit BigInt Euclidean continued fraction expansion.
  * Cauer index 0 sits at the heat-source terminal TJ (high-frequency admittance pole),
- * guaranteeing sum(R_cauer) matches sum(R_foster) within < 1e-6 relative error.
+ * guaranteeing sum(R_cauer) matches sum(R_foster) within < 1e-12 relative error across orders 1..8+.
  */
 export function fosterToCauer(foster: FosterStage[]): {
   cauer: CauerStage[];
   totalRthFoster: number;
   totalRthCauer: number;
   relErr: number;
+  hasDegenerateStage: boolean;
 } {
   const valid = foster.filter((f) => isFinite(f.r) && f.r > 0 && isFinite(f.tau) && f.tau > 0);
   const n = valid.length;
   if (n === 0) {
-    return { cauer: [], totalRthFoster: 0, totalRthCauer: 0, relErr: 0 };
+    return { cauer: [], totalRthFoster: 0, totalRthCauer: 0, relErr: 0, hasDegenerateStage: true };
   }
 
   const totalRthFoster = valid.reduce((acc, s) => acc + s.r, 0);
 
-  // Geometric mean time constant normalization keeps polynomial coefficients ~ O(1)
+  // Geometric mean time constant normalization keeps polynomial coefficients balanced around O(1)
   let logSum = 0;
   for (const s of valid) logSum += Math.log(s.tau);
   const tauGeom = Math.exp(logSum / n);
-  const tausNorm = valid.map((s) => s.tau / tauGeom);
-  const rNorms = valid.map((s) => s.r);
+  const tausNorm = valid.map((s) => toFP(s.tau / tauGeom));
+  const rNorms = valid.map((s) => toFP(s.r));
 
   // Build rational impedance Z(u) = P(u) / Q(u), where u = s * tauGeom
-  // Foster stage i: r_i / (1 + tauNorm_i * u)
   // Ascending power coefficients: index k = power of u^k
-  const polyMul = (a: DD[], b: DD[]): DD[] => {
-    const out = Array.from({ length: a.length + b.length - 1 }, () => ddFrom(0));
+  const polyMul = (a: bigint[], b: bigint[]): bigint[] => {
+    const out = new Array<bigint>(a.length + b.length - 1).fill(0n);
     for (let i = 0; i < a.length; i++) {
       for (let j = 0; j < b.length; j++) {
-        out[i + j] = ddAdd(out[i + j], ddMul(a[i], b[j]));
+        out[i + j] += fpMul(a[i], b[j]);
       }
     }
     return out;
   };
-  const polyAdd = (a: DD[], b: DD[]): DD[] => {
+  const polyAdd = (a: bigint[], b: bigint[]): bigint[] => {
     const len = Math.max(a.length, b.length);
-    const out: DD[] = [];
+    const out = new Array<bigint>(len);
     for (let i = 0; i < len; i++) {
-      out.push(ddAdd(a[i] || ddFrom(0), b[i] || ddFrom(0)));
+      out[i] = (a[i] ?? 0n) + (b[i] ?? 0n);
     }
     return out;
   };
 
-  let Q: DD[] = [ddFrom(1)];
+  let Q: bigint[] = [FP_SCALE];
   for (let i = 0; i < n; i++) {
-    Q = polyMul(Q, [ddFrom(1), ddFrom(tausNorm[i])]);
+    Q = polyMul(Q, [FP_SCALE, tausNorm[i]]);
   }
-  let P: DD[] = [ddFrom(0)];
+  let P: bigint[] = [0n];
   for (let i = 0; i < n; i++) {
-    let prod: DD[] = [ddFrom(rNorms[i])];
+    let prod: bigint[] = [rNorms[i]];
     for (let j = 0; j < n; j++) {
       if (i !== j) {
-        prod = polyMul(prod, [ddFrom(1), ddFrom(tausNorm[j])]);
+        prod = polyMul(prod, [FP_SCALE, tausNorm[j]]);
       }
     }
     P = polyAdd(P, prod);
   }
 
   // Continued fraction from infinity (highest powers of u) -> Cauer ladder starting at TJ
-  const trimHigh = (poly: DD[]): DD[] => {
+  const trimHigh = (poly: bigint[]): bigint[] => {
     const out = [...poly];
-    while (out.length > 1 && Math.abs(out[out.length - 1].hi) < 1e-30) out.pop();
+    while (out.length > 1) {
+      const top = out[out.length - 1];
+      const absTop = top < 0n ? -top : top;
+      if (absTop < FP_TRIM_EPS) out.pop();
+      else break;
+    }
     return out;
   };
 
   let num = trimHigh(Q); // Admittance Y(u) = Q(u)/P(u) has degree n over degree n-1
   let den = trimHigh(P);
   const cauer: CauerStage[] = [];
+  let hasDegenerateStage = false;
 
   for (let stage = 0; stage < n; stage++) {
     num = trimHigh(num);
     den = trimHigh(den);
-    if (num.length < 2 || den.length < 1) break;
+    if (num.length < 2 || den.length < 1 || den[den.length - 1] === 0n) {
+      hasDegenerateStage = true;
+      break;
+    }
 
     // Step A: Y(u) = c_k * u + Y_rem(u) -> extract highest u term for C_k
-    const cNorm = ddDiv(num[num.length - 1], den[den.length - 1]);
-    const remNum: DD[] = [];
+    const cNorm = fpDiv(num[num.length - 1], den[den.length - 1]);
+    const remNum: bigint[] = [];
     for (let k = 0; k < num.length - 1; k++) {
-      const subTerm = k - 1 >= 0 ? ddMul(cNorm, den[k - 1]) : ddFrom(0);
-      remNum.push(ddSub(num[k], subTerm));
+      const subTerm = k - 1 >= 0 ? fpMul(cNorm, den[k - 1]) : 0n;
+      remNum.push(num[k] - subTerm);
     }
     const YremNum = trimHigh(remNum);
-    // Now Z_rem(u) = den / YremNum -> both degree n-1-stage -> extract high ratio for R_k!
+    // Now Z_rem(u) = den / YremNum -> extract high ratio for R_k
     const dLen = den.length;
     const yLen = YremNum.length;
-    if (yLen === 0 || Math.abs(YremNum[yLen - 1].hi) < 1e-31) break;
+    if (yLen === 0 || YremNum[yLen - 1] === 0n) {
+      hasDegenerateStage = true;
+      break;
+    }
 
-    const rStage = ddDiv(den[dLen - 1], YremNum[yLen - 1]);
-    const remZ: DD[] = [];
+    const rStage = fpDiv(den[dLen - 1], YremNum[yLen - 1]);
+    const remZ: bigint[] = [];
     const shift = dLen - yLen;
     for (let k = 0; k < dLen; k++) {
-      const subTerm = k - shift >= 0 ? ddMul(rStage, YremNum[k - shift]) : ddFrom(0);
-      remZ.push(ddSub(den[k], subTerm));
+      const subTerm = k - shift >= 0 ? fpMul(rStage, YremNum[k - shift]) : 0n;
+      remZ.push(den[k] - subTerm);
     }
     const nextP = trimHigh(remZ);
 
-    const rVal = Math.max(1e-12, rStage.hi);
-    const cVal = Math.max(1e-15, cNorm.hi * tauGeom);
+    const rawR = fromFP(rStage);
+    const rawC = fromFP(cNorm) * tauGeom;
+    if (!isFinite(rawR) || rawR <= 1e-12 || !isFinite(rawC) || rawC <= 1e-15) {
+      hasDegenerateStage = true;
+    }
+    const rVal = Math.max(1e-12, isFinite(rawR) ? rawR : 1e-12);
+    const cVal = Math.max(1e-15, isFinite(rawC) ? rawC : 1e-15);
     const tauEst = rVal * cVal;
     cauer.push({
       r: rVal,
@@ -566,39 +692,45 @@ export function fosterToCauer(foster: FosterStage[]): {
     den = nextP;
   }
 
+  if (cauer.length < n) {
+    hasDegenerateStage = true;
+  }
+
   const totalRthCauer = cauer.reduce((acc, s) => acc + s.r, 0);
   const relErr = totalRthFoster > 1e-15 ? Math.abs(totalRthCauer - totalRthFoster) / totalRthFoster : 0;
-  return { cauer, totalRthFoster, totalRthCauer, relErr };
+  return { cauer, totalRthFoster, totalRthCauer, relErr, hasDegenerateStage };
 }
 
 /**
- * Generates LTspice standard Cauer `.subckt MOS_THERM TJ TAMB` netlist.
+ * Generates LTspice standard Cauer `.subckt <NAME> <HEAT_NODE> TAMB` netlist.
  * Guarantees:
- * - C1 sits strictly on heat-source node TJ -> 0
+ * - C1 sits strictly on heat-source node (TJ or PAD) -> 0
  * - C2..Cn sit strictly on internal nodes N1..N(n-1) -> 0
- * - Rn connects N(n-1) (or TJ if 1-stage) -> TAMB with ZERO capacitance directly on TAMB
+ * - Rn connects N(n-1) (or HEAT_NODE if 1-stage) -> TAMB with ZERO capacitance directly on TAMB
  * - Defensive .ic initial conditions set all nodes to T_amb
  */
 export function cauerToSpice(
   cauer: CauerStage[],
   tAmbC: number = 25,
-  subcktName: string = 'MOS_THERM'
+  subcktName: string = 'MOS_THERM',
+  heatNodeName: string = 'TJ'
 ): string {
   if (cauer.length === 0) {
     return `* Empty Cauer thermal network`;
   }
+  const hNode = (heatNodeName || 'TJ').trim().toUpperCase();
   const n = cauer.length;
   const totalR = cauer.reduce((a, b) => a + b.r, 0);
   const lines: string[] = [
     `* Waveform Viewer Pro - Cauer Thermal Ladder (.subckt ${subcktName})`,
-    `* Total Steady-State Rth = ${totalR.toFixed(6)} C/W (${n} stages)`,
+    `* Thermal Path: ${hNode} -> TAMB | Total Steady-State Rth = ${totalR.toFixed(6)} C/W (${n} stages)`,
     `* Units: Voltage = Temp (degC), Current = Power (W)`,
-    `.subckt ${subcktName} TJ TAMB params: T_amb=${tAmbC.toFixed(2)}`,
+    `.subckt ${subcktName} ${hNode} TAMB params: T_amb=${tAmbC.toFixed(2)}`,
   ];
 
-  const icNodes: string[] = [`V(TJ)={T_amb}`];
+  const icNodes: string[] = [`V(${hNode})={T_amb}`];
   for (let i = 0; i < n; i++) {
-    const leftNode = i === 0 ? 'TJ' : `N${i}`;
+    const leftNode = i === 0 ? hNode : `N${i}`;
     const rightNode = i === n - 1 ? 'TAMB' : `N${i + 1}`;
     if (i < n - 1) icNodes.push(`V(N${i + 1})={T_amb}`);
     lines.push(`C${i + 1} ${leftNode} 0 ${cauer[i].c.toExponential(6)} ; ${cauer[i].layerLabel}`);
@@ -610,20 +742,22 @@ export function cauerToSpice(
   lines.push(`.ends ${subcktName}`);
   lines.push('');
   lines.push(`* --- Example LTspice Transient Harness (Paste into .asc SPICE Directive) ---`);
-  lines.push(`* X_MOS TJ AMB ${subcktName} T_amb=${tAmbC.toFixed(2)}`);
+  lines.push(`* X_DEV ${hNode} AMB ${subcktName} T_amb=${tAmbC.toFixed(2)}`);
   lines.push(`* V_AMB AMB 0 ${tAmbC.toFixed(2)}`);
-  lines.push(`* I_PWR 0 TJ PULSE(0 10 0 1u 1u 10 20) ; Example 10W step into TJ`);
+  lines.push(`* I_PWR 0 ${hNode} PULSE(0 10 0 1u 1u 10 20) ; Example 10W step into ${hNode}`);
   return lines.join('\n');
 }
 
 /**
- * Structural validator checking Cauer grounding, C1@TJ placement, non-shorted TAMB,
+ * Structural validator checking Cauer grounding, C1@heatNode placement, non-shorted TAMB,
  * sum-R conservation, and defensive .ic presence.
  */
 export function validateCauerSpiceNetlist(
   spiceText: string,
-  expectedTotalR?: number
+  expectedTotalR?: number,
+  heatNodeName: string = 'TJ'
 ): SpiceValidationResult {
+  const hNode = (heatNodeName || 'TJ').trim().toUpperCase();
   const lines = spiceText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('*'));
   const caps: Array<{ name: string; n1: string; n2: string }> = [];
   const ress: Array<{ name: string; n1: string; n2: string; val: number }> = [];
@@ -650,8 +784,8 @@ export function validateCauerSpiceNetlist(
   const allCapsGroundedTo0 = caps.length > 0 && caps.every((c) => c.n2 === '0');
   if (!allCapsGroundedTo0) errors.push('One or more capacitors do not terminate at global node 0.');
 
-  const firstCapAtTJ = caps.length > 0 && caps[0].n1 === 'TJ';
-  if (!firstCapAtTJ) errors.push('First capacitor C1 must attach directly to heat-source node TJ.');
+  const firstCapAtTJ = caps.length > 0 && caps[0].n1 === hNode;
+  if (!firstCapAtTJ) errors.push(`First capacitor C1 must attach directly to heat-source node ${hNode}.`);
 
   const noCapOnTamb = caps.every((c) => c.n1 !== 'TAMB' && c.n2 !== 'TAMB');
   if (!noCapOnTamb) errors.push('Capacitor attached directly to TAMB would be shorted by ideal ambient source.');
@@ -659,7 +793,7 @@ export function validateCauerSpiceNetlist(
   const finalResToTamb = ress.length > 0 && ress[ress.length - 1].n2 === 'TAMB';
   if (!finalResToTamb) errors.push('Final resistor must terminate at TAMB.');
 
-  const internalNodes = new Set<string>(['TJ']);
+  const internalNodes = new Set<string>([hNode]);
   for (const r of ress) {
     if (r.n1 !== 'TAMB') internalNodes.add(r.n1);
     if (r.n2 !== 'TAMB') internalNodes.add(r.n2);
@@ -678,6 +812,7 @@ export function validateCauerSpiceNetlist(
   return {
     valid: errors.length === 0,
     errors,
+    heatNodeName: hNode,
     allCapsGroundedTo0,
     firstCapAtTJ,
     noCapOnTamb,
@@ -688,24 +823,49 @@ export function validateCauerSpiceNetlist(
 }
 
 /**
- * Impedance-domain reduction to N in [2, 6] compact Foster stages, followed by unbiased NNLS refit.
+ * Impedance-domain reduction to N in [1, 8] compact Foster stages, followed by unbiased NNLS refit.
+ * Optional allowWellSeparatedSplit only splits poles when genuine wide logarithmic headroom exists (>= 1.38x spacing)
+ * and never generates degenerate collinear pole pairs.
  */
 function reduceFosterOrder(
   mergedPoles: FosterStage[],
   fitDt: Float64Array,
   fitZth: Float64Array,
-  targetOrder: number
+  targetOrder: number,
+  allowWellSeparatedSplit: boolean = false
 ): FosterStage[] {
-  const N = Math.max(2, Math.min(6, Math.round(targetOrder)));
+  const N = Math.max(1, Math.min(8, Math.round(targetOrder)));
   if (mergedPoles.length === 0) return [];
 
   let reduced: FosterStage[] = [];
   if (mergedPoles.length <= N) {
-    reduced = mergedPoles.map((p) => ({ ...p }));
+    // Re-fit via NNLS on exact poles to ensure unbiased residuals
+    const sorted = [...mergedPoles].sort((a, b) => a.tau - b.tau);
+    const m = fitDt.length;
+    const A: Float64Array[] = new Array(m);
+    for (let i = 0; i < m; i++) {
+      const row = new Float64Array(sorted.length);
+      for (let k = 0; k < sorted.length; k++) row[k] = 1 - Math.exp(-fitDt[i] / sorted[k].tau);
+      A[i] = row;
+    }
+    const rSolved = solveNNLS(A, fitZth);
+    for (let k = 0; k < sorted.length; k++) {
+      if (rSolved[k] > 1e-9) {
+        reduced.push({
+          r: rSolved[k],
+          c: sorted[k].tau / rSolved[k],
+          tau: sorted[k].tau,
+          layerLabel: classifyThermalLayer(sorted[k].tau),
+        });
+      }
+    }
+    if (reduced.length === 0) {
+      reduced = sorted.map((p) => ({ ...p }));
+    }
     reduced.sort((a, b) => a.tau - b.tau);
   } else {
     // Merge closest pairs weighted by reduced-resistance perturbation cost: (r1*r2/(r1+r2)) * |d(ln tau)|
-    let clusters = mergedPoles.map((p) => ({ r: p.r, logTau: Math.log(p.tau) }));
+    const clusters = mergedPoles.map((p) => ({ r: p.r, logTau: Math.log(p.tau) }));
     while (clusters.length > N) {
       let bestIdx = 0;
       let bestCost = Infinity;
@@ -754,54 +914,343 @@ function reduceFosterOrder(
     reduced.sort((a, b) => a.tau - b.tau);
   }
 
-  // Ensure exact targetOrder stages when NNLS drops collinear poles or fewer poles entered
-  let splitGuard = 0;
-  while (reduced.length < N && reduced.length >= 1 && splitGuard < 12) {
-    splitGuard++;
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < reduced.length; i++) {
-      const s = reduced[i];
-      const leftTau = i > 0 ? reduced[i - 1].tau : s.tau / 4;
-      const rightTau = i < reduced.length - 1 ? reduced[i + 1].tau : s.tau * 4;
-      const gapL = s.tau / Math.max(1e-12, leftTau);
-      const gapR = rightTau / Math.max(1e-12, s.tau);
-      const minGap = Math.min(gapL, gapR);
-      const headroom = Math.log(Math.max(1.03, minGap));
-      const score = s.r * (0.25 + headroom);
-      if (score > bestScore) {
-        bestScore = score;
-        bestIdx = i;
+  // Only attempt pole expansion if explicitly allowed, current RMSE is materially above zero,
+  // and inserting + locally refining a >=1.4x separated pole yields >=10% residual RMSE reduction with >=1.2% Rth share.
+  if (allowWellSeparatedSplit && reduced.length < N && reduced.length >= 1) {
+    const m = fitDt.length;
+    const fitZeroSpan = Math.max(1e-9, Math.max(...fitZth) - Math.min(...fitZth));
+    const solveForTaus = (tausIn: number[]): { stages: FosterStage[]; rmse: number } => {
+      const sortedTaus = [...tausIn].sort((a, b) => a - b);
+      const A: Float64Array[] = new Array(m);
+      for (let i = 0; i < m; i++) {
+        const row = new Float64Array(sortedTaus.length);
+        for (let k = 0; k < sortedTaus.length; k++) row[k] = 1 - Math.exp(-fitDt[i] / sortedTaus[k]);
+        A[i] = row;
       }
-    }
+      const rSolved = solveNNLS(A, fitZth);
+      const stages: FosterStage[] = [];
+      for (let k = 0; k < sortedTaus.length; k++) {
+        if (rSolved[k] > 1e-9) {
+          stages.push({
+            r: rSolved[k],
+            c: sortedTaus[k] / rSolved[k],
+            tau: sortedTaus[k],
+            layerLabel: classifyThermalLayer(sortedTaus[k]),
+          });
+        }
+      }
+      let sse = 0;
+      for (let i = 0; i < m; i++) {
+        let z = 0;
+        for (const s of stages) z += s.r * (1 - Math.exp(-fitDt[i] / s.tau));
+        const d = fitZth[i] - z;
+        sse += d * d;
+      }
+      return { stages, rmse: Math.sqrt(sse / Math.max(1, m)) };
+    };
 
-    const target = reduced[bestIdx];
-    const leftBound = bestIdx > 0 ? Math.sqrt(reduced[bestIdx - 1].tau * target.tau) : target.tau / 1.45;
-    const rightBound =
-      bestIdx < reduced.length - 1 ? Math.sqrt(target.tau * reduced[bestIdx + 1].tau) : target.tau * 1.45;
-    let tauA = Math.max(leftBound, target.tau / 1.15);
-    let tauB = Math.min(rightBound, target.tau * 1.15);
-    if (tauB <= tauA * 1.03) {
-      tauA = target.tau / 1.06;
-      tauB = target.tau * 1.06;
-    }
+    const refineTaus = (initTaus: number[], minB: number, maxB: number): { stages: FosterStage[]; rmse: number } => {
+      let curTaus = [...initTaus].sort((a, b) => a - b);
+      let best = solveForTaus(curTaus);
+      const factors = [1.32, 1.14, 1.05];
+      for (const fac of factors) {
+        for (let idx = 0; idx < curTaus.length; idx++) {
+          for (const dir of [fac, 1 / fac]) {
+            const candTau = curTaus[idx] * dir;
+            if (candTau < minB || candTau > maxB) continue;
+            if (idx > 0 && candTau / curTaus[idx - 1] < 1.38) continue;
+            if (idx < curTaus.length - 1 && curTaus[idx + 1] / candTau < 1.38) continue;
+            const trial = [...curTaus];
+            trial[idx] = candTau;
+            const sol = solveForTaus(trial);
+            if (sol.stages.length === curTaus.length && sol.rmse < best.rmse * 0.999) {
+              best = sol;
+              curTaus = sol.stages.map((s) => s.tau);
+            }
+          }
+        }
+      }
+      return best;
+    };
 
-    const rA = target.r * 0.55;
-    const rB = target.r * 0.45;
-    reduced.splice(
-      bestIdx,
-      1,
-      { r: rA, c: tauA / Math.max(1e-15, rA), tau: tauA, layerLabel: classifyThermalLayer(tauA) },
-      { r: rB, c: tauB / Math.max(1e-15, rB), tau: tauB, layerLabel: classifyThermalLayer(tauB) }
-    );
-    reduced.sort((a, b) => a.tau - b.tau);
+    const dt0 = Math.max(1e-6, fitDt[0]);
+    const dtEnd = Math.max(dt0 * 10, fitDt[m - 1]);
+    const tauMinBound = Math.max(1e-5, Math.min(dt0 * 0.5, reduced[0].tau * 0.5));
+    const tauMaxBound = Math.max(tauMinBound * 4, Math.min(2.5 * dtEnd, Math.max(dtEnd, reduced[reduced.length - 1].tau * 2.0)));
+
+    let curRmse = solveForTaus(reduced.map((s) => s.tau)).rmse;
+    let expandGuard = 0;
+
+    while (reduced.length < N && expandGuard < 8) {
+      if (curRmse / fitZeroSpan < 5e-5) break; // Already near exact fit; never invent spurious poles
+      expandGuard++;
+
+      // Compute current residual vector
+      const resVec = new Float64Array(m);
+      for (let i = 0; i < m; i++) {
+        let z = 0;
+        for (const s of reduced) z += s.r * (1 - Math.exp(-fitDt[i] / s.tau));
+        resVec[i] = fitZth[i] - z;
+      }
+
+      // Build separated candidate insertion taus (all geometric midpoints + boundary probes + active-span log grid)
+      const candSet: number[] = [];
+      const addIfSeparated = (tau: number) => {
+        if (!isFinite(tau) || tau < tauMinBound || tau > tauMaxBound) return;
+        if (reduced.every((s) => Math.max(tau / s.tau, s.tau / tau) >= 1.42)) {
+          if (candSet.every((existing) => Math.max(tau / existing, existing / tau) >= 1.15)) {
+            candSet.push(tau);
+          }
+        }
+      };
+
+      for (let i = 0; i < reduced.length - 1; i++) {
+        addIfSeparated(Math.sqrt(reduced[i].tau * reduced[i + 1].tau));
+      }
+      addIfSeparated(Math.max(tauMinBound, reduced[0].tau / 2.8));
+      addIfSeparated(Math.min(tauMaxBound, reduced[reduced.length - 1].tau * 2.8));
+
+      const activeMax = Math.max(tauMinBound * 10, Math.min(tauMaxBound, reduced[reduced.length - 1].tau * 3.0));
+      const gridCount = 16;
+      for (let g = 0; g < gridCount; g++) {
+        const cand = tauMinBound * Math.pow(activeMax / tauMinBound, g / Math.max(1, gridCount - 1));
+        addIfSeparated(cand);
+      }
+      if (candSet.length === 0) break;
+
+      const baseTaus = reduced.map((s) => s.tau);
+      let bestExpand: { stages: FosterStage[]; rmse: number } | null = null;
+      for (const candTau of candSet) {
+        const trial = solveForTaus([...baseTaus, candTau]);
+        if (trial.stages.length > reduced.length) {
+          if (!bestExpand || trial.rmse < bestExpand.rmse) {
+            bestExpand = trial;
+          }
+        }
+      }
+      if (!bestExpand) break;
+
+      // Co-optimize log(tau) positions briefly so split pairs settle onto true underlying poles
+      const refined = refineTaus(
+        bestExpand.stages.map((s) => s.tau),
+        tauMinBound,
+        tauMaxBound
+      );
+      if (refined.stages.length <= reduced.length) break;
+      if (refined.rmse > curRmse * 0.9) break; // Must meaningfully reduce residual RMSE (>= 10%)
+
+      const totR = refined.stages.reduce((a, b) => a + b.r, 0);
+      const minShare = Math.min(...refined.stages.map((s) => s.r / Math.max(1e-12, totR)));
+      if (minShare < 0.012) break; // Reject redundant <1.2% Rth poles
+
+      reduced = refined.stages;
+      curRmse = refined.rmse;
+    }
   }
 
   return reduced;
 }
 
+export function auditThermalPhysics(params: {
+  foster: FosterStage[];
+  cauer: CauerStage[];
+  fosterCauerRelErr: number;
+  hasDegenerateCauer: boolean;
+  requestedOrder: number;
+  zMeasuredEnd: number;
+  tMaxSec: number;
+  rSquared: number;
+  rmseC: number;
+  measuredSpanC: number;
+  mode: ThermalInputMode;
+  refitCount?: number;
+  rejectedReasons?: string[];
+}): ThermalPhysicsAudit {
+  const {
+    foster,
+    cauer,
+    fosterCauerRelErr,
+    hasDegenerateCauer,
+    requestedOrder,
+    zMeasuredEnd,
+    tMaxSec,
+    rSquared,
+    rmseC,
+    measuredSpanC,
+    refitCount = 0,
+    rejectedReasons = [],
+  } = params;
+
+  const checks: ThermalPhysicsCheck[] = [];
+  const totalRFoster = foster.reduce((a, b) => a + b.r, 0);
+  const totalRCauer = cauer.reduce((a, b) => a + b.r, 0);
+
+  // 1. Cauer Conversion Integrity
+  const cauerParityOk =
+    cauer.length > 0 &&
+    cauer.length === foster.length &&
+    !hasDegenerateCauer &&
+    isFinite(fosterCauerRelErr) &&
+    fosterCauerRelErr <= 1e-3;
+  checks.push({
+    key: 'cauer_parity',
+    label: 'Foster→Cauer 拓扑等价性',
+    passed: cauerParityOk,
+    detail: cauerParityOk
+      ? `阶数一致 (${cauer.length} 阶), 误差 ${(fosterCauerRelErr * 100).toExponential(1)}%`
+      : `Cauer 转换出现退化/负值或误差过大 (relErr=${fosterCauerRelErr.toExponential(2)}, stages=${cauer.length}/${foster.length})`,
+  });
+
+  // 2. Physical RC Parameter Bounds
+  let rcBoundsOk = foster.length > 0 && cauer.length > 0;
+  let rcBadReason = '';
+  for (let i = 0; i < cauer.length; i++) {
+    const cs = cauer[i];
+    const fs = foster[i];
+    if (!isFinite(cs.r) || cs.r < 1e-5 || cs.r > 500 || !isFinite(cs.c) || cs.c < 1e-6 || cs.c > 5000) {
+      rcBoundsOk = false;
+      rcBadReason = `Cauer 第${i + 1}阶超出物理范围 (R=${cs.r.toExponential(2)} °C/W, C=${cs.c.toExponential(2)} J/°C)`;
+      break;
+    }
+    if (fs && (!isFinite(fs.r) || fs.r < 1e-5 || fs.r > 500 || !isFinite(fs.c) || fs.c < 1e-6 || fs.c > 5000 || fs.tau <= 0)) {
+      rcBoundsOk = false;
+      rcBadReason = `Foster 第${i + 1}阶超出物理范围 (R=${fs.r.toExponential(2)} °C/W, C=${fs.c.toExponential(2)} J/°C)`;
+      break;
+    }
+  }
+  checks.push({
+    key: 'rc_bounds',
+    label: 'RC 参数物理量级',
+    passed: rcBoundsOk,
+    detail: rcBoundsOk
+      ? `所有 R ∈ [1e-5, 500] °C/W, C ∈ [1e-6, 5000] J/°C`
+      : rcBadReason || '缺少有效 RC 阶数',
+  });
+
+  // 3. Stage Effectiveness (each stage >= 1% Foster Rth & >= 0.5% Cauer Rth)
+  let stageEffOk = foster.length > 0 && totalRFoster > 1e-9;
+  let stageBadReason = '';
+  if (stageEffOk) {
+    for (let i = 0; i < foster.length; i++) {
+      const ratio = foster[i].r / totalRFoster;
+      if (ratio < 0.01) {
+        stageEffOk = false;
+        stageBadReason = `Foster 第${i + 1}阶热阻占比仅 ${(ratio * 100).toFixed(2)}% (<1% 为冗余无效阶)`;
+        break;
+      }
+    }
+    if (stageEffOk) {
+      for (let i = 0; i < cauer.length; i++) {
+        const ratio = cauer[i].r / Math.max(1e-9, totalRCauer);
+        if (ratio < 0.004) {
+          stageEffOk = false;
+          stageBadReason = `Cauer 第${i + 1}阶热阻占比仅 ${(ratio * 100).toFixed(2)}% (梯形网络塌缩)`;
+          break;
+        }
+      }
+    }
+  } else {
+    stageBadReason = '无有效热阻阶';
+  }
+  checks.push({
+    key: 'stage_effectiveness',
+    label: '各阶热阻有效性',
+    passed: stageEffOk,
+    detail: stageEffOk ? `全部 ${cauer.length} 阶均贡献显著热阻份额` : stageBadReason,
+  });
+
+  // 4. Time Constant Separation (distinct poles, >= 1.35x ratio)
+  let tauSepOk = true;
+  let tauBadReason = '';
+  for (let i = 1; i < foster.length; i++) {
+    const ratio = foster[i].tau / Math.max(1e-15, foster[i - 1].tau);
+    if (ratio < 1.35) {
+      tauSepOk = false;
+      tauBadReason = `τ${i}=${foster[i - 1].tau.toExponential(2)}s 与 τ${i + 1}=${foster[i].tau.toExponential(2)}s 比值仅 ${ratio.toFixed(2)}× (<1.35× 极点重合)`;
+      break;
+    }
+  }
+  checks.push({
+    key: 'tau_separation',
+    label: '时间常数可辨识性',
+    passed: tauSepOk,
+    detail: tauSepOk ? `极点时间常数间隔清晰` : tauBadReason,
+  });
+
+  // 5. Total Rth Credibility (bounds + non-excessive steady-state extrapolation)
+  const extrapolationRatio = zMeasuredEnd > 1e-9 ? totalRFoster / zMeasuredEnd : Infinity;
+  const tailOverDominated =
+    foster.length > 0 &&
+    foster[foster.length - 1].tau > 1.8 * Math.max(1e-9, tMaxSec) &&
+    foster[foster.length - 1].r / Math.max(1e-9, totalRFoster) > 0.65 &&
+    extrapolationRatio > 1.7;
+  const rthCredible =
+    isFinite(totalRFoster) &&
+    totalRFoster >= 1e-3 &&
+    totalRFoster <= 400 &&
+    isFinite(extrapolationRatio) &&
+    extrapolationRatio <= 2.35 &&
+    !tailOverDominated;
+  checks.push({
+    key: 'rth_credibility',
+    label: '总热阻 Rth 可信度',
+    passed: rthCredible,
+    detail: rthCredible
+      ? `实测末值 Z_end=${zMeasuredEnd.toFixed(3)} °C/W, 外推倍率 ${extrapolationRatio.toFixed(2)}×`
+      : `总热阻 ${totalRFoster.toFixed(3)} °C/W 相对实测末值 Z_end=${zMeasuredEnd.toFixed(3)} °C/W 外推过大 (${isFinite(extrapolationRatio) ? extrapolationRatio.toFixed(2) + '×' : '∞'})`,
+  });
+
+  // 6. Fit Quality & Thermal Polarity
+  const absSpan = Math.max(0, measuredSpanC);
+  const fitQualityOk =
+    measuredSpanC > 0.05 &&
+    isFinite(rSquared) &&
+    rSquared >= 0.85 &&
+    (absSpan < 1.0 || rmseC <= 0.18 * absSpan);
+  checks.push({
+    key: 'fit_quality',
+    label: '热响应方向与拟合优度',
+    passed: fitQualityOk,
+    detail: fitQualityOk
+      ? `ΔT=${measuredSpanC.toFixed(2)} °C, R²=${rSquared.toFixed(4)}, RMSE=${rmseC.toFixed(3)} °C`
+      : measuredSpanC <= 0.05
+      ? `有效温升/温降幅度不足或方向相反 (ΔT=${measuredSpanC.toFixed(3)} °C，请检查 Heating/Cooling 模式与电源功率)`
+      : `拟合优度不足 (R²=${rSquared.toFixed(4)}, RMSE=${rmseC.toFixed(3)} °C)`,
+  });
+
+  const passed = checks.every((c) => c.passed);
+  const effectiveOrder = cauer.length;
+  const orderReduced = passed && effectiveOrder < requestedOrder;
+  const status: ThermalFitStatus = !passed ? 'failed' : orderReduced ? 'reduced' : 'valid';
+
+  let summary = '';
+  if (status === 'valid') {
+    summary = `${effectiveOrder} 阶模型通过全部物理检查 (外推 ${extrapolationRatio.toFixed(2)}×, R²=${rSquared.toFixed(4)})`;
+  } else if (status === 'reduced') {
+    summary = `原 ${requestedOrder} 阶存在无效/极端参数，已自动重拟合并降阶至 ${effectiveOrder} 阶有效模型 (${rejectedReasons[0] || '自动降阶'})`;
+  } else {
+    const failedLabels = checks.filter((c) => !c.passed).map((c) => `${c.label}: ${c.detail}`);
+    summary = `拟合判定失败: ${failedLabels.join('；')}`;
+  }
+
+  return {
+    status,
+    passed,
+    requestedOrder,
+    effectiveOrder,
+    orderReduced,
+    refitCount,
+    extrapolationRatio,
+    measuredSpanC,
+    zMeasuredEnd,
+    checks,
+    rejectedReasons,
+    summary,
+  };
+}
+
 /**
- * Main Phase 1 Entry Point: Two-Stage Debiased LASSO Deconvolution + Reduction + Cauer Synthesis.
+ * Main Phase 1 Entry Point: Two-Stage Debiased LASSO Deconvolution + Physics-Audited Refit / Reduction + Cauer Synthesis.
  */
 export function deconvolveThermalImpedance(
   rawTime: Float64Array,
@@ -810,6 +1259,11 @@ export function deconvolveThermalImpedance(
 ): ThermalDeconvResult {
   const warnings: string[] = [];
   const powerW = isFinite(options.powerW) && options.powerW > 1e-9 ? options.powerW : 1.0;
+  const thermalPathMode: ThermalPathMode = options.thermalPathMode === 'pad_ambient' ? 'pad_ambient' : 'junction_ambient';
+  const padSpreadRthCPerW =
+    thermalPathMode === 'pad_ambient' && options.padSpreadRthCPerW !== undefined && isFinite(options.padSpreadRthCPerW)
+      ? Math.max(0, options.padSpreadRthCPerW)
+      : 0;
 
   // 1. Slice window & sanitize finite points
   const slicedT: number[] = [];
@@ -838,11 +1292,9 @@ export function deconvolveThermalImpedance(
       : { t0: tSlice[0], onsetIdx: 0, tBase: ySlice[0] };
 
   const t0Sec = onset.t0;
-  const tBaseC = options.tAmbOverride !== undefined && isFinite(options.tAmbOverride)
-    ? options.tAmbOverride
-    : onset.tBase;
+  const tPreStepC = onset.tBase;
 
-  // 3. Extract post-t0 response and handle Cooling sqrt(t) Tj(0) extrapolation
+  // 3. Extract post-t0 response and handle Cooling sqrt(t) Tj(0) extrapolation & true T_amb
   const tBlank = options.mode === 'cooling' ? Math.max(0, options.tBlankSec || 0) : 0;
   const postDtAll: number[] = [];
   const postTempAll: number[] = [];
@@ -856,6 +1308,24 @@ export function deconvolveThermalImpedance(
   if (postDtAll.length < 5) {
     throw new Error('Insufficient post-step samples after t0/t_blank for thermal deconvolution.');
   }
+
+  const coolTailCount = Math.max(3, Math.floor(postTempAll.length * 0.08));
+  const coolTailVals = postTempAll.slice(Math.max(0, postTempAll.length - coolTailCount));
+  const tTailMedC = median(coolTailVals);
+
+  const tBaseC =
+    options.mode === 'heating'
+      ? options.tAmbOverride !== undefined && isFinite(options.tAmbOverride)
+        ? options.tAmbOverride
+        : tPreStepC
+      : tPreStepC;
+
+  const tAmbC =
+    options.tAmbOverride !== undefined && isFinite(options.tAmbOverride)
+      ? options.tAmbOverride
+      : options.mode === 'heating'
+      ? tBaseC
+      : tTailMedC;
 
   // Estimate cooling initial junction temperature Tj(0) by comparing early JEDEC sqrt(t) vs linear-t cooling regression
   let tJ0C = ySlice[onset.onsetIdx];
@@ -890,25 +1360,39 @@ export function deconvolveThermalImpedance(
     const regSqrt = fitReg(true);
     const regLin = fitReg(false);
     const chosen = regLin.sse < regSqrt.sse ? regLin.intercept : regSqrt.intercept;
-    if (isFinite(chosen) && chosen >= Math.max(postTempAll[0], tBaseC) - 2) {
+    const maxAllowedTj0 = postTempAll[0] + Math.max(15, 0.6 * Math.max(0, postTempAll[0] - tAmbC));
+    if (onset.onsetIdx > 0 && tPreStepC >= postTempAll[0]) {
+      tJ0C = tPreStepC;
+    } else if (isFinite(chosen) && chosen >= postTempAll[0] && chosen <= maxAllowedTj0) {
       tJ0C = chosen;
+    } else {
+      tJ0C = Math.max(tPreStepC, postTempAll[0]);
     }
     if (tJ0C <= postTempAll[postTempAll.length - 1]) {
-      tJ0C = Math.max(...postTempAll);
+      tJ0C = Math.max(postTempAll[0], tPreStepC);
     }
   }
 
+  const measuredSpanC = options.mode === 'heating' ? tTailMedC - tBaseC : tJ0C - tTailMedC;
   const rawZthAll = postTempAll.map((tempVal) =>
     options.mode === 'heating' ? Math.max(0, (tempVal - tBaseC) / powerW) : Math.max(0, (tJ0C - tempVal) / powerW)
   );
 
-  // Median dt guard for tau_min / tau_max
+  // Sampling step guards: use early-time step resolution for tau_min (supports log-spaced & adaptive captures)
   const stepDiffs: number[] = [];
   for (let i = 1; i < postDtAll.length; i++) {
     const d = postDtAll[i] - postDtAll[i - 1];
     if (d > 1e-15) stepDiffs.push(d);
   }
   const dtMedSec = stepDiffs.length > 0 ? median(stepDiffs) : postDtAll[0];
+  let dtEarlySec = dtMedSec;
+  if (stepDiffs.length >= 10) {
+    const sortedDiffs = [...stepDiffs].sort((a, b) => a - b);
+    const p5Step = sortedDiffs[Math.floor(sortedDiffs.length * 0.05)];
+    dtEarlySec = Math.min(dtMedSec, Math.max(postDtAll[0], p5Step));
+  } else if (postDtAll[0] > 0) {
+    dtEarlySec = Math.min(dtMedSec, postDtAll[0]);
+  }
   const tMax = postDtAll[postDtAll.length - 1];
 
   // 4. Logarithmic binning for >=300 dense captures (skip empty bins), raw timestamps for <300 sparse captures
@@ -956,262 +1440,439 @@ export function deconvolveThermalImpedance(
   }
 
   // 5. Dynamic tau_min / tau_max guard & non-steady-state warning
-  const tauMinSec = Math.max(1e-4, 0.5 * dtMedSec);
-  const tauMaxSec = Math.max(tauMinSec * 5, 3.0 * tMax);
-  if (fitDt.length >= 8) {
-    const tailLen = Math.max(3, Math.floor(fitZth.length * 0.12));
-    const tailStartZ = fitZth[fitZth.length - tailLen];
-    const tailEndZ = fitZth[fitZth.length - 1];
+  const tauMinSec = Math.max(1e-4, 0.5 * dtEarlySec);
+  const tauMaxDefaultSec = Math.max(tauMinSec * 5, 3.0 * tMax);
+  const M = fitDt.length;
+  const tailZCount = Math.max(2, Math.floor(M * 0.08));
+  const zMeasuredEnd = Math.max(0, median(Array.from(fitZth.slice(Math.max(0, M - tailZCount)))));
+
+  if (M >= 8) {
+    const tailLen = Math.max(3, Math.floor(M * 0.12));
+    const tailStartZ = fitZth[M - tailLen];
+    const tailEndZ = fitZth[M - 1];
     const spanZ = Math.max(1e-9, tailEndZ - fitZth[0]);
     if (Math.abs(tailEndZ - tailStartZ) / spanZ > 0.05) {
       warnings.push(
-        `Curve has not reached full thermal steady state at end (${((Math.abs(tailEndZ - tailStartZ) / spanZ) * 100).toFixed(1)}% tail drift); τ_max capped at 3·t_max = ${tauMaxSec.toFixed(2)} s.`
+        `Curve has not reached full thermal steady state at end (${((Math.abs(tailEndZ - tailStartZ) / spanZ) * 100).toFixed(1)}% tail drift); τ_max initially capped at 3·t_max = ${tauMaxDefaultSec.toFixed(2)} s.`
       );
     }
   }
-  if (dtMedSec >= 0.2) {
+  if (dtEarlySec >= 0.2) {
     warnings.push(
-      `Coarse sampling step Δt_med ≈ ${dtMedSec.toFixed(3)} s: fast poles clamped to τ_min = ${tauMinSec.toFixed(3)} s (fast die transients below sampling resolution are absorbed).`
+      `Coarse sampling step Δt_early ≈ ${dtEarlySec.toFixed(3)} s: fast poles clamped to τ_min = ${tauMinSec.toFixed(3)} s (fast die transients below sampling resolution are absorbed).`
     );
   }
 
-  // 6. Build tau dictionary (18 points/decade) & column-norm balanced matrix
-  const decades = Math.max(0.8, Math.log10(tauMaxSec / tauMinSec));
-  const P = Math.max(24, Math.min(120, Math.round(decades * 18)));
-  const tauGrid = new Float64Array(P);
-  const ANormCols: Float64Array[] = new Array(P);
-  const colNorms = new Float64Array(P);
-  const M = fitDt.length;
-
-  for (let j = 0; j < P; j++) {
-    const tau = tauMinSec * Math.pow(tauMaxSec / tauMinSec, j / Math.max(1, P - 1));
-    tauGrid[j] = tau;
-    const col = new Float64Array(M);
-    let sq = 0;
-    for (let i = 0; i < M; i++) {
-      const val = 1 - Math.exp(-fitDt[i] / tau);
-      col[i] = val;
-      sq += val * val;
-    }
-    const norm = Math.sqrt(sq);
-    colNorms[j] = norm;
-    if (norm > 1e-15) {
-      for (let i = 0; i < M; i++) col[i] /= norm;
-    }
-    ANormCols[j] = col;
-  }
-
-  // Maximum lambda where any feature enters
-  let lambdaMax = 0;
-  for (let j = 0; j < P; j++) {
-    let dot = 0;
-    const col = ANormCols[j];
-    for (let i = 0; i < M; i++) dot += col[i] * fitZth[i];
-    if (dot > lambdaMax) lambdaMax = dot;
-  }
-  lambdaMax = Math.max(lambdaMax, 1e-9);
-
-  // Automatic lambda selection via pathwise warm-started LASSO + Stage-2 Debiased L-curve
-  const requestedOrder = options.targetOrder !== undefined ? Math.max(2, Math.min(6, Math.round(options.targetOrder))) : 3;
-  let selectedLambda = options.lambdaOverride ?? 0;
-  let lassoWeights: Float64Array = new Float64Array(P);
-
-  const extractMergedTaus = (weights: Float64Array): number[] => {
-    const totalW = weights.reduce((a, b) => a + b, 0);
-    const floorW = Math.max(1e-9, totalW * 1e-3);
-    const taus: number[] = [];
-    let wSum = 0;
-    let logSum = 0;
-    let active = false;
-    for (let j = 0; j < P; j++) {
-      if (weights[j] > floorW) {
-        wSum += weights[j];
-        logSum += weights[j] * Math.log(tauGrid[j]);
-        active = true;
-      } else if (active) {
-        if (wSum > 0) taus.push(Math.exp(logSum / wSum));
-        wSum = 0;
-        logSum = 0;
-        active = false;
-      }
-    }
-    if (active && wSum > 0) taus.push(Math.exp(logSum / wSum));
-    return taus;
-  };
-
-  const evalDebiasedCandidate = (weights: Float64Array): { rmse: number; k: number } => {
-    const taus = extractMergedTaus(weights);
-    if (taus.length === 0) return { rmse: Infinity, k: 0 };
-    if (taus.length > 24) {
-      // Fallback RMSE directly if too many clusters
-      let sse = 0;
-      for (let i = 0; i < M; i++) {
-        let pred = 0;
-        for (let j = 0; j < P; j++) if (weights[j] > 0) pred += weights[j] * (1 - Math.exp(-fitDt[i] / tauGrid[j]));
-        const d = fitZth[i] - pred;
-        sse += d * d;
-      }
-      return { rmse: Math.sqrt(sse / M), k: taus.length };
-    }
-    const ACand: Float64Array[] = new Array(M);
-    for (let i = 0; i < M; i++) {
-      const row = new Float64Array(taus.length);
-      for (let k = 0; k < taus.length; k++) row[k] = 1 - Math.exp(-fitDt[i] / taus[k]);
-      ACand[i] = row;
-    }
-    const rDeb = solveNNLS(ACand, fitZth);
-    let sse = 0;
-    let activeK = 0;
-    for (let k = 0; k < taus.length; k++) if (rDeb[k] > 1e-8) activeK++;
-    for (let i = 0; i < M; i++) {
-      let pred = 0;
-      for (let k = 0; k < taus.length; k++) pred += rDeb[k] * ACand[i][k];
-      const d = fitZth[i] - pred;
-      sse += d * d;
-    }
-    return { rmse: Math.sqrt(sse / M), k: activeK };
-  };
-
-  if (options.lambdaOverride !== undefined && options.lambdaOverride >= 0) {
-    lassoWeights = solveNonNegLassoCD(ANormCols, colNorms, fitZth, selectedLambda, 2500).weights;
-  } else {
-    const numLambdas = 20;
-    const candLambdas: number[] = [];
-    const candRmses: number[] = [];
-    const candK: number[] = [];
-    const candWeights: Float64Array[] = [];
-    let warmW: Float64Array | undefined = undefined;
-
-    // Sweep pathwise from largest lambda -> smallest lambda with warm starts
-    for (let li = 0; li < numLambdas; li++) {
-      const exp = -0.5 - (li / (numLambdas - 1)) * 5.0; // 10^-0.5 down to 10^-5.5
-      const lam = lambdaMax * Math.pow(10, exp);
-      const sol = solveNonNegLassoCD(ANormCols, colNorms, fitZth, lam, 2500, warmW);
-      warmW = sol.normW;
-      const deb = evalDebiasedCandidate(sol.weights);
-      candLambdas.push(lam);
-      candRmses.push(deb.rmse);
-      candK.push(deb.k);
-      candWeights.push(sol.weights);
-    }
-
-    const zSpan = Math.max(1e-9, Math.max(...fitZth) - Math.min(...fitZth));
-    const hasEnoughOrderCandidates = candK.some((k, li) => k >= requestedOrder && isFinite(candRmses[li]));
-    let bestScore = Infinity;
-    let bestIdx = 0;
-    for (let li = 0; li < numLambdas; li++) {
-      if (candK[li] === 0 || !isFinite(candRmses[li])) continue;
-      if (hasEnoughOrderCandidates && candK[li] < requestedOrder) continue;
-      const relErr = Math.max(candRmses[li] / zSpan, 5e-4);
-      const score = hasEnoughOrderCandidates
-        ? Math.log(relErr * relErr) + 0.08 * (candK[li] - requestedOrder)
-        : Math.log(relErr * relErr) + 0.32 * candK[li];
-      if (score < bestScore) {
-        bestScore = score;
-        bestIdx = li;
-      }
-    }
-    selectedLambda = candLambdas[bestIdx];
-    lassoWeights = candWeights[bestIdx];
-  }
-
-  // 7. Cluster adjacent non-zero weights -> energy-weighted log-tau centroid merge
-  const sparseSpectrum: ThermalSpectrumBin[] = [];
-  const totalL1R = lassoWeights.reduce((a, b) => a + b, 0);
-  const rNoiseFloor = Math.max(1e-9, totalL1R * 1e-3);
-
-  interface RawCluster {
-    indices: number[];
-  }
-  const rawClusters: RawCluster[] = [];
-  let cur: RawCluster | null = null;
-  for (let j = 0; j < P; j++) {
-    if (lassoWeights[j] > rNoiseFloor) {
-      sparseSpectrum.push({ tau: tauGrid[j], r: lassoWeights[j] });
-      if (!cur) {
-        cur = { indices: [j] };
-        rawClusters.push(cur);
-      } else {
-        cur.indices.push(j);
-      }
-    } else {
-      cur = null;
-    }
-  }
-
-  let mergedTaus: number[] = [];
-  for (const cl of rawClusters) {
-    let wSum = 0;
-    let logSum = 0;
-    for (const idx of cl.indices) {
-      wSum += lassoWeights[idx];
-      logSum += lassoWeights[idx] * Math.log(tauGrid[idx]);
-    }
-    if (wSum > 0) mergedTaus.push(Math.exp(logSum / wSum));
-  }
-  if (mergedTaus.length === 0) {
-    mergedTaus = [Math.sqrt(tauMinSec * tauMaxSec)];
-  }
-
-  // 8. Stage 2 Debiased Pure NNLS Refit on centroid-merged poles (zero L1 shrinkage!)
-  const AStar: Float64Array[] = new Array(M);
-  for (let i = 0; i < M; i++) {
-    const row = new Float64Array(mergedTaus.length);
-    for (let k = 0; k < mergedTaus.length; k++) {
-      row[k] = 1 - Math.exp(-fitDt[i] / mergedTaus[k]);
-    }
-    AStar[i] = row;
-  }
-  const rDebiased = solveNNLS(AStar, fitZth);
-
-  const mergedPoles: FosterStage[] = [];
-  for (let k = 0; k < mergedTaus.length; k++) {
-    if (rDebiased[k] > 1e-8) {
-      const r = rDebiased[k];
-      const tau = mergedTaus[k];
-      mergedPoles.push({
-        r,
-        c: tau / r,
-        tau,
-        layerLabel: classifyThermalLayer(tau),
-      });
-    }
-  }
-  mergedPoles.sort((a, b) => a.tau - b.tau);
-
-  // 9. Reduce to target order N in [2, 6] & Convert Foster -> Cauer
-  const targetOrder = options.targetOrder !== undefined ? Math.max(2, Math.min(6, options.targetOrder)) : 3;
-  const reducedFoster = reduceFosterOrder(mergedPoles, fitDt, fitZth, targetOrder);
-  const cauerConv = fosterToCauer(reducedFoster);
-
-  // Evaluate model fit metrics on fitDt using reducedFoster
-  const fitZthPredicted = new Float64Array(M);
-  const fitTempPredicted = new Float64Array(M);
-  const residualTemp = new Float64Array(M);
-
-  let ssRes = 0;
-  let ssTot = 0;
   let meanMeasT = 0;
   for (let i = 0; i < M; i++) meanMeasT += fitTempMeasured[i];
   meanMeasT /= M;
-
+  let ssTot = 0;
   for (let i = 0; i < M; i++) {
-    let zPred = 0;
-    for (const s of reducedFoster) {
-      zPred += s.r * (1 - Math.exp(-fitDt[i] / s.tau));
-    }
-    fitZthPredicted[i] = zPred;
-    const tPred = options.mode === 'heating' ? tBaseC + powerW * zPred : tJ0C - powerW * zPred;
-    fitTempPredicted[i] = tPred;
-    const err = fitTempMeasured[i] - tPred;
-    residualTemp[i] = err;
-    ssRes += err * err;
     const dtMean = fitTempMeasured[i] - meanMeasT;
     ssTot += dtMean * dtMean;
   }
 
-  const rmseC = Math.sqrt(ssRes / M);
-  const rSquared = ssTot > 1e-12 ? Math.max(0, 1 - ssRes / ssTot) : 1.0;
+  const requestedOrder = options.targetOrder !== undefined ? Math.max(1, Math.min(8, Math.round(options.targetOrder))) : 3;
+
+  interface CandidateSolveResult {
+    tauMaxUsed: number;
+    selectedLambda: number;
+    sparseSpectrum: ThermalSpectrumBin[];
+    mergedPoles: FosterStage[];
+    reducedFoster: FosterStage[];
+    reducedCauer: CauerStage[];
+    cauerConv: ReturnType<typeof fosterToCauer>;
+    fitZthPredicted: Float64Array;
+    fitTempPredicted: Float64Array;
+    residualTemp: Float64Array;
+    rSquared: number;
+    rmseC: number;
+    audit: ThermalPhysicsAudit;
+  }
+
+  // Helper that solves LASSO spectrum once for a given tauMaxCapSec & lambda preference, then caches dictionary
+  const solveDictionary = (tauMaxCapSec: number, orderHint: number) => {
+    const effectiveTauMax = Math.max(tauMinSec * 3.5, tauMaxCapSec);
+    const decades = Math.max(0.8, Math.log10(effectiveTauMax / tauMinSec));
+    const P = Math.max(24, Math.min(120, Math.round(decades * 18)));
+    const tauGrid = new Float64Array(P);
+    const ANormCols: Float64Array[] = new Array(P);
+    const colNorms = new Float64Array(P);
+
+    for (let j = 0; j < P; j++) {
+      const tau = tauMinSec * Math.pow(effectiveTauMax / tauMinSec, j / Math.max(1, P - 1));
+      tauGrid[j] = tau;
+      const col = new Float64Array(M);
+      let sq = 0;
+      for (let i = 0; i < M; i++) {
+        const val = 1 - Math.exp(-fitDt[i] / tau);
+        col[i] = val;
+        sq += val * val;
+      }
+      const norm = Math.sqrt(sq);
+      colNorms[j] = norm;
+      if (norm > 1e-15) {
+        for (let i = 0; i < M; i++) col[i] /= norm;
+      }
+      ANormCols[j] = col;
+    }
+
+    let lambdaMax = 0;
+    for (let j = 0; j < P; j++) {
+      let dot = 0;
+      const col = ANormCols[j];
+      for (let i = 0; i < M; i++) dot += col[i] * fitZth[i];
+      if (dot > lambdaMax) lambdaMax = dot;
+    }
+    lambdaMax = Math.max(lambdaMax, 1e-9);
+
+    const extractMergedTaus = (weights: Float64Array): number[] => {
+      const totalW = weights.reduce((a, b) => a + b, 0);
+      const floorW = Math.max(1e-9, totalW * 1e-3);
+      const taus: number[] = [];
+      let wSum = 0;
+      let logSum = 0;
+      let active = false;
+      for (let j = 0; j < P; j++) {
+        if (weights[j] > floorW) {
+          wSum += weights[j];
+          logSum += weights[j] * Math.log(tauGrid[j]);
+          active = true;
+        } else if (active) {
+          if (wSum > 0) taus.push(Math.exp(logSum / wSum));
+          wSum = 0;
+          logSum = 0;
+          active = false;
+        }
+      }
+      if (active && wSum > 0) taus.push(Math.exp(logSum / wSum));
+      return taus;
+    };
+
+    const evalDebiasedCandidate = (weights: Float64Array): { rmse: number; k: number } => {
+      const taus = extractMergedTaus(weights);
+      if (taus.length === 0) return { rmse: Infinity, k: 0 };
+      if (taus.length > 24) {
+        let sse = 0;
+        for (let i = 0; i < M; i++) {
+          let pred = 0;
+          for (let j = 0; j < P; j++) if (weights[j] > 0) pred += weights[j] * (1 - Math.exp(-fitDt[i] / tauGrid[j]));
+          const d = fitZth[i] - pred;
+          sse += d * d;
+        }
+        return { rmse: Math.sqrt(sse / M), k: taus.length };
+      }
+      const ACand: Float64Array[] = new Array(M);
+      for (let i = 0; i < M; i++) {
+        const row = new Float64Array(taus.length);
+        for (let k = 0; k < taus.length; k++) row[k] = 1 - Math.exp(-fitDt[i] / taus[k]);
+        ACand[i] = row;
+      }
+      const rDeb = solveNNLS(ACand, fitZth);
+      let sse = 0;
+      let activeK = 0;
+      for (let k = 0; k < taus.length; k++) if (rDeb[k] > 1e-8) activeK++;
+      for (let i = 0; i < M; i++) {
+        let pred = 0;
+        for (let k = 0; k < taus.length; k++) pred += rDeb[k] * ACand[i][k];
+        const d = fitZth[i] - pred;
+        sse += d * d;
+      }
+      return { rmse: Math.sqrt(sse / M), k: activeK };
+    };
+
+    let selectedLambda = options.lambdaOverride ?? 0;
+    let lassoWeights: Float64Array;
+    if (options.lambdaOverride !== undefined && options.lambdaOverride >= 0) {
+      lassoWeights = solveNonNegLassoCD(ANormCols, colNorms, fitZth, selectedLambda, 2500).weights;
+    } else {
+      const numLambdas = 20;
+      const candLambdas: number[] = [];
+      const candRmses: number[] = [];
+      const candK: number[] = [];
+      const candWeights: Float64Array[] = [];
+      let warmW: Float64Array | undefined = undefined;
+
+      for (let li = 0; li < numLambdas; li++) {
+        const exp = -0.5 - (li / (numLambdas - 1)) * 5.0;
+        const lam = lambdaMax * Math.pow(10, exp);
+        const sol = solveNonNegLassoCD(ANormCols, colNorms, fitZth, lam, 2500, warmW);
+        warmW = sol.normW;
+        const deb = evalDebiasedCandidate(sol.weights);
+        candLambdas.push(lam);
+        candRmses.push(deb.rmse);
+        candK.push(deb.k);
+        candWeights.push(sol.weights);
+      }
+
+      const zSpan = Math.max(1e-9, Math.max(...fitZth) - Math.min(...fitZth));
+      const hasEnoughOrderCandidates = candK.some((k, li) => k >= orderHint && isFinite(candRmses[li]));
+      let bestScore = Infinity;
+      let bestIdx = 0;
+      for (let li = 0; li < numLambdas; li++) {
+        if (candK[li] === 0 || !isFinite(candRmses[li])) continue;
+        if (hasEnoughOrderCandidates && candK[li] < orderHint) continue;
+        const relErr = Math.max(candRmses[li] / zSpan, 5e-4);
+        const score = hasEnoughOrderCandidates
+          ? Math.log(relErr * relErr) + 0.08 * (candK[li] - orderHint)
+          : Math.log(relErr * relErr) + 0.32 * candK[li];
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = li;
+        }
+      }
+      selectedLambda = candLambdas[bestIdx];
+      lassoWeights = candWeights[bestIdx];
+    }
+
+    const sparseSpectrum: ThermalSpectrumBin[] = [];
+    const totalL1R = lassoWeights.reduce((a, b) => a + b, 0);
+    const rNoiseFloor = Math.max(1e-9, totalL1R * 1e-3);
+    const rawClusters: Array<{ indices: number[] }> = [];
+    let cur: { indices: number[] } | null = null;
+    for (let j = 0; j < P; j++) {
+      if (lassoWeights[j] > rNoiseFloor) {
+        sparseSpectrum.push({ tau: tauGrid[j], r: lassoWeights[j] });
+        if (!cur) {
+          cur = { indices: [j] };
+          rawClusters.push(cur);
+        } else {
+          cur.indices.push(j);
+        }
+      } else {
+        cur = null;
+      }
+    }
+
+    let mergedTaus: number[] = [];
+    for (const cl of rawClusters) {
+      let wSum = 0;
+      let logSum = 0;
+      for (const idx of cl.indices) {
+        wSum += lassoWeights[idx];
+        logSum += lassoWeights[idx] * Math.log(tauGrid[idx]);
+      }
+      if (wSum > 0) mergedTaus.push(Math.exp(logSum / wSum));
+    }
+    if (mergedTaus.length === 0) {
+      mergedTaus = [Math.sqrt(tauMinSec * effectiveTauMax)];
+    }
+
+    const AStar: Float64Array[] = new Array(M);
+    for (let i = 0; i < M; i++) {
+      const row = new Float64Array(mergedTaus.length);
+      for (let k = 0; k < mergedTaus.length; k++) row[k] = 1 - Math.exp(-fitDt[i] / mergedTaus[k]);
+      AStar[i] = row;
+    }
+    const rDebiased = solveNNLS(AStar, fitZth);
+    const mergedPoles: FosterStage[] = [];
+    for (let k = 0; k < mergedTaus.length; k++) {
+      if (rDebiased[k] > 1e-8) {
+        const r = rDebiased[k];
+        const tau = mergedTaus[k];
+        mergedPoles.push({
+          r,
+          c: tau / r,
+          tau,
+          layerLabel: classifyThermalLayer(tau, thermalPathMode),
+        });
+      }
+    }
+    mergedPoles.sort((a, b) => a.tau - b.tau);
+
+    return {
+      tauMaxUsed: effectiveTauMax,
+      selectedLambda,
+      sparseSpectrum,
+      mergedPoles,
+    };
+  };
+
+  const evaluateCandidate = (
+    dict: ReturnType<typeof solveDictionary>,
+    orderToTry: number,
+    allowSplit: boolean,
+    refitCount: number,
+    rejectedReasons: string[]
+  ): CandidateSolveResult => {
+    const reducedFoster = reduceFosterOrder(dict.mergedPoles, fitDt, fitZth, orderToTry, allowSplit).map((s) => ({
+      ...s,
+      layerLabel: classifyThermalLayer(s.tau, thermalPathMode),
+    }));
+    const cauerConv = fosterToCauer(reducedFoster);
+    const reducedCauer = cauerConv.cauer.map((s) => ({
+      ...s,
+      layerLabel: classifyThermalLayer(s.tauEst, thermalPathMode),
+    }));
+
+    const fitZthPredicted = new Float64Array(M);
+    const fitTempPredicted = new Float64Array(M);
+    const residualTemp = new Float64Array(M);
+    let ssRes = 0;
+    for (let i = 0; i < M; i++) {
+      let zPred = 0;
+      for (const s of reducedFoster) {
+        zPred += s.r * (1 - Math.exp(-fitDt[i] / s.tau));
+      }
+      fitZthPredicted[i] = zPred;
+      const tPred = options.mode === 'heating' ? tBaseC + powerW * zPred : tJ0C - powerW * zPred;
+      fitTempPredicted[i] = tPred;
+      const err = fitTempMeasured[i] - tPred;
+      residualTemp[i] = err;
+      ssRes += err * err;
+    }
+    const rmseC = Math.sqrt(ssRes / M);
+    const rSquared = ssTot > 1e-12 ? Math.max(0, 1 - ssRes / ssTot) : 1.0;
+
+    const audit = auditThermalPhysics({
+      foster: reducedFoster,
+      cauer: reducedCauer,
+      fosterCauerRelErr: cauerConv.relErr,
+      hasDegenerateCauer: cauerConv.hasDegenerateStage,
+      requestedOrder,
+      zMeasuredEnd,
+      tMaxSec: tMax,
+      rSquared,
+      rmseC,
+      measuredSpanC,
+      mode: options.mode,
+      refitCount,
+      rejectedReasons: [...rejectedReasons],
+    });
+
+    return {
+      tauMaxUsed: dict.tauMaxUsed,
+      selectedLambda: dict.selectedLambda,
+      sparseSpectrum: dict.sparseSpectrum,
+      mergedPoles: dict.mergedPoles,
+      reducedFoster,
+      reducedCauer,
+      cauerConv,
+      fitZthPredicted,
+      fitTempPredicted,
+      residualTemp,
+      rSquared,
+      rmseC,
+      audit,
+    };
+  };
+
+  // 6-8. Physics-Audited Fit, Refit & Automatic Order Reduction Loop
+  const rejectedReasons: string[] = [];
+  let refitCount = 0;
+
+  const baseDict = solveDictionary(tauMaxDefaultSec, requestedOrder);
+  let chosen = evaluateCandidate(baseDict, requestedOrder, true, 0, rejectedReasons);
+  let bestDiagnostic = chosen;
+
+  if (!chosen.audit.passed) {
+    const failSummary = (c: CandidateSolveResult) =>
+      c.audit.checks
+        .filter((ck) => !ck.passed)
+        .map((ck) => ck.detail)
+        .join('; ');
+    rejectedReasons.push(`${requestedOrder}阶初拟合失败: ${failSummary(chosen)}`);
+
+    // Strategy A: Refit at requestedOrder without splitting, and tighten tau_max if over-extrapolated
+    const rthCredFailed = !chosen.audit.checks.find((c) => c.key === 'rth_credibility')?.passed;
+    const tauCaps = rthCredFailed ? [1.6 * tMax, 1.0 * tMax] : [tauMaxDefaultSec, 1.3 * tMax];
+    let foundValid = false;
+
+    for (const cap of tauCaps) {
+      refitCount++;
+      const d = cap === tauMaxDefaultSec ? baseDict : solveDictionary(cap, requestedOrder);
+      const allowSplitCand = d.mergedPoles.length < requestedOrder;
+      const cand = evaluateCandidate(d, requestedOrder, allowSplitCand, refitCount, rejectedReasons);
+      if (cand.audit.passed && cand.reducedCauer.length === requestedOrder) {
+        chosen = cand;
+        foundValid = true;
+        break;
+      }
+      if (cand.audit.passed && (!bestDiagnostic.audit.passed || cand.rSquared > bestDiagnostic.rSquared)) {
+        bestDiagnostic = cand;
+      }
+      if (!cand.audit.passed) {
+        rejectedReasons.push(`重拟合(N=${requestedOrder}, τmax=${cap.toFixed(2)}s)未通过: ${failSummary(cand)}`);
+      }
+    }
+
+    // Strategy B: Automatic Order Reduction (降阶: N-1 -> ... -> 1)
+    if (!foundValid) {
+      for (let ord = requestedOrder - 1; ord >= 1; ord--) {
+        const capsToTry = rthCredFailed ? [1.6 * tMax, 1.0 * tMax, tauMaxDefaultSec] : [tauMaxDefaultSec, 1.3 * tMax];
+        for (const cap of capsToTry) {
+          refitCount++;
+          const d = solveDictionary(cap, ord);
+          const cand = evaluateCandidate(d, ord, false, refitCount, rejectedReasons);
+          if (cand.audit.passed) {
+            chosen = cand;
+            foundValid = true;
+            break;
+          }
+          if (cand.rSquared > bestDiagnostic.rSquared && !bestDiagnostic.audit.passed) {
+            bestDiagnostic = cand;
+          }
+        }
+        if (foundValid) break;
+        rejectedReasons.push(`降阶至 ${ord} 阶仍未通过物理检验`);
+      }
+    }
+
+    if (!foundValid) {
+      chosen = bestDiagnostic;
+    }
+  }
+
+  // Re-finalize physics audit with latest refitCount and rejectedReasons
+  const finalAudit = auditThermalPhysics({
+    foster: chosen.reducedFoster,
+    cauer: chosen.reducedCauer,
+    fosterCauerRelErr: chosen.cauerConv.relErr,
+    hasDegenerateCauer: chosen.cauerConv.hasDegenerateStage,
+    requestedOrder,
+    zMeasuredEnd,
+    tMaxSec: tMax,
+    rSquared: chosen.rSquared,
+    rmseC: chosen.rmseC,
+    measuredSpanC,
+    mode: options.mode,
+    refitCount,
+    rejectedReasons,
+  });
+
+  if (finalAudit.status === 'reduced') {
+    warnings.push(finalAudit.summary);
+  } else if (finalAudit.status === 'failed') {
+    warnings.unshift(finalAudit.summary);
+  }
+
+  const reducedFoster = chosen.reducedFoster.map((s) => ({ ...s }));
+  const reducedCauer = chosen.reducedCauer.map((s) => ({ ...s }));
+
+  // Optional Pad -> Sensor PCB copper spreading resistance compensation when measuring beside MOS on PCB
+  let totalRthFoster = chosen.cauerConv.totalRthFoster;
+  let totalRthCauer = chosen.cauerConv.totalRthCauer;
+  const tauSpreadSec = Math.max(tauMinSec, Math.min(0.015, tMax * 0.02));
+  if (thermalPathMode === 'pad_ambient' && padSpreadRthCPerW > 1e-6) {
+    const spreadC = tauSpreadSec / padSpreadRthCPerW;
+    reducedCauer.unshift({
+      r: padSpreadRthCPerW,
+      c: spreadC,
+      tauEst: tauSpreadSec,
+      layerLabel: '焊盘→测点扩散补偿 (R_spread)',
+    });
+    reducedFoster.unshift({
+      r: padSpreadRthCPerW,
+      c: spreadC,
+      tau: tauSpreadSec,
+      layerLabel: '焊盘→测点扩散补偿 (R_spread)',
+    });
+    totalRthFoster += padSpreadRthCPerW;
+    totalRthCauer += padSpreadRthCPerW;
+    warnings.push(
+      `已计入芯片焊盘→PCB测点扩展热阻补偿 R_spread = ${padSpreadRthCPerW.toFixed(3)} °C/W：Rth,pad-a = ${totalRthCauer.toFixed(3)} °C/W (实测点 Rth = ${chosen.cauerConv.totalRthCauer.toFixed(3)} °C/W)。`
+    );
+  }
 
   // 10. Generate 12x smooth analytical trace (zero overshoot, physically monotone)
   const smoothCount = Math.max(200, Math.min(4000, Math.max(postDtAll.length * 12, 400)));
@@ -1236,49 +1897,55 @@ export function deconvolveThermalImpedance(
   const structureFunction: StructurePoint[] = [];
   let rCum = 0;
   let cCum = 0;
-  for (const st of cauerConv.cauer) {
+  for (const st of reducedCauer) {
     rCum += st.r;
     cCum += st.c;
     structureFunction.push({ rCum, cCum, layerLabel: st.layerLabel });
   }
 
-  const spiceNetlist = cauerToSpice(cauerConv.cauer, tBaseC, 'MOS_THERM');
-  const spiceValidation = validateCauerSpiceNetlist(spiceNetlist, cauerConv.totalRthCauer);
+  const subcktName = thermalPathMode === 'pad_ambient' ? 'PAD_THERM' : 'MOS_THERM';
+  const heatNode = thermalPathMode === 'pad_ambient' ? 'PAD' : 'TJ';
+  const spiceNetlist = cauerToSpice(reducedCauer, tAmbC, subcktName, heatNode);
+  const spiceValidation = validateCauerSpiceNetlist(spiceNetlist, totalRthCauer, heatNode);
 
   return {
     mode: options.mode,
+    thermalPathMode,
+    padSpreadRthCPerW,
     powerW,
     t0Sec,
     tBaseC,
+    tAmbC,
     tJ0C,
     tauMinSec,
-    tauMaxSec,
+    tauMaxSec: chosen.tauMaxUsed,
     dtMedSec,
     usedLogBinning,
     rawPointCount: postDtAll.length,
     fitPointCount: M,
-    selectedLambda,
+    selectedLambda: chosen.selectedLambda,
     warnings,
     fitTimeRel: fitDt,
     fitTempMeasured,
-    fitTempPredicted,
+    fitTempPredicted: chosen.fitTempPredicted,
     fitZthMeasured: fitZth,
-    fitZthPredicted,
-    residualTemp,
+    fitZthPredicted: chosen.fitZthPredicted,
+    residualTemp: chosen.residualTemp,
     smoothAbsTime,
     smoothTemp,
-    sparseSpectrum,
-    mergedPoles,
+    sparseSpectrum: chosen.sparseSpectrum,
+    mergedPoles: chosen.mergedPoles,
     reducedFoster,
-    reducedCauer: cauerConv.cauer,
+    reducedCauer,
     structureFunction,
-    totalRthFoster: cauerConv.totalRthFoster,
-    totalRthCauer: cauerConv.totalRthCauer,
-    fosterCauerRelErr: cauerConv.relErr,
-    rSquared,
-    rmseC,
+    totalRthFoster,
+    totalRthCauer,
+    fosterCauerRelErr: chosen.cauerConv.relErr,
+    rSquared: chosen.rSquared,
+    rmseC: chosen.rmseC,
     spiceNetlist,
     spiceValidation,
+    physicsAudit: finalAudit,
   };
 }
 
@@ -1302,7 +1969,7 @@ export function simulateFosterZoh(
 
   for (let i = 1; i < n; i++) {
     const dt = Math.max(0, time[i] - time[i - 1]);
-    const p = isFinite(power[i - 1]) ? power[i - 1] : 0;
+    const p = isFinite(power[i - 1]) ? Math.max(0, power[i - 1]) : 0;
     let sumDt = 0;
     for (let m = 0; m < kLen; m++) {
       const { r, tau } = stages[m];
@@ -1365,7 +2032,7 @@ export function simulateCauerZoh(
       tj[i] = nodeT[0];
       continue;
     }
-    const p = isFinite(power[i - 1]) ? power[i - 1] : 0;
+    const p = isFinite(power[i - 1]) ? Math.max(0, power[i - 1]) : 0;
     const subSteps = Math.min(64, Math.max(1, Math.ceil(dt / Math.max(1e-8, 0.04 * minTau))));
     const subDt = dt / subSteps;
 
@@ -1413,9 +2080,10 @@ export function simulateCauerZoh(
 
 /**
  * Tab 2 Loss Stripping & Closed-Loop Tj(t) Simulator:
- * - Linearly interpolates Ids(t - deskew) for sub-sample Deskew (ns) alignment
- * - Strips Coss stored energy Eoss (deducted at turn-off, added back at turn-on)
- * - Runs closed-loop Cauer/Foster thermal advance with Rds(on)(Tj) feedback
+ * - Scales SI prefixes (mV/kV, uA/mA) cleanly to base V and A
+ * - Linearly interpolates Ids(t - deskew) for sub-sample Deskew (ns) alignment and mismatched timebases
+ * - Strips Coss stored energy Eoss with exact trapezoidal 1x energy weighting per completed edge
+ * - Runs sub-stepped closed-loop Cauer thermal advance with Rds(on)(Tj) feedback
  */
 export function computeLossWithDeskewAndEoss(
   vdsCh: WaveformChannel,
@@ -1423,11 +2091,16 @@ export function computeLossWithDeskewAndEoss(
   cauerStages: CauerStage[],
   opts: LossSimulationOptions
 ): LossSimulationResult {
-  const nFull = Math.min(vdsCh.t.length, vdsCh.v.length, idsCh.v.length);
+  const nVFull = Math.min(vdsCh.t.length, vdsCh.v.length);
+  const nIFull = Math.min(idsCh.t.length, idsCh.v.length);
+  if (nVFull < 4 || nIFull < 2) {
+    throw new Error('At least 4 Vds samples and 2 Ids samples are required for loss stripping simulation.');
+  }
+
   let i0 = 0;
-  let i1 = nFull - 1;
+  let i1 = nVFull - 1;
   if (opts.tStart !== undefined) {
-    while (i0 < nFull && vdsCh.t[i0] < opts.tStart) i0++;
+    while (i0 < nVFull && vdsCh.t[i0] < opts.tStart) i0++;
   }
   if (opts.tEnd !== undefined) {
     while (i1 > i0 && vdsCh.t[i1] > opts.tEnd) i1--;
@@ -1437,6 +2110,14 @@ export function computeLossWithDeskewAndEoss(
     throw new Error('At least 4 samples are required inside gate for loss stripping simulation.');
   }
 
+  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name);
+  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name);
+  const sameTimebase =
+    nVFull === nIFull &&
+    (vdsCh.t === idsCh.t ||
+      (Math.abs(vdsCh.t[0] - idsCh.t[0]) <= 1e-15 &&
+        Math.abs(vdsCh.t[nVFull - 1] - idsCh.t[nIFull - 1]) <= 1e-15));
+
   const time = new Float64Array(len);
   const pLossW = new Float32Array(len);
   const tjC = new Float32Array(len);
@@ -1444,11 +2125,10 @@ export function computeLossWithDeskewAndEoss(
   const mV = vdsCh.coupling === 'AC' ? computeChannelMean(vdsCh) : 0;
   const mI = idsCh.coupling === 'AC' ? computeChannelMean(idsCh) : 0;
 
-  // Determine Vds span for turn-on / turn-off edge detection
   let vMin = Infinity;
   let vMax = -Infinity;
   for (let i = i0; i <= i1; i++) {
-    const vv = getChannelDisplayValue(vdsCh, i, mV);
+    const vv = getChannelDisplayValue(vdsCh, i, mV) * vScale;
     if (isFinite(vv)) {
       if (vv < vMin) vMin = vv;
       if (vv > vMax) vMax = vv;
@@ -1466,13 +2146,12 @@ export function computeLossWithDeskewAndEoss(
 
   const sampleIdsAt = (targetT: number): number => {
     const tArr = idsCh.t;
-    const nI = Math.min(tArr.length, idsCh.v.length);
-    if (nI === 0) return 0;
-    if (targetT <= tArr[0]) return getChannelDisplayValue(idsCh, 0, mI);
-    if (targetT >= tArr[nI - 1]) return getChannelDisplayValue(idsCh, nI - 1, mI);
+    if (nIFull === 0) return 0;
+    if (targetT <= tArr[0]) return getChannelDisplayValue(idsCh, 0, mI) * iScale;
+    if (targetT >= tArr[nIFull - 1]) return getChannelDisplayValue(idsCh, nIFull - 1, mI) * iScale;
 
     let lo = 0;
-    let hi = nI - 1;
+    let hi = nIFull - 1;
     while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;
       if (tArr[mid] <= targetT) lo = mid;
@@ -1480,8 +2159,8 @@ export function computeLossWithDeskewAndEoss(
     }
     const dt = tArr[hi] - tArr[lo];
     const frac = dt > 1e-18 ? (targetT - tArr[lo]) / dt : 0;
-    const v0 = getChannelDisplayValue(idsCh, lo, mI);
-    const v1 = getChannelDisplayValue(idsCh, hi, mI);
+    const v0 = getChannelDisplayValue(idsCh, lo, mI) * iScale;
+    const v1 = getChannelDisplayValue(idsCh, hi, mI) * iScale;
     return v0 + frac * (v1 - v0);
   };
 
@@ -1490,7 +2169,6 @@ export function computeLossWithDeskewAndEoss(
   let energyStrippedJ = 0;
   let switchingEvents = 0;
 
-  // Cauer state variables initialized at tAmbC
   const mStages = cauerStages.length;
   const nodeT = new Float64Array(Math.max(1, mStages)).fill(opts.tAmbC);
   const aSub = new Float64Array(Math.max(1, mStages));
@@ -1500,41 +2178,64 @@ export function computeLossWithDeskewAndEoss(
   const cPrime = new Float64Array(Math.max(1, mStages));
   const dPrime = new Float64Array(Math.max(1, mStages));
 
+  let minTau = Infinity;
+  for (let s = 0; s < mStages; s++) {
+    const tauS = cauerStages[s].r * cauerStages[s].c;
+    if (isFinite(tauS) && tauS > 1e-12 && tauS < minTau) minTau = tauS;
+  }
+  if (!isFinite(minTau)) minTau = 1e-4;
+
   let swState: 'on' | 'off' | 'trans_off' | 'trans_on' =
-    getChannelDisplayValue(vdsCh, i0, mV) <= vLowThresh ? 'on' : 'off';
+    getChannelDisplayValue(vdsCh, i0, mV) * vScale <= vLowThresh ? 'on' : 'off';
   let transStartIdx = -1;
 
   const pRawArr = new Float64Array(len);
   const pDeskewArr = new Float64Array(len);
+  const vScaledArr = new Float64Array(len);
+  const iAlignedArr = new Float64Array(len);
 
   for (let k = 0; k < len; k++) {
     const idx = i0 + k;
     const tCurr = vdsCh.t[idx];
     time[k] = tCurr;
-    const vds = getChannelDisplayValue(vdsCh, idx, mV);
-    const idsRaw = getChannelDisplayValue(idsCh, idx, mI);
-    const idsAligned = deskewSec !== 0 ? sampleIdsAt(tCurr - deskewSec) : idsRaw;
+    const vds = getChannelDisplayValue(vdsCh, idx, mV) * vScale;
+    const idsRaw = sameTimebase
+      ? getChannelDisplayValue(idsCh, idx, mI) * iScale
+      : sampleIdsAt(tCurr);
+    const idsAligned = deskewSec !== 0 || !sameTimebase ? sampleIdsAt(tCurr - deskewSec) : idsRaw;
 
+    vScaledArr[k] = vds;
+    iAlignedArr[k] = idsAligned;
     pRawArr[k] = vds * idsRaw;
     pDeskewArr[k] = vds * idsAligned;
     pLossW[k] = pDeskewArr[k];
   }
 
+  // Trapezoidal time-weight helper for exact 1.0x Eoss energy attribution
+  const applyExactEdgeEnergy = (startK: number, endK: number, energyDeltaJ: number) => {
+    if (energyDeltaJ === 0 || endK < startK) return;
+    let totalTrapWeight = 0;
+    for (let j = startK; j <= endK; j++) {
+      const dtPrev = j > 0 ? Math.max(0, time[j] - time[j - 1]) : 0;
+      const dtNext = j < len - 1 ? Math.max(0, time[j + 1] - time[j]) : 0;
+      totalTrapWeight += 0.5 * (dtPrev + dtNext);
+    }
+    if (totalTrapWeight <= 1e-15) return;
+    const pAdj = energyDeltaJ / totalTrapWeight;
+    for (let j = startK; j <= endK; j++) {
+      pLossW[j] += pAdj;
+    }
+  };
+
   // Strip Eoss across identified turn-off (Vds rising) and turn-on (Vds falling) intervals
   for (let k = 0; k < len; k++) {
-    const idx = i0 + k;
-    const vds = getChannelDisplayValue(vdsCh, idx, mV);
+    const vds = vScaledArr[k];
     if (swState === 'on' && vds > vLowThresh) {
       swState = 'trans_off';
       transStartIdx = k;
     } else if (swState === 'trans_off') {
       if (vds >= vHighThresh) {
-        // Completed turn-off: deduct Eoss across [transStartIdx..k]
-        const spanT = Math.max(1e-12, time[k] - time[transStartIdx]);
-        if (eossJ > 0) {
-          const pAdj = eossJ / spanT;
-          for (let j = transStartIdx; j <= k; j++) pLossW[j] -= pAdj;
-        }
+        applyExactEdgeEnergy(transStartIdx, k, -eossJ);
         switchingEvents++;
         swState = 'off';
       } else if (vds <= vLowThresh) {
@@ -1545,12 +2246,7 @@ export function computeLossWithDeskewAndEoss(
       transStartIdx = k;
     } else if (swState === 'trans_on') {
       if (vds <= vLowThresh) {
-        // Completed turn-on: add stored Eoss back across [transStartIdx..k]
-        const spanT = Math.max(1e-12, time[k] - time[transStartIdx]);
-        if (eossJ > 0) {
-          const pAdj = eossJ / spanT;
-          for (let j = transStartIdx; j <= k; j++) pLossW[j] += pAdj;
-        }
+        applyExactEdgeEnergy(transStartIdx, k, +eossJ);
         switchingEvents++;
         swState = 'on';
       } else if (vds >= vHighThresh) {
@@ -1559,7 +2255,7 @@ export function computeLossWithDeskewAndEoss(
     }
   }
 
-  // Advance closed-loop Tj(t) with temperature-dependent Rds(on)(Tj) feedback
+  // Advance closed-loop Tj(t) with temperature-dependent Rds(on)(Tj) feedback and Cauer sub-stepping
   let sumLoss = 0;
   let tjMaxC = opts.tAmbC;
   let tjMinC = opts.tAmbC;
@@ -1572,44 +2268,67 @@ export function computeLossWithDeskewAndEoss(
       energyRawJ += 0.5 * (pRawArr[k - 1] + pRawArr[k]) * dt;
       energyDeskewedJ += 0.5 * (pDeskewArr[k - 1] + pDeskewArr[k]) * dt;
 
-      // Apply Rds(on)(Tj) feedback during on-state conduction if r25Ohm > 0
-      const idxPrev = i0 + k - 1;
-      const vPrev = getChannelDisplayValue(vdsCh, idxPrev, mV);
+      const vPrev = vScaledArr[k - 1];
       if (r25Ohm > 0 && alpha !== 0 && Math.abs(vPrev) <= vOnThresh) {
-        const idsPrev = deskewSec !== 0 ? sampleIdsAt(time[k - 1] - deskewSec) : getChannelDisplayValue(idsCh, idxPrev, mI);
+        const idsPrev = iAlignedArr[k - 1];
         const rTj = Math.max(1e-6, r25Ohm * (1 + alpha * (nodeT[0] - 25)));
         const deltaCond = idsPrev * idsPrev * (rTj - r25Ohm);
         pLossW[k - 1] += deltaCond;
       }
 
-      const pStep = isFinite(pLossW[k - 1]) ? pLossW[k - 1] : 0;
-      energyStrippedJ += 0.5 * (pStep + pLossW[k]) * dt;
+      const pStepSigned = isFinite(pLossW[k - 1]) ? pLossW[k - 1] : 0;
+      const pThermalStep = Math.max(0, pStepSigned);
 
       if (mStages > 0) {
+        const subSteps = Math.min(32, Math.max(1, Math.ceil(dt / Math.max(1e-8, 0.05 * minTau))));
+        const subDt = dt / subSteps;
         for (let s = 0; s < mStages; s++) {
-          const ckOverDt = cauerStages[s].c / dt;
+          const ckOverDt = cauerStages[s].c / subDt;
           const gLeft = s > 0 ? 1 / cauerStages[s - 1].r : 0;
           const gRight = 1 / cauerStages[s].r;
           aSub[s] = s > 0 ? -gLeft : 0;
           bDiag[s] = ckOverDt + gLeft + gRight;
           cSup[s] = s < mStages - 1 ? -gRight : 0;
-          rhs[s] = ckOverDt * nodeT[s] + (s === 0 ? pStep : 0) + (s === mStages - 1 ? opts.tAmbC * gRight : 0);
         }
         cPrime[0] = mStages > 1 ? cSup[0] / bDiag[0] : 0;
-        dPrime[0] = rhs[0] / bDiag[0];
         for (let s = 1; s < mStages; s++) {
           const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
           cPrime[s] = s < mStages - 1 ? cSup[s] / denom : 0;
-          dPrime[s] = (rhs[s] - aSub[s] * dPrime[s - 1]) / denom;
         }
-        nodeT[mStages - 1] = dPrime[mStages - 1];
-        for (let s = mStages - 2; s >= 0; s--) {
-          nodeT[s] = dPrime[s] - cPrime[s] * nodeT[s + 1];
+        const gLast = 1 / cauerStages[mStages - 1].r;
+        for (let sub = 0; sub < subSteps; sub++) {
+          for (let s = 0; s < mStages; s++) {
+            const ckOverDt = cauerStages[s].c / subDt;
+            rhs[s] = ckOverDt * nodeT[s] + (s === 0 ? pThermalStep : 0) + (s === mStages - 1 ? opts.tAmbC * gLast : 0);
+          }
+          dPrime[0] = rhs[0] / bDiag[0];
+          for (let s = 1; s < mStages; s++) {
+            const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
+            dPrime[s] = (rhs[s] - aSub[s] * dPrime[s - 1]) / denom;
+          }
+          nodeT[mStages - 1] = dPrime[mStages - 1];
+          for (let s = mStages - 2; s >= 0; s--) {
+            nodeT[s] = dPrime[s] - cPrime[s] * nodeT[s + 1];
+          }
         }
         tjC[k] = nodeT[0];
       } else {
         tjC[k] = opts.tAmbC;
       }
+
+      // Apply Rds(Tj) feedback at sample k consistently before integrating interval [k-1..k]
+      if (r25Ohm > 0 && alpha !== 0 && Math.abs(vScaledArr[k]) <= vOnThresh) {
+        const idsCurr = iAlignedArr[k];
+        const rTjCurr = Math.max(1e-6, r25Ohm * (1 + alpha * (tjC[k] - 25)));
+        const deltaCondCurr = idsCurr * idsCurr * (rTjCurr - r25Ohm);
+        // Store updated value on k only at final sample or track pCurr cleanly without double-adding on next iter
+        const pCurr = (isFinite(pLossW[k]) ? pLossW[k] : 0) + deltaCondCurr;
+        energyStrippedJ += 0.5 * (pStepSigned + pCurr) * dt;
+        if (k === len - 1) pLossW[k] = pCurr;
+      } else {
+        energyStrippedJ += 0.5 * (pStepSigned + (isFinite(pLossW[k]) ? pLossW[k] : 0)) * dt;
+      }
+
       if (tjC[k] > tjMaxC) tjMaxC = tjC[k];
       if (tjC[k] < tjMinC) tjMinC = tjC[k];
       sumTj += tjC[k];
@@ -1630,4 +2349,217 @@ export function computeLossWithDeskewAndEoss(
     energyStrippedMj: energyStrippedJ * 1e3,
     switchingEvents,
   };
+}
+
+export interface ViSignalSource {
+  channel?: WaveformChannel | null;
+  constantValue?: number;
+}
+
+/**
+ * Flexible V × I instantaneous & step-active power computation supporting:
+ * - Waveform V(t) × Waveform I(t)
+ * - Constant V × Waveform I(t)
+ * - Waveform V(t) × Constant I
+ * - Constant V × Constant I
+ */
+export function computePowerFromVISources(
+  vSource: ViSignalSource,
+  iSource: ViSignalSource,
+  opts: ViPowerOptions = {}
+): ViPowerResult {
+  const vCh = vSource.channel || null;
+  const iCh = iSource.channel || null;
+  const useAbs = opts.useAbsPower !== false;
+
+  // Case 1: Both constants
+  if (!vCh && !iCh) {
+    const vVal = isFinite(vSource.constantValue ?? NaN) ? Number(vSource.constantValue) : 0;
+    const iVal = isFinite(iSource.constantValue ?? NaN) ? Number(iSource.constantValue) : 0;
+    const pRaw = vVal * iVal;
+    const pVal = useAbs ? Math.abs(pRaw) : pRaw;
+    const t0 = opts.tStart !== undefined && isFinite(opts.tStart) ? opts.tStart : 0;
+    const t1 = opts.tEnd !== undefined && isFinite(opts.tEnd) && opts.tEnd > t0 ? opts.tEnd : t0 + 1;
+    const time = Float64Array.from([t0, t1]);
+    const powerW = Float32Array.from([pVal, pVal]);
+    return {
+      time,
+      powerW,
+      pGateMeanW: pVal,
+      pStepActiveW: pVal,
+      pPeakW: Math.abs(pVal),
+      energyJ: pVal * (t1 - t0),
+      activeFraction: 1,
+      vMeanV: vVal,
+      iMeanA: iVal,
+      vUnitScale: 1,
+      iUnitScale: 1,
+      sampleCount: 2,
+    };
+  }
+
+  // Pick master channel for timebase (denser channel if both exist, or the sole waveform channel)
+  const nV = vCh ? Math.min(vCh.t.length, vCh.v.length) : 0;
+  const nI = iCh ? Math.min(iCh.t.length, iCh.v.length) : 0;
+  if (vCh && nV < 2) throw new Error('Voltage waveform must have at least 2 samples.');
+  if (iCh && nI < 2) throw new Error('Current waveform must have at least 2 samples.');
+
+  const vScale = vCh ? parseSiUnitScale(vCh.unit, 'V', vCh.name) : 1;
+  const iScale = iCh ? parseSiUnitScale(iCh.unit, 'A', iCh.name) : 1;
+  const mV = vCh && vCh.coupling === 'AC' ? computeChannelMean(vCh) : 0;
+  const mI = iCh && iCh.coupling === 'AC' ? computeChannelMean(iCh) : 0;
+
+  const masterIsV = Boolean(vCh && (!iCh || nV >= nI));
+  const masterCh = (masterIsV ? vCh : iCh)!;
+  const nMaster = masterIsV ? nV : nI;
+  const sameTimebase = Boolean(vCh && iCh && nV === nI && vCh.t === iCh.t);
+
+  const sampleChannelAt = (ch: WaveformChannel, nCh: number, scale: number, meanAc: number, targetT: number, fallbackIdx: number): number => {
+    if (sameTimebase) return getChannelDisplayValue(ch, fallbackIdx, meanAc) * scale;
+    const tArr = ch.t;
+    if (targetT <= tArr[0]) return getChannelDisplayValue(ch, 0, meanAc) * scale;
+    if (targetT >= tArr[nCh - 1]) return getChannelDisplayValue(ch, nCh - 1, meanAc) * scale;
+    let lo = 0;
+    let hi = nCh - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (tArr[mid] <= targetT) lo = mid;
+      else hi = mid;
+    }
+    const dt = tArr[hi] - tArr[lo];
+    const frac = dt > 1e-18 ? (targetT - tArr[lo]) / dt : 0;
+    const val0 = getChannelDisplayValue(ch, lo, meanAc) * scale;
+    const val1 = getChannelDisplayValue(ch, hi, meanAc) * scale;
+    return val0 + frac * (val1 - val0);
+  };
+
+  let iStart = 0;
+  let iEnd = nMaster - 1;
+  if (opts.tStart !== undefined) {
+    while (iStart < nMaster && masterCh.t[iStart] < opts.tStart) iStart++;
+  }
+  if (opts.tEnd !== undefined) {
+    while (iEnd > iStart && masterCh.t[iEnd] > opts.tEnd) iEnd--;
+  }
+  const len = Math.max(0, iEnd - iStart + 1);
+  if (len < 2) {
+    throw new Error('At least 2 samples are required inside the analysis gate to compute V × I power.');
+  }
+
+  const time = new Float64Array(len);
+  const powerW = new Float32Array(len);
+  let sumV = 0;
+  let sumI = 0;
+  let pPeakW = 0;
+  const absPowers: number[] = new Array(len);
+  const vConst = isFinite(vSource.constantValue ?? NaN) ? Number(vSource.constantValue) : 0;
+  const iConst = isFinite(iSource.constantValue ?? NaN) ? Number(iSource.constantValue) : 0;
+
+  for (let k = 0; k < len; k++) {
+    const idx = iStart + k;
+    const ti = masterCh.t[idx];
+    const vVal = vCh
+      ? masterIsV
+        ? getChannelDisplayValue(vCh, idx, mV) * vScale
+        : sampleChannelAt(vCh, nV, vScale, mV, ti, idx)
+      : vConst;
+    const iVal = iCh
+      ? !masterIsV
+        ? getChannelDisplayValue(iCh, idx, mI) * iScale
+        : sampleChannelAt(iCh, nI, iScale, mI, ti, idx)
+      : iConst;
+    const pRaw = vVal * iVal;
+    const pVal = useAbs ? Math.abs(pRaw) : pRaw;
+    time[k] = ti;
+    powerW[k] = isFinite(pVal) ? pVal : 0;
+    absPowers[k] = Math.abs(powerW[k]);
+    if (isFinite(vVal)) sumV += vVal;
+    if (isFinite(iVal)) sumI += iVal;
+    if (Math.abs(powerW[k]) > pPeakW) pPeakW = Math.abs(powerW[k]);
+  }
+
+  let energyJ = 0;
+  for (let k = 1; k < len; k++) {
+    const dt = Math.max(0, time[k] - time[k - 1]);
+    energyJ += 0.5 * (powerW[k - 1] + powerW[k]) * dt;
+  }
+  const totalSpan = Math.max(0, time[len - 1] - time[0]);
+  const pGateMeanW =
+    totalSpan > 1e-18
+      ? energyJ / totalSpan
+      : powerW.reduce((acc, v) => acc + v, 0) / len;
+
+  let pStepActiveW = pGateMeanW;
+  let activeFraction = 1;
+
+  if (
+    opts.stepOnsetTimeSec !== undefined &&
+    isFinite(opts.stepOnsetTimeSec) &&
+    opts.stepOnsetTimeSec > time[0] &&
+    opts.stepOnsetTimeSec < time[len - 1]
+  ) {
+    let onsetK = 0;
+    while (onsetK < len - 1 && time[onsetK] < opts.stepOnsetTimeSec) onsetK++;
+    const activeSpan = time[len - 1] - time[onsetK];
+    if (activeSpan > 1e-18 && len - onsetK >= 2) {
+      let eAct = 0;
+      for (let k = onsetK + 1; k < len; k++) {
+        const dt = Math.max(0, time[k] - time[k - 1]);
+        eAct += 0.5 * (powerW[k - 1] + powerW[k]) * dt;
+      }
+      pStepActiveW = eAct / activeSpan;
+      activeFraction = totalSpan > 1e-18 ? activeSpan / totalSpan : (len - onsetK) / len;
+    }
+  } else {
+    const sortedAbs = [...absPowers].sort((a, b) => a - b);
+    const p95 = sortedAbs[Math.min(len - 1, Math.floor(len * 0.95))];
+    if (p95 > 1e-9) {
+      const thresh = p95 * 0.1;
+      let activeCnt = 0;
+      let sumActiveTime = 0;
+      let energyActive = 0;
+      for (let k = 0; k < len; k++) {
+        if (absPowers[k] >= thresh) activeCnt++;
+        if (k > 0) {
+          const dt = Math.max(0, time[k] - time[k - 1]);
+          if (0.5 * (absPowers[k - 1] + absPowers[k]) >= thresh) {
+            sumActiveTime += dt;
+            energyActive += 0.5 * (powerW[k - 1] + powerW[k]) * dt;
+          }
+        }
+      }
+      const frac = totalSpan > 1e-18 ? sumActiveTime / totalSpan : activeCnt / len;
+      if (frac > 0.02 && frac < 0.97 && sumActiveTime > 1e-18) {
+        pStepActiveW = energyActive / sumActiveTime;
+        activeFraction = frac;
+      }
+    }
+  }
+
+  return {
+    time,
+    powerW,
+    pGateMeanW,
+    pStepActiveW,
+    pPeakW,
+    energyJ,
+    activeFraction,
+    vMeanV: sumV / len,
+    iMeanA: sumI / len,
+    vUnitScale: vScale,
+    iUnitScale: iScale,
+    sampleCount: len,
+  };
+}
+
+/**
+ * Computes instantaneous power p(t) = v(t) * i(t), trapezoidal energy, gate-mean power,
+ * and step-active mean power (excluding pre-step idle baseline if present) from V and I waveforms.
+ */
+export function computePowerFromVIWaveforms(
+  vCh: WaveformChannel,
+  iCh: WaveformChannel,
+  opts: ViPowerOptions = {}
+): ViPowerResult {
+  return computePowerFromVISources({ channel: vCh }, { channel: iCh }, opts);
 }

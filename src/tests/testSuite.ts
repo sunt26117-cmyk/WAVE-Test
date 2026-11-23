@@ -10,7 +10,7 @@ import { resampleUniform } from '../modules/resampler';
 import { analyzeSamplingQuality } from '../modules/qualityCheck';
 import { evaluateMathExpression } from '../modules/mathParser';
 import { computeClarke, computePark, computeInstantaneousPower } from '../modules/transforms';
-import { computeMeasurements } from '../modules/measurements';
+import { computeMeasurements, evaluateCustomMeasurement } from '../modules/measurements';
 import { WaveformChannel, TabState } from '../types/models';
 import { runDynamicMutationTests } from './dynamicMutationTest';
 import { parseLtspiceRawBuffer, isLtspiceExportText, parseLtspiceText } from '../parsers/ltspiceParser';
@@ -23,10 +23,12 @@ import {
   getSubplotRects,
   getChannelDisplayValue,
   syncSameUnitChannelsScale,
+  getTabGlobalIndexBounds,
+  extendTabViewToLongestChannel,
 } from '../modules/oscilloscopeScale';
 import { buildDecimatedSegments, interpolateSmoothSegments } from '../modules/decimator';
 import { clampCursorsToViewport, centerCursorsInViewport } from '../modules/cursorEngine';
-import { previewCsv, parseFullCsv } from '../parsers/csvParser';
+import { previewCsv, parseFullCsv, parseNumericCell } from '../parsers/csvParser';
 import {
   applyGlobalEdit,
   applyLocalEdit,
@@ -47,11 +49,14 @@ import {
   COMPARE_GROUP_THEMES,
   getCompareGroupTraceColor,
   alignAndInterpolateReference,
+  buildMappedReferenceTrace,
   computeAutoTimeAlignShift,
   computeWaveformCompareMetrics,
   computeTextFingerprint,
   detectRecommendedTimeScale,
 } from '../modules/waveformCompare';
+import { serializeSession, deserializeSession } from '../engine/session';
+import { escapeHtml, escapeCsvCell } from '../utils/html';
 import {
   analyzeThreePhaseBalance,
   analyzeBldcHallCommutation,
@@ -59,6 +64,13 @@ import {
   analyzeTorqueAndCurrentRipple,
   computeBldcDerivedTraces,
 } from '../modules/bldcAnalysis';
+import { solveSinglePoint, forwardVerifyPoint } from '../modules/focDyno/motorPhysics';
+import { DEMO_MOTOR_PARAMS } from '../modules/focDyno/demoData';
+import { synthesizeSixMosWaveform } from '../modules/focDyno/thermalExporter';
+import {
+  buildThermalHandoffFromSixMos,
+  extractRuntimeLogFromScopeChannels,
+} from '../modules/focDyno/scopeBridge';
 import * as XLSX from 'xlsx';
 import {
   formatEng,
@@ -98,6 +110,7 @@ import {
   simulateFoc6Mos,
   runFocStallSweep,
 } from '../modules/focThermal';
+import { createDefaultFilterConfig, applyWaveformFilter } from '../modules/filter';
 
 export interface TestResult {
   name: string;
@@ -2883,6 +2896,561 @@ export function runAllTests(): TestResult[] {
   } catch (err: any) {
     results.push({
       name: 'Channel Δt Time Shift Buffer Isolation & Reset',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 44: FOC DynoLab SI Inverse/Forward Parity, 4-Quadrant Handoff & Scope Unit Bridge
+  try {
+    const invMotor = solveSinglePoint(13.5, 2.2, 1000, DEMO_MOTOR_PARAMS);
+    const fwdMotor = forwardVerifyPoint(invMotor.iqA, 1000, 13.5, DEMO_MOTOR_PARAMS);
+    const parityOk =
+      Number.isFinite(invMotor.iqA) &&
+      Math.abs(fwdMotor.iBusEstA - 2.2) < 1e-4 &&
+      Math.abs(fwdMotor.tEstNm - invMotor.tEstNm) < 1e-6;
+
+    // Regenerative braking 4-quadrant PF angle preservation (> 90 deg)
+    const regenSynth = synthesizeSixMosWaveform(
+      { vMeasV: 13.5, iBusA: -1.8, nRpm: 1200, tAmbC: 25, fsHz: 20000, durationS: 0.05 },
+      DEMO_MOTOR_PARAMS
+    );
+    const regenHandoff = buildThermalHandoffFromSixMos(regenSynth, DEMO_MOTOR_PARAMS, 1200, 25);
+    const regenOk =
+      !!regenHandoff &&
+      regenHandoff.modDepthM <= 1.2 &&
+      Math.abs(regenHandoff.pfAngleDeg) > 90 &&
+      Math.abs(regenHandoff.pfAngleDeg) <= 180;
+
+    // Scope channel unit conversion (mA -> A, elec_hz -> mechanical RPM using polePairs=7)
+    const tArr = new Float64Array([0, 0.01, 0.02]);
+    const baseMeta = analyzeSamplingQuality(tArr);
+    const mkCh = (id: string, name: string, unit: string, vals: number[]): WaveformChannel => ({
+      id,
+      name,
+      unit,
+      color: '#38bdf8',
+      visible: true,
+      t: tArr,
+      v: new Float32Array(vals),
+      fs: 100,
+      dt: 0.01,
+      metadata: baseMeta,
+      isMath: false,
+      sourceChannelIds: [],
+      vMin: -100,
+      vMax: 5000,
+    });
+    const ibusCh = mkCh('i', 'Ibus', 'mA', [2200, 2200, 2200]); // 2.2 A
+    const spdCh = mkCh('w', 'fe', 'Hz', [70, 70, 70]); // 70 Hz elec / 7 pole pairs = 10 rev/s = 600 RPM
+    const vbusCh = mkCh('v', 'Vbus', 'V', [13.5, 13.5, 13.5]);
+    const rows = extractRuntimeLogFromScopeChannels({
+      vbusCh,
+      vbusConstV: 13.5,
+      ibusCh,
+      currentUnit: 'mA',
+      speedCh: spdCh,
+      speedConstRpm: 600,
+      speedUnit: 'elec_hz',
+      polePairs: 7,
+    });
+    const unitBridgeOk =
+      rows.length === 3 &&
+      Math.abs(rows[0].iBusA - 2.2) < 1e-5 &&
+      Math.abs(rows[0].nRpm - 600) < 1e-4 &&
+      Math.abs(rows[0].vMeasV - 13.5) < 1e-5;
+
+    results.push({
+      name: 'FOC DynoLab SI Inverse/Forward Parity, 4-Quadrant Handoff & Unit Bridge',
+      passed: parityOk && regenOk && unitBridgeOk,
+      message: `parity=${parityOk}, regenPf=${regenHandoff?.pfAngleDeg}deg, unitBridge=${unitBridgeOk}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'FOC DynoLab SI Inverse/Forward Parity, 4-Quadrant Handoff & Unit Bridge',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 45: Circuit & DSP Waveform Filtering (RC R*C, Partial Slice Isolation & 50 Hz Notch)
+  try {
+    const fs = 10000;
+    const n = 4000;
+    const t = new Float64Array(n);
+    const v = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      t[i] = i / fs;
+      v[i] = Math.sin(2 * Math.PI * 50 * t[i]) + 0.5 * Math.sin(2 * Math.PI * 1500 * t[i]);
+    }
+
+    // 1. Partial Butterworth LPF on [0.10s, 0.30s]: outside indices stay bit-exact, inside suppresses 1500 Hz
+    const bwCfg = createDefaultFilterConfig(fs);
+    bwCfg.algorithm = 'butterworth';
+    bwCfg.response = 'lowpass';
+    bwCfg.order = 4;
+    bwCfg.cutoffHz = 250;
+    bwCfg.zeroPhase = true;
+    bwCfg.regionMode = 'custom';
+    bwCfg.tStart = 0.1;
+    bwCfg.tEnd = 0.3;
+    const bwRes = applyWaveformFilter(t, v, bwCfg);
+    let outsideExact = true;
+    for (let i = 0; i < 1000; i++) {
+      if (bwRes.v[i] !== v[i]) outsideExact = false;
+    }
+    let maxInsideErr = 0;
+    for (let i = 1400; i < 2600; i++) {
+      const err = Math.abs(bwRes.v[i] - Math.sin(2 * Math.PI * 50 * t[i]));
+      if (err > maxInsideErr) maxInsideErr = err;
+    }
+
+    // 2. Parametric 50 Hz Notch: strips 50 Hz leaving 1500 Hz component clean
+    const notchCfg = createDefaultFilterConfig(fs);
+    notchCfg.algorithm = 'notch';
+    notchCfg.centerFreqHz = 50;
+    notchCfg.qFactor = 10;
+    notchCfg.zeroPhase = true;
+    notchCfg.regionMode = 'entire';
+    const notchRes = applyWaveformFilter(t, v, notchCfg);
+    let maxNotchErr = 0;
+    for (let i = 1500; i < 2500; i++) {
+      const err = Math.abs(notchRes.v[i] - 0.5 * Math.sin(2 * Math.PI * 1500 * t[i]));
+      if (err > maxNotchErr) maxNotchErr = err;
+    }
+
+    // 3. Passive RC physical R & C LPF at fc = 1/(2*pi*R*C) ≈ 159.15 Hz
+    const rcCfg = createDefaultFilterConfig(fs);
+    rcCfg.algorithm = 'rc_passive';
+    rcCfg.useRcComponents = true;
+    rcCfg.rOhm = 1000;
+    rcCfg.cFarad = 1e-6;
+    rcCfg.zeroPhase = false;
+    rcCfg.order = 1;
+    const rcSine = new Float32Array(n);
+    const rcFc = 1 / (2 * Math.PI * rcCfg.rOhm * rcCfg.cFarad);
+    for (let i = 0; i < n; i++) rcSine[i] = Math.sin(2 * Math.PI * rcFc * t[i]);
+    const rcRes = applyWaveformFilter(t, rcSine, rcCfg);
+    let rcPeak = 0;
+    for (let i = 2000; i < n; i++) rcPeak = Math.max(rcPeak, Math.abs(rcRes.v[i]));
+
+    const passed = outsideExact && maxInsideErr < 0.02 && maxNotchErr < 0.03 && Math.abs(rcPeak - Math.SQRT1_2) < 0.02;
+    results.push({
+      name: 'Circuit & DSP Waveform Filtering (RC R·C, Partial Butterworth, 50Hz Notch)',
+      passed,
+      message: `outsideExact=${outsideExact}, partialErr=${maxInsideErr.toFixed(4)}, notchErr=${maxNotchErr.toFixed(4)}, rc@fc=${rcPeak.toFixed(4)}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Circuit & DSP Waveform Filtering (RC R·C, Partial Butterworth, 50Hz Notch)',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 46: Cauer Deconvolution Orders 1..8 & Negative-Power Thermal Conservation
+  try {
+    const n = 2000;
+    const t = new Float64Array(n);
+    const temp = new Float64Array(n);
+    const powerW = 40;
+    const trueR = [0.04, 0.08, 0.12, 0.18, 0.25, 0.32, 0.40, 0.50];
+    const trueTau = [0.0002, 0.001, 0.005, 0.025, 0.12, 0.6, 2.5, 10.0];
+    for (let i = 0; i < n; i++) {
+      const dtStep = 0.0001 * Math.pow(1.006, i);
+      t[i] = i === 0 ? 0 : t[i - 1] + dtStep;
+      let zth = 0;
+      for (let k = 0; k < 8; k++) zth += trueR[k] * (1 - Math.exp(-t[i] / trueTau[k]));
+      temp[i] = 25 + powerW * zth;
+    }
+    const orderCounts: number[] = [];
+    for (let ord = 1; ord <= 8; ord++) {
+      const r = deconvolveThermalImpedance(t, temp, {
+        mode: 'heating',
+        powerW,
+        autoT0: false,
+        targetOrder: ord,
+      });
+      orderCounts.push(r.reducedCauer.length);
+    }
+    const exactOrdersOk = orderCounts.every((cnt, idx) => cnt === idx + 1);
+
+    // Negative power clamping test in Cauer ZOH and Loss/Tj
+    const negT = new Float64Array(50);
+    const negP = new Float64Array(50);
+    for (let i = 0; i < 50; i++) {
+      negT[i] = i * 1e-4;
+      negP[i] = -50;
+    }
+    const stages = [{ r: 0.5, c: 0.01, tauEst: 0.005, layerLabel: 'Die' }];
+    const zohNeg = simulateCauerZoh(negT, negP, stages, 25);
+    const neverCoolsBelowAmb = Array.from(zohNeg).every((tj) => tj >= 25 - 1e-9);
+
+    const nL = 100;
+    const tL = new Float64Array(nL);
+    const vL = new Float32Array(nL);
+    const iL = new Float32Array(nL);
+    for (let i = 0; i < nL; i++) {
+      tL[i] = i * 1e-6;
+      vL[i] = 40;
+      iL[i] = -10; // reverse capacitive return
+    }
+    const mkNegCh = (id: string, unit: string, vals: Float32Array): WaveformChannel => ({
+      id,
+      name: id,
+      unit,
+      color: '#22d3ee',
+      visible: true,
+      t: tL,
+      v: vals,
+      fs: 1e6,
+      dt: 1e-6,
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: analyzeSamplingQuality(tL),
+      vMin: -50,
+      vMax: 50,
+    });
+    const negLoss = computeLossWithDeskewAndEoss(mkNegCh('v', 'V', vL), mkNegCh('i', 'A', iL), stages, {
+      deskewNs: 0,
+      eossUj: 0,
+      rdsOn25Mohm: 10,
+      tempCoeffAlphaPerC: 0.004,
+      tAmbC: 25,
+    });
+    const tjNonNegativeClampOk = negLoss.tjMaxC >= 25 && negLoss.energyRawMj < 0;
+
+    results.push({
+      name: 'Cauer Orders 1-8 & Non-Negative Thermal Power Conservation',
+      passed: exactOrdersOk && neverCoolsBelowAmb && tjNonNegativeClampOk,
+      message: `orders=[${orderCounts.join(',')}], zohMin=${Math.min(...Array.from(zohNeg)).toFixed(2)}C, lossTjMax=${negLoss.tjMaxC.toFixed(2)}C`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Cauer Orders 1-8 & Non-Negative Thermal Power Conservation',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 47: Math Parser Lexer (1+2, 5-2), NaN Safety (/0, sqrt(-1)), Timebase Interpolation & Unit Derivation
+  try {
+    const tA = new Float64Array([0, 0.1, 0.2, 0.3, 0.4]);
+    const vA = new Float32Array([0, 2, 4, 6, 8]);
+    const tB = new Float64Array([0, 0.2, 0.4]);
+    const vB = new Float32Array([2, 2, 2]);
+    const mkMCh = (id: string, name: string, unit: string, tArr: Float64Array, vArr: Float32Array): WaveformChannel => ({
+      id,
+      name,
+      unit,
+      color: '#facc15',
+      visible: true,
+      t: tArr,
+      v: vArr,
+      fs: 10,
+      dt: tArr[1] - tArr[0],
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: analyzeSamplingQuality(tArr),
+      vMin: -10,
+      vMax: 10,
+    });
+    const chMap = {
+      c1: mkMCh('c1', 'Vbus', 'V', tA, vA),
+      c2: mkMCh('c2', 'Ibus', 'A', tB, vB),
+      c3: mkMCh('c3', 'Zero', 'V', tA, new Float32Array([0, 0, 0, 0, 0])),
+    };
+    const ord = ['c1', 'c2', 'c3'];
+
+    const lexAdd = evaluateMathExpression('1+2', chMap, ord);
+    const lexSub = evaluateMathExpression('5-2', chMap, ord);
+    const divZero = evaluateMathExpression('CH1 / CH3', chMap, ord);
+    const negSqrt = evaluateMathExpression('sqrt(-4)', chMap, ord);
+    const prod = evaluateMathExpression('CH1 * CH2', chMap, ord);
+    const ddt = evaluateMathExpression('deriv(CH1)', chMap, ord);
+
+    const lexOk = lexAdd.v[0] === 3 && lexSub.v[0] === 3;
+    const nanOk = Number.isNaN(divZero.v[1]) && Number.isNaN(negSqrt.v[0]);
+    const interpOk = Math.abs(prod.v[1] - 4) < 1e-4 && Math.abs(prod.v[3] - 12) < 1e-4;
+    const unitOk = prod.unit === 'W' && ddt.unit === 'V/s';
+
+    results.push({
+      name: 'Math Parser Lexer (1+2/5-2), NaN Safety, Interpolation & Units',
+      passed: lexOk && nanOk && interpOk && unitOk,
+      message: `1+2=${lexAdd.v[0]}, 5-2=${lexSub.v[0]}, /0=NaN(${Number.isNaN(divZero.v[1])}), prod[1]=${prod.v[1]} (${prod.unit}), derivUnit=${ddt.unit}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Math Parser Lexer (1+2/5-2), NaN Safety, Interpolation & Units',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 48: Non-Power-of-2 Bluestein FFT + Unit Preservation & Idempotent Filter from refV
+  try {
+    const fs = 10000;
+    const n = 5000; // Non-power-of-2 (previously truncated to 4096)
+    const t = new Float64Array(n);
+    const v = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      t[i] = i / fs;
+      v[i] = 3.0 * Math.sin(2 * Math.PI * 250 * t[i]);
+    }
+    const spec = computeFFT(
+      t,
+      v,
+      fs,
+      { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: false },
+      'i_ch',
+      'I_phase',
+      { sourceUnit: 'A', isUniformSampling: true }
+    );
+    const fftOk =
+      spec.fftSize === 5000 &&
+      spec.sourceUnit === 'A' &&
+      Math.abs((spec.peaks[0]?.frequency ?? 0) - 250) < 2.0 &&
+      Math.abs((spec.peaks[0]?.magnitude ?? 0) - 3.0) < 0.15;
+
+    const fCfg = createDefaultFilterConfig(fs);
+    fCfg.algorithm = 'butterworth';
+    fCfg.cutoffHz = 500;
+    const r1 = applyWaveformFilter(t, v, fCfg);
+    const r2 = applyWaveformFilter(t, v, fCfg); // Always recomputing from original refV gives bit-identical output
+    let maxDiff = 0;
+    for (let i = 0; i < n; i++) maxDiff = Math.max(maxDiff, Math.abs(r1.v[i] - r2.v[i]));
+
+    results.push({
+      name: 'Bluestein Non-2^N FFT (5000 pts, Unit A) & Ref-Based Filter Idempotency',
+      passed: fftOk && maxDiff < 1e-7,
+      message: `fftSize=${spec.fftSize}, peak=${spec.peaks[0]?.frequency?.toFixed(2)}Hz/${spec.peaks[0]?.magnitude?.toFixed(2)}${spec.sourceUnit}, filterMaxDiff=${maxDiff}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Bluestein Non-2^N FFT (5000 pts, Unit A) & Ref-Based Filter Idempotency',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 49: Trapezoidal |V|avg, Variable-Duty Max/Min Duty Cycle & Extensible Custom Metrics
+  try {
+    // 25% duty cycle period 1, 75% duty cycle period 2, 50% duty cycle period 3 at 1 kHz (fs=100kHz)
+    const fs = 100000;
+    const n = 316; // Leading low + 3 full rising-to-rising periods + closing rising edge
+    const t = new Float64Array(n);
+    const v = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      t[i] = i / fs;
+      if (i < 10) v[i] = -4;
+      else if (i < 110) v[i] = i - 10 < 25 ? 4 : -4; // 25% duty, |V|=4 everywhere
+      else if (i < 210) v[i] = i - 110 < 75 ? 4 : -4; // 75% duty
+      else if (i < 310) v[i] = i - 210 < 50 ? 4 : -4; // 50% duty
+      else v[i] = 4; // closing rising edge at i=310
+    }
+    const mCh: WaveformChannel = {
+      id: 'duty_ch',
+      name: 'DutyVar',
+      unit: 'V',
+      color: '#22d3ee',
+      visible: true,
+      t,
+      v,
+      fs,
+      dt: 1 / fs,
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: analyzeSamplingQuality(t),
+      vMin: -5,
+      vMax: 5,
+    };
+    const meas = computeMeasurements(
+      mCh,
+      'entire',
+      { startIndex: 0, endIndex: n - 1 },
+      { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null }
+    );
+    const dutyBoundsOk =
+      meas.maxDutyCycle !== null &&
+      meas.minDutyCycle !== null &&
+      Math.abs(meas.maxDutyCycle - 75) < 3.0 &&
+      Math.abs(meas.minDutyCycle - 25) < 3.0;
+    const absMeanOk = meas.absAverage !== null && Math.abs(meas.absAverage - 4.0) < 0.2;
+
+    // Non-uniform trapezoidal RMS check: 1V for 0.1s (10 samples of 0.01s) + 0V for 0.9s (1 giant step)
+    const tNu = new Float64Array([0, 0.02, 0.04, 0.06, 0.08, 0.1, 1.0]);
+    const vNu = new Float32Array([1, 1, 1, 1, 1, 0, 0]);
+    const nuCh: WaveformChannel = { ...mCh, id: 'nu', t: tNu, v: vNu, metadata: analyzeSamplingQuality(tNu) };
+    const nuMeas = computeMeasurements(
+      nuCh,
+      'entire',
+      { startIndex: 0, endIndex: 6 },
+      { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null }
+    );
+    const nuTrapOk = nuMeas.average !== null && nuMeas.average < 0.15; // sample-count would give ~0.71!
+
+    // Custom metric evaluation ("maxduty - minduty" & "peak / vrms")
+    const customSpread = evaluateCustomMeasurement(
+      { id: 'c1', label: 'Duty Spread', shortLabel: 'dDuty', expression: 'maxduty - minduty', unitType: 'percent' },
+      mCh,
+      meas,
+      'entire',
+      { startIndex: 0, endIndex: n - 1 },
+      { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null }
+    );
+    const customOk = customSpread !== null && Math.abs(customSpread - 50) < 5;
+
+    results.push({
+      name: '|V|avg, Max/Min Duty Cycle, Non-Uniform Trapezoid & Custom Metric Test',
+      passed: dutyBoundsOk && absMeanOk && nuTrapOk && customOk,
+      message: `maxDuty=${meas.maxDutyCycle?.toFixed(1)}%, minDuty=${meas.minDutyCycle?.toFixed(1)}%, |V|avg=${meas.absAverage?.toFixed(2)}V, nuAvg=${nuMeas.average?.toFixed(3)}V, customSpread=${customSpread?.toFixed(1)}%`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: '|V|avg, Max/Min Duty Cycle, Non-Uniform Trapezoid & Custom Metric Test',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 50: Adaptive Time Axis Extension for Longer Compare References
+  try {
+    const tShort = new Float64Array([0, 0.001, 0.002, 0.003, 0.004]); // 4ms
+    const vShort = new Float32Array([1, 2, 3, 2, 1]);
+    const tLong = new Float64Array([0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01]); // 10ms
+    const vLong = new Float32Array(11).fill(2);
+
+    const mkCmpCh = (id: string, tArr: Float64Array, vArr: Float32Array): WaveformChannel => ({
+      id,
+      name: id,
+      unit: 'V',
+      color: '#22d3ee',
+      visible: true,
+      t: tArr,
+      v: vArr,
+      fs: 1000,
+      dt: 0.001,
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: analyzeSamplingQuality(tArr),
+      vMin: -5,
+      vMax: 5,
+    });
+    const baseCh = mkCmpCh('base', tShort, vShort);
+    const longRefCh = mkCmpCh('longRef', tLong, vLong);
+    const mapped = buildMappedReferenceTrace(baseCh, longRefCh, 0.002, false, 1);
+    const refInserted: WaveformChannel = { ...baseCh, id: 'cmp_ref', t: mapped.t, v: mapped.v };
+    const tab: TabState = {
+      id: 'ext_tab',
+      fileName: 'ext.csv',
+      channels: { base: baseCh, cmp_ref: refInserted },
+      drawOrder: ['base', 'cmp_ref'],
+      activeChannelId: 'base',
+      view: { startIndex: 0, endIndex: tShort.length },
+      cursors: { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null },
+      annotations: [],
+      annotationMode: false,
+      annotationsVisible: true,
+      isOverlap: true,
+      plotMode: 'time',
+      fftOptions: { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: false },
+      motorConfig: { rpm: null, polePairs: null, enabled: false },
+      triggerConfig: { enabled: false, channelId: 'base', type: 'rising', level: 0, positionPercent: 50 },
+      measurementGate: 'view',
+      separateView: false,
+    };
+
+    const extended = extendTabViewToLongestChannel(tab);
+    const bounds = getTabGlobalIndexBounds(tab);
+    const passed =
+      mapped.t.length === tLong.length &&
+      Math.abs(mapped.t[mapped.t.length - 1] - 0.012) < 1e-9 &&
+      extended &&
+      tab.view.endIndex === bounds.maxIdx &&
+      bounds.maxIdx >= 12;
+
+    results.push({
+      name: 'Adaptive Compare Time Axis Extension (Preserve Full Duration & Extend View)',
+      passed,
+      message: `mappedPts=${mapped.t.length}, tMax=${bounds.tMax.toFixed(4)}s, viewEndIdx=${tab.view.endIndex} (base=${tShort.length})`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Adaptive Compare Time Axis Extension (Preserve Full Duration & Extend View)',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 51: CSV SI Unit Conversion ("12mV"->0.012V), .graphx Schema Validation & XSS/CSV Formula Escaping
+  try {
+    const unitV = parseNumericCell('12 mV', 'V');
+    const unitMv = parseNumericCell('1.5 V', 'mV');
+    const unitA = parseNumericCell('250uA', 'A');
+    const siOk =
+      Math.abs(unitV - 0.012) < 1e-9 &&
+      Math.abs(unitMv - 1500) < 1e-6 &&
+      Math.abs(unitA - 0.00025) < 1e-9;
+
+    let rejectedMalformed = false;
+    try {
+      deserializeSession(JSON.stringify({ version: 4, tabs: [{ id: 't1', channels: { c1: { t: [0, 1], v: [1] } }, drawOrder: ['c1'] }] }));
+    } catch {
+      rejectedMalformed = true;
+    }
+
+    const roundTripTab: TabState = {
+      id: 'rt1',
+      fileName: 'rt.csv',
+      channels: {
+        c1: {
+          id: 'c1',
+          name: 'Vout',
+          unit: 'V',
+          color: '#facc15',
+          visible: true,
+          t: new Float64Array([0, 0.01]),
+          v: new Float32Array([1, 2]),
+          fs: 100,
+          dt: 0.01,
+          isMath: false,
+          sourceChannelIds: [],
+          metadata: analyzeSamplingQuality(new Float64Array([0, 0.01])),
+          vMin: -5,
+          vMax: 5,
+        },
+      },
+      drawOrder: ['c1'],
+      activeChannelId: 'c1',
+      view: { startIndex: 0, endIndex: 2 },
+      cursors: { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null },
+      annotations: [],
+      annotationMode: false,
+      annotationsVisible: true,
+      isOverlap: true,
+      plotMode: 'time',
+      fftOptions: { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: false },
+      motorConfig: { rpm: null, polePairs: null, enabled: false },
+      triggerConfig: { enabled: false, channelId: 'c1', type: 'rising', level: 0, positionPercent: 50 },
+      measurementGate: 'view',
+      separateView: false,
+      customMeasurements: [{ id: 'cm1', label: 'CF', shortLabel: 'CF', expression: 'peak/vrms', unitType: 'ratio' }],
+    };
+    const restored = deserializeSession(serializeSession([roundTripTab], 0));
+    const rtOk = restored.tabs[0].customMeasurements?.length === 1 && restored.tabs[0].channels.c1.v.length === 2;
+
+    const escapedHtml = escapeHtml('<img src=x onerror="alert(1)">');
+    const escapedCsv = escapeCsvCell('=CMD("calc")');
+    const escOk = !escapedHtml.includes('<') && escapedCsv.startsWith('"\'=CMD');
+
+    results.push({
+      name: 'SI Unit Cell Parsing, .graphx Strict Validation & XSS/CSV Formula Escaping',
+      passed: siOk && rejectedMalformed && rtOk && escOk,
+      message: `12mV=${unitV}V, 1.5V=${unitMv}mV, malformedRejected=${rejectedMalformed}, roundTripCustom=${rtOk}, escaped=${escOk}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'SI Unit Cell Parsing, .graphx Strict Validation & XSS/CSV Formula Escaping',
       passed: false,
       message: `Exception: ${err.message}`,
     });

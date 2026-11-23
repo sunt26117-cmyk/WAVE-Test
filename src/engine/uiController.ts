@@ -11,6 +11,7 @@ import {
   SpectrumResult,
   MeasurementGate,
   MeasurementMetricKey,
+  CustomMeasurementDefinition,
   CsvPreviewInfo,
   CursorMode,
   ActiveTool,
@@ -53,6 +54,7 @@ import {
   generateWaveformSVG,
   formatEng,
   formatMeasurementMetricValue,
+  formatCustomMeasurementValue,
 } from './canvasRenderer';
 import {
   ThemePreset,
@@ -68,23 +70,36 @@ import {
   syncChannelBoundsFromScaleOffset,
   fitChannelTo125,
   getTimebaseInfo,
+  getTabGlobalIndexBounds,
+  extendTabViewToLongestChannel,
   stepTimebase125,
   panHorizontalDivs,
   getSubplotRects,
   syncSameUnitChannelsScale,
 } from '../modules/oscilloscopeScale';
 import { computeFFT, computeBLDCHarmonics } from '../modules/fft';
-import { computeMeasurements, MEASUREMENT_DEFINITIONS } from '../modules/measurements';
+import {
+  computeMeasurements,
+  evaluateCustomMeasurement,
+  MEASUREMENT_DEFINITIONS,
+} from '../modules/measurements';
 import { clampCursorsToViewport, centerCursorsInViewport } from '../modules/cursorEngine';
 import {
   applyGlobalEdit,
   applyLocalEdit,
+  ensureReferenceLocked,
   revertChannelToReference,
   applyChannelTimeShift,
   resetChannelTimeShift,
   GlobalEditOp,
   LocalEditOp,
 } from '../modules/waveformEditor';
+import {
+  FilterConfig,
+  FilterExecutionResult,
+  applyWaveformFilter,
+  validateFilterConfig,
+} from '../modules/filter';
 import {
   captureCompositeScopePNG,
   exportCroppedWaveformCSV,
@@ -121,6 +136,7 @@ import {
   releaseExcelWorkbookSession,
 } from '../parsers/excelParser';
 import { excelImportModal, ExcelImportedSheetPayload } from '../modules/excelImportModal';
+import { escapeHtml, escapeCsvCell } from '../utils/html';
 
 type DragMode =
   | null
@@ -170,6 +186,8 @@ export class OscilloscopeApp {
 
   // Cached measurements by channel key for fast 60fps strip updates
   private measCache: Record<string, { key: string; value: ChannelMeasurements }> = {};
+  private customMeasCache: Record<string, { key: string; values: Record<string, number | null> }> = {};
+  private pendingDrawRaf: number | null = null;
   private editVersion: number = 0;
 
   // CSV import modal state
@@ -818,7 +836,7 @@ export class OscilloscopeApp {
   }
 
   // --- On-Demand Measurements Management ---
-  public toggleMeasurementSelection(channelId: string, metric: MeasurementMetricKey, enabled?: boolean): void {
+  public toggleMeasurementSelection(channelId: string, metric: MeasurementMetricKey | string, enabled?: boolean): void {
     const tab = this.getActiveTab();
     if (!tab) return;
     if (!tab.selectedMeasurements) tab.selectedMeasurements = [];
@@ -831,6 +849,55 @@ export class OscilloscopeApp {
     } else if (!shouldAdd && existsIdx !== -1) {
       tab.selectedMeasurements.splice(existsIdx, 1);
     }
+    this.renderMeasurementStrip(tab);
+    this.updateScreenTelemetry();
+    this.handleResize();
+  }
+
+  public addCustomMeasurement(
+    def: Omit<CustomMeasurementDefinition, 'id'>,
+    autoEnableChannelId?: string
+  ): CustomMeasurementDefinition {
+    const tab = this.getActiveTab();
+    if (!tab) {
+      throw new Error('No active waveform tab.');
+    }
+    const label = (def.label || '').trim();
+    const expression = (def.expression || '').trim();
+    if (!label || !expression) {
+      throw new Error('Metric label and expression are required.');
+    }
+    if (!tab.customMeasurements) tab.customMeasurements = [];
+    const id = `cm_${Date.now().toString(36)}_${Math.floor(Math.random() * 1000)}`;
+    const item: CustomMeasurementDefinition = {
+      id,
+      label,
+      shortLabel: (def.shortLabel || label).trim().slice(0, 12),
+      expression,
+      unitType: def.unitType || 'signal',
+      customUnit: def.customUnit?.trim() || undefined,
+    };
+    tab.customMeasurements.push(item);
+    this.customMeasCache = {};
+    if (autoEnableChannelId && tab.channels[autoEnableChannelId]) {
+      this.toggleMeasurementSelection(autoEnableChannelId, `custom:${id}`, true);
+    } else {
+      this.renderMeasurementStrip(tab);
+    }
+    return item;
+  }
+
+  public removeCustomMeasurement(customId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    if (tab.customMeasurements) {
+      tab.customMeasurements = tab.customMeasurements.filter((cm) => cm.id !== customId);
+    }
+    const targetMetric = `custom:${customId}`;
+    if (tab.selectedMeasurements) {
+      tab.selectedMeasurements = tab.selectedMeasurements.filter((sm) => sm.metric !== targetMetric);
+    }
+    this.customMeasCache = {};
     this.renderMeasurementStrip(tab);
     this.updateScreenTelemetry();
     this.handleResize();
@@ -853,6 +920,13 @@ export class OscilloscopeApp {
       const id = `${channelId}::${def.key}`;
       if (!tab.selectedMeasurements.some((m) => m.id === id)) {
         tab.selectedMeasurements.push({ id, channelId, metric: def.key });
+      }
+    }
+    for (const customDef of tab.customMeasurements || []) {
+      const metricKey = `custom:${customDef.id}`;
+      const id = `${channelId}::${metricKey}`;
+      if (!tab.selectedMeasurements.some((m) => m.id === id)) {
+        tab.selectedMeasurements.push({ id, channelId, metric: metricKey });
       }
     }
     this.renderMeasurementStrip(tab);
@@ -937,6 +1011,102 @@ export class OscilloscopeApp {
     }
   }
 
+  public applyFilterToChannel(
+    sourceChannelId: string,
+    config: FilterConfig
+  ): { ok: boolean; targetChannelId?: string; result?: FilterExecutionResult; error?: string } {
+    const tab = this.getActiveTab();
+    const srcCh = tab?.channels[sourceChannelId];
+    if (!tab || !srcCh) {
+      return { ok: false, error: 'No active waveform channel selected.' };
+    }
+
+    const check = validateFilterConfig(config, srcCh.t);
+    if (!check.ok) {
+      const msg = check.message || 'Invalid filter parameters.';
+      this.showToast(msg, 'error');
+      return { ok: false, error: msg };
+    }
+
+    const viewBounds = getTimeBoundsForView(tab, srcCh);
+    // In-place filtering must remain idempotent by recomputing from original refV
+    const filterInputV =
+      config.outputMode === 'in_place' && srcCh.hasEdits && srcCh.refV && srcCh.refV.length === srcCh.v.length
+        ? srcCh.refV
+        : srcCh.v;
+    const res = applyWaveformFilter(srcCh.t, filterInputV, config, {
+      viewStart: viewBounds.tStart,
+      viewEnd: viewBounds.tEnd,
+      cursorX1: tab.cursors.enabled ? tab.cursors.x1 : null,
+      cursorX2: tab.cursors.enabled ? tab.cursors.x2 : null,
+    });
+
+    if (config.outputMode === 'in_place') {
+      this.pushUndoSnapshot(`Filter ${srcCh.name} (${res.metrics.badgeText})`, true);
+      ensureReferenceLocked(srcCh);
+      srcCh.v = new Float32Array(res.v);
+      srcCh.hasEdits = true;
+      this.editVersion++;
+      this.cachedSpectrum = null;
+      this.cachedSpectrumKey = '';
+      this.renderSidebar();
+      this.draw();
+      this.showToast(
+        `Filtered ${srcCh.name} in-place (${res.metrics.summaryText}, recomputed from original Ref).`,
+        check.warning ? 'warn' : 'info'
+      );
+      return { ok: true, targetChannelId: srcCh.id, result: res };
+    }
+
+    this.pushUndoSnapshot(`New Filtered Trace (${res.metrics.badgeText})`, true);
+    const filterCount = tab.drawOrder.filter((id) => tab.channels[id]?.derivedKind === 'filter').length;
+    const newId = `filt_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const newCh: WaveformChannel = {
+      ...srcCh,
+      id: newId,
+      name: `${srcCh.name}_${res.metrics.badgeText}`,
+      unit: srcCh.unit,
+      color: this.getNextComputedColor(filterCount),
+      visible: true,
+      t: srcCh.t,
+      v: new Float32Array(res.v),
+      isMath: true,
+      channelKind: 'computed',
+      derivedKind: 'filter',
+      derivedBadge: res.metrics.badgeText,
+      mathExpression: res.metrics.summaryText,
+      sourceChannelIds: [srcCh.id],
+      coupling: 'DC',
+      inverted: false,
+      hasEdits: false,
+      refV: undefined,
+      showRef: false,
+      showDiff: false,
+      voltsPerDiv: undefined,
+      vOffset: undefined,
+      vMin: -1,
+      vMax: 1,
+    };
+    fitChannelTo125(newCh);
+
+    tab.channels[newId] = newCh;
+    tab.drawOrder.push(newId);
+    tab.activeChannelId = newId;
+    tab.selectedMeasurementChannelId = newId;
+    tab.selectedFftChannelId = newId;
+    tab.cursors.trackingChannel = newId;
+    this.editVersion++;
+    this.cachedSpectrum = null;
+    this.cachedSpectrumKey = '';
+    this.renderSidebar();
+    this.draw();
+    this.showToast(
+      `Created [${res.metrics.badgeText}] ${newCh.name} (${res.metrics.sampleCountFiltered.toLocaleString()} pts).`,
+      check.warning ? 'warn' : 'info'
+    );
+    return { ok: true, targetChannelId: newId, result: res };
+  }
+
   public setChannelsTimeShift(
     channelIds: string[],
     shiftSec: number,
@@ -955,6 +1125,7 @@ export class OscilloscopeApp {
       changed = true;
     }
     if (!changed) return;
+    extendTabViewToLongestChannel(tab);
     this.editVersion++;
     this.cachedSpectrum = null;
     this.cachedSpectrumKey = '';
@@ -1129,6 +1300,7 @@ export class OscilloscopeApp {
       goldenMode: 'percent' | 'absolute';
       goldenTolerance: number;
       addDiffChannel: boolean;
+      fullRefTrace?: { t: Float64Array; v: Float32Array };
     }
   ): void {
     const tab = this.getActiveTab();
@@ -1142,6 +1314,8 @@ export class OscilloscopeApp {
     if (options.overlayRefTrace) {
       const refChId = `cmp_ref_${targetChannelId}`;
       const existing = tab.channels[refChId];
+      const fullT = options.fullRefTrace?.t && options.fullRefTrace.t.length > 0 ? options.fullRefTrace.t : targetCh.t;
+      const fullV = options.fullRefTrace?.v && options.fullRefTrace.v.length === fullT.length ? options.fullRefTrace.v : alignedRefV;
       const refTrace: WaveformChannel = {
         ...targetCh,
         id: refChId,
@@ -1149,8 +1323,10 @@ export class OscilloscopeApp {
         unit: targetCh.unit || 'V',
         color: this.theme.isLight ? '#475569' : '#94a3b8',
         visible: true,
-        t: new Float64Array(targetCh.t),
-        v: new Float32Array(alignedRefV),
+        t: new Float64Array(fullT),
+        v: new Float32Array(fullV),
+        timeShiftSec: 0,
+        timeShiftBaseT: undefined,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'ref',
@@ -1197,6 +1373,8 @@ export class OscilloscopeApp {
         visible: true,
         t: new Float64Array(targetCh.t),
         v: new Float32Array(diffV),
+        timeShiftSec: 0,
+        timeShiftBaseT: undefined,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'diff',
@@ -1219,6 +1397,8 @@ export class OscilloscopeApp {
       }
     }
 
+    extendTabViewToLongestChannel(tab);
+    clampCursorsToViewport(tab);
     this.cachedSpectrum = null;
     this.cachedSpectrumKey = '';
     this.renderSidebar();
@@ -1256,6 +1436,8 @@ export class OscilloscopeApp {
       color: string;
       alignedRefV: Float32Array;
       diffV: Float32Array;
+      fullRefT?: Float64Array;
+      fullRefV?: Float32Array;
     }>
   ): void {
     const tab = this.getActiveTab();
@@ -1312,6 +1494,8 @@ export class OscilloscopeApp {
       items.forEach((item, idx) => {
         const refChId = `cmp_ref_${groupConfig.groupId}_${idx}_${item.id}`;
         const existing = tab.channels[refChId];
+        const fullT = item.fullRefT && item.fullRefT.length > 0 ? item.fullRefT : targetCh.t;
+        const fullV = item.fullRefV && item.fullRefV.length === fullT.length ? item.fullRefV : item.alignedRefV;
         const refTrace: WaveformChannel = {
           ...targetCh,
           id: refChId,
@@ -1319,8 +1503,10 @@ export class OscilloscopeApp {
           unit: targetCh.unit || 'V',
           color: item.color,
           visible: true,
-          t: new Float64Array(targetCh.t),
-          v: new Float32Array(item.alignedRefV),
+          t: new Float64Array(fullT),
+          v: new Float32Array(fullV),
+          timeShiftSec: 0,
+          timeShiftBaseT: undefined,
           isMath: true,
           channelKind: 'computed',
           derivedKind: 'ref',
@@ -1372,6 +1558,8 @@ export class OscilloscopeApp {
           visible: true,
           t: new Float64Array(targetCh.t),
           v: new Float32Array(item.diffV),
+          timeShiftSec: 0,
+          timeShiftBaseT: undefined,
           isMath: true,
           channelKind: 'computed',
           derivedKind: 'diff',
@@ -1399,6 +1587,8 @@ export class OscilloscopeApp {
       });
     }
 
+    extendTabViewToLongestChannel(tab);
+    clampCursorsToViewport(tab);
     this.cachedSpectrum = null;
     this.cachedSpectrumKey = '';
     this.renderSidebar();
@@ -1534,7 +1724,19 @@ export class OscilloscopeApp {
   }
 
   // --- Rendering Pipeline ---
+  public scheduleDraw(): void {
+    if (this.pendingDrawRaf !== null) return;
+    this.pendingDrawRaf = requestAnimationFrame(() => {
+      this.pendingDrawRaf = null;
+      this.draw();
+    });
+  }
+
   public draw(): void {
+    if (this.pendingDrawRaf !== null) {
+      cancelAnimationFrame(this.pendingDrawRaf);
+      this.pendingDrawRaf = null;
+    }
     const dpr = window.devicePixelRatio || 1;
     const width = this.canvas.width / dpr;
     const height = this.canvas.height / dpr;
@@ -1657,10 +1859,21 @@ export class OscilloscopeApp {
         let vSlice = primaryCh.v;
 
         if (tab.fftOptions.range === 'view') {
-          const s = Math.max(0, tab.view.startIndex);
-          const e = Math.min(primaryCh.v.length, tab.view.endIndex);
-          tSlice = primaryCh.t.subarray(s, e);
-          vSlice = primaryCh.v.subarray(s, e);
+          const primaryRef = tab.channels[tab.drawOrder[0]];
+          if (primaryRef && primaryCh.id === primaryRef.id && tab.view.startIndex >= 0 && tab.view.endIndex <= primaryCh.v.length) {
+            const s = Math.max(0, tab.view.startIndex);
+            const e = Math.min(primaryCh.v.length, tab.view.endIndex);
+            tSlice = primaryCh.t.subarray(s, e);
+            vSlice = primaryCh.v.subarray(s, e);
+          } else {
+            const vb = getTimeBoundsForView(tab, primaryRef || primaryCh);
+            let s = 0;
+            while (s < primaryCh.t.length && primaryCh.t[s] < vb.tStart) s++;
+            let e = s;
+            while (e < primaryCh.t.length && primaryCh.t[e] <= vb.tEnd) e++;
+            tSlice = primaryCh.t.subarray(s, e);
+            vSlice = primaryCh.v.subarray(s, e);
+          }
         } else if (
           tab.fftOptions.range === 'cursors' &&
           tab.cursors.enabled &&
@@ -1684,7 +1897,11 @@ export class OscilloscopeApp {
           fs,
           tab.fftOptions,
           primaryCh.id,
-          primaryCh.name
+          primaryCh.name,
+          {
+            sourceUnit: primaryCh.unit || 'V',
+            isUniformSampling: primaryCh.metadata?.isUniformSampling,
+          }
         );
         this.cachedSpectrumKey = key;
       } catch (e) {
@@ -1710,10 +1927,13 @@ export class OscilloscopeApp {
         this.lastRenderedPeaksKey = peaksRenderKey;
         const peaksEl = document.getElementById('fftPeaksList');
         if (peaksEl) {
+          const warnHtml = this.cachedSpectrum.cappedWarning
+            ? `<div class="mb-1.5 px-1.5 py-1 bg-amber-950/50 border border-amber-500/50 text-amber-200 rounded-xs text-[10px] font-mono">⚠ ${escapeHtml(this.cachedSpectrum.cappedWarning)}</div>`
+            : '';
           if (this.cachedSpectrum.peaks.length === 0) {
-            peaksEl.innerHTML = '<div class="text-slate-500">No peaks detected above threshold</div>';
+            peaksEl.innerHTML = `${warnHtml}<div class="text-slate-500">No peaks detected above threshold</div>`;
           } else {
-            let html = '';
+            let html = warnHtml;
             this.cachedSpectrum.peaks.forEach((peak, i) => {
               const isFund = peak.isFundamental;
               const magStr =
@@ -1723,7 +1943,7 @@ export class OscilloscopeApp {
               html += `
                 <div class="flex justify-between items-center py-0.5 ${isFund ? 'text-amber-300 font-semibold' : 'text-slate-300'}">
                   <span>${isFund ? '* ' : ''}P${i + 1}: ${formatEng(peak.frequency, 'Hz', 2)}</span>
-                  <span>${magStr}</span>
+                  <span>${escapeHtml(magStr)}</span>
                 </div>
               `;
             });
@@ -2137,7 +2357,7 @@ export class OscilloscopeApp {
           this.syncVerticalPanelOnly(ch);
           this.renderSoftkeysOnly(tab);
           this.renderCursorReadoutOnly(tab);
-          this.draw();
+          this.scheduleDraw();
         }
         return;
       }
@@ -2153,7 +2373,7 @@ export class OscilloscopeApp {
           this.syncVerticalPanelOnly(ch);
           this.renderSoftkeysOnly(tab);
           this.renderCursorReadoutOnly(tab);
-          this.draw();
+          this.scheduleDraw();
         }
         return;
       }
@@ -2167,7 +2387,7 @@ export class OscilloscopeApp {
         else tab.cursors.x2 = tCur;
         clampCursorsToViewport(tab);
         this.renderCursorReadoutOnly(tab);
-        this.draw();
+        this.scheduleDraw();
         return;
       }
 
@@ -2182,14 +2402,14 @@ export class OscilloscopeApp {
           else tab.cursors.y2 = val;
           clampCursorsToViewport(tab);
           this.renderCursorReadoutOnly(tab);
-          this.draw();
+          this.scheduleDraw();
         }
         return;
       }
 
       if (this.dragState.type === 'areaZoom' || this.dragState.type === 'areaAnnotate') {
         this.dragState.end = { x, y };
-        this.draw();
+        this.scheduleDraw();
         return;
       }
 
@@ -2211,28 +2431,27 @@ export class OscilloscopeApp {
           }
           tab.view.fMin = newFMin;
           tab.view.fMax = newFMax;
-          this.draw();
+          this.scheduleDraw();
           return;
         }
 
         const viewSpan = this.dragState.initialEndIdx - this.dragState.initialStartIdx;
         const shiftPoints = Math.round((dx / p.width) * viewSpan);
-        const primaryCh = tab.channels[tab.drawOrder[0]];
-        const totalN = primaryCh?.v.length || 1000;
+        const bounds = getTabGlobalIndexBounds(tab);
 
         let newStart = this.dragState.initialStartIdx - shiftPoints;
         let newEnd = this.dragState.initialEndIdx - shiftPoints;
 
-        if (newStart < 0) {
-          newStart = 0;
-          newEnd = viewSpan;
-        } else if (newEnd > totalN) {
-          newEnd = totalN;
-          newStart = Math.max(0, totalN - viewSpan);
+        if (newStart < bounds.minIdx) {
+          newStart = bounds.minIdx;
+          newEnd = bounds.minIdx + viewSpan;
+        } else if (newEnd > bounds.maxIdx) {
+          newEnd = bounds.maxIdx;
+          newStart = Math.max(bounds.minIdx, bounds.maxIdx - viewSpan);
         }
 
-        tab.view.startIndex = Math.max(0, newStart);
-        tab.view.endIndex = Math.min(totalN, newEnd);
+        tab.view.startIndex = Math.max(bounds.minIdx, newStart);
+        tab.view.endIndex = Math.min(bounds.maxIdx, newEnd);
 
         if (tab.plotMode === 'time' && this.dragState.targetChannelId && Math.abs(y - this.dragState.startY) > 1.5) {
           const ch = tab.channels[this.dragState.targetChannelId];
@@ -2253,7 +2472,7 @@ export class OscilloscopeApp {
 
         clampCursorsToViewport(tab);
         this.renderCursorReadoutOnly(tab);
-        this.draw();
+        this.scheduleDraw();
         return;
       }
     }
@@ -2465,21 +2684,21 @@ export class OscilloscopeApp {
     const mouseFrac = (x - p.x) / p.width;
     const mouseIdx = tab.view.startIndex + mouseFrac * viewSpan;
 
-    const primaryCh = tab.channels[tab.drawOrder[0]];
-    const totalN = primaryCh?.v.length || 1000;
-    const minSpan = Math.min(totalN, 2);
-    const newSpan = Math.max(minSpan, Math.round(viewSpan * zoomFactor));
+    const bounds = getTabGlobalIndexBounds(tab);
+    const totalSpanBounds = Math.max(2, bounds.maxIdx - bounds.minIdx);
+    const minSpan = Math.min(totalSpanBounds, 2);
+    const newSpan = Math.max(minSpan, Math.min(totalSpanBounds, Math.round(viewSpan * zoomFactor)));
 
     let newStart = Math.round(mouseIdx - mouseFrac * newSpan);
     let newEnd = newStart + newSpan;
 
-    if (newStart < 0) {
-      newStart = 0;
-      newEnd = Math.min(totalN, newSpan);
+    if (newStart < bounds.minIdx) {
+      newStart = bounds.minIdx;
+      newEnd = Math.min(bounds.maxIdx, bounds.minIdx + newSpan);
     }
-    if (newEnd > totalN) {
-      newEnd = totalN;
-      newStart = Math.max(0, totalN - newSpan);
+    if (newEnd > bounds.maxIdx) {
+      newEnd = bounds.maxIdx;
+      newStart = Math.max(bounds.minIdx, bounds.maxIdx - newSpan);
     }
 
     tab.view.startIndex = newStart;
@@ -2506,8 +2725,9 @@ export class OscilloscopeApp {
     if (!primaryCh) return;
 
     this.pushUndoSnapshot('Fit View');
-    tab.view.startIndex = 0;
-    tab.view.endIndex = primaryCh.v.length;
+    const bounds = getTabGlobalIndexBounds(tab);
+    tab.view.startIndex = bounds.minIdx;
+    tab.view.endIndex = bounds.maxIdx;
 
     for (const id of tab.drawOrder) {
       const ch = tab.channels[id];
@@ -3051,7 +3271,7 @@ export class OscilloscopeApp {
         const role = p.columnMappings[idx]?.role || (isTime ? 'time' : 'channel');
         tableHtml += `<th class="p-2 border border-[#222933] text-left ${isTime ? 'text-amber-300 font-semibold' : ''}">
           <div class="flex flex-col gap-1">
-            <span>${h}</span>
+            <span>${escapeHtml(h)}</span>
             <select class="col-role-select text-xs bg-[#0c0f13] border border-[#2c3543] rounded-sm px-1 text-white" data-col="${idx}">
               <option value="time" ${role === 'time' ? 'selected' : ''}>Time</option>
               <option value="channel" ${role === 'channel' ? 'selected' : ''}>Channel</option>
@@ -3065,7 +3285,7 @@ export class OscilloscopeApp {
       p.rows.slice(0, 8).forEach((r: string[]) => {
         tableHtml += '<tr class="border-b border-[#222933] hover:bg-[#161b22]">';
         r.forEach((c: string) => {
-          tableHtml += `<td class="p-2 border-r border-[#222933] whitespace-nowrap">${c}</td>`;
+          tableHtml += `<td class="p-2 border-r border-[#222933] whitespace-nowrap">${escapeHtml(c)}</td>`;
         });
         tableHtml += '</tr>';
       });
@@ -3800,7 +4020,7 @@ export class OscilloscopeApp {
           : 'bg-[#0c0f13] border-[#222933] text-slate-400 hover:text-slate-200 hover:border-[#2c3543]'
       }`;
       tabEl.innerHTML = `
-        <span class="truncate max-w-[145px]">${tab.fileName}</span>
+        <span class="truncate max-w-[145px]" title="${escapeHtml(tab.fileName)}">${escapeHtml(tab.fileName)}</span>
         <button class="tab-close text-slate-400 hover:text-white px-0.5 cursor-pointer" title="Close Tab">×</button>
       `;
 
@@ -3949,8 +4169,10 @@ export class OscilloscopeApp {
       }
 
       const refTag = ch.hasEdits ? '<span class="text-[9px] font-mono text-rose-300 border border-rose-500/50 px-1 ml-0.5">REF</span>' : '';
+      const safeGrpName = escapeHtml(ch.compareGroupName || '');
+      const safeChName = escapeHtml(ch.name);
       const grpBadge = ch.compareGroupName
-        ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${ch.compareGroupName}</span>`
+        ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${safeGrpName}</span>`
         : '';
       const swatchEl = computed
         ? `<button class="sk-vis-btn w-4 h-3 flex items-center justify-center shrink-0 cursor-pointer" title="Toggle computed trace visibility"><span class="w-4 h-0 border-t-2 border-dashed block" style="border-color:${ch.color};opacity:${ch.visible ? 1 : 0.3}"></span></button>`
@@ -3961,11 +4183,11 @@ export class OscilloscopeApp {
         <div class="flex flex-col leading-tight min-w-0">
           <div class="flex items-center gap-1 font-mono text-[11px]">
             ${grpBadge}
-            <span class="font-bold" style="color:${ch.color}">${tag}</span>
-            <span class="truncate max-w-[88px] text-slate-200 font-sans text-[11px]" title="${ch.name}">${ch.name}</span>${refTag}
+            <span class="font-bold" style="color:${ch.color}">${escapeHtml(tag)}</span>
+            <span class="truncate max-w-[88px] text-slate-200 font-sans text-[11px]" title="${safeChName}">${safeChName}</span>${refTag}
           </div>
           <div class="font-mono text-[10px] text-slate-400 tabular-nums">
-            ${formatEng(voltsPerDiv, ch.unit, 1)}/ · ${ch.coupling || 'DC'}${ch.inverted ? ' · INV' : ''} · ${vOffset >= 0 ? '+' : ''}${vOffset.toFixed(1)}${ch.unit}
+            ${escapeHtml(formatEng(voltsPerDiv, ch.unit, 1))}/ · ${ch.coupling || 'DC'}${ch.inverted ? ' · INV' : ''} · ${vOffset >= 0 ? '+' : ''}${vOffset.toFixed(1)}${escapeHtml(ch.unit)}
           </div>
         </div>
       `;
@@ -4013,9 +4235,10 @@ export class OscilloscopeApp {
       const grpChip = document.createElement('div');
       grpChip.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-sm border bg-[#0c1118] text-[10px] font-mono shrink-0';
       grpChip.style.borderColor = grp.color;
+      const safeGroupName = escapeHtml(grp.name);
       grpChip.innerHTML = `
         <span class="w-2 h-2 rounded-full shrink-0" style="background:${grp.color}"></span>
-        <button type="button" class="grp-edit-btn font-bold hover:underline cursor-pointer" style="color:${grp.color}" title="Edit compare group">[${grp.name}]</button>
+        <button type="button" class="grp-edit-btn font-bold hover:underline cursor-pointer" style="color:${grp.color}" title="Edit compare group">[${safeGroupName}]</button>
         <span class="text-slate-400">· ${totalOverlays} ref${totalOverlays > 1 ? 's' : ''}</span>
         <button type="button" class="grp-vis-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-slate-200 cursor-pointer" title="Show/Hide compare overlays">${grp.allRefVisible ? 'Hide' : 'Show'}</button>
         <button type="button" class="grp-edit-icon-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 cursor-pointer" title="Edit / Re-align group">Edit</button>
@@ -4268,13 +4491,15 @@ export class OscilloscopeApp {
         : 'N/A';
 
       fileSummaryEl.innerHTML = `
-        <div class="flex justify-between py-0.5"><span class="text-slate-400">File</span><span class="font-mono text-slate-200 truncate max-w-[175px]">${tab.fileName}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">File</span><span class="font-mono text-slate-200 truncate max-w-[175px]" title="${escapeHtml(tab.fileName)}">${escapeHtml(tab.fileName)}</span></div>
         <div class="flex justify-between py-0.5"><span class="text-slate-400">Samples</span><span class="font-mono text-slate-200">${primaryCh?.v.length.toLocaleString() || 0}</span></div>
-        <div class="flex justify-between py-0.5"><span class="text-slate-400">Rate</span><span class="font-mono text-slate-200">${sampleRateStr}</span></div>
-        <div class="flex justify-between py-0.5"><span class="text-slate-400">Duration</span><span class="font-mono text-slate-200">${durationStr}</span></div>
-        <div class="flex justify-between py-0.5"><span class="text-slate-400">Timing</span><span>${qualityBadge}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Rate</span><span class="font-mono text-slate-200">${escapeHtml(sampleRateStr)}${meta?.syntheticClockUsed ? ' (10k默认)' : ''}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Duration</span><span class="font-mono text-slate-200">${escapeHtml(durationStr)}</span></div>
+        <div class="flex justify-between py-0.5"><span class="text-slate-400">Timing</span><span>${qualityBadge}${meta?.resampledFromNonUniform ? ' <span class="text-cyan-300 text-[10px]">(Resampled)</span>' : ''}</span></div>
         ${meta && meta.jitterRms !== null ? `<div class="flex justify-between py-0.5"><span class="text-slate-400">Jitter RMS</span><span class="font-mono text-slate-200">${meta.jitterRms.toFixed(2)}%</span></div>` : ''}
-        ${meta && meta.gapCount > 0 ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Gaps</span><span class="font-mono font-semibold">${meta.gapCount}</span></div>` : ''}
+        ${meta && ((meta.rawGapCount ?? meta.gapCount) > 0 || meta.gapCount > 0) ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Gaps${meta.resampledFromNonUniform ? ' (raw)' : ''}</span><span class="font-mono font-semibold">${meta.rawGapCount ?? meta.gapCount}</span></div>` : ''}
+        ${meta && (meta.signalNanCount || 0) > 0 ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Missing/NaN</span><span class="font-mono font-semibold">${meta.signalNanCount}</span></div>` : ''}
+        ${meta && (meta.nonMonotonicCount || 0) > 0 ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Non-Monotonic (sorted)</span><span class="font-mono font-semibold">${meta.nonMonotonicCount}</span></div>` : ''}
       `;
     }
 
@@ -4334,7 +4559,7 @@ export class OscilloscopeApp {
             <div class="flex items-center justify-between gap-1">
               <div class="flex items-center gap-1.5 min-w-0">
                 <span class="w-2 h-2 rounded-full shrink-0" style="background:${grp.color}"></span>
-                <span class="font-mono font-bold truncate" style="color:${grp.color}">[${grp.name}]</span>
+                <span class="font-mono font-bold truncate" style="color:${grp.color}">[${escapeHtml(grp.name)}]</span>
                 <span class="text-[10px] font-mono text-slate-400">×${grp.members.length}</span>
               </div>
               <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
@@ -4343,7 +4568,7 @@ export class OscilloscopeApp {
                 <button type="button" class="cmp-sb-del text-red-400 hover:text-red-300 px-1 py-0.5 cursor-pointer" title="Remove group">✕</button>
               </div>
             </div>
-            ${grp.targetName ? `<div class="text-[10px] font-mono text-slate-400 truncate">Base: <span class="text-slate-200">${grp.targetName}</span></div>` : ''}
+            ${grp.targetName ? `<div class="text-[10px] font-mono text-slate-400 truncate">Base: <span class="text-slate-200">${escapeHtml(grp.targetName)}</span></div>` : ''}
           `;
           card.innerHTML = headerHtml;
 
@@ -4358,7 +4583,7 @@ export class OscilloscopeApp {
               <label class="flex items-center gap-1.5 min-w-0 cursor-pointer flex-1">
                 <input type="checkbox" class="cmp-m-vis cursor-pointer accent-emerald-400" ${ch.visible ? 'checked' : ''} />
                 <span class="w-2 h-2 rounded-xs shrink-0" style="background:${ch.color}"></span>
-                <span class="truncate text-slate-200" title="${ch.name}">${shortName}</span>
+                <span class="truncate text-slate-200" title="${escapeHtml(ch.name)}">${escapeHtml(shortName)}</span>
               </label>
               <button type="button" class="cmp-m-del text-slate-500 hover:text-red-400 px-1 cursor-pointer" title="Remove trace">✕</button>
             `;
@@ -4415,9 +4640,11 @@ export class OscilloscopeApp {
             row.style.borderLeftColor = ch.compareGroupColor;
           }
           const grpBadgeHtml = ch.compareGroupName
-            ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${ch.compareGroupName}</span>`
+            ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${escapeHtml(ch.compareGroupName)}</span>`
             : '';
-          const badgeTxt = ch.derivedBadge || 'fx';
+          const badgeTxt = escapeHtml(ch.derivedBadge || 'fx');
+          const safeMathChName = escapeHtml(ch.name);
+          const safeMathExpr = escapeHtml(ch.mathExpression || '');
           row.innerHTML = `
             <div class="flex items-center justify-between gap-1">
               <div class="flex items-center gap-1.5 overflow-hidden">
@@ -4425,7 +4652,7 @@ export class OscilloscopeApp {
                 <span class="w-4 h-0 border-t-2 border-dashed shrink-0" style="border-color:${ch.color}"></span>
                 <span class="text-[9px] font-mono px-1 rounded-xs border border-purple-500/40 text-purple-300 shrink-0">[${badgeTxt}]</span>
                 ${grpBadgeHtml}
-                <span class="font-medium text-purple-200 truncate max-w-[92px]" title="${ch.name}">${ch.name}</span>
+                <span class="font-medium text-purple-200 truncate max-w-[92px]" title="${safeMathChName}">${safeMathChName}</span>
               </div>
               <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
                 <button class="ch-fit-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Fit</button>
@@ -4434,8 +4661,8 @@ export class OscilloscopeApp {
               </div>
             </div>
             <div class="flex justify-between items-center text-[10px] text-slate-400 mt-1 font-mono tabular-nums">
-              <span class="truncate max-w-[165px] text-purple-300/80" title="${ch.mathExpression || ''}">${ch.mathExpression || 'Math'}</span>
-              <span>${formatEng(voltsPerDiv, ch.unit, 1)}/div</span>
+              <span class="truncate max-w-[165px] text-purple-300/80" title="${safeMathExpr}">${safeMathExpr || 'Math'}</span>
+              <span>${escapeHtml(formatEng(voltsPerDiv, ch.unit, 1))}/div</span>
             </div>
           `;
 
@@ -4514,14 +4741,18 @@ export class OscilloscopeApp {
 
   private getCachedMeasurements(tab: TabState, ch: WaveformChannel): ChannelMeasurements {
     const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
-    const key = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${this.editVersion}`;
+    const key = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${ch.timeShiftSec || 0}_${this.editVersion}`;
     const existing = this.measCache[ch.id];
     if (existing && existing.key === key) {
       return existing.value;
     }
     const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
-    const hasCustomTime = primaryCh && ch.t !== primaryCh.t && ch.t.length !== primaryCh.t.length;
-    const viewBounds = hasCustomTime ? getTimeBoundsForView(tab, primaryCh) : undefined;
+    const hasCustomTime = Boolean(
+      primaryCh &&
+        ch !== primaryCh &&
+        (ch.t !== primaryCh.t || ch.t.length !== primaryCh.t.length || (ch.timeShiftSec || 0) !== 0)
+    );
+    const viewBounds = hasCustomTime && primaryCh ? getTimeBoundsForView(tab, primaryCh) : undefined;
     const computed = computeMeasurements(
       ch,
       tab.measurementGate,
@@ -4531,6 +4762,42 @@ export class OscilloscopeApp {
     );
     this.measCache[ch.id] = { key, value: computed };
     return computed;
+  }
+
+  private getCachedCustomMeasurementValue(
+    tab: TabState,
+    ch: WaveformChannel,
+    customDef: CustomMeasurementDefinition,
+    meas: ChannelMeasurements
+  ): number | null {
+    const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const cacheKey = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${ch.timeShiftSec || 0}_${this.editVersion}`;
+    let entry = this.customMeasCache[ch.id];
+    if (!entry || entry.key !== cacheKey) {
+      entry = { key: cacheKey, values: {} };
+      this.customMeasCache[ch.id] = entry;
+    }
+    if (Object.prototype.hasOwnProperty.call(entry.values, customDef.id)) {
+      return entry.values[customDef.id];
+    }
+    const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
+    const hasCustomTime = Boolean(
+      primaryCh &&
+        ch !== primaryCh &&
+        (ch.t !== primaryCh.t || ch.t.length !== primaryCh.t.length || (ch.timeShiftSec || 0) !== 0)
+    );
+    const viewBounds = hasCustomTime && primaryCh ? getTimeBoundsForView(tab, primaryCh) : undefined;
+    const val = evaluateCustomMeasurement(
+      customDef,
+      ch,
+      meas,
+      tab.measurementGate,
+      tab.view,
+      tab.cursors,
+      viewBounds ? { tStart: viewBounds.tStart, tEnd: viewBounds.tEnd } : undefined
+    );
+    entry.values[customDef.id] = val;
+    return val;
   }
 
   private lastMeasStripKey: string = '';
@@ -4552,8 +4819,9 @@ export class OscilloscopeApp {
     }
 
     const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const customDefsKey = (tab.customMeasurements || []).map((c) => `${c.id}:${c.expression}:${c.shortLabel}`).join(';');
     const itemsKey = items.map((i) => `${i.id}:${i.channelId}:${i.metric}`).join('|');
-    const stripKey = `${tab.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${this.editVersion}_${itemsKey}`;
+    const stripKey = `${tab.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${this.editVersion}_${itemsKey}_${customDefsKey}`;
     if (this.lastMeasStripKey === stripKey) return;
     this.lastMeasStripKey = stripKey;
 
@@ -4563,11 +4831,24 @@ export class OscilloscopeApp {
     container.innerHTML = '';
     for (const item of items) {
       const ch = tab.channels[item.channelId];
-      const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
-      if (!ch || !def) continue;
-
+      if (!ch) continue;
       const m = this.getCachedMeasurements(tab, ch);
-      const valStr = formatMeasurementMetricValue(m, def, ch.unit);
+
+      let shortLabel = '';
+      let valStr = '';
+      if (typeof item.metric === 'string' && item.metric.startsWith('custom:')) {
+        const customId = item.metric.slice(7);
+        const customDef = (tab.customMeasurements || []).find((c) => c.id === customId);
+        if (!customDef) continue;
+        const customVal = this.getCachedCustomMeasurementValue(tab, ch, customDef, m);
+        shortLabel = customDef.shortLabel || customDef.label;
+        valStr = formatCustomMeasurementValue(customVal, customDef, ch.unit);
+      } else {
+        const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
+        if (!def) continue;
+        shortLabel = def.shortLabel;
+        valStr = formatMeasurementMetricValue(m, def, ch.unit);
+      }
 
       const card = document.createElement('div');
       const isComputed = isComputedChannel(ch);
@@ -4576,11 +4857,11 @@ export class OscilloscopeApp {
       card.style.borderTopStyle = isComputed ? 'dashed' : 'solid';
       card.style.borderTopColor = ch.color;
 
-      const fxTag = isComputed ? `<span class="text-[9px] font-mono text-purple-300 mr-1">[${ch.derivedBadge || 'fx'}]</span>` : '';
+      const fxTag = isComputed ? `<span class="text-[9px] font-mono text-purple-300 mr-1">[${escapeHtml(ch.derivedBadge || 'fx')}]</span>` : '';
       card.innerHTML = `
         <div class="flex flex-col leading-tight">
-          <span class="text-[10px] text-slate-400 truncate max-w-[125px]">${fxTag}${ch.name} · ${def.shortLabel}</span>
-          <span class="font-mono font-semibold text-slate-100 tabular-nums">${valStr}</span>
+          <span class="text-[10px] text-slate-400 truncate max-w-[135px]">${fxTag}${escapeHtml(ch.name)} · ${escapeHtml(shortLabel)}</span>
+          <span class="font-mono font-semibold text-slate-100 tabular-nums">${escapeHtml(valStr)}</span>
         </div>
         <button class="meas-card-remove text-slate-500 hover:text-red-300 px-0.5 font-mono cursor-pointer" title="Remove metric">×</button>
       `;
@@ -4678,18 +4959,38 @@ export class OscilloscopeApp {
     const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
     if (visibleChs.length === 0) return;
 
-    const baseCh = visibleChs[0];
-    const n = baseCh.v.length;
-
-    let csv = 'Time(s),' + visibleChs.map((c) => `"${c.name} (${c.unit})"`).join(',') + '\n';
-    for (let i = 0; i < n; i++) {
-      const row = [baseCh.t[i].toExponential(6)];
-      for (const ch of visibleChs) {
-        row.push(ch.v[i]?.toFixed(5) || '0');
+    // Choose a reference grid spanning the longest duration, or baseCh if identical grids
+    let refCh = visibleChs[0];
+    let maxSpan = refCh.t.length > 1 ? refCh.t[refCh.t.length - 1] - refCh.t[0] : 0;
+    for (const ch of visibleChs) {
+      const span = ch.t.length > 1 ? ch.t[ch.t.length - 1] - ch.t[0] : 0;
+      if (span > maxSpan || (Math.abs(span - maxSpan) < 1e-15 && ch.t.length > refCh.t.length)) {
+        maxSpan = span;
+        refCh = ch;
       }
-      csv += row.join(',') + '\n';
     }
 
+    const n = refCh.t.length;
+    const headerCells = ['Time(s)', ...visibleChs.map((c) => escapeCsvCell(`${c.name} (${c.unit || 'V'})`))];
+    const lines: string[] = [headerCells.join(',')];
+
+    for (let i = 0; i < n; i++) {
+      const timeSec = refCh.t[i];
+      if (!Number.isFinite(timeSec)) continue;
+      const row = [timeSec.toExponential(6)];
+      for (const ch of visibleChs) {
+        let val: number | null;
+        if (ch === refCh || (ch.t === refCh.t && ch.v.length === refCh.v.length)) {
+          val = i < ch.v.length && Number.isFinite(ch.v[i]) ? ch.v[i] : null;
+        } else {
+          val = sampleChannelValueAtTime(ch, timeSec);
+        }
+        row.push(val !== null && Number.isFinite(val) ? val.toFixed(6) : '');
+      }
+      lines.push(row.join(','));
+    }
+
+    const csv = lines.join('\n') + '\n';
     const blob = new Blob([csv], { type: 'text/csv' });
     const link = document.createElement('a');
     link.download = `${tab.fileName}_waveform.csv`;
@@ -4704,7 +5005,8 @@ export class OscilloscopeApp {
     }
 
     const s = this.cachedSpectrum;
-    let csv = 'Frequency(Hz),Magnitude(V),Magnitude(dB)\n';
+    const magUnit = s.sourceUnit || 'V';
+    let csv = `${['Frequency(Hz)', escapeCsvCell(`Magnitude(${magUnit})`), 'Magnitude(dB)'].join(',')}\n`;
     for (let i = 0; i < s.frequencies.length; i++) {
       csv += `${s.frequencies[i].toFixed(2)},${s.magnitudes[i].toExponential(5)},${s.dbValues[i].toFixed(2)}\n`;
     }

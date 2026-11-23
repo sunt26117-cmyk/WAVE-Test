@@ -1,19 +1,21 @@
 /**
  * Waveform Viewer Pro - Oscilloscope Automated Measurements Engine
- * Computes 15 engineering parameters:
- *   Voltage: Max, Min, Vpp, Mean, RMS, Vtop (histogram high plateau), Vbase (histogram low plateau), Overshoot (%)
- *   Timing:  Frequency, Period, Rise Time (10-90%), Fall Time (90-10%), +Width, -Width, Duty Cycle (%)
- * Strictly guarded against empty arrays, NaNs, flat signals, and division by zero.
+ * Computes 18 built-in engineering parameters plus extensible custom user metrics:
+ *   Voltage: Max, Min, Vpp, Mean, |V| Mean (Abs Mean), RMS, Vtop, Vbase, Overshoot (%)
+ *   Timing:  Frequency, Period, Rise Time (10-90%), Fall Time (90-10%), +Width, -Width, Duty Cycle, Max Duty, Min Duty (%)
+ * Uses time-weighted trapezoidal integrals for non-uniform / variable-step captures.
  */
 
 import {
   ChannelMeasurements,
+  CustomMeasurementDefinition,
   MeasurementGate,
   MeasurementMetricKey,
   WaveformChannel,
   CursorsState,
 } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
+import { evaluateRPN, tokenizeMath, toRPN } from './mathParser';
 
 export interface MeasurementDefinition {
   key: MeasurementMetricKey;
@@ -29,6 +31,7 @@ export const MEASUREMENT_DEFINITIONS: MeasurementDefinition[] = [
   { key: 'min', group: 'voltage', label: 'Min (Vmin)', shortLabel: 'Vmin', unitType: 'signal' },
   { key: 'vpp', group: 'voltage', label: 'Peak-to-Peak (Vpp)', shortLabel: 'Vpp', unitType: 'signal' },
   { key: 'average', group: 'voltage', label: 'Mean (Vmean)', shortLabel: 'Vmean', unitType: 'signal' },
+  { key: 'absAverage', group: 'voltage', label: 'Abs Mean (|V|avg)', shortLabel: '|V|avg', unitType: 'signal' },
   { key: 'rms', group: 'voltage', label: 'RMS (Vrms)', shortLabel: 'Vrms', unitType: 'signal' },
   { key: 'vtop', group: 'voltage', label: 'Top (Vtop)', shortLabel: 'Vtop', unitType: 'signal' },
   { key: 'vbase', group: 'voltage', label: 'Base (Vbase)', shortLabel: 'Vbase', unitType: 'signal' },
@@ -41,7 +44,63 @@ export const MEASUREMENT_DEFINITIONS: MeasurementDefinition[] = [
   { key: 'posWidth', group: 'timing', label: '+Width (50%)', shortLabel: '+Width', unitType: 'time' },
   { key: 'negWidth', group: 'timing', label: '-Width (50%)', shortLabel: '-Width', unitType: 'time' },
   { key: 'dutyCycle', group: 'timing', label: 'Duty Cycle (%)', shortLabel: 'Duty', unitType: 'percent' },
+  { key: 'maxDutyCycle', group: 'timing', label: 'Max Duty Cycle (%)', shortLabel: 'DutyMax', unitType: 'percent' },
+  { key: 'minDutyCycle', group: 'timing', label: 'Min Duty Cycle (%)', shortLabel: 'DutyMin', unitType: 'percent' },
 ];
+
+export const CUSTOM_MEASUREMENT_PRESETS: Array<Omit<CustomMeasurementDefinition, 'id'>> = [
+  { label: 'Crest Factor (Peak/RMS)', shortLabel: 'CF', expression: 'peak / vrms', unitType: 'ratio' },
+  { label: 'AC Ripple RMS', shortLabel: 'Vac_rms', expression: 'sqrt(vrms^2 - vmean^2)', unitType: 'signal' },
+  { label: 'Form Factor (RMS/|Avg|)', shortLabel: 'FF', expression: 'vrms / absmean', unitType: 'ratio' },
+  { label: 'Duty Spread (Max-Min)', shortLabel: 'ΔDuty', expression: 'maxduty - minduty', unitType: 'percent' },
+];
+
+function resolveGateIndexRange(
+  t: Float64Array,
+  totalN: number,
+  gate: MeasurementGate,
+  viewIndices: { startIndex: number; endIndex: number },
+  cursors: CursorsState,
+  viewTimeBounds?: { tStart: number; tEnd: number }
+): { startIdx: number; endIdx: number } {
+  let startIdx = 0;
+  let endIdx = totalN - 1;
+
+  if (gate === 'view') {
+    if (viewTimeBounds) {
+      let lo = 0;
+      let hi = totalN - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (t[mid] < viewTimeBounds.tStart) lo = mid + 1;
+        else hi = mid;
+      }
+      startIdx = lo;
+      lo = startIdx;
+      hi = totalN;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (t[mid] <= viewTimeBounds.tEnd) lo = mid + 1;
+        else hi = mid;
+      }
+      endIdx = Math.max(startIdx, Math.min(totalN - 1, lo - 1));
+    } else {
+      startIdx = Math.max(0, Math.min(totalN - 1, viewIndices.startIndex));
+      endIdx = Math.max(startIdx, Math.min(totalN - 1, viewIndices.endIndex));
+    }
+  } else if (gate === 'cursors' && cursors.enabled && cursors.x1 !== null && cursors.x2 !== null) {
+    const xMin = Math.min(cursors.x1, cursors.x2);
+    const xMax = Math.max(cursors.x1, cursors.x2);
+    let s = 0;
+    while (s < totalN && t[s] < xMin) s++;
+    let e = s;
+    while (e < totalN && t[e] <= xMax) e++;
+    startIdx = Math.max(0, Math.min(totalN - 1, s));
+    endIdx = Math.max(startIdx, Math.min(totalN - 1, e - 1));
+  }
+
+  return { startIdx, endIdx };
+}
 
 /**
  * Estimates steady-state Vtop and Vbase via 64-bin amplitude histogram modal clustering.
@@ -111,7 +170,6 @@ function estimateHistogramTopBase(
     return c > 0 ? s / c : null;
   };
 
-  // Only treat histogram mode as bimodal plateau if peak density >= 3x uniform average
   const avgPerBin = totalSampled / bins;
   const vtop =
     topMaxCount > avgPerBin * 2.0 ? (clusterMean(topPeakBin) ?? max) : max;
@@ -147,6 +205,7 @@ export function computeMeasurements(
       max: null,
       min: null,
       average: null,
+      absAverage: null,
       rms: null,
       vpp: null,
       peak: null,
@@ -157,6 +216,8 @@ export function computeMeasurements(
       period: null,
       frequency: null,
       dutyCycle: null,
+      maxDutyCycle: null,
+      minDutyCycle: null,
       riseTime: null,
       fallTime: null,
       posWidth: null,
@@ -169,41 +230,7 @@ export function computeMeasurements(
   const cachedMean = channel.coupling === 'AC' ? computeChannelMean(channel) : 0;
   const valAt = (idx: number) => (isConditioned ? getChannelDisplayValue(channel, idx, cachedMean) : v[idx]);
 
-  let startIdx = 0;
-  let endIdx = totalN - 1;
-
-  if (gate === 'view') {
-    if (viewTimeBounds) {
-      let lo = 0;
-      let hi = totalN - 1;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (t[mid] < viewTimeBounds.tStart) lo = mid + 1;
-        else hi = mid;
-      }
-      startIdx = lo;
-      lo = startIdx;
-      hi = totalN;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (t[mid] <= viewTimeBounds.tEnd) lo = mid + 1;
-        else hi = mid;
-      }
-      endIdx = Math.max(startIdx, Math.min(totalN - 1, lo - 1));
-    } else {
-      startIdx = Math.max(0, Math.min(totalN - 1, viewIndices.startIndex));
-      endIdx = Math.max(startIdx, Math.min(totalN - 1, viewIndices.endIndex));
-    }
-  } else if (gate === 'cursors' && cursors.enabled && cursors.x1 !== null && cursors.x2 !== null) {
-    const xMin = Math.min(cursors.x1, cursors.x2);
-    const xMax = Math.max(cursors.x1, cursors.x2);
-    let s = 0;
-    while (s < totalN && t[s] < xMin) s++;
-    let e = s;
-    while (e < totalN && t[e] <= xMax) e++;
-    startIdx = Math.max(0, Math.min(totalN - 1, s));
-    endIdx = Math.max(startIdx, Math.min(totalN - 1, e - 1));
-  }
+  const { startIdx, endIdx } = resolveGateIndexRange(t, totalN, gate, viewIndices, cursors, viewTimeBounds);
 
   const sampleCount = endIdx - startIdx + 1;
   const timeStart = t[startIdx];
@@ -223,6 +250,7 @@ export function computeMeasurements(
       max: singleVal,
       min: singleVal,
       average: singleVal,
+      absAverage: singleVal !== null ? Math.abs(singleVal) : null,
       rms: singleVal !== null ? Math.abs(singleVal) : null,
       vpp: singleVal !== null ? 0 : null,
       peak: singleVal !== null ? Math.abs(singleVal) : null,
@@ -233,6 +261,8 @@ export function computeMeasurements(
       period: null,
       frequency: null,
       dutyCycle: null,
+      maxDutyCycle: null,
+      minDutyCycle: null,
       riseTime: null,
       fallTime: null,
       posWidth: null,
@@ -241,21 +271,60 @@ export function computeMeasurements(
     };
   }
 
-  // Pass 1: Basic statistics (Min, Max, Sum, SumSq)
+  // Pass 1: Basic statistics + time-weighted trapezoidal integrals for non-uniform / variable-step captures
   let min = Infinity;
   let max = -Infinity;
   let sum = 0;
+  let sumAbs = 0;
   let sumSq = 0;
   let validCount = 0;
 
+  let trapSum = 0;
+  let trapAbsSum = 0;
+  let trapSqSum = 0;
+  let totalDtWeight = 0;
+  let minDtObserved = Infinity;
+  let maxDtObserved = 0;
+  let prevValidVal: number | null = null;
+  let prevValidTime: number | null = null;
+
   for (let i = startIdx; i <= endIdx; i++) {
     const val = valAt(i);
-    if (!isNaN(val) && isFinite(val)) {
+    const ti = t[i];
+    if (isFinite(val) && isFinite(ti)) {
       if (val < min) min = val;
       if (val > max) max = val;
       sum += val;
+      sumAbs += Math.abs(val);
       sumSq += val * val;
       validCount++;
+
+      if (prevValidVal !== null && prevValidTime !== null) {
+        const dt = ti - prevValidTime;
+        if (dt > 0) {
+          if (dt < minDtObserved) minDtObserved = dt;
+          if (dt > maxDtObserved) maxDtObserved = dt;
+          trapSum += 0.5 * (prevValidVal + val) * dt;
+          // Exact integral of |linear(t)| across segment
+          if ((prevValidVal >= 0 && val >= 0) || (prevValidVal <= 0 && val <= 0)) {
+            trapAbsSum += 0.5 * (Math.abs(prevValidVal) + Math.abs(val)) * dt;
+          } else {
+            const abs0 = Math.abs(prevValidVal);
+            const abs1 = Math.abs(val);
+            const denom = abs0 + abs1;
+            const tZeroFrac = denom > 1e-18 ? abs0 / denom : 0.5;
+            trapAbsSum += 0.5 * abs0 * (dt * tZeroFrac) + 0.5 * abs1 * (dt * (1 - tZeroFrac));
+          }
+          // Exact integral of linear^2(t) over [a, b]: (a^2 + a*b + b^2) / 3 * dt
+          trapSqSum += ((prevValidVal * prevValidVal + prevValidVal * val + val * val) / 3) * dt;
+          totalDtWeight += dt;
+        }
+      }
+      prevValidVal = val;
+      prevValidTime = ti;
+    } else {
+      prevValidVal = null;
+      prevValidTime = null;
     }
   }
 
@@ -271,6 +340,7 @@ export function computeMeasurements(
       max: null,
       min: null,
       average: null,
+      absAverage: null,
       rms: null,
       vpp: null,
       peak: null,
@@ -281,6 +351,8 @@ export function computeMeasurements(
       period: null,
       frequency: null,
       dutyCycle: null,
+      maxDutyCycle: null,
+      minDutyCycle: null,
       riseTime: null,
       fallTime: null,
       posWidth: null,
@@ -289,8 +361,14 @@ export function computeMeasurements(
     };
   }
 
-  const average = sum / validCount;
-  const rms = Math.sqrt(sumSq / validCount);
+  const hasVaryingDt =
+    isFinite(minDtObserved) && maxDtObserved > 0 && minDtObserved < maxDtObserved * 0.98;
+  const useTimeWeighted =
+    totalDtWeight > 0 && (channel.metadata?.isUniformSampling === false || hasVaryingDt);
+
+  const average = useTimeWeighted ? trapSum / totalDtWeight : sum / validCount;
+  const absAverage = useTimeWeighted ? trapAbsSum / totalDtWeight : sumAbs / validCount;
+  const rms = useTimeWeighted ? Math.sqrt(Math.max(0, trapSqSum / totalDtWeight)) : Math.sqrt(sumSq / validCount);
   const vpp = max - min;
   const peak = Math.max(Math.abs(max), Math.abs(min));
   const { vtop, vbase } = estimateHistogramTopBase(valAt, startIdx, endIdx, min, max);
@@ -303,10 +381,12 @@ export function computeMeasurements(
     undershoot = Math.max(0, ((vbase - min) / baseAmp) * 100);
   }
 
-  // Timing analysis: Frequency, Period, +Width, -Width, Duty, Rise/Fall Time
+  // Timing analysis: Frequency, Period, +Width, -Width, Duty, Max Duty, Min Duty, Rise/Fall Time
   let period: number | null = null;
   let frequency: number | null = null;
   let dutyCycle: number | null = null;
+  let maxDutyCycle: number | null = null;
+  let minDutyCycle: number | null = null;
   let riseTime: number | null = null;
   let fallTime: number | null = null;
   let posWidth: number | null = null;
@@ -384,7 +464,28 @@ export function computeMeasurements(
       negWidth = negWidths.reduce((a, b) => a + b, 0) / negWidths.length;
     }
 
-    if (posWidth !== null && period !== null && period > 0) {
+    // Cycle-by-cycle duty cycle array across consecutive rising edges
+    const cycleDuties: number[] = [];
+    let fallCursor = 0;
+    for (let k = 0; k + 1 < risingEdgeTimes.length; k++) {
+      const rStart = risingEdgeTimes[k];
+      const rEnd = risingEdgeTimes[k + 1];
+      const cycPeriod = rEnd - rStart;
+      if (cycPeriod <= 0) continue;
+      while (fallCursor < fallingEdgeTimes.length && fallingEdgeTimes[fallCursor] <= rStart) {
+        fallCursor++;
+      }
+      if (fallCursor < fallingEdgeTimes.length && fallingEdgeTimes[fallCursor] < rEnd) {
+        const highDur = fallingEdgeTimes[fallCursor] - rStart;
+        cycleDuties.push(Math.max(0, Math.min(100, (highDur / cycPeriod) * 100)));
+      }
+    }
+
+    if (cycleDuties.length > 0) {
+      maxDutyCycle = Math.max(...cycleDuties);
+      minDutyCycle = Math.min(...cycleDuties);
+      dutyCycle = cycleDuties.reduce((a, b) => a + b, 0) / cycleDuties.length;
+    } else if (posWidth !== null && period !== null && period > 0) {
       dutyCycle = Math.max(0, Math.min(100, (posWidth / period) * 100));
     }
 
@@ -397,7 +498,6 @@ export function computeMeasurements(
     const riseTimes: number[] = [];
     const fallTimes: number[] = [];
 
-    // Track threshold crossings robustly even across multi-sample edges
     let riseStartT: number | null = null;
     let fallStartT: number | null = null;
 
@@ -413,7 +513,6 @@ export function computeMeasurements(
       const tc = t[i];
       const dtSpan = tc - tp;
 
-      // Single-step or multi-step rising edge
       if (vp <= v10 && vc > v10) {
         riseStartT = tp + ((v10 - vp) / (vc - vp)) * dtSpan;
       }
@@ -425,7 +524,6 @@ export function computeMeasurements(
         riseStartT = null;
       }
 
-      // Single-step or multi-step falling edge
       if (vp >= v90 && vc < v90) {
         fallStartT = tp + ((vp - v90) / (vp - vc)) * dtSpan;
       }
@@ -457,6 +555,7 @@ export function computeMeasurements(
     max,
     min,
     average,
+    absAverage,
     rms,
     vpp,
     peak,
@@ -467,10 +566,102 @@ export function computeMeasurements(
     period,
     frequency,
     dutyCycle,
+    maxDutyCycle,
+    minDutyCycle,
     riseTime,
     fallTime,
     posWidth,
     negWidth,
     statusMessage,
   };
+}
+
+/**
+ * Evaluates a user-defined extensible custom metric safely using mathParser AST.
+ * Supports built-in metric variables (vmax, vmin, vpp, vmean, absmean, vrms, vtop, vbase,
+ * overshoot, freq, period, rise, fall, poswidth, negwidth, duty, maxduty, minduty, peak)
+ * as well as gated signal vectors x / v (e.g. "mean(abs(x)^2)", "peak/vrms").
+ */
+export function evaluateCustomMeasurement(
+  def: CustomMeasurementDefinition,
+  channel: WaveformChannel,
+  meas: ChannelMeasurements,
+  gate: MeasurementGate,
+  viewIndices: { startIndex: number; endIndex: number },
+  cursors: CursorsState,
+  viewTimeBounds?: { tStart: number; tEnd: number }
+): number | null {
+  try {
+    const totalN = Math.min(channel.t.length, channel.v.length);
+    if (totalN === 0) return null;
+
+    const { startIdx, endIdx } = resolveGateIndexRange(
+      channel.t,
+      totalN,
+      gate,
+      viewIndices,
+      cursors,
+      viewTimeBounds
+    );
+    const sliceLen = Math.max(1, endIdx - startIdx + 1);
+    const sliceT = channel.t.subarray(startIdx, endIdx + 1);
+    const isConditioned = channel.coupling === 'AC' || !!channel.inverted;
+    const cachedMean = channel.coupling === 'AC' ? computeChannelMean(channel) : 0;
+    const sliceV = new Float32Array(sliceLen);
+    for (let i = 0; i < sliceLen; i++) {
+      const idx = startIdx + i;
+      sliceV[i] = isConditioned ? getChannelDisplayValue(channel, idx, cachedMean) : channel.v[idx];
+    }
+
+    const sliceChannel: WaveformChannel = {
+      ...channel,
+      id: '__x__',
+      name: 'x',
+      t: sliceT,
+      v: sliceV,
+    };
+
+    const scalarVars: Record<string, number> = {
+      vmax: meas.max ?? NaN,
+      vmin: meas.min ?? NaN,
+      vpp: meas.vpp ?? NaN,
+      vmean: meas.average ?? NaN,
+      absmean: meas.absAverage ?? NaN,
+      vrms: meas.rms ?? NaN,
+      vtop: meas.vtop ?? NaN,
+      vbase: meas.vbase ?? NaN,
+      overshoot: meas.overshoot ?? NaN,
+      freq: meas.frequency ?? NaN,
+      period: meas.period ?? NaN,
+      rise: meas.riseTime ?? NaN,
+      fall: meas.fallTime ?? NaN,
+      poswidth: meas.posWidth ?? NaN,
+      negwidth: meas.negWidth ?? NaN,
+      duty: meas.dutyCycle ?? NaN,
+      maxduty: meas.maxDutyCycle ?? NaN,
+      minduty: meas.minDutyCycle ?? NaN,
+      peak: meas.peak ?? NaN,
+    };
+
+    const channelsMap: Record<string, WaveformChannel> = {
+      __x__: sliceChannel,
+    };
+    const aliases = { X: '__x__', V: '__x__' };
+    const tokens = tokenizeMath(def.expression, aliases, channelsMap);
+    const rpn = toRPN(tokens);
+    const dt = channel.dt || (sliceLen > 1 ? (sliceT[sliceLen - 1] - sliceT[0]) / (sliceLen - 1) : 1e-4);
+    const outArr = evaluateRPN(rpn, channelsMap, aliases, sliceLen, dt, sliceT, scalarVars);
+
+    let sum = 0;
+    let cnt = 0;
+    for (let i = 0; i < outArr.length; i++) {
+      if (isFinite(outArr[i])) {
+        sum += outArr[i];
+        cnt++;
+      }
+    }
+    return cnt > 0 ? sum / cnt : null;
+  } catch {
+    return null;
+  }
 }

@@ -285,6 +285,81 @@ export function alignAndInterpolateReference(
   };
 }
 
+export interface MappedReferenceTrace {
+  t: Float64Array;
+  v: Float32Array;
+}
+
+/**
+ * Maps all samples of refCh into targetCh's time coordinate frame (applying timeScale,
+ * timeShiftSec, AC/inverted display conditioning, and optional DC offset alignment)
+ * WITHOUT truncating refCh to targetCh's duration, allowing the time axis to extend
+ * to the longest imported Compare waveform.
+ */
+export function buildMappedReferenceTrace(
+  targetCh: WaveformChannel,
+  refCh: WaveformChannel,
+  timeShiftSec: number = 0,
+  removeDcOffset: boolean = false,
+  timeScale: number = 1,
+  targetMeanApplied?: number,
+  refMeanApplied?: number
+): MappedReferenceTrace {
+  const nR = Math.min(refCh.t.length, refCh.v.length);
+  const mappedT = new Float64Array(nR);
+  const mappedV = new Float32Array(nR);
+  if (nR === 0) return { t: mappedT, v: mappedV };
+
+  const safeScale = isFinite(timeScale) && timeScale > 0 ? timeScale : 1;
+  const refT0 = refCh.t[0];
+  const refAcMean = refCh.coupling === 'AC' ? computeChannelMean(refCh) : 0;
+
+  let targetShift = 0;
+  let refShift = 0;
+  if (removeDcOffset) {
+    if (targetMeanApplied !== undefined && refMeanApplied !== undefined) {
+      targetShift = targetMeanApplied;
+      refShift = refMeanApplied;
+    } else {
+      const targetAcMean = targetCh.coupling === 'AC' ? computeChannelMean(targetCh) : 0;
+      const nT = Math.min(targetCh.t.length, targetCh.v.length);
+      let sT = 0;
+      let cT = 0;
+      for (let i = 0; i < nT; i++) {
+        const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
+        if (isFinite(tv)) {
+          sT += tv;
+          cT++;
+        }
+      }
+      targetShift = cT > 0 ? sT / cT : 0;
+
+      let sR = 0;
+      let cR = 0;
+      for (let i = 0; i < nR; i++) {
+        const rv = getChannelDisplayValue(refCh, i, refAcMean);
+        if (isFinite(rv)) {
+          sR += rv;
+          cR++;
+        }
+      }
+      refShift = cR > 0 ? sR / cR : 0;
+    }
+  }
+
+  for (let i = 0; i < nR; i++) {
+    mappedT[i] = refT0 + (refCh.t[i] - refT0) * safeScale + timeShiftSec;
+    const raw = getChannelDisplayValue(refCh, i, refAcMean);
+    if (!isFinite(raw)) {
+      mappedV[i] = NaN;
+    } else {
+      mappedV[i] = removeDcOffset ? raw - refShift + targetShift : raw;
+    }
+  }
+
+  return { t: mappedT, v: mappedV };
+}
+
 function findFirstRisingCrossingTime(ch: WaveformChannel): number | null {
   const n = Math.min(ch.t.length, ch.v.length);
   if (n < 4) return null;

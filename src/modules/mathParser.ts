@@ -1,7 +1,7 @@
 /**
  * Waveform Viewer Pro - Math Expression Parser & Evaluator
  * Safe tokenizer and AST/RPN evaluator (zero eval() usage)
- * Supports vector/scalar operations, functions, and engineering presets.
+ * Supports vector/scalar operations, functions, time-axis alignment, NaN semantics, and unit inference.
  */
 
 import { WaveformChannel } from '../types/models';
@@ -19,11 +19,13 @@ const OPERATOR_PRECEDENCE: Record<string, number> = {
   '/': 2,
   '^': 3,
   'unary-': 4,
+  'unary+': 4,
 };
 
 const RIGHT_ASSOCIATIVE: Record<string, boolean> = {
   '^': true,
   'unary-': true,
+  'unary+': true,
 };
 
 const MATH_FUNCTIONS = new Set([
@@ -108,21 +110,30 @@ export function tokenizeMath(
       continue;
     }
 
+    // Strict numeric literal parsing: integer/decimal mantissa + optional valid scientific exponent [eE][+-]?\d+
     if (/[0-9]/.test(ch) || (ch === '.' && i + 1 < len && /[0-9]/.test(expr[i + 1]))) {
-      let numStr = '';
-      while (i < len && /[0-9.eE+-]/.test(expr[i])) {
-        // Handle scientific notation e.g. 1e-3
-        if (/[eE]/.test(expr[i])) {
-          numStr += expr[i++];
-          if (i < len && /[+-]/.test(expr[i])) {
-            numStr += expr[i++];
-          }
+      const start = i;
+      let hasDot = false;
+      while (i < len) {
+        const c = expr[i];
+        if (/[0-9]/.test(c)) {
+          i++;
+        } else if (c === '.' && !hasDot) {
+          hasDot = true;
+          i++;
         } else {
-          numStr += expr[i++];
+          break;
         }
       }
-      const numVal = parseFloat(numStr);
-      if (isNaN(numVal)) {
+      if (i < len && /[eE]/.test(expr[i])) {
+        const expMatch = /^[eE][+-]?\d+/.exec(expr.slice(i));
+        if (expMatch) {
+          i += expMatch[0].length;
+        }
+      }
+      const numStr = expr.slice(start, i);
+      const numVal = Number(numStr);
+      if (!isFinite(numVal)) {
         throw new Error(`Invalid numeric literal in expression: "${numStr}"`);
       }
       tokens.push({ type: 'number', value: numStr, numValue: numVal });
@@ -162,15 +173,14 @@ export function tokenizeMath(
     }
 
     if ('+-*/^'.includes(ch)) {
-      // Check for unary minus
       const prev = tokens[tokens.length - 1];
-      const isUnary =
-        ch === '-' &&
+      const isUnaryPrefix =
+        (ch === '-' || ch === '+') &&
         (!prev || prev.type === 'operator' || prev.type === 'lparen' || prev.type === 'comma');
 
       tokens.push({
         type: 'operator',
-        value: isUnary ? 'unary-' : ch,
+        value: isUnaryPrefix ? (ch === '-' ? 'unary-' : 'unary+') : ch,
       });
       i++;
       continue;
@@ -260,15 +270,168 @@ export function toRPN(tokens: Token[]): Token[] {
 
 type OperandValue = { isScalar: true; val: number } | { isScalar: false; val: Float32Array };
 
+function resolveChannelByIdentifier(
+  rawName: string,
+  channels: Record<string, WaveformChannel>,
+  channelAliases: Record<string, string>
+): WaveformChannel | undefined {
+  const upperName = rawName.toUpperCase();
+  let targetChannel: WaveformChannel | undefined;
+
+  // 1. Check alias (e.g. CH1, CH2)
+  if (channelAliases[upperName] && channels[channelAliases[upperName]]) {
+    targetChannel = channels[channelAliases[upperName]];
+  }
+
+  // 2. Check by channel ID directly
+  if (!targetChannel) {
+    if (channels[rawName]) targetChannel = channels[rawName];
+    else {
+      targetChannel = Object.values(channels).find(
+        (c) => c.id.toLowerCase() === rawName.toLowerCase()
+      );
+    }
+  }
+
+  // 3. Check by channel Name (exact, case-insensitive)
+  if (!targetChannel) {
+    targetChannel = Object.values(channels).find(
+      (c) => c.name.toLowerCase() === rawName.toLowerCase()
+    );
+  }
+
+  // 4. Check prefix before parentheses e.g. "Ua (Phase A)" -> "Ua"
+  if (!targetChannel) {
+    targetChannel = Object.values(channels).find((c) => {
+      const prefix = c.name.split(/[\(\[\{]/)[0].trim().toLowerCase();
+      return prefix && prefix === rawName.toLowerCase();
+    });
+  }
+
+  // 5. Check inside parentheses e.g. "Ua (Phase A)" -> "Phase A" or "PhaseA"
+  if (!targetChannel) {
+    targetChannel = Object.values(channels).find((c) => {
+      const m = c.name.match(/[\(\[]\s*([^()\[\]]+)\s*[\)\]]/);
+      if (!m) return false;
+      const inside = m[1].trim().toLowerCase();
+      return (
+        inside === rawName.toLowerCase() ||
+        inside.replace(/[^a-z0-9]/g, '') === rawName.toLowerCase().replace(/[^a-z0-9]/g, '')
+      );
+    });
+  }
+
+  // 6. Normalized match
+  if (!targetChannel) {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const targetNorm = norm(rawName);
+    if (targetNorm) {
+      targetChannel = Object.values(channels).find(
+        (c) => norm(c.name) === targetNorm || norm(c.id) === targetNorm
+      );
+    }
+  }
+
+  return targetChannel;
+}
+
 /**
- * Evaluates RPN tokens with channel data.
+ * Resamples a channel onto masterT via binary-search linear interpolation whenever timebases differ.
+ */
+function sampleChannelOntoTimebase(
+  ch: WaveformChannel,
+  masterT: Float64Array | undefined,
+  sampleCount: number
+): Float32Array {
+  if (!masterT || masterT.length === 0) return ch.v;
+  const srcT = ch.t;
+  const srcV = ch.v;
+  const srcN = Math.min(srcT ? srcT.length : 0, srcV ? srcV.length : 0);
+  if (srcN === 0) {
+    const empty = new Float32Array(sampleCount);
+    empty.fill(NaN);
+    return empty;
+  }
+
+  // Fast path: identical timebase reference or identical grid bounds and uniform sampling
+  if (srcT === masterT && srcV.length >= sampleCount) {
+    return srcV;
+  }
+  if (
+    srcN === sampleCount &&
+    masterT.length === sampleCount &&
+    Math.abs(srcT[0] - masterT[0]) <= 1e-15 &&
+    Math.abs(srcT[srcN - 1] - masterT[sampleCount - 1]) <= 1e-15 &&
+    ch.metadata?.isUniformSampling !== false
+  ) {
+    return srcV;
+  }
+
+  const out = new Float32Array(sampleCount);
+  const tMin = srcT[0];
+  const tMax = srcT[srcN - 1];
+
+  for (let i = 0; i < sampleCount; i++) {
+    const qt = masterT[i];
+    if (!isFinite(qt) || qt < tMin || qt > tMax) {
+      out[i] = NaN;
+      continue;
+    }
+    if (srcN === 1) {
+      out[i] = srcV[0];
+      continue;
+    }
+    let lo = 0;
+    let hi = srcN - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (srcT[mid] <= qt) lo = mid;
+      else hi = mid;
+    }
+    const v0 = srcV[lo];
+    const v1 = srcV[hi];
+    if (!isFinite(v0) && !isFinite(v1)) {
+      out[i] = NaN;
+    } else if (!isFinite(v0)) {
+      out[i] = v1;
+    } else if (!isFinite(v1)) {
+      out[i] = v0;
+    } else {
+      const span = srcT[hi] - srcT[lo];
+      const frac = span > 1e-18 ? (qt - srcT[lo]) / span : 0;
+      out[i] = v0 + frac * (v1 - v0);
+    }
+  }
+  return out;
+}
+
+function safeDiv(a: number, b: number): number {
+  if (!isFinite(a) || !isFinite(b) || b === 0) return NaN;
+  const r = a / b;
+  return isFinite(r) ? r : NaN;
+}
+
+function safePow(a: number, b: number): number {
+  const r = Math.pow(a, b);
+  return isFinite(r) ? r : NaN;
+}
+
+function safeSqrt(v: number): number {
+  if (!isFinite(v) || v < 0) return NaN;
+  return Math.sqrt(v);
+}
+
+/**
+ * Evaluates RPN tokens with channel data (and optional scalar variable overrides).
  */
 export function evaluateRPN(
   rpn: Token[],
   channels: Record<string, WaveformChannel>,
   channelAliases: Record<string, string>, // e.g. "CH1" -> channelId
   sampleCount: number,
-  dt: number
+  dt: number,
+  baseTimeArray?: Float64Array,
+  scalarVariables?: Record<string, number>
 ): Float32Array {
   const stack: OperandValue[] = [];
 
@@ -280,64 +443,12 @@ export function evaluateRPN(
 
     if (token.type === 'identifier') {
       const rawName = token.value;
-      const upperName = rawName.toUpperCase();
-
-      let targetChannel: WaveformChannel | undefined;
-
-      // 1. Check alias (e.g. CH1, CH2)
-      if (channelAliases[upperName] && channels[channelAliases[upperName]]) {
-        targetChannel = channels[channelAliases[upperName]];
+      if (scalarVariables && Object.prototype.hasOwnProperty.call(scalarVariables, rawName.toLowerCase())) {
+        stack.push({ isScalar: true, val: scalarVariables[rawName.toLowerCase()] });
+        continue;
       }
 
-      // 2. Check by channel ID directly
-      if (!targetChannel) {
-        if (channels[rawName]) targetChannel = channels[rawName];
-        else {
-          targetChannel = Object.values(channels).find(
-            (c) => c.id.toLowerCase() === rawName.toLowerCase()
-          );
-        }
-      }
-
-      // 3. Check by channel Name (exact, case-insensitive)
-      if (!targetChannel) {
-        targetChannel = Object.values(channels).find(
-          (c) => c.name.toLowerCase() === rawName.toLowerCase()
-        );
-      }
-
-      // 4. Check prefix before parentheses e.g. "Ua (Phase A)" -> "Ua"
-      if (!targetChannel) {
-        targetChannel = Object.values(channels).find((c) => {
-          const prefix = c.name.split(/[\(\[\{]/)[0].trim().toLowerCase();
-          return prefix && prefix === rawName.toLowerCase();
-        });
-      }
-
-      // 5. Check inside parentheses e.g. "Ua (Phase A)" -> "Phase A" or "PhaseA"
-      if (!targetChannel) {
-        targetChannel = Object.values(channels).find((c) => {
-          const m = c.name.match(/[\(\[]\s*([^()\[\]]+)\s*[\)\]]/);
-          if (!m) return false;
-          const inside = m[1].trim().toLowerCase();
-          return (
-            inside === rawName.toLowerCase() ||
-            inside.replace(/[^a-z0-9]/g, '') === rawName.toLowerCase().replace(/[^a-z0-9]/g, '')
-          );
-        });
-      }
-
-      // 6. Normalized match
-      if (!targetChannel) {
-        const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const targetNorm = norm(rawName);
-        if (targetNorm) {
-          targetChannel = Object.values(channels).find(
-            (c) => norm(c.name) === targetNorm || norm(c.id) === targetNorm
-          );
-        }
-      }
-
+      const targetChannel = resolveChannelByIdentifier(rawName, channels, channelAliases);
       if (!targetChannel) {
         const available = Object.keys(channelAliases)
           .concat(Object.values(channels).map((c) => c.name))
@@ -347,16 +458,20 @@ export function evaluateRPN(
         );
       }
 
-      stack.push({ isScalar: false, val: targetChannel.v });
+      const alignedV = sampleChannelOntoTimebase(targetChannel, baseTimeArray, sampleCount);
+      stack.push({ isScalar: false, val: alignedV });
       continue;
     }
 
     if (token.type === 'operator') {
-      if (token.value === 'unary-') {
+      if (token.value === 'unary-' || token.value === 'unary+') {
         const a = stack.pop();
-        if (!a) throw new Error('Invalid syntax: missing operand for unary minus');
+        if (!a) throw new Error(`Invalid syntax: missing operand for "${token.value}"`);
+        const sign = token.value === 'unary-' ? -1 : 1;
         if (a.isScalar) {
-          stack.push({ isScalar: true, val: -a.val });
+          stack.push({ isScalar: true, val: sign * a.val });
+        } else if (sign === 1) {
+          stack.push(a);
         } else {
           const res = new Float32Array(sampleCount);
           for (let i = 0; i < sampleCount; i++) res[i] = -a.val[i];
@@ -373,12 +488,12 @@ export function evaluateRPN(
 
       const op = token.value;
       if (a.isScalar && b.isScalar) {
-        let r = 0;
+        let r = NaN;
         if (op === '+') r = a.val + b.val;
         else if (op === '-') r = a.val - b.val;
         else if (op === '*') r = a.val * b.val;
-        else if (op === '/') r = b.val !== 0 ? a.val / b.val : 0;
-        else if (op === '^') r = Math.pow(a.val, b.val);
+        else if (op === '/') r = safeDiv(a.val, b.val);
+        else if (op === '^') r = safePow(a.val, b.val);
         stack.push({ isScalar: true, val: r });
       } else if (a.isScalar && !b.isScalar) {
         const s = a.val;
@@ -389,8 +504,8 @@ export function evaluateRPN(
           if (op === '+') res[i] = s + v;
           else if (op === '-') res[i] = s - v;
           else if (op === '*') res[i] = s * v;
-          else if (op === '/') res[i] = v !== 0 ? s / v : 0;
-          else if (op === '^') res[i] = Math.pow(s, v);
+          else if (op === '/') res[i] = safeDiv(s, v);
+          else if (op === '^') res[i] = safePow(s, v);
         }
         stack.push({ isScalar: false, val: res });
       } else if (!a.isScalar && b.isScalar) {
@@ -402,13 +517,13 @@ export function evaluateRPN(
           if (op === '+') res[i] = v + s;
           else if (op === '-') res[i] = v - s;
           else if (op === '*') res[i] = v * s;
-          else if (op === '/') res[i] = s !== 0 ? v / s : 0;
-          else if (op === '^') res[i] = Math.pow(v, s);
+          else if (op === '/') res[i] = safeDiv(v, s);
+          else if (op === '^') res[i] = safePow(v, s);
         }
         stack.push({ isScalar: false, val: res });
       } else if (!a.isScalar && !b.isScalar) {
-        const arrA: Float32Array = a.val;
-        const arrB: Float32Array = b.val;
+        const arrA = a.val as Float32Array;
+        const arrB = b.val as Float32Array;
         const res = new Float32Array(sampleCount);
         for (let i = 0; i < sampleCount; i++) {
           const vA = arrA[i];
@@ -416,8 +531,8 @@ export function evaluateRPN(
           if (op === '+') res[i] = vA + vB;
           else if (op === '-') res[i] = vA - vB;
           else if (op === '*') res[i] = vA * vB;
-          else if (op === '/') res[i] = vB !== 0 ? vA / vB : 0;
-          else if (op === '^') res[i] = Math.pow(vA, vB);
+          else if (op === '/') res[i] = safeDiv(vA, vB);
+          else if (op === '^') res[i] = safePow(vA, vB);
         }
         stack.push({ isScalar: false, val: res });
       }
@@ -431,9 +546,9 @@ export function evaluateRPN(
 
       if (fn === 'abs' || fn === 'sqrt' || fn === 'sin' || fn === 'cos' || fn === 'tan') {
         if (arg.isScalar) {
-          let r = 0;
+          let r = NaN;
           if (fn === 'abs') r = Math.abs(arg.val);
-          else if (fn === 'sqrt') r = Math.sqrt(Math.max(0, arg.val));
+          else if (fn === 'sqrt') r = safeSqrt(arg.val);
           else if (fn === 'sin') r = Math.sin(arg.val);
           else if (fn === 'cos') r = Math.cos(arg.val);
           else if (fn === 'tan') r = Math.tan(arg.val);
@@ -444,7 +559,7 @@ export function evaluateRPN(
           for (let i = 0; i < sampleCount; i++) {
             const v = src[i];
             if (fn === 'abs') res[i] = Math.abs(v);
-            else if (fn === 'sqrt') res[i] = Math.sqrt(Math.max(0, v));
+            else if (fn === 'sqrt') res[i] = safeSqrt(v);
             else if (fn === 'sin') res[i] = Math.sin(v);
             else if (fn === 'cos') res[i] = Math.cos(v);
             else if (fn === 'tan') res[i] = Math.tan(v);
@@ -452,41 +567,62 @@ export function evaluateRPN(
           stack.push({ isScalar: false, val: res });
         }
       } else if (fn === 'mean' || fn === 'rms' || fn === 'min' || fn === 'max') {
-        let scalar = 0;
+        let scalar = NaN;
         if (arg.isScalar) {
           scalar = arg.val;
         } else {
           const src = arg.val;
           if (fn === 'mean') {
             let sum = 0;
-            for (let i = 0; i < sampleCount; i++) sum += src[i];
-            scalar = sum / sampleCount;
+            let count = 0;
+            for (let i = 0; i < sampleCount; i++) {
+              if (isFinite(src[i])) {
+                sum += src[i];
+                count++;
+              }
+            }
+            scalar = count > 0 ? sum / count : NaN;
           } else if (fn === 'rms') {
             let sumSq = 0;
-            for (let i = 0; i < sampleCount; i++) sumSq += src[i] * src[i];
-            scalar = Math.sqrt(sumSq / sampleCount);
+            let count = 0;
+            for (let i = 0; i < sampleCount; i++) {
+              if (isFinite(src[i])) {
+                sumSq += src[i] * src[i];
+                count++;
+              }
+            }
+            scalar = count > 0 ? Math.sqrt(sumSq / count) : NaN;
           } else if (fn === 'min') {
             let m = Infinity;
-            for (let i = 0; i < sampleCount; i++) if (src[i] < m) m = src[i];
-            scalar = m;
+            for (let i = 0; i < sampleCount; i++) {
+              if (isFinite(src[i]) && src[i] < m) m = src[i];
+            }
+            scalar = isFinite(m) ? m : NaN;
           } else if (fn === 'max') {
             let m = -Infinity;
-            for (let i = 0; i < sampleCount; i++) if (src[i] > m) m = src[i];
-            scalar = m;
+            for (let i = 0; i < sampleCount; i++) {
+              if (isFinite(src[i]) && src[i] > m) m = src[i];
+            }
+            scalar = isFinite(m) ? m : NaN;
           }
         }
         stack.push({ isScalar: true, val: scalar });
       } else if (fn === 'diff' || fn === 'deriv') {
         const res = new Float32Array(sampleCount);
         if (arg.isScalar) {
-          // Derivative/diff of a constant is 0
           stack.push({ isScalar: false, val: res });
         } else {
           const src = arg.val;
-          const denom = fn === 'deriv' ? (dt > 0 ? dt : 1) : 1;
+          const fallbackDt = dt > 0 ? dt : 1;
           res[0] = 0;
           for (let i = 1; i < sampleCount; i++) {
-            res[i] = (src[i] - src[i - 1]) / denom;
+            const localDt =
+              fn === 'deriv'
+                ? baseTimeArray && baseTimeArray[i] - baseTimeArray[i - 1] > 1e-18
+                  ? baseTimeArray[i] - baseTimeArray[i - 1]
+                  : fallbackDt
+                : 1;
+            res[i] = isFinite(src[i]) && isFinite(src[i - 1]) ? (src[i] - src[i - 1]) / localDt : NaN;
           }
           stack.push({ isScalar: false, val: res });
         }
@@ -509,6 +645,78 @@ export function evaluateRPN(
 }
 
 /**
+ * Infers physical output unit from RPN AST and channel units.
+ */
+export function inferUnitFromRpn(
+  rpn: Token[],
+  channels: Record<string, WaveformChannel>,
+  channelAliases: Record<string, string>
+): string {
+  const unitStack: string[] = [];
+
+  for (const token of rpn) {
+    if (token.type === 'number') {
+      unitStack.push('');
+      continue;
+    }
+    if (token.type === 'identifier') {
+      const ch = resolveChannelByIdentifier(token.value, channels, channelAliases);
+      unitStack.push((ch?.unit || '').trim());
+      continue;
+    }
+    if (token.type === 'operator') {
+      if (token.value === 'unary-' || token.value === 'unary+') {
+        const u = unitStack.pop() ?? '';
+        unitStack.push(u);
+        continue;
+      }
+      const uB = unitStack.pop() ?? '';
+      const uA = unitStack.pop() ?? '';
+      const op = token.value;
+      if (op === '+' || op === '-') {
+        if (uA === uB) unitStack.push(uA);
+        else if (!uA) unitStack.push(uB);
+        else if (!uB) unitStack.push(uA);
+        else unitStack.push('');
+      } else if (op === '*') {
+        if (!uA) unitStack.push(uB);
+        else if (!uB) unitStack.push(uA);
+        else if ((uA === 'V' && uB === 'A') || (uA === 'A' && uB === 'V')) unitStack.push('W');
+        else if (uA === uB) unitStack.push(`${uA}²`);
+        else unitStack.push(`${uA}·${uB}`);
+      } else if (op === '/') {
+        if (!uB) unitStack.push(uA);
+        else if (!uA) unitStack.push(`1/${uB}`);
+        else if (uA === uB) unitStack.push('');
+        else if (uA === 'V' && uB === 'A') unitStack.push('Ω');
+        else if (uA === 'W' && uB === 'V') unitStack.push('A');
+        else if (uA === 'W' && uB === 'A') unitStack.push('V');
+        else unitStack.push(`${uA}/${uB}`);
+      } else if (op === '^') {
+        unitStack.push('');
+      }
+      continue;
+    }
+    if (token.type === 'function') {
+      const u = unitStack.pop() ?? '';
+      const fn = token.value;
+      if (fn === 'sin' || fn === 'cos' || fn === 'tan') {
+        unitStack.push('');
+      } else if (fn === 'sqrt') {
+        if (u.endsWith('²')) unitStack.push(u.slice(0, -1));
+        else unitStack.push(u);
+      } else if (fn === 'deriv') {
+        unitStack.push(u ? `${u}/s` : '1/s');
+      } else {
+        unitStack.push(u);
+      }
+    }
+  }
+
+  return unitStack.length === 1 ? unitStack[0] : '';
+}
+
+/**
  * Evaluates math expression string against dataset and creates or updates a WaveformChannel.
  */
 export function evaluateMathExpression(
@@ -526,10 +734,6 @@ export function evaluateMathExpression(
     throw new Error('No source channels available to evaluate Math expression.');
   }
 
-  const baseCh = visibleChList[0];
-  const sampleCount = baseCh.v.length;
-  const dt = baseCh.dt || (baseCh.t.length > 1 ? baseCh.t[1] - baseCh.t[0] : 1e-4);
-
   // Map CH1, CH2... aliases based on drawOrder
   const channelAliases: Record<string, string> = {};
   drawOrder.forEach((id, idx) => {
@@ -538,46 +742,47 @@ export function evaluateMathExpression(
 
   const tokens = tokenizeMath(expression, channelAliases, channels);
   const rpn = toRPN(tokens);
-  const v = evaluateRPN(rpn, channels, channelAliases, sampleCount, dt);
 
-  // Compute min/max for scaling
+  // Collect source channel IDs referenced
+  const referencedIds: string[] = [];
+  tokens.forEach((t) => {
+    if (t.type === 'identifier') {
+      const resolved = resolveChannelByIdentifier(t.value, channels, channelAliases);
+      if (resolved && !referencedIds.includes(resolved.id)) {
+        referencedIds.push(resolved.id);
+      }
+    }
+  });
+
+  // Use the first referenced source channel as master timebase (falls back to first channel)
+  const baseCh = (referencedIds[0] && channels[referencedIds[0]]) || visibleChList[0];
+  const sampleCount = baseCh.v.length;
+  const dt = baseCh.dt || (baseCh.t.length > 1 ? baseCh.t[1] - baseCh.t[0] : 1e-4);
+
+  const v = evaluateRPN(rpn, channels, channelAliases, sampleCount, dt, baseCh.t);
+  const inferredUnit = inferUnitFromRpn(rpn, channels, channelAliases);
+
+  // Compute min/max and count NaNs for scaling & audit
   let min = Infinity;
   let max = -Infinity;
+  let nanCount = 0;
   for (let i = 0; i < sampleCount; i++) {
     const val = v[i];
-    if (!isNaN(val)) {
+    if (isFinite(val)) {
       if (val < min) min = val;
       if (val > max) max = val;
+    } else {
+      nanCount++;
     }
   }
   if (!isFinite(min)) min = -1;
   if (!isFinite(max)) max = 1;
   const margin = (max - min) * 0.1 || 0.1;
 
-  // Collect source channel IDs referenced
-  const referencedIds: string[] = [];
-  tokens.forEach((t) => {
-    if (t.type === 'identifier') {
-      const upper = t.value.toUpperCase();
-      if (channelAliases[upper] && !referencedIds.includes(channelAliases[upper])) {
-        referencedIds.push(channelAliases[upper]);
-      } else if (channels[t.value] && !referencedIds.includes(t.value)) {
-        referencedIds.push(t.value);
-      } else {
-        const found = Object.values(channels).find(
-          (c) => c.name.toLowerCase() === t.value.toLowerCase() || c.id.toLowerCase() === t.value.toLowerCase()
-        );
-        if (found && !referencedIds.includes(found.id)) {
-          referencedIds.push(found.id);
-        }
-      }
-    }
-  });
-
   return {
     id: channelId,
     name: channelName,
-    unit: 'V',
+    unit: inferredUnit,
     color: '#ff007f', // distinctive magenta/pink for math
     visible: true,
     t: baseCh.t,
@@ -592,7 +797,8 @@ export function evaluateMathExpression(
     sourceChannelIds: referencedIds,
     metadata: {
       ...baseCh.metadata,
-      invalidSamples: 0,
+      invalidSamples: nanCount,
+      signalNanCount: nanCount,
       gapCount: baseCh.metadata?.gapCount || 0,
       gapIndices: [...(baseCh.metadata?.gapIndices || [])],
     },

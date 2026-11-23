@@ -14,7 +14,8 @@ import { SamplingMetadata, TimeQualityStatus } from '../types/models';
  */
 export function analyzeSamplingQuality(
   timeArray: Float64Array,
-  invalidCount: number = 0
+  invalidCount: number = 0,
+  signalNanCount: number = 0
 ): SamplingMetadata {
   const N = timeArray.length;
 
@@ -33,6 +34,9 @@ export function analyzeSamplingQuality(
       jitterMax: null,
       droppedSamples: 0,
       invalidSamples: invalidCount,
+      signalNanCount,
+      duplicateTimeCount: 0,
+      nonMonotonicCount: 0,
       sampleRate: null,
       qualityStatus: 'severe-jitter',
       gapCount: 0,
@@ -44,10 +48,14 @@ export function analyzeSamplingQuality(
   let minDt = Infinity;
   let maxDt = -Infinity;
   let sumDt = 0;
+  let duplicateTimeCount = 0;
+  let nonMonotonicCount = 0;
 
   for (let i = 1; i < N; i++) {
     const dt = timeArray[i] - timeArray[i - 1];
     dtArray[i - 1] = dt;
+    if (dt === 0) duplicateTimeCount++;
+    else if (dt < 0 || !isFinite(dt)) nonMonotonicCount++;
     if (dt < minDt) minDt = dt;
     if (dt > maxDt) maxDt = dt;
     sumDt += dt;
@@ -105,10 +113,10 @@ export function analyzeSamplingQuality(
   let qualityStatus: TimeQualityStatus = 'uniform';
   let isUniform = true;
 
-  if (gapIndices.length > 0 || jitterMaxPercent >= 25 || invalidCount > 0) {
+  if (gapIndices.length > 0 || jitterMaxPercent >= 25 || invalidCount > 0 || nonMonotonicCount > 0) {
     qualityStatus = 'severe-jitter';
     isUniform = false;
-  } else if (jitterMaxPercent >= 1.0) {
+  } else if (jitterMaxPercent >= 1.0 || duplicateTimeCount > 0) {
     qualityStatus = 'non-uniform';
     isUniform = false;
   } else {
@@ -132,6 +140,9 @@ export function analyzeSamplingQuality(
     jitterMax: jitterMaxPercent,
     droppedSamples,
     invalidSamples: invalidCount,
+    signalNanCount,
+    duplicateTimeCount,
+    nonMonotonicCount,
     sampleRate,
     qualityStatus,
     gapCount: gapIndices.length,

@@ -26,6 +26,14 @@
           </svg>
           <span>Waveform Viewer Pro</span>
         </div>
+        <div class="flex items-center bg-[#161b22] border border-[#222933] rounded-sm p-0.5 text-[11px] font-medium shrink-0">
+          <button id="wsScopeBtn" type="button" class="px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold whitespace-nowrap cursor-pointer">
+            Scope 示波器
+          </button>
+          <button id="wsFocDynoBtn" type="button" class="px-2 py-0.5 rounded-xs text-slate-300 hover:text-white whitespace-nowrap cursor-pointer">
+            FOC DynoLab
+          </button>
+        </div>
         <div class="h-4 w-px bg-[#222933] shrink-0"></div>
         <div id="tabsContainer" class="flex items-center gap-1 overflow-x-auto"></div>
       </div>
@@ -102,7 +110,7 @@
     </header>
 
     <!-- Main Oscilloscope Chassis Body -->
-    <main class="flex-1 flex overflow-hidden min-h-0">
+    <main id="scopeWorkspaceMain" class="flex-1 flex overflow-hidden min-h-0">
       <!-- Left/Center Oscilloscope Screen Bay -->
       <section class="flex-1 flex flex-col min-w-0 bg-[#080b0f] relative">
         <!-- Top Screen Telemetry & Scope Toolbar (2 compact non-overflowing rows) -->
@@ -182,6 +190,9 @@
               <button id="openCompareModalBtn" class="px-2.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Compare waveforms across files, tabs, or channels">
                 Compare
               </button>
+              <button id="openFilterModalBtn" class="px-2.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="Whole or partial waveform filtering: Passive RC, Butterworth, Bessel, Chebyshev, Notch, FIR Sinc, Savitzky-Golay, Moving Avg & Median">
+                Filter
+              </button>
               <button id="openThermalModalBtn" class="px-2.5 py-0.5 bg-[#132229] hover:bg-[#19303a] border border-cyan-600/60 text-cyan-200 font-medium rounded-sm transition cursor-pointer whitespace-nowrap" title="MOS Electro-Thermal Deconvolution, LTspice Cauer Netlist, Closed-Loop Tj(t), Dynamic SOA & BLDC FOC 6-MOS">
                 MOS Thermal
               </button>
@@ -193,6 +204,7 @@
                   <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
                 </button>
                 <div class="wvp-dropdown-menu absolute left-0 top-full mt-1 hidden flex-col z-50 min-w-[200px] rounded-sm py-1">
+                  <button id="openFilterMenuBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Signal Filter / Condition...</button>
                   <button id="openBldcModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">BLDC Diagnostics...</button>
                   <button id="openPhaseModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Phase Diff ΔΦ...</button>
                   <button id="openAnomalyModalBtn" class="text-left px-3 py-1.5 hover:bg-[#1e2530] text-xs text-slate-200 cursor-pointer">Anomaly Scan...</button>
@@ -486,6 +498,9 @@
         </section>
       </aside>
     </main>
+
+    <!-- Embedded FOC DynoLab V2 Workspace -->
+    <section id="focDynoLabView" class="hidden flex-1 min-h-0 overflow-y-auto"></section>
 
     <!-- Bottom Instrument Status Footer -->
     <footer class="h-7 bg-[#0c0f13] border-t border-[#222933] px-3 flex items-center justify-between text-[11px] font-mono text-slate-400 shrink-0 tabular-nums">
@@ -949,6 +964,29 @@
             <div class="text-[11px] font-semibold uppercase tracking-wider text-cyan-300 mb-2 pb-1 border-b border-[#222933]">Timing / Frequency</div>
             <div id="measureTimingList" class="space-y-1.5"></div>
           </div>
+
+          <div class="md:col-span-2 bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2">
+            <div class="flex flex-wrap items-center justify-between gap-2 pb-1 border-b border-[#222933]">
+              <span class="text-[11px] font-semibold uppercase tracking-wider text-emerald-300">Custom Extensible Metrics (自定义扩展指标)</span>
+              <span class="text-[10px] font-mono text-slate-400">Vars: vmax, vmin, vpp, vmean, absmean, vrms, duty, maxduty, minduty, peak, crest, x</span>
+            </div>
+            <div id="measureCustomPresets" class="flex flex-wrap gap-1.5"></div>
+            <div class="grid grid-cols-1 sm:grid-cols-12 gap-1.5 items-center">
+              <input id="measureCustomLabelInput" type="text" placeholder="Label (e.g. Crest Factor)" class="sm:col-span-3 bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 text-slate-100 font-mono text-[11px]" />
+              <input id="measureCustomExprInput" type="text" placeholder="Expr (e.g. peak / vrms)" class="sm:col-span-4 bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 text-cyan-200 font-mono text-[11px]" />
+              <select id="measureCustomUnitSelect" class="sm:col-span-2 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-slate-200 font-mono text-[11px]">
+                <option value="signal">Signal Unit</option>
+                <option value="ratio">Ratio</option>
+                <option value="percent">%</option>
+                <option value="freq">Hz</option>
+                <option value="time">s</option>
+                <option value="custom">Custom</option>
+              </select>
+              <input id="measureCustomUnitCustomInput" type="text" placeholder="Unit" class="sm:col-span-1 hidden bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-slate-100 font-mono text-[11px]" />
+              <button id="measureCustomAddBtn" type="button" class="sm:col-span-2 px-2.5 py-1 bg-emerald-700 hover:bg-emerald-600 text-slate-950 font-semibold rounded-xs cursor-pointer text-[11px]">+ Add Metric</button>
+            </div>
+            <div id="measureCustomList" class="space-y-1 max-h-32 overflow-y-auto"></div>
+          </div>
         </div>
 
         <div class="flex items-center justify-between pt-3 mt-4 border-t border-[#222933] text-xs">
@@ -1037,16 +1075,16 @@
             </label>
             <span id="goldenEvalReadout" class="font-mono text-[11px] text-slate-400 tabular-nums">Disabled</span>
           </div>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-2 items-center">
-            <select id="goldenSourceSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-slate-200"></select>
-            <div class="flex items-center gap-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <select id="goldenSourceSelect" class="flex-1 min-w-[140px] bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-slate-200"></select>
+            <div class="flex items-center gap-1 shrink-0">
               <select id="goldenModeSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-slate-200">
                 <option value="percent">% of Vpp</option>
-                <option value="absolute">± Absolute Unit</option>
+                <option value="absolute">± Abs Unit</option>
               </select>
-              <input id="goldenTolInput" type="number" step="0.5" min="0.01" value="5" class="w-20 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
+              <input id="goldenTolInput" type="number" step="0.5" min="0.01" value="5" class="w-16 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 font-mono text-white" />
             </div>
-            <button id="goldenCaptureBtn" type="button" class="px-2.5 py-1 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-600/60 text-emerald-200 rounded-sm cursor-pointer">Capture Current as Golden</button>
+            <button id="goldenCaptureBtn" type="button" class="px-2.5 py-1 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-600/60 text-emerald-200 rounded-sm cursor-pointer whitespace-nowrap">Capture Current as Golden</button>
           </div>
         </div>
 
@@ -1062,11 +1100,16 @@
             </div>
           </div>
           <div id="editShiftChannelsList" class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto p-1.5 bg-[#12161c] border border-[#222933] rounded-xs"></div>
-          <div class="flex items-center gap-2.5 pt-1">
+          <div class="flex items-center gap-2 pt-1">
             <span class="font-mono text-[10px] text-slate-400 shrink-0">-100%</span>
-            <input id="editTimeShiftSlider" type="range" min="-100" max="100" step="0.5" value="0" class="flex-1 accent-cyan-400 cursor-pointer" />
+            <button id="editTimeShiftDecBtn" type="button" aria-label="Decrease Δt by 0.1% (Shift: 1%)" title="Fine step −0.1% (Shift+Click: −1.0%)" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-mono font-bold text-xs rounded-xs cursor-pointer shrink-0 select-none">−</button>
+            <input id="editTimeShiftSlider" type="range" min="-100" max="100" step="0.1" value="0" class="flex-1 min-w-0 accent-cyan-400 cursor-pointer" />
+            <button id="editTimeShiftIncBtn" type="button" aria-label="Increase Δt by 0.1% (Shift: 1%)" title="Fine step +0.1% (Shift+Click: +1.0%)" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-mono font-bold text-xs rounded-xs cursor-pointer shrink-0 select-none">+</button>
             <span class="font-mono text-[10px] text-slate-400 shrink-0">+100%</span>
-            <span id="editTimeShiftReadout" class="font-mono text-[11px] text-cyan-300 tabular-nums min-w-[205px] text-right">0.0% · 0.00 s (T_view = --)</span>
+          </div>
+          <div class="flex items-center justify-between text-[10px] font-mono">
+            <span class="text-slate-400">Fine: ±0.1% · Shift+Click: ±1.0%</span>
+            <span id="editTimeShiftReadout" class="text-cyan-300 tabular-nums text-right">0.0% · 0.00 s (T_view = --)</span>
           </div>
         </div>
 
@@ -1598,43 +1641,94 @@
           <div id="thermalPanelDeconv" class="space-y-3">
             <!-- Card 1: Parameters & Run -->
             <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2.5">
-              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 items-end">
-                <div class="col-span-2 sm:col-span-2">
-                  <label class="block text-[10px] text-slate-400 mb-1">Temperature / TSEP Channel (°C)</label>
+              <!-- Row 1: Temperature Channel & Thermal Path (Junction->Amb vs Pad/PCB->Amb) -->
+              <div class="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+                <div class="sm:col-span-4">
+                  <label class="block text-[10px] text-slate-400 mb-1">Temperature / TSEP / PCB (°C)</label>
                   <select id="thermTempChSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
                 </div>
-                <div>
-                  <label class="block text-[10px] text-slate-400 mb-1">Step Power ΔP (W)</label>
-                  <input id="thermPowerWInput" type="number" step="any" value="40" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-amber-300 font-mono" />
+                <div class="sm:col-span-5">
+                  <label class="block text-[10px] text-slate-400 mb-1">Thermal Path (热阻计算目标)</label>
+                  <select id="thermPathModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono">
+                    <option value="junction_ambient">结 → 环境/壳 (Junction → Ambient, Rth,j-a)</option>
+                    <option value="pad_ambient">芯片焊盘 / 旁侧PCB → 环境 (Pad → Ambient, Rth,pad-a)</option>
+                  </select>
                 </div>
-                <div>
-                  <label class="block text-[10px] text-slate-400 mb-1">Power Ch</label>
-                  <div class="flex gap-1">
-                    <select id="thermPowerChSelect" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 text-white font-mono"></select>
-                    <button id="thermReadPowerChBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 font-mono text-[10px] rounded-sm cursor-pointer shrink-0" title="Read mean power from selected Power channel">Read</button>
-                  </div>
+                <div id="thermPadSpreadWrap" class="sm:col-span-3 opacity-50">
+                  <label class="block text-[10px] text-slate-400 mb-1" title="若测温点位于MOS/芯片旁PCB铜皮上，可填焊盘到测点的扩展热阻补偿；直测焊盘填 0">Pad→测点 R_spread (°C/W)</label>
+                  <input id="thermPadSpreadInput" type="number" step="0.05" min="0" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-cyan-200 font-mono" />
                 </div>
               </div>
 
-              <div class="grid grid-cols-2 sm:grid-cols-6 gap-2.5 items-end">
-                <div class="col-span-1 sm:col-span-2">
+              <!-- Row 2: Power Source (Auto V*I, Power Channel, or Manual) -->
+              <div class="grid grid-cols-2 sm:grid-cols-12 gap-2.5 items-start">
+                <div class="col-span-2 sm:col-span-3">
+                  <label class="block text-[10px] text-slate-400 mb-1">Power Source (功率来源)</label>
+                  <select id="thermPowerModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono">
+                    <option value="auto_vi">V × I 自动计算功率</option>
+                    <option value="power_ch">读取 Power 通道</option>
+                    <option value="manual">手动输入 ΔP (W)</option>
+                  </select>
+                </div>
+                <div id="thermViVoltWrap" class="sm:col-span-2">
+                  <label class="block text-[10px] text-slate-400 mb-1">Voltage V</label>
+                  <select id="thermVoltChSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 text-white font-mono"></select>
+                  <div id="thermConstVoltWrap" class="hidden mt-1 flex items-center gap-1">
+                    <input id="thermConstVoltInput" type="number" step="any" value="24" class="w-full min-w-0 bg-[#12161c] border border-cyan-600/60 rounded-sm px-1.5 py-0.5 text-cyan-200 font-mono text-[11px]" title="输入恒定电压 V_const (V)" />
+                    <span class="text-[10px] text-slate-400 font-mono shrink-0">V</span>
+                  </div>
+                </div>
+                <div id="thermViCurrWrap" class="sm:col-span-2">
+                  <label class="block text-[10px] text-slate-400 mb-1">Current I</label>
+                  <select id="thermCurrChSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 text-white font-mono"></select>
+                  <div id="thermConstCurrWrap" class="hidden mt-1 flex items-center gap-1">
+                    <input id="thermConstCurrInput" type="number" step="any" value="1" class="w-full min-w-0 bg-[#12161c] border border-cyan-600/60 rounded-sm px-1.5 py-0.5 text-cyan-200 font-mono text-[11px]" title="输入恒定电流 I_const (A)" />
+                    <span class="text-[10px] text-slate-400 font-mono shrink-0">A</span>
+                  </div>
+                </div>
+                <div id="thermPowerChWrap" class="hidden col-span-2 sm:col-span-4">
+                  <label class="block text-[10px] text-slate-400 mb-1">Power Ch</label>
+                  <select id="thermPowerChSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 text-white font-mono"></select>
+                </div>
+                <div class="sm:col-span-2">
+                  <label class="block text-[10px] text-slate-400 mb-1">Step Power ΔP (W)</label>
+                  <input id="thermPowerWInput" type="number" step="any" value="40" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-amber-300 font-mono" />
+                </div>
+                <div class="col-span-2 sm:col-span-3">
+                  <label class="hidden sm:block text-[10px] text-transparent mb-1 select-none">Actions</label>
+                  <div class="flex items-center gap-1">
+                    <button id="thermCalcViPowerBtn" type="button" class="flex-1 px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/50 text-cyan-300 font-mono text-[10px] rounded-sm cursor-pointer whitespace-nowrap" title="Compute ΔP = V × I across active step">计算 V×I</button>
+                    <button id="thermReadPowerChBtn" type="button" class="hidden flex-1 px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 font-mono text-[10px] rounded-sm cursor-pointer whitespace-nowrap" title="Read mean power from selected Power channel">读取 P</button>
+                    <button id="thermInjectViPowerBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-amber-500/50 text-amber-200 font-mono text-[10px] rounded-sm cursor-pointer whitespace-nowrap" title="Inject computed P(t) = V(t)×I(t) trace onto scope">+ P(t)</button>
+                  </div>
+                </div>
+              </div>
+              <div id="thermViPowerMeta" class="text-[10px] font-mono text-slate-400 bg-[#12161c] border border-[#1b222c] px-2 py-1 rounded-xs tabular-nums">
+                Auto V×I: 支持波形×波形、或单侧输入恒定电压/电流 (如测 I + 恒定 V_const)，自动换算 mV/mA 并剔除阶跃前待机功率。
+              </div>
+
+              <div class="grid grid-cols-2 sm:grid-cols-12 gap-2.5 items-end">
+                <div class="col-span-2 sm:col-span-3">
                   <label class="block text-[10px] text-slate-400 mb-1">Capture Mode</label>
                   <select id="thermModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono">
                     <option value="heating">Heating Step</option>
                     <option value="cooling">Cooling (t_blank + √t)</option>
                   </select>
                 </div>
-                <div>
+                <div class="sm:col-span-2">
                   <label class="block text-[10px] text-slate-400 mb-1">Cauer Order</label>
                   <select id="thermOrderSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono">
+                    <option value="1">1-Stage RC</option>
                     <option value="2">2-Stage RC</option>
                     <option value="3">3-Stage RC</option>
                     <option value="4" selected>4-Stage RC</option>
                     <option value="5">5-Stage RC</option>
                     <option value="6">6-Stage RC</option>
+                    <option value="7">7-Stage RC</option>
+                    <option value="8">8-Stage RC</option>
                   </select>
                 </div>
-                <div>
+                <div class="col-span-2 sm:col-span-4">
                   <label class="block text-[10px] text-slate-400 mb-1">Data Gate</label>
                   <div class="flex gap-1">
                     <select id="thermGateSelect" class="flex-1 min-w-0 bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 text-white font-mono">
@@ -1642,33 +1736,45 @@
                       <option value="view">View</option>
                       <option value="cursors">X1~X2</option>
                     </select>
-                    <button id="thermUseCursorsBtn" type="button" class="px-1.5 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-mono text-[10px] rounded-sm cursor-pointer shrink-0">X1~X2</button>
+                    <button id="thermUseCursorsBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 font-mono text-[10px] rounded-sm cursor-pointer shrink-0">X1~X2</button>
                   </div>
                 </div>
-                <div id="thermTBlankWrap" class="opacity-50">
+                <div id="thermTBlankWrap" class="sm:col-span-2 opacity-50">
                   <label class="block text-[10px] text-slate-400 mb-1">t_blank (ms)</label>
                   <input id="thermTBlankMsInput" type="number" step="0.05" min="0" value="0.15" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
                 </div>
-                <div class="flex items-center justify-between gap-2">
-                  <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer whitespace-nowrap">
+                <div class="sm:col-span-1 flex items-center justify-end pb-1">
+                  <label class="flex items-center gap-1 text-[11px] text-slate-300 cursor-pointer whitespace-nowrap">
                     <input id="thermAutoT0Chk" type="checkbox" class="accent-cyan-400 cursor-pointer" checked />
-                    <span>Auto t0</span>
+                    <span>t0</span>
                   </label>
                 </div>
               </div>
 
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1b222c]">
-                <span class="text-[11px] text-slate-400">两阶段去偏 Relaxed-LASSO 反演（自动检测阶跃起点 t0 与单调多指数拟合）</span>
+                <span class="text-[11px] text-slate-400">两阶段去偏 Relaxed-LASSO 反演（物理参数核验、自动重拟合与降阶保护）</span>
                 <button id="thermRunDeconvBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">Run Relaxed-LASSO Deconvolution</button>
               </div>
             </div>
 
             <!-- Card 2: KPI Summary Strip -->
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px] tabular-nums">
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Rth Total</div><div id="thermStatRth" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermStatRthLabel" class="text-[9px] text-slate-400">Rth Total</div><div id="thermStatRth" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Fit R² / RMSE</div><div class="text-cyan-300 mt-0.5"><span id="thermStatR2">--</span> / <span id="thermStatRmse">--</span></div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Detected t0</div><div id="thermStatT0" class="text-slate-200 mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">dt_med / λ</div><div class="text-slate-300 text-[10px] mt-0.5"><span id="thermStatDt">--</span> · <span id="thermStatLambda">--</span></div></div>
+            </div>
+
+            <!-- Physics Audit Banner (Parameter Credibility, Refit & Auto-Reduction) -->
+            <div id="thermPhysicsAuditBox" class="hidden bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 space-y-1.5 text-[11px]">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span id="thermPhysicsBadge" class="px-2 py-0.5 bg-[#12161c] border border-[#222933] text-slate-300 font-mono text-[10px] font-semibold rounded-xs shrink-0">PENDING</span>
+                  <span id="thermPhysicsSummary" class="font-mono text-slate-200 break-words">--</span>
+                </div>
+                <span id="thermPhysicsMeta" class="font-mono text-[10px] text-slate-400 shrink-0 tabular-nums">--</span>
+              </div>
+              <div id="thermPhysicsChecks" class="flex flex-wrap gap-1.5 font-mono text-[10px]"></div>
             </div>
 
             <div id="thermWarningsBox" class="hidden bg-amber-950/50 border border-amber-500/60 text-amber-200 px-2.5 py-1.5 rounded-sm font-mono text-[11px]"></div>
@@ -1722,7 +1828,7 @@
             <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 space-y-2">
               <div class="flex flex-wrap items-center justify-between gap-2">
                 <div class="flex items-center gap-2">
-                  <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-300">LTspice .subckt MOS_THERM</span>
+                  <span id="thermSpiceTitle" class="text-[10px] font-semibold uppercase tracking-wider text-slate-300">LTspice .subckt MOS_THERM</span>
                   <span id="thermSpiceValidBadge" class="px-1.5 py-0.5 bg-[#12161c] border border-[#222933] text-slate-400 font-mono text-[10px] rounded-xs">PENDING</span>
                 </div>
                 <div class="flex flex-wrap items-center gap-1.5">
@@ -1775,8 +1881,10 @@
                     <span>Probe Deskew Δt (ns, shifts Ids vs Vds)</span>
                     <span class="font-mono text-cyan-300">-100 .. +100 ns</span>
                   </div>
-                  <div class="flex items-center gap-2">
+                  <div class="flex items-center gap-1.5">
+                    <button id="thermLossDeskewDecBtn" type="button" aria-label="Decrease deskew by 0.5 ns" title="Fine step −0.5 ns (Shift+Click: −5 ns)" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-mono font-bold text-xs rounded-xs cursor-pointer shrink-0 select-none">−</button>
                     <input id="thermLossDeskewSlider" type="range" min="-100" max="100" step="0.5" value="0" class="flex-1 accent-cyan-400 cursor-pointer" />
+                    <button id="thermLossDeskewIncBtn" type="button" aria-label="Increase deskew by 0.5 ns" title="Fine step +0.5 ns (Shift+Click: +5 ns)" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-mono font-bold text-xs rounded-xs cursor-pointer shrink-0 select-none">+</button>
                     <input id="thermLossDeskewInput" type="number" step="0.5" value="0" class="w-20 bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-cyan-300 font-mono text-center" />
                   </div>
                 </div>
@@ -1981,11 +2089,11 @@
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">Mod Depth m</label>
-                  <input id="focModDepthInput" type="number" step="0.05" min="0" max="1.15" value="0.85" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <input id="focModDepthInput" type="number" step="0.01" min="0" max="1.20" value="0.85" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">PF Angle φ (°)</label>
-                  <input id="focPfAngleInput" type="number" step="1" min="-90" max="90" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <input id="focPfAngleInput" type="number" step="1" min="-180" max="180" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
               </div>
 
@@ -2039,8 +2147,12 @@
                   <button id="focInjectBtn" type="button" class="px-2.5 py-1.5 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-600/60 text-emerald-200 rounded-sm text-[11px] cursor-pointer">注入 Tj_AH..CL 到示波器</button>
                   <button id="focRunSweepBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-200 rounded-sm text-[11px] cursor-pointer">SVPWM vs DPWM1 扫频</button>
                 </div>
-                <span id="focModelSummaryBadge" class="text-[10px] font-mono text-slate-400 truncate">ZthJC + Zth_board Ready</span>
+                <div class="flex flex-wrap items-center gap-2 min-w-0">
+                  <span id="focModelSourceBadge" class="px-1.5 py-0.5 bg-[#12161c] border border-[#222933] text-amber-300 font-mono text-[10px] rounded-xs">来源: 系统默认 Fallback 模型</span>
+                  <span id="focModelSummaryBadge" class="text-[10px] font-mono text-slate-400 truncate">ZthJC + Zth_board Ready</span>
+                </div>
               </div>
+              <div id="focSingleStageWarning" class="hidden bg-amber-950/50 border border-amber-500/60 text-amber-200 px-2.5 py-1.5 rounded-xs font-mono text-[10px]">▲ 当前为单阶 Cauer 模型经验拆分（R 40%/60%、C 25%/75%），JC 与 Board 参数无独立物理反演依据，建议反演 ≥2 阶热模型。</div>
 
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1b222c]">
                 <div class="flex flex-wrap items-center gap-2 text-[11px]">
@@ -2121,6 +2233,314 @@
         <div class="flex items-center justify-between gap-2 pt-3 mt-3 border-t border-[#222933] shrink-0 text-xs">
           <span class="text-[11px] font-mono text-slate-400">Side-by-side non-overlapping panel · Drag left edge to resize</span>
           <button id="thermCloseBottomBtn" type="button" class="px-3.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs cursor-pointer">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Signal Filter & Circuit Conditioning Workbench Modal (Dockable) -->
+    <div id="filterModal" class="modal-overlay tool-dockable fixed inset-0 z-50 hidden items-center justify-center p-4">
+      <div class="bg-[#12161c] border border-[#222933] w-full max-w-2xl rounded-sm shadow-2xl p-4 flex flex-col max-h-[92vh]">
+        <div class="flex items-center justify-between gap-2 pb-2.5 border-b border-[#222933] shrink-0 modal-drag-handle">
+          <div class="min-w-0">
+            <h3 class="text-xs font-semibold text-cyan-300 uppercase tracking-wider truncate">Signal Filter &amp; Circuit Conditioning</h3>
+            <p class="text-[10px] text-slate-400 font-mono truncate">Whole or Partial Slice [tStart ~ tEnd] · Analog Circuit / IIR / FIR / DSP</p>
+          </div>
+          <button id="filtCloseTopBtn" type="button" class="text-slate-400 hover:text-white cursor-pointer shrink-0">✕</button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto pr-1 pt-2 space-y-2 text-xs min-h-0">
+          <!-- Target Channel & Sampling Info -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2 space-y-1.5">
+            <div class="flex items-center justify-between gap-2">
+              <label for="filtChannelSelect" class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Target Channel</label>
+              <span id="filtChannelMeta" class="text-[10px] font-mono text-cyan-300 tabular-nums truncate">--</span>
+            </div>
+            <select id="filtChannelSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-2 py-1 text-white font-mono text-[11px]"></select>
+
+            <!-- Circuit / DSP Presets -->
+            <div class="pt-0.5">
+              <div class="text-[10px] text-slate-400 mb-1">Quick Circuit &amp; DSP Presets</div>
+              <div class="grid grid-cols-3 gap-1 font-mono text-[10px]">
+                <button type="button" class="filt-preset-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer truncate" data-preset="sw_noise" title="4th-order Zero-Phase Butterworth LPF for switching ripple">PWM Sw Noise</button>
+                <button type="button" class="filt-preset-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer truncate" data-preset="rc_lpf" title="1st-order Passive RC LPF using physical R & C">Passive RC</button>
+                <button type="button" class="filt-preset-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer truncate" data-preset="hum_notch" title="50 Hz high-Q IIR Biquad Notch filter">50Hz Notch</button>
+                <button type="button" class="filt-preset-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer truncate" data-preset="median_glitch" title="Median rank filter to reject switching EMI spikes">EMI Glitch</button>
+                <button type="button" class="filt-preset-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer truncate" data-preset="sg_smooth" title="Savitzky-Golay polynomial smoothing preserving peak heights">SavGol Peak</button>
+                <button type="button" class="filt-preset-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-xs cursor-pointer truncate" data-preset="ac_couple" title="1st-order RC High-Pass DC-blocking filter">AC Couple HP</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Region Scope (Whole vs Partial) & Output Mode -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2 space-y-1.5">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Region Scope</span>
+              <span id="filtRegionMeta" class="text-[10px] font-mono text-slate-400 tabular-nums truncate">--</span>
+            </div>
+            <div class="grid grid-cols-4 bg-[#12161c] p-0.5 border border-[#222933] rounded-xs font-mono">
+              <button id="filtRegion_entire" type="button" class="px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold text-[11px] cursor-pointer whitespace-nowrap">Entire</button>
+              <button id="filtRegion_view" type="button" class="px-2 py-0.5 rounded-xs text-slate-300 hover:text-white text-[11px] cursor-pointer whitespace-nowrap">Viewport</button>
+              <button id="filtRegion_cursors" type="button" class="px-2 py-0.5 rounded-xs text-slate-300 hover:text-white text-[11px] cursor-pointer whitespace-nowrap">X1 ~ X2</button>
+              <button id="filtRegion_custom" type="button" class="px-2 py-0.5 rounded-xs text-slate-300 hover:text-white text-[11px] cursor-pointer whitespace-nowrap">Custom [t]</button>
+            </div>
+
+            <!-- Custom Partial Time Bounds -->
+            <div id="filtCustomRangeRow" class="hidden grid grid-cols-5 gap-1.5 items-end pt-0.5">
+              <div class="col-span-2">
+                <label class="block text-[10px] text-slate-400 mb-0.5">t_start</label>
+                <input id="filtCustomTStartInput" type="number" step="any" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white font-mono text-[11px]" />
+              </div>
+              <div class="col-span-2">
+                <label class="block text-[10px] text-slate-400 mb-0.5">t_end</label>
+                <input id="filtCustomTEndInput" type="number" step="any" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white font-mono text-[11px]" />
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Unit</label>
+                <select id="filtCustomTimeUnitSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-cyan-200 font-mono text-[11px]">
+                  <option value="s">s</option>
+                  <option value="ms" selected>ms</option>
+                  <option value="us">µs</option>
+                </select>
+              </div>
+            </div>
+
+            <div id="filtPartialBlendRow" class="hidden flex items-center justify-between gap-2 pt-1 border-t border-[#1b222c]">
+              <span class="text-[10px] text-slate-400">Edge Crossfade Taper (%) — smooth boundary join</span>
+              <input id="filtEdgeBlendInput" type="number" min="0" max="25" step="1" value="5" class="w-16 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white font-mono text-[11px] text-right" />
+            </div>
+
+            <!-- Output Target -->
+            <div class="flex items-center justify-between gap-2 pt-1 border-t border-[#1b222c]">
+              <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Output</span>
+              <div class="flex flex-1 max-w-[260px] bg-[#12161c] p-0.5 border border-[#222933] rounded-xs font-mono">
+                <button id="filtOut_new_channel" type="button" class="flex-1 py-0.5 px-2 rounded-xs bg-cyan-600 text-slate-950 font-semibold text-[11px] cursor-pointer whitespace-nowrap">New Channel</button>
+                <button id="filtOut_in_place" type="button" class="flex-1 py-0.5 px-2 rounded-xs text-slate-300 hover:text-white text-[11px] cursor-pointer whitespace-nowrap">In-Place (+Ref)</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Filter Topology & Parameters -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2 space-y-1.5">
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Filter Topology / Algorithm</label>
+                <select id="filtAlgoSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]">
+                  <option value="butterworth">Butterworth IIR</option>
+                  <option value="rc_passive">Passive RC (R·C / fc)</option>
+                  <option value="bessel">Bessel IIR (Linear Phase)</option>
+                  <option value="chebyshev1">Chebyshev IIR (Steep)</option>
+                  <option value="notch">Parametric Notch (f0, Q)</option>
+                  <option value="fir_sinc">Windowed-Sinc FIR</option>
+                  <option value="savgol">Savitzky-Golay (Peak)</option>
+                  <option value="moving_avg">Moving Avg (Boxcar / EMA)</option>
+                  <option value="median">Median (Spike / Glitch)</option>
+                </select>
+              </div>
+              <div id="filtResponseWrap">
+                <label class="block text-[10px] text-slate-400 mb-0.5">Response Band</label>
+                <select id="filtResponseSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]">
+                  <option value="lowpass">Low-Pass (LPF)</option>
+                  <option value="highpass">High-Pass (HPF)</option>
+                  <option value="bandpass">Band-Pass (BPF)</option>
+                  <option value="bandstop">Band-Stop (BSF)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Order / Ripple / Zero-Phase row -->
+            <div class="grid grid-cols-3 gap-2 items-end">
+              <div id="filtOrderWrap">
+                <label class="block text-[10px] text-slate-400 mb-0.5">Order (Poles)</label>
+                <select id="filtOrderSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]">
+                  <option value="1">1st (20 dB/dec)</option>
+                  <option value="2">2nd (40 dB/dec)</option>
+                  <option value="3">3rd (60 dB/dec)</option>
+                  <option value="4" selected>4th (80 dB/dec)</option>
+                  <option value="5">5th</option>
+                  <option value="6">6th</option>
+                  <option value="7">7th</option>
+                  <option value="8">8th</option>
+                </select>
+              </div>
+              <div id="filtRippleWrap" class="hidden">
+                <label class="block text-[10px] text-slate-400 mb-0.5">Passband Ripple (dB)</label>
+                <input id="filtRippleInput" type="number" step="0.1" min="0.05" max="6" value="0.5" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+              </div>
+              <div id="filtZeroPhaseWrap" class="col-span-2 flex items-center justify-end pb-1">
+                <label class="inline-flex items-center gap-1.5 text-[11px] text-slate-200 cursor-pointer" title="Forward-backward filtfilt removes phase delay (doubles effective order)">
+                  <input id="filtZeroPhaseChk" type="checkbox" checked class="accent-cyan-500" />
+                  <span>Zero-Phase (filtfilt, Δφ = 0°)</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Physical R & C toggle + inputs -->
+            <div id="filtRcToggleWrap" class="hidden pt-1 border-t border-[#1b222c] space-y-1.5">
+              <label class="inline-flex items-center gap-1.5 text-[11px] text-cyan-200 cursor-pointer">
+                <input id="filtUseRcChk" type="checkbox" checked class="accent-cyan-500" />
+                <span>Specify Physical R &amp; C Values (fc = 1 / 2πRC)</span>
+              </label>
+              <div id="filtRcComponentsRow" class="space-y-1">
+                <div class="grid grid-cols-2 gap-2">
+                  <div>
+                    <label class="block text-[10px] text-slate-400 mb-0.5">Resistor R</label>
+                    <div class="flex gap-1">
+                      <input id="filtResInput" type="number" step="any" min="0.001" value="1" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                      <select id="filtResUnitSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-cyan-200 font-mono text-[11px]">
+                        <option value="ohm">Ω</option>
+                        <option value="kohm" selected>kΩ</option>
+                        <option value="mohm">MΩ</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <label class="block text-[10px] text-slate-400 mb-0.5">Capacitor C</label>
+                    <div class="flex gap-1">
+                      <input id="filtCapInput" type="number" step="any" min="0.001" value="100" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                      <select id="filtCapUnitSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-cyan-200 font-mono text-[11px]">
+                        <option value="pF">pF</option>
+                        <option value="nF" selected>nF</option>
+                        <option value="uF">µF</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <div id="filtRcCalcReadout" class="text-[10px] font-mono text-emerald-300 tabular-nums">τ = 100 µs · f_c = 1.592 kHz</div>
+              </div>
+            </div>
+
+            <!-- Cutoff Frequency fc + Log Slider -->
+            <div id="filtFcWrap" class="space-y-1 pt-1 border-t border-[#1b222c]">
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Cutoff Frequency fc (Low / Main)</label>
+                  <div class="flex gap-1">
+                    <input id="filtFcInput" type="number" step="any" min="0.0001" value="5" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                    <select id="filtFcUnitSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-cyan-200 font-mono text-[11px]">
+                      <option value="Hz">Hz</option>
+                      <option value="kHz" selected>kHz</option>
+                      <option value="MHz">MHz</option>
+                    </select>
+                  </div>
+                </div>
+                <div id="filtFcHighWrap" class="hidden">
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Upper Cutoff fc_high</label>
+                  <div class="flex gap-1">
+                    <input id="filtFcHighInput" type="number" step="any" min="0.0001" value="20" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                    <select id="filtFcHighUnitSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-cyan-200 font-mono text-[11px]">
+                      <option value="Hz">Hz</option>
+                      <option value="kHz" selected>kHz</option>
+                      <option value="MHz">MHz</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <input id="filtFcSlider" type="range" min="0" max="1000" value="500" class="w-full accent-cyan-500 cursor-pointer" title="Logarithmic cutoff frequency sweep" />
+            </div>
+
+            <!-- Notch Parameters -->
+            <div id="filtNotchWrap" class="hidden grid grid-cols-2 gap-2 pt-1 border-t border-[#1b222c]">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Center Frequency f0</label>
+                <div class="flex gap-1">
+                  <input id="filtF0Input" type="number" step="any" min="0.01" value="50" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <select id="filtF0UnitSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-cyan-200 font-mono text-[11px]">
+                    <option value="Hz" selected>Hz</option>
+                    <option value="kHz">kHz</option>
+                    <option value="MHz">MHz</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">Quality Factor Q (BW = f0 / Q)</label>
+                <input id="filtQInput" type="number" step="0.5" min="0.2" max="200" value="12" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+              </div>
+            </div>
+
+            <!-- FIR Parameters -->
+            <div id="filtFirWrap" class="hidden grid grid-cols-2 gap-2 pt-1 border-t border-[#1b222c]">
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">FIR Taps (Odd, 5..401)</label>
+                <input id="filtFirTapsInput" type="number" step="2" min="5" max="401" value="51" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-0.5">FIR Window</label>
+                <select id="filtFirWinSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]">
+                  <option value="hann">Hann</option>
+                  <option value="hamming">Hamming</option>
+                  <option value="blackman">Blackman (~74 dB)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Time-Domain Smoothing Parameters (MA / EMA / SavGol / Median) -->
+            <div class="grid grid-cols-3 gap-2">
+              <div id="filtMaModeWrap" class="hidden">
+                <label class="block text-[10px] text-slate-400 mb-0.5">MA Type</label>
+                <select id="filtMaModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]">
+                  <option value="boxcar">Boxcar Window</option>
+                  <option value="ema">Exponential (EMA α)</option>
+                </select>
+              </div>
+              <div id="filtWinSamplesWrap" class="hidden">
+                <label class="block text-[10px] text-slate-400 mb-0.5">Window (Samples)</label>
+                <input id="filtWinSamplesInput" type="number" step="2" min="3" max="201" value="9" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+              </div>
+              <div id="filtEmaWrap" class="hidden">
+                <label class="block text-[10px] text-slate-400 mb-0.5">EMA α (0 &lt; α &lt; 1)</label>
+                <input id="filtEmaAlphaInput" type="number" step="0.02" min="0.005" max="0.99" value="0.15" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+              </div>
+              <div id="filtSgPolyWrap" class="hidden">
+                <label class="block text-[10px] text-slate-400 mb-0.5">Poly Order</label>
+                <select id="filtSgPolySelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]">
+                  <option value="2" selected>Quadratic (2)</option>
+                  <option value="3">Cubic (3)</option>
+                  <option value="4">Quartic (4)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Validation Banner -->
+          <div id="filtValidationBanner" class="hidden"></div>
+
+          <!-- Live Preview Canvas (Time Before/After vs Bode |H(f)|) -->
+          <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2">
+            <div class="flex items-center justify-between gap-2 mb-1">
+              <span class="text-[11px] font-semibold text-slate-200">Live Filter Response &amp; Preview</span>
+              <div class="flex bg-[#12161c] p-0.5 border border-[#222933] rounded-xs font-mono">
+                <button id="filtPreviewMode_time" type="button" class="px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold text-[11px] cursor-pointer">Time Preview</button>
+                <button id="filtPreviewMode_bode" type="button" class="px-2 py-0.5 rounded-xs text-slate-300 hover:text-white text-[11px] cursor-pointer">|H(f)| Bode</button>
+              </div>
+            </div>
+            <canvas id="filtPreviewCanvas" class="w-full h-[152px] block rounded-xs"></canvas>
+          </div>
+
+          <!-- Live Conditioning Metrics -->
+          <div class="grid grid-cols-3 gap-1.5 font-mono text-[10px] tabular-nums">
+            <div class="bg-[#0c0f13] border border-[#222933] p-1.5 rounded-sm">
+              <div class="text-[9px] text-slate-400">Filtered Pts</div>
+              <div id="filtKpiPoints" class="text-cyan-300 font-semibold mt-0.5 truncate">--</div>
+            </div>
+            <div class="bg-[#0c0f13] border border-[#222933] p-1.5 rounded-sm">
+              <div class="text-[9px] text-slate-400">Removed RMS</div>
+              <div id="filtKpiNoiseRms" class="text-amber-300 font-semibold mt-0.5 truncate">--</div>
+            </div>
+            <div class="bg-[#0c0f13] border border-[#222933] p-1.5 rounded-sm">
+              <div class="text-[9px] text-slate-400">Vpp (Raw → Filt)</div>
+              <div id="filtKpiVpp" class="text-emerald-300 font-semibold mt-0.5 truncate">--</div>
+            </div>
+          </div>
+          <div id="filtKpiBadge" class="text-[10px] font-mono text-slate-400 px-1 truncate">--</div>
+        </div>
+
+        <!-- Pinned Bottom Bar -->
+        <div class="flex items-center justify-between gap-2 pt-2.5 mt-2 border-t border-[#222933] shrink-0 text-xs">
+          <div class="flex items-center gap-2">
+            <button id="filtCloseBottomBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm text-xs cursor-pointer">Close</button>
+            <button id="filtRevertRawBtn" type="button" class="hidden px-3 py-1.5 bg-amber-950/50 hover:bg-amber-900/60 border border-amber-600/50 text-amber-200 rounded-sm text-xs cursor-pointer">Restore Raw (还原原始)</button>
+          </div>
+          <button id="filtApplyBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm text-xs cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed">Apply Filter to Trace</button>
         </div>
       </div>
     </div>

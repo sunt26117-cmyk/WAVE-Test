@@ -78,6 +78,73 @@ export function radix2FFT(real: Float64Array, imag: Float64Array): void {
   }
 }
 
+/**
+ * Exact O(N log N) Bluestein (Chirp-Z) DFT for arbitrary non-power-of-2 lengths.
+ * Falls back directly to radix2FFT when n is already a power of 2.
+ */
+export function arbitraryLengthFFT(real: Float64Array, imag: Float64Array): void {
+  const n = real.length;
+  if (n <= 1) return;
+  if ((n & (n - 1)) === 0) {
+    radix2FFT(real, imag);
+    return;
+  }
+
+  let m = 1;
+  while (m < 2 * n - 1) m <<= 1;
+
+  const cosTable = new Float64Array(n);
+  const sinTable = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const angle = (Math.PI * ((i * i) % (2 * n))) / n;
+    cosTable[i] = Math.cos(angle);
+    sinTable[i] = Math.sin(angle);
+  }
+
+  const aR = new Float64Array(m);
+  const aI = new Float64Array(m);
+  const bR = new Float64Array(m);
+  const bI = new Float64Array(m);
+
+  bR[0] = 1;
+  for (let i = 0; i < n; i++) {
+    const wr = cosTable[i];
+    const wi = -sinTable[i];
+    aR[i] = real[i] * wr - imag[i] * wi;
+    aI[i] = real[i] * wi + imag[i] * wr;
+    if (i > 0) {
+      bR[i] = cosTable[i];
+      bI[i] = sinTable[i];
+      bR[m - i] = cosTable[i];
+      bI[m - i] = sinTable[i];
+    }
+  }
+
+  radix2FFT(aR, aI);
+  radix2FFT(bR, bI);
+
+  for (let i = 0; i < m; i++) {
+    const ar = aR[i];
+    const ai = aI[i];
+    aR[i] = ar * bR[i] - ai * bI[i];
+    aI[i] = ar * bI[i] + ai * bR[i];
+  }
+
+  // Inverse FFT via conjugate -> radix2FFT -> conjugate / m
+  for (let i = 0; i < m; i++) aI[i] = -aI[i];
+  radix2FFT(aR, aI);
+
+  const invM = 1 / m;
+  for (let i = 0; i < n; i++) {
+    const cr = aR[i] * invM;
+    const ci = -aI[i] * invM;
+    const wr = cosTable[i];
+    const wi = -sinTable[i];
+    real[i] = cr * wr - ci * wi;
+    imag[i] = cr * wi + ci * wr;
+  }
+}
+
 const windowCache = new Map<string, { weights: Float64Array; coherentGain: number }>();
 
 /**
@@ -256,42 +323,78 @@ export function computeFFT(
   sampleRate: number,
   options: FFTOptions,
   channelId: string,
-  channelName: string
+  channelName: string,
+  extra?: { sourceUnit?: string; isUniformSampling?: boolean }
 ): SpectrumResult {
   const totalSamples = v.length;
   if (totalSamples < 4 || sampleRate <= 0) {
     throw new Error('Insufficient points or invalid sample rate for FFT.');
   }
 
-  const MAX_FFT_SIZE = 262144; // Keeps UI interactive (<30 ms) even on 1M+ sample captures
-  let baseN = Math.min(floorPowerOfTwo(totalSamples), MAX_FFT_SIZE);
+  const MAX_FFT_SIZE = 262144; // Keeps UI interactive even on 1M+ sample captures
+  const baseN = Math.min(totalSamples, MAX_FFT_SIZE);
   let paddingFactor = options.zeroPadding || 1;
   while (baseN * paddingFactor > MAX_FFT_SIZE && paddingFactor > 1) {
     paddingFactor >>= 1;
   }
   const fftN = baseN * paddingFactor;
-  const cappedWarning =
-    totalSamples > MAX_FFT_SIZE
-      ? `Windowed to ${baseN.toLocaleString()} pts for interactive speed`
+  const warnings: string[] = [];
+  if (totalSamples > MAX_FFT_SIZE) {
+    warnings.push(`Windowed to ${baseN.toLocaleString()} pts for interactive speed`);
+  }
+  const nonUniformWarning =
+    extra?.isUniformSampling === false
+      ? 'Non-uniform sampling detected; spectrum amplitude/frequency accuracy may degrade'
       : undefined;
+  if (nonUniformWarning) {
+    warnings.push(nonUniformWarning);
+  }
+  const cappedWarning = warnings.length > 0 ? warnings.join(' · ') : undefined;
 
-  // Sanitize NaN/Inf values once and compute DC mean
-  let sliceMean = 0;
+  // Sanitize NaN/Inf via linear interpolation between valid neighbors
+  const cleanSlice = new Float64Array(baseN);
+  let firstValidIdx = -1;
   let validSum = 0;
   let validCount = 0;
-  let lastValid = 0;
-  const cleanSlice = new Float64Array(baseN);
+
   for (let i = 0; i < baseN; i++) {
     const val = v[i];
     if (isFinite(val)) {
       cleanSlice[i] = val;
-      lastValid = val;
+      if (firstValidIdx === -1) {
+        firstValidIdx = i;
+        for (let k = 0; k < i; k++) cleanSlice[k] = val;
+      }
       validSum += val;
       validCount++;
     } else {
-      cleanSlice[i] = lastValid;
+      cleanSlice[i] = NaN;
     }
   }
+
+  if (validCount === 0) {
+    cleanSlice.fill(0);
+  } else {
+    let prevValid = firstValidIdx;
+    for (let i = firstValidIdx + 1; i < baseN; i++) {
+      if (isFinite(cleanSlice[i])) {
+        const gap = i - prevValid;
+        if (gap > 1) {
+          const y0 = cleanSlice[prevValid];
+          const y1 = cleanSlice[i];
+          for (let k = 1; k < gap; k++) {
+            cleanSlice[prevValid + k] = y0 + ((y1 - y0) * k) / gap;
+          }
+        }
+        prevValid = i;
+      }
+    }
+    for (let i = prevValid + 1; i < baseN; i++) {
+      cleanSlice[i] = cleanSlice[prevValid];
+    }
+  }
+
+  let sliceMean = 0;
   if (options.removeDC && validCount > 0) {
     sliceMean = validSum / validCount;
   }
@@ -306,11 +409,12 @@ export function computeFFT(
     real[i] = (cleanSlice[i] - sliceMean) * weights[i];
   }
 
-  // Run Cooley-Tukey Radix-2
-  radix2FFT(real, imag);
+  // Run exact Radix-2 (for 2^k) or Bluestein O(N log N) (for arbitrary N)
+  arbitraryLengthFFT(real, imag);
 
-  // Single-sided spectrum has (fftN / 2) + 1 bins
-  const numBins = (fftN >> 1) + 1;
+  // Single-sided spectrum has floor(fftN / 2) + 1 bins
+  const numBins = Math.floor(fftN / 2) + 1;
+  const isEvenN = fftN % 2 === 0;
   const frequencies = new Float32Array(numBins);
   const magnitudes = new Float32Array(numBins);
   const dbValues = new Float32Array(numBins);
@@ -328,7 +432,8 @@ export function computeFFT(
     const im = imag[k];
     const rawMag = Math.sqrt(r * r + im * im);
 
-    const mag = k === 0 || k === numBins - 1 ? rawMag / normFactor : (2.0 * rawMag) / normFactor;
+    const isNyquistBin = isEvenN && k === numBins - 1;
+    const mag = k === 0 || isNyquistBin ? rawMag / normFactor : (2.0 * rawMag) / normFactor;
     magnitudes[k] = mag;
     if (mag > maxMag) maxMag = mag;
 
@@ -359,6 +464,7 @@ export function computeFFT(
     dbValues,
     sourceChannelId: channelId,
     sourceChannelName: channelName,
+    sourceUnit: extra?.sourceUnit || 'V',
     sampleRate,
     fftSize: fftN,
     resolution: binResolution,
@@ -375,6 +481,7 @@ export function computeFFT(
     magYMin,
     magYMax,
     cappedWarning,
+    nonUniformWarning,
   };
 }
 

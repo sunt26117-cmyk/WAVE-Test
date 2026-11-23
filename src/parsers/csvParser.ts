@@ -22,10 +22,54 @@ function stripBom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
+function parseUnitToken(unitStr?: string): { family: string; scale: number } | null {
+  if (!unitStr) return null;
+  const clean = unitStr.trim().replace(/^[\[\(]|[\]\)]$/g, '').trim();
+  if (!clean) return null;
+  const m = /^(p|n|u|µ|μ|m|k|K|M|meg|G)?(V|A|W|Hz|Ω|ohm|s)$/i.exec(clean);
+  if (!m) return null;
+  const prefix = m[1] || '';
+  const baseRaw = m[2].toLowerCase();
+  const family = baseRaw === 'ohm' || baseRaw === 'ω' ? 'ohm' : baseRaw;
+  let scale = 1;
+  switch (prefix) {
+    case 'p':
+      scale = 1e-12;
+      break;
+    case 'n':
+      scale = 1e-9;
+      break;
+    case 'u':
+    case 'µ':
+    case 'μ':
+      scale = 1e-6;
+      break;
+    case 'm':
+      scale = 1e-3;
+      break;
+    case 'k':
+    case 'K':
+      scale = 1e3;
+      break;
+    case 'M':
+    case 'meg':
+      scale = 1e6;
+      break;
+    case 'G':
+      scale = 1e9;
+      break;
+    default:
+      scale = 1;
+      break;
+  }
+  return { family, scale };
+}
+
 /**
- * Parses a numeric signal cell (supports scientific notation and optional trailing units like "1.25V").
+ * Parses a numeric signal cell (supports scientific notation and optional trailing units like "12mV").
+ * Converts unit prefixes relative to targetUnit when physical families match (e.g. "12mV" in a "V" column -> 0.012).
  */
-export function parseNumericCell(raw: string): number {
+export function parseNumericCell(raw: string, targetUnit?: string): number {
   const s = (raw || '').trim().replace(/^["']|["']$/g, '').trim();
   if (!s) return NaN;
 
@@ -35,11 +79,18 @@ export function parseNumericCell(raw: string): number {
     return isFinite(v) ? v : NaN;
   }
 
-  // Tolerate trailing common engineering units (e.g. "3.30V", "-12.5 mV", "100uA")
-  const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(?:m?V|uV|µV|kV|m?A|uA|µA|m?W|kW|Hz|kHz|MHz|GHz|Ω|ohm|deg|rad|%)$/i.exec(s);
+  // Tolerate trailing common engineering units (e.g. "3.30V", "-12.5 mV", "100uA", "12MHz")
+  const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(pV|nV|uV|µV|μV|mV|V|kV|MV|pA|nA|uA|µA|μA|mA|A|kA|pW|nW|uW|µW|μW|mW|W|kW|MW|Hz|kHz|MHz|GHz|mΩ|Ω|kΩ|MΩ|mohm|ohm|kohm|ps|ns|us|µs|ms|s|deg|rad|%)$/i.exec(s);
   if (match) {
     const v = Number(match[1]);
-    return isFinite(v) ? v : NaN;
+    if (!isFinite(v)) return NaN;
+    const cellUnit = parseUnitToken(match[2]);
+    if (!cellUnit) return v;
+    const colUnit = parseUnitToken(targetUnit);
+    if (colUnit && colUnit.family === cellUnit.family) {
+      return v * (cellUnit.scale / colUnit.scale);
+    }
+    return v * cellUnit.scale;
   }
 
   return NaN;
@@ -351,6 +402,34 @@ export function previewCsv(text: string): CsvPreviewInfo {
     }
   }
 
+  const inferCsvChannelUnit = (header: string): string => {
+    const h = (header || '').trim();
+    if (!h) return 'V';
+    const bracketMatch = h.match(/[\(\[\{]\s*([µμunmk]?[VAW]|°C|degC|C|K|Hz|kHz|MHz|Ω|Ohm|rpm)\s*[\)\]\}]/i);
+    if (bracketMatch) {
+      const u = bracketMatch[1];
+      if (/^(degc|°c|c)$/i.test(u)) return '°C';
+      if (/^k$/i.test(u)) return 'K';
+      if (/^mv$/i.test(u)) return 'mV';
+      if (/^[µμu]v$/i.test(u)) return 'µV';
+      if (/^kv$/i.test(u)) return 'kV';
+      if (/^v$/i.test(u)) return 'V';
+      if (/^ma$/i.test(u)) return 'mA';
+      if (/^[µμu]a$/i.test(u)) return 'µA';
+      if (/^ka$/i.test(u)) return 'kA';
+      if (/^a$/i.test(u)) return 'A';
+      if (/^mw$/i.test(u)) return 'mW';
+      if (/^[µμu]w$/i.test(u)) return 'µW';
+      if (/^kw$/i.test(u)) return 'kW';
+      if (/^w$/i.test(u)) return 'W';
+      return u;
+    }
+    if (/^(t_?pcb|t_?pad|t_?j|temp|ntc|t_?case)/i.test(h) || /temp|°c|degc/i.test(h)) return '°C';
+    if (/^(i_?[a-z0-9]*|ids|i_ds|curr)/i.test(h)) return 'A';
+    if (/^(p_?[a-z0-9]*|pwr|power)/i.test(h)) return 'W';
+    return 'V';
+  };
+
   const columnMappings: CsvColumnMapping[] = headers.map((header, idx) => {
     if (idx === timeColIndex) {
       return {
@@ -366,7 +445,7 @@ export function previewCsv(text: string): CsvPreviewInfo {
       header,
       role: 'channel',
       channelName: header || `CH ${idx + 1}`,
-      unit: 'V',
+      unit: inferCsvChannelUnit(header),
     };
   });
 
@@ -438,7 +517,10 @@ export function parseFullCsv(
 
   let parsedRowIdx = 0;
   let needsSort = false;
+  let nonMonotonicRawCount = 0;
   let prevTime = -Infinity;
+  const syntheticClockUsed = overrideFs === null && !hasExplicitTime;
+  const perChannelNanCounts = new Int32Array(activeChannels.length);
 
   for (let lineIdx = startIndex; lineIdx < lines.length; lineIdx++) {
     const trimmed = lines[lineIdx].trim();
@@ -470,6 +552,7 @@ export function parseFullCsv(
 
     if (parsedRowIdx > 0 && rowT < prevTime) {
       needsSort = true;
+      nonMonotonicRawCount++;
     }
     prevTime = rowT;
     rawTime[parsedRowIdx] = rowT;
@@ -477,8 +560,13 @@ export function parseFullCsv(
     for (let c = 0; c < activeChannels.length; c++) {
       const colIdx = activeChannels[c].index;
       const cell = colIdx < cols.length ? cols[colIdx] : '';
-      const vVal = parseNumericCell(cell);
-      rawValues[c][parsedRowIdx] = isNaN(vVal) || !isFinite(vVal) ? NaN : vVal;
+      const vVal = parseNumericCell(cell, activeChannels[c].unit);
+      if (isNaN(vVal) || !isFinite(vVal)) {
+        rawValues[c][parsedRowIdx] = NaN;
+        perChannelNanCounts[c]++;
+      } else {
+        rawValues[c][parsedRowIdx] = vVal;
+      }
     }
 
     parsedRowIdx++;
@@ -511,8 +599,13 @@ export function parseFullCsv(
     }
   }
 
+  const totalSignalNanCount = perChannelNanCounts.reduce((a, b) => a + b, 0);
+
   // Quality check
-  const quality = analyzeSamplingQuality(finalTime, invalidRows);
+  const quality = analyzeSamplingQuality(finalTime, invalidRows, totalSignalNanCount);
+  quality.nonMonotonicCount = (quality.nonMonotonicCount || 0) + nonMonotonicRawCount;
+  quality.syntheticClockUsed = syntheticClockUsed;
+  quality.rawGapCount = quality.gapCount;
   if (overrideFs !== null && validCount >= 2) {
     quality.isUniformSampling = true;
     quality.qualityStatus = 'uniform';
@@ -530,15 +623,17 @@ export function parseFullCsv(
   for (let c = 0; c < activeChannels.length; c++) {
     const chMap = activeChannels[c];
     const chRawV = orderedValues[c];
+    const chNanCount = perChannelNanCounts[c];
 
     let finalT: Float64Array = finalTime;
     let finalV: Float32Array = chRawV;
     let fs = quality.sampleRate;
     let dt = quality.nominalDt;
-    let chMetadata = {
+    let chMetadata: SamplingMetadata = {
       ...quality,
       sampleRate: fs,
       nominalDt: dt,
+      signalNanCount: chNanCount,
     };
 
     if (options.resample && overrideFs === null && (!quality.isUniformSampling || quality.qualityStatus !== 'uniform')) {
@@ -562,6 +657,9 @@ export function parseFullCsv(
         jitterMax: 0,
         gapCount: 0,
         gapIndices: [],
+        rawGapCount: quality.gapCount,
+        resampledFromNonUniform: true,
+        signalNanCount: chNanCount,
       };
     }
 

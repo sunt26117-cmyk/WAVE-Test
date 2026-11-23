@@ -12,12 +12,18 @@ import { formatEng, getTimeBoundsForView } from '../engine/canvasRenderer';
 import { TabState, WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 import { analyzeSamplingQuality } from './qualityCheck';
+import { escapeHtml } from '../utils/html';
 import {
   CauerStage,
   ThermalDeconvResult,
   ThermalInputMode,
+  ThermalPathMode,
   LossSimulationResult,
+  ViPowerResult,
   deconvolveThermalImpedance,
+  detectThermalStepOnset,
+  computePowerFromVISources,
+  parseSiUnitScale,
   computeLossWithDeskewAndEoss,
   cauerToSpice,
   validateCauerSpiceNetlist,
@@ -48,6 +54,7 @@ import {
   runFocStallSweep,
   runFocControlSweep,
 } from './focThermal';
+import { FocThermalHandoffPayload } from './focDyno/scopeBridge';
 
 type WorkbenchTabKey = 'deconv' | 'loss' | 'soa' | 'foc';
 type DeconvSubPlotKey = 'spectrum' | 'structure' | 'residual';
@@ -71,23 +78,50 @@ function getChannelGateRange(tab: TabState, ch: WaveformChannel, gate: 'entire' 
   return { tStart: b.tStart, tEnd: b.tEnd };
 }
 
-function getSliceMean(ch: WaveformChannel, tStart?: number, tEnd?: number): number {
+function getSliceAbsTrapezoidalMean(ch: WaveformChannel, tStart?: number, tEnd?: number): number {
   const n = Math.min(ch.t.length, ch.v.length);
   if (n === 0) return 0;
   const meanAc = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
-  let sum = 0;
-  let cnt = 0;
+  let absEnergy = 0;
+  let dur = 0;
+  let fallbackSum = 0;
+  let fallbackCnt = 0;
+  let prevT: number | null = null;
+  let prevV: number | null = null;
+
   for (let i = 0; i < n; i++) {
     const ti = ch.t[i];
     if (tStart !== undefined && ti < tStart) continue;
     if (tEnd !== undefined && ti > tEnd) break;
     const val = getChannelDisplayValue(ch, i, meanAc);
-    if (isFinite(val)) {
-      sum += val;
-      cnt++;
+    if (!isFinite(val) || !isFinite(ti)) {
+      prevT = null;
+      prevV = null;
+      continue;
     }
+    fallbackSum += Math.abs(val);
+    fallbackCnt++;
+    if (prevT !== null && prevV !== null) {
+      const dt = ti - prevT;
+      if (dt > 0) {
+        if ((prevV >= 0 && val >= 0) || (prevV <= 0 && val <= 0)) {
+          absEnergy += 0.5 * (Math.abs(prevV) + Math.abs(val)) * dt;
+        } else {
+          const a0 = Math.abs(prevV);
+          const a1 = Math.abs(val);
+          const denom = a0 + a1;
+          const frac = denom > 1e-18 ? a0 / denom : 0.5;
+          absEnergy += 0.5 * a0 * (dt * frac) + 0.5 * a1 * (dt * (1 - frac));
+        }
+        dur += dt;
+      }
+    }
+    prevT = ti;
+    prevV = val;
   }
-  return cnt > 0 ? sum / cnt : 0;
+
+  if (dur > 0) return absEnergy / dur;
+  return fallbackCnt > 0 ? fallbackSum / fallbackCnt : 0;
 }
 
 function prepareHiDpiCanvas(canvas: HTMLCanvasElement): { ctx: CanvasRenderingContext2D; w: number; h: number } | null {
@@ -116,9 +150,14 @@ export class ThermalWorkbenchController {
   private lastDeconv: ThermalDeconvResult | null = null;
   private activeCauerStages: CauerStage[] = DEFAULT_FALLBACK_CAUER.map((s) => ({ ...s }));
   private cauerSourceLabel: string = 'Default 3-Stage MOSFET Fallback (1.22 °C/W)';
+  private focModelSource: 'fallback_default' | 'default_demo' | 'tab1_extracted' = 'fallback_default';
   private activeTambC: number = 25;
 
   private lastLossResult: LossSimulationResult | null = null;
+  private lastViPowerResult: ViPowerResult | null = null;
+  private userSetPathMode: boolean = false;
+  private userSetPowerMode: boolean = false;
+  private lastActiveTabId: string | null = null;
   private allSoaPresets: SoaCurveSet[] = getAllSoaPresets();
   private soaCurveSet: SoaCurveSet = cloneSoaPreset(getAllSoaPresets()[0]);
   private soaEditCurveKey: SoaPulseKey = '1ms';
@@ -143,6 +182,12 @@ export class ThermalWorkbenchController {
   public openModal(): void {
     const modal = document.getElementById('thermalModal');
     if (!modal) return;
+    const activeTab = this.app.getActiveTab();
+    if (activeTab && activeTab.id !== this.lastActiveTabId) {
+      this.lastActiveTabId = activeTab.id;
+      this.userSetPathMode = false;
+      this.userSetPowerMode = false;
+    }
     this.populateChannelSelectors();
     modal.style.display = 'flex';
     this.switchTab(this.activeTab);
@@ -196,6 +241,8 @@ export class ThermalWorkbenchController {
     const selIds = [
       'thermTempChSelect',
       'thermPowerChSelect',
+      'thermVoltChSelect',
+      'thermCurrChSelect',
       'thermLossVdsSelect',
       'thermLossIdsSelect',
       'thermSoaVdsSelect',
@@ -246,12 +293,31 @@ export class ThermalWorkbenchController {
       }
     };
 
-    fill('thermTempChSelect', (c) => /temp|tj|tsep|tc|th|°c|deg/i.test(`${c.name} ${c.unit}`), 0);
-    fill('thermPowerChSelect', (c) => /p|pwr|power|watt|^w$/i.test(`${c.name} ${c.unit}`), 1);
-    fill('thermLossVdsSelect', (c) => /vds|v_ds|u|v\(|^v$/i.test(`${c.name} ${c.unit}`), 0);
-    fill('thermLossIdsSelect', (c) => /ids|i_ds|id|i\(|^a$/i.test(`${c.name} ${c.unit}`), 1);
-    fill('thermSoaVdsSelect', (c) => /vds|v_ds|u|v\(|^v$/i.test(`${c.name} ${c.unit}`), 0);
-    fill('thermSoaIdsSelect', (c) => /ids|i_ds|id|i\(|^a$/i.test(`${c.name} ${c.unit}`), 1);
+    const isTempCh = (c: WaveformChannel) => /temp|tj|tsep|t_pcb|tpcb|t_pad|tpad|pcb|pad|ntc|tc|th|°c|deg/i.test(`${c.name} ${c.unit}`);
+    const isPowerCh = (c: WaveformChannel) =>
+      /\b(pwr|power|p_mos|pmos|ploss|p_loss|watt)\b|^w$|mw$|kw$/i.test(`${c.name} ${c.unit}`.trim()) && !isTempCh(c);
+    const isVoltCh = (c: WaveformChannel) =>
+      (/vds|v_ds|vin|vbus|v_mos|vmos|vgs|volt|^v|mv$|uv$|kv$/i.test(`${c.name} ${c.unit}`.trim()) ||
+        /^v$/i.test((c.unit || '').trim())) &&
+      !isTempCh(c) &&
+      !isPowerCh(c);
+    const isCurrCh = (c: WaveformChannel) =>
+      (/ids|i_ds|i_mos|imos|idrain|curr|^i_|ma$|ua$|ka$/i.test(`${c.name} ${c.unit}`.trim()) ||
+        /^a$/i.test((c.unit || '').trim())) &&
+      !isTempCh(c) &&
+      !isPowerCh(c);
+
+    fill('thermTempChSelect', isTempCh, 0);
+    fill('thermPowerChSelect', isPowerCh, Math.min(1, Math.max(0, chs.length - 1)));
+    fill('thermVoltChSelect', isVoltCh, 0, { value: '__const__', label: '恒定值 Const (V)' });
+    fill('thermCurrChSelect', isCurrCh, Math.min(1, Math.max(0, chs.length - 1)), {
+      value: '__const__',
+      label: '恒定值 Const (A)',
+    });
+    fill('thermLossVdsSelect', isVoltCh, 0);
+    fill('thermLossIdsSelect', isCurrCh, 1);
+    fill('thermSoaVdsSelect', isVoltCh, 0);
+    fill('thermSoaIdsSelect', isCurrCh, 1);
 
     fill('focIaSelect', (c) => /\bia\b|i_a|phase.?a.*a/i.test(`${c.name} ${c.unit}`) || /^ia$/i.test(c.name), 0);
     fill('focIbSelect', (c) => /\bib\b|i_b|phase.?b.*a/i.test(`${c.name} ${c.unit}`) || /^ib$/i.test(c.name), 1);
@@ -267,6 +333,247 @@ export class ThermalWorkbenchController {
       3,
       { value: '__const__', label: 'Use Vbus Const (V)' }
     );
+
+    // Smart auto-detection of Thermal Path (PCB/Pad vs Junction) & Power Source (Auto V*I vs Power Ch)
+    if (!this.userSetPathMode) {
+      const tSel = document.getElementById('thermTempChSelect') as HTMLSelectElement | null;
+      const tCh = tSel?.value ? tab.channels[tSel.value] : undefined;
+      const pathSel = document.getElementById('thermPathModeSelect') as HTMLSelectElement | null;
+      if (tCh && pathSel) {
+        const looksLikePadOrPcb = /pcb|pad|board|ntc|case|tc|surf|焊盘|板温/i.test(`${tCh.name}`);
+        pathSel.value = looksLikePadOrPcb ? 'pad_ambient' : 'junction_ambient';
+      }
+    }
+    this.syncThermalPathUI();
+
+    if (!this.userSetPowerMode) {
+      const hasPower = chs.some(isPowerCh);
+      const hasV = chs.some(isVoltCh);
+      const hasI = chs.some(isCurrCh);
+      const pModeSel = document.getElementById('thermPowerModeSelect') as HTMLSelectElement | null;
+      if (pModeSel) {
+        if ((hasV || hasI) && !hasPower) pModeSel.value = 'auto_vi';
+        else if (hasPower) pModeSel.value = 'power_ch';
+        else if (hasV || hasI) pModeSel.value = 'auto_vi';
+        else pModeSel.value = 'manual';
+      }
+    }
+    this.syncPowerSourceUI(true);
+  }
+
+  private syncThermalPathUI(): void {
+    const pathMode = ((document.getElementById('thermPathModeSelect') as HTMLSelectElement)?.value || 'junction_ambient') as ThermalPathMode;
+    const spreadWrap = document.getElementById('thermPadSpreadWrap');
+    const spreadInp = document.getElementById('thermPadSpreadInput') as HTMLInputElement | null;
+    if (spreadWrap) spreadWrap.classList.toggle('opacity-50', pathMode !== 'pad_ambient');
+    if (spreadInp) spreadInp.disabled = pathMode !== 'pad_ambient';
+
+    const rthLabel = document.getElementById('thermStatRthLabel');
+    const spiceTitle = document.getElementById('thermSpiceTitle');
+    if (rthLabel && !this.lastDeconv) {
+      rthLabel.innerText = pathMode === 'pad_ambient' ? 'Rth,pad-a (焊盘→环境)' : 'Rth Total';
+    }
+    if (spiceTitle && !this.lastDeconv) {
+      spiceTitle.innerText =
+        pathMode === 'pad_ambient' ? 'LTspice .subckt PAD_THERM (PAD → TAMB)' : 'LTspice .subckt MOS_THERM';
+    }
+  }
+
+  private syncConstViInputsUI(): void {
+    const vSel = (document.getElementById('thermVoltChSelect') as HTMLSelectElement | null)?.value;
+    const iSel = (document.getElementById('thermCurrChSelect') as HTMLSelectElement | null)?.value;
+    const vConstWrap = document.getElementById('thermConstVoltWrap');
+    const iConstWrap = document.getElementById('thermConstCurrWrap');
+    vConstWrap?.classList.toggle('hidden', vSel !== '__const__');
+    iConstWrap?.classList.toggle('hidden', iSel !== '__const__');
+  }
+
+  private syncPowerSourceUI(autoCompute: boolean = false): void {
+    const mode = (document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value || 'auto_vi';
+    const viVoltWrap = document.getElementById('thermViVoltWrap');
+    const viCurrWrap = document.getElementById('thermViCurrWrap');
+    const pwrChWrap = document.getElementById('thermPowerChWrap');
+    const calcViBtn = document.getElementById('thermCalcViPowerBtn');
+    const readPBtn = document.getElementById('thermReadPowerChBtn');
+    const injectPBtn = document.getElementById('thermInjectViPowerBtn');
+    const metaEl = document.getElementById('thermViPowerMeta');
+    const powerInp = document.getElementById('thermPowerWInput') as HTMLInputElement | null;
+
+    const isVi = mode === 'auto_vi';
+    const isPwrCh = mode === 'power_ch';
+    viVoltWrap?.classList.toggle('hidden', !isVi);
+    viCurrWrap?.classList.toggle('hidden', !isVi);
+    pwrChWrap?.classList.toggle('hidden', !isPwrCh);
+    calcViBtn?.classList.toggle('hidden', !isVi);
+    injectPBtn?.classList.toggle('hidden', !isVi);
+    readPBtn?.classList.toggle('hidden', !isPwrCh);
+    if (powerInp) powerInp.readOnly = false;
+    this.syncConstViInputsUI();
+
+    if (autoCompute) {
+      if (isVi) {
+        this.computeAndApplyViPower(false);
+      } else if (isPwrCh) {
+        this.readAndApplyPowerChannel(false);
+      } else if (metaEl) {
+        metaEl.innerText = 'Manual ΔP: 直接在 Step Power ΔP (W) 输入阶跃热功率。';
+      }
+    }
+  }
+
+  private getDetectedStepOnsetTime(tab: TabState): number | undefined {
+    const autoT0 = (document.getElementById('thermAutoT0Chk') as HTMLInputElement)?.checked ?? true;
+    if (!autoT0) return undefined;
+    const tId = (document.getElementById('thermTempChSelect') as HTMLSelectElement)?.value;
+    const tCh = tab.channels[tId];
+    if (!tCh || tCh.t.length < 6) return undefined;
+    const gate = ((document.getElementById('thermGateSelect') as HTMLSelectElement)?.value || 'entire') as 'entire' | 'view' | 'cursors';
+    const rng = getChannelGateRange(tab, tCh, gate);
+    const meanAc = tCh.coupling === 'AC' ? computeChannelMean(tCh) : 0;
+    const tArr: number[] = [];
+    const yArr: number[] = [];
+    const n = Math.min(tCh.t.length, tCh.v.length);
+    for (let i = 0; i < n; i++) {
+      const ti = tCh.t[i];
+      if (rng.tStart !== undefined && ti < rng.tStart) continue;
+      if (rng.tEnd !== undefined && ti > rng.tEnd) break;
+      tArr.push(ti);
+      yArr.push(getChannelDisplayValue(tCh, i, meanAc));
+    }
+    if (tArr.length < 6) return undefined;
+    const mode = ((document.getElementById('thermModeSelect') as HTMLSelectElement)?.value || 'heating') as ThermalInputMode;
+    const onset = detectThermalStepOnset(Float64Array.from(tArr), Float64Array.from(yArr), mode);
+    return onset.onsetIdx > 0 ? onset.t0 : undefined;
+  }
+
+  private computeAndApplyViPower(showToast: boolean = true): ViPowerResult | null {
+    const tab = this.app.getActiveTab();
+    const vId = (document.getElementById('thermVoltChSelect') as HTMLSelectElement)?.value;
+    const iId = (document.getElementById('thermCurrChSelect') as HTMLSelectElement)?.value;
+    const vIsConst = vId === '__const__';
+    const iIsConst = iId === '__const__';
+    const vCh = !vIsConst && tab ? tab.channels[vId] || null : null;
+    const iCh = !iIsConst && tab ? tab.channels[iId] || null : null;
+    const vConstVal = parseFloat((document.getElementById('thermConstVoltInput') as HTMLInputElement)?.value || '');
+    const iConstVal = parseFloat((document.getElementById('thermConstCurrInput') as HTMLInputElement)?.value || '');
+
+    const metaEl = document.getElementById('thermViPowerMeta');
+    if (!tab) {
+      if (metaEl) metaEl.innerText = 'Auto V×I: 请先加载波形文件。';
+      if (showToast) this.app.showToast('Load a capture tab first.', 'warn');
+      return null;
+    }
+    if ((!vIsConst && !vCh) || (!iIsConst && !iCh)) {
+      if (metaEl) metaEl.innerText = 'Auto V×I: 请选择有效的电压/电流波形或切换到恒定值 (Const)。';
+      if (showToast) this.app.showToast('Select valid V / I channels or switch to Const.', 'warn');
+      return null;
+    }
+    if ((vIsConst && !isFinite(vConstVal)) || (iIsConst && !isFinite(iConstVal))) {
+      if (metaEl) metaEl.innerText = 'Auto V×I: 恒定电压/电流数值无效。';
+      if (showToast) this.app.showToast('Enter a finite constant Voltage/Current value.', 'warn');
+      return null;
+    }
+
+    const tId = (document.getElementById('thermTempChSelect') as HTMLSelectElement)?.value;
+    const gateRefCh = vCh || iCh || (tId ? tab.channels[tId] : undefined);
+    const gate = ((document.getElementById('thermGateSelect') as HTMLSelectElement)?.value || 'entire') as 'entire' | 'view' | 'cursors';
+    const rng = gateRefCh ? getChannelGateRange(tab, gateRefCh, gate) : {};
+    const stepOnset = this.getDetectedStepOnsetTime(tab);
+    try {
+      const res = computePowerFromVISources(
+        vIsConst ? { constantValue: vConstVal } : { channel: vCh },
+        iIsConst ? { constantValue: iConstVal } : { channel: iCh },
+        {
+          tStart: rng.tStart,
+          tEnd: rng.tEnd,
+          stepOnsetTimeSec: stepOnset,
+          useAbsPower: true,
+        }
+      );
+      this.lastViPowerResult = res;
+      const inp = document.getElementById('thermPowerWInput') as HTMLInputElement | null;
+      const chosenPower = res.pStepActiveW > 1e-6 ? res.pStepActiveW : res.pGateMeanW;
+      const validPower = isFinite(chosenPower) && chosenPower > 1e-9;
+      if (inp) {
+        inp.value = validPower
+          ? chosenPower >= 10
+            ? chosenPower.toFixed(3)
+            : chosenPower.toPrecision(4)
+          : '0';
+      }
+      const vLabel = vIsConst ? `Const ${vConstVal} V` : `${vCh!.name}(×${res.vUnitScale})`;
+      const iLabel = iIsConst ? `Const ${iConstVal} A` : `${iCh!.name}(×${res.iUnitScale})`;
+      if (!validPower) {
+        if (metaEl) {
+          metaEl.innerText = `V×I 功率无效 (${vLabel} · ${iLabel} → ${isFinite(chosenPower) ? chosenPower.toFixed(4) : 'NaN'} W ≤ 0)，请检查所选通道与区间。`;
+        }
+        if (showToast) {
+          this.app.showToast('Auto V×I computed power <= 0 W; please check V / I channels.', 'warn');
+        }
+        return null;
+      }
+      if (metaEl) {
+        const idleNote =
+          res.activeFraction < 0.96
+            ? ` · 有效阶跃占比 ${(res.activeFraction * 100).toFixed(1)}% (已剔除阶跃前待机)`
+            : '';
+        metaEl.innerText = `V×I 已计算: ${vLabel} · ${iLabel} → ΔP_step = ${res.pStepActiveW.toFixed(3)} W (Gate均 ${res.pGateMeanW.toFixed(3)} W · Peak ${res.pPeakW.toFixed(2)} W · E=${formatEng(res.energyJ, 'J', 3)})${idleNote}`;
+      }
+      if (showToast) {
+        this.app.showToast(
+          `Auto V×I: ΔP_step = ${res.pStepActiveW.toFixed(3)} W (${vLabel} × ${iLabel})`,
+          'info'
+        );
+      }
+      return res;
+    } catch (err: any) {
+      const inp = document.getElementById('thermPowerWInput') as HTMLInputElement | null;
+      if (inp) inp.value = '0';
+      if (metaEl) metaEl.innerText = `V×I 计算失败: ${err?.message || err}`;
+      if (showToast) this.app.showToast(`V×I calculation failed: ${err?.message || err}`, 'warn');
+      return null;
+    }
+  }
+
+  private readAndApplyPowerChannel(showToast: boolean = true): number | null {
+    const tab = this.app.getActiveTab();
+    const chId = (document.getElementById('thermPowerChSelect') as HTMLSelectElement)?.value;
+    const ch = tab?.channels[chId];
+    const metaEl = document.getElementById('thermViPowerMeta');
+    const inp = document.getElementById('thermPowerWInput') as HTMLInputElement | null;
+    if (!tab || !ch) {
+      if (inp) inp.value = '0';
+      if (metaEl) metaEl.innerText = 'Power Ch: 未找到有效的功率通道。';
+      if (showToast) this.app.showToast('Select a valid Power channel first.', 'warn');
+      return null;
+    }
+    const gate = ((document.getElementById('thermGateSelect') as HTMLSelectElement)?.value || 'entire') as 'entire' | 'view' | 'cursors';
+    const rng = getChannelGateRange(tab, ch, gate);
+    const stepOnset = this.getDetectedStepOnsetTime(tab);
+    const effStart =
+      stepOnset !== undefined && (rng.tStart === undefined || stepOnset > rng.tStart) && (rng.tEnd === undefined || stepOnset < rng.tEnd)
+        ? stepOnset
+        : rng.tStart;
+    const scaleW = parseSiUnitScale(ch.unit, 'W', ch.name);
+    const meanDissW = getSliceAbsTrapezoidalMean(ch, effStart, rng.tEnd) * scaleW;
+    if (!isFinite(meanDissW) || meanDissW <= 1e-9) {
+      if (inp) inp.value = '0';
+      if (metaEl) {
+        metaEl.innerText = `Power Ch "${ch.name}" 耗散均值 = 0 W (无效或全零区间)，已阻止反演回退。`;
+      }
+      if (showToast) {
+        this.app.showToast(`Power channel "${ch.name}" dissipation mean is <= 0 W.`, 'warn');
+      }
+      return null;
+    }
+    if (inp) inp.value = meanDissW >= 10 ? meanDissW.toFixed(3) : meanDissW.toPrecision(4);
+    if (metaEl) {
+      metaEl.innerText = `Power Ch "${ch.name}" (${ch.unit || 'W'}, ×${scaleW}): 非负耗散均ΔP = ${meanDissW.toFixed(3)} W`;
+    }
+    if (showToast) {
+      this.app.showToast(`Power step set from "${ch.name}" dissipation mean = ${meanDissW.toFixed(3)} W`, 'info');
+    }
+    return meanDissW;
   }
 
   private bindEvents(): void {
@@ -285,23 +592,93 @@ export class ThermalWorkbenchController {
       if (wrap) wrap.classList.toggle('opacity-50', e.target.value !== 'cooling');
     });
 
-    document.getElementById('thermReadPowerChBtn')?.addEventListener('click', () => {
+    document.getElementById('thermPathModeSelect')?.addEventListener('change', () => {
+      this.userSetPathMode = true;
+      this.syncThermalPathUI();
+      if (this.lastDeconv) this.runDeconvolution();
+    });
+    document.getElementById('thermTempChSelect')?.addEventListener('change', () => {
       const tab = this.app.getActiveTab();
-      const chId = (document.getElementById('thermPowerChSelect') as HTMLSelectElement)?.value;
-      const ch = tab?.channels[chId];
-      if (!tab || !ch) {
-        this.app.showToast('Select a valid Power channel first.', 'warn');
-        return;
+      const tSel = document.getElementById('thermTempChSelect') as HTMLSelectElement | null;
+      const pathSel = document.getElementById('thermPathModeSelect') as HTMLSelectElement | null;
+      if (!this.userSetPathMode && tab && tSel?.value && pathSel) {
+        const ch = tab.channels[tSel.value];
+        if (ch) {
+          pathSel.value = /pcb|pad|board|ntc|case|tc|surf|焊盘|板温/i.test(ch.name) ? 'pad_ambient' : 'junction_ambient';
+          this.syncThermalPathUI();
+        }
       }
-      const gate = ((document.getElementById('thermGateSelect') as HTMLSelectElement)?.value || 'entire') as
-        | 'entire'
-        | 'view'
-        | 'cursors';
-      const rng = getChannelGateRange(tab, ch, gate);
-      const meanP = Math.abs(getSliceMean(ch, rng.tStart, rng.tEnd));
-      const inp = document.getElementById('thermPowerWInput') as HTMLInputElement | null;
-      if (inp) inp.value = (meanP > 0 ? meanP : 40).toFixed(3);
-      this.app.showToast(`Power step set from "${ch.name}" mean = ${meanP.toFixed(3)} W`, 'info');
+      if ((document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value === 'auto_vi') {
+        this.computeAndApplyViPower(false);
+      }
+    });
+    document.getElementById('thermPowerModeSelect')?.addEventListener('change', () => {
+      this.userSetPowerMode = true;
+      this.syncPowerSourceUI(true);
+    });
+    document.getElementById('thermVoltChSelect')?.addEventListener('change', () => {
+      this.syncConstViInputsUI();
+      if ((document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value === 'auto_vi') {
+        this.computeAndApplyViPower(false);
+      }
+    });
+    document.getElementById('thermCurrChSelect')?.addEventListener('change', () => {
+      this.syncConstViInputsUI();
+      if ((document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value === 'auto_vi') {
+        this.computeAndApplyViPower(false);
+      }
+    });
+    const onConstViInput = () => {
+      if ((document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value === 'auto_vi') {
+        this.computeAndApplyViPower(false);
+      }
+    };
+    document.getElementById('thermConstVoltInput')?.addEventListener('input', onConstViInput);
+    document.getElementById('thermConstCurrInput')?.addEventListener('input', onConstViInput);
+    document.getElementById('thermGateSelect')?.addEventListener('change', () => {
+      const mode = (document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value;
+      if (mode === 'auto_vi') this.computeAndApplyViPower(false);
+      else if (mode === 'power_ch') this.readAndApplyPowerChannel(false);
+    });
+    document.getElementById('thermCalcViPowerBtn')?.addEventListener('click', () => {
+      this.computeAndApplyViPower(true);
+    });
+    document.getElementById('thermInjectViPowerBtn')?.addEventListener('click', () => {
+      const res = this.computeAndApplyViPower(false);
+      if (!res) return;
+      const vId = (document.getElementById('thermVoltChSelect') as HTMLSelectElement)?.value;
+      const iId = (document.getElementById('thermCurrChSelect') as HTMLSelectElement)?.value;
+      const validSourceIds = [
+        vId && vId !== '__const__' ? vId : '',
+        iId && iId !== '__const__' ? iId : '',
+      ].filter(Boolean);
+      const tId = (document.getElementById('thermTempChSelect') as HTMLSelectElement)?.value || '';
+      const baseId = validSourceIds[0] || tId;
+      this.app.injectThermalTraces(
+        [
+          {
+            replaceKey: 'vi_power',
+            name: 'P_vi (V×I)',
+            unit: 'W',
+            t: res.time,
+            values: res.powerW,
+            color: '#f59e0b',
+            badge: 'PWR',
+            expr: vId === '__const__' || iId === '__const__' ? 'V*I(Const)' : 'V(t)*I(t)',
+            sourceIds: validSourceIds,
+            baseChannelId: baseId,
+            pinMetrics: ['average'],
+          },
+        ],
+        {
+          separateView: true,
+          toastMessage: `Injected P_vi(t) = V×I trace (ΔP_step=${res.pStepActiveW.toFixed(3)} W, E=${formatEng(res.energyJ, 'J', 3)}) onto scope.`,
+        }
+      );
+    });
+
+    document.getElementById('thermReadPowerChBtn')?.addEventListener('click', () => {
+      this.readAndApplyPowerChannel(true);
     });
 
     document.getElementById('thermUseCursorsBtn')?.addEventListener('click', () => {
@@ -376,18 +753,19 @@ export class ThermalWorkbenchController {
 
     document.getElementById('thermDownloadSpiceBtn')?.addEventListener('click', () => {
       const box = document.getElementById('thermSpiceTextarea') as HTMLTextAreaElement | null;
+      const subName = this.lastDeconv?.thermalPathMode === 'pad_ambient' ? 'PAD_THERM' : 'MOS_THERM';
       if (!box || !box.value.trim()) {
-        this.app.showToast('Run deconvolution first to generate MOS_THERM.lib.', 'warn');
+        this.app.showToast(`Run deconvolution first to generate ${subName}.lib.`, 'warn');
         return;
       }
       const blob = new Blob([box.value], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'MOS_THERM.lib';
+      a.download = `${subName}.lib`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      this.app.showToast('Downloaded MOS_THERM.lib for LTspice.', 'info');
+      this.app.showToast(`Downloaded ${subName}.lib for LTspice.`, 'info');
     });
 
     document.getElementById('thermApplyToSimBtn')?.addEventListener('click', () => {
@@ -395,16 +773,23 @@ export class ThermalWorkbenchController {
         this.app.showToast('Run deconvolution first.', 'warn');
         return;
       }
+      if (this.lastDeconv.physicsAudit.status === 'failed') {
+        this.app.showToast('当前热模型未通过物理有效性检验，已阻止应用到闭环结温仿真。', 'error');
+        return;
+      }
       this.activeCauerStages = this.lastDeconv.reducedCauer.map((s) => ({ ...s }));
-      this.activeTambC = this.lastDeconv.tBaseC;
-      this.cauerSourceLabel = `Tab 1 Extracted (${this.activeCauerStages.length}-Stage, Rth=${this.lastDeconv.totalRthCauer.toFixed(3)} °C/W)`;
+      this.activeTambC = this.lastDeconv.tAmbC;
+      this.focModelSource = 'tab1_extracted';
+      const rthSym = this.lastDeconv.thermalPathMode === 'pad_ambient' ? 'Rth,pad-a' : 'Rth';
+      this.cauerSourceLabel = `Tab 1 Extracted (${this.activeCauerStages.length}-Stage, ${rthSym}=${this.lastDeconv.totalRthCauer.toFixed(3)} °C/W)`;
       const tambInp = document.getElementById('thermLossTambInput') as HTMLInputElement | null;
-      if (tambInp && this.lastDeconv.mode === 'heating') {
-        tambInp.value = this.lastDeconv.tBaseC.toFixed(1);
+      if (tambInp) {
+        tambInp.value = this.lastDeconv.tAmbC.toFixed(1);
       }
       this.updateCauerSummaryBox();
+      this.refreshFocModelAndSpice();
       this.switchTab('loss');
-      this.app.showToast('Applied Cauer RC ladder to Closed-Loop Tj(t) simulator.', 'info');
+      this.app.showToast('Applied Cauer RC ladder to Closed-Loop simulator.', 'info');
     });
 
     document.getElementById('thermInjectSmoothBtn')?.addEventListener('click', () => {
@@ -413,11 +798,12 @@ export class ThermalWorkbenchController {
         return;
       }
       const chId = (document.getElementById('thermTempChSelect') as HTMLSelectElement)?.value;
+      const isPad = this.lastDeconv.thermalPathMode === 'pad_ambient';
       this.app.injectThermalTraces(
         [
           {
             replaceKey: 'fit_tj',
-            name: `Fit Tj (${this.lastDeconv.reducedCauer.length}-RC)`,
+            name: `${isPad ? 'Fit T_pad' : 'Fit Tj'} (${this.lastDeconv.reducedCauer.length}-RC)`,
             unit: '°C',
             t: this.lastDeconv.smoothAbsTime,
             values: this.lastDeconv.smoothTemp,
@@ -449,6 +835,19 @@ export class ThermalWorkbenchController {
       if (deskewSlider && isFinite(val)) {
         deskewSlider.value = String(Math.max(-100, Math.min(100, val)));
       }
+    });
+    const nudgeDeskew = (deltaNs: number) => {
+      if (!deskewInput) return;
+      const cur = parseFloat(deskewInput.value) || 0;
+      const next = Math.max(-100, Math.min(100, Math.round((cur + deltaNs) * 10) / 10));
+      deskewInput.value = String(next);
+      if (deskewSlider) deskewSlider.value = String(next);
+    };
+    document.getElementById('thermLossDeskewDecBtn')?.addEventListener('click', (ev) => {
+      nudgeDeskew((ev as MouseEvent).shiftKey ? -5.0 : -0.5);
+    });
+    document.getElementById('thermLossDeskewIncBtn')?.addEventListener('click', (ev) => {
+      nudgeDeskew((ev as MouseEvent).shiftKey ? 5.0 : 0.5);
     });
     document.getElementById('thermRunLossBtn')?.addEventListener('click', () => {
       this.runLossAndTjSimulation();
@@ -644,19 +1043,36 @@ export class ThermalWorkbenchController {
     const chId = (document.getElementById('thermTempChSelect') as HTMLSelectElement)?.value;
     const ch = tab?.channels[chId];
     if (!tab || !ch) {
-      this.app.showToast('Please select a Temperature / TSEP channel.', 'warn');
+      this.app.showToast('Please select a Temperature / PCB / TSEP channel.', 'warn');
       return;
     }
 
+    const powerSourceMode = (document.getElementById('thermPowerModeSelect') as HTMLSelectElement)?.value || 'manual';
+    if (powerSourceMode === 'auto_vi') {
+      const viRes = this.computeAndApplyViPower(false);
+      if (!viRes) {
+        this.app.showToast('Auto V×I 功率计算失败或结果 ≤ 0 W，已阻断热阻反演。', 'error');
+        return;
+      }
+    } else if (powerSourceMode === 'power_ch') {
+      const pChVal = this.readAndApplyPowerChannel(false);
+      if (pChVal === null || !isFinite(pChVal) || pChVal <= 0) {
+        this.app.showToast('Power 通道平均耗散功率无效或 ≤ 0 W，已阻断热阻反演。', 'error');
+        return;
+      }
+    }
+
     const mode = ((document.getElementById('thermModeSelect') as HTMLSelectElement)?.value || 'heating') as ThermalInputMode;
-    const powerW = parseFloat((document.getElementById('thermPowerWInput') as HTMLInputElement)?.value || '40');
+    const thermalPathMode = ((document.getElementById('thermPathModeSelect') as HTMLSelectElement)?.value || 'junction_ambient') as ThermalPathMode;
+    const padSpreadRthCPerW = Math.max(0, parseFloat((document.getElementById('thermPadSpreadInput') as HTMLInputElement)?.value || '0') || 0);
+    const powerW = parseFloat((document.getElementById('thermPowerWInput') as HTMLInputElement)?.value || '');
     const gate = ((document.getElementById('thermGateSelect') as HTMLSelectElement)?.value || 'entire') as 'entire' | 'view' | 'cursors';
     const autoT0 = (document.getElementById('thermAutoT0Chk') as HTMLInputElement)?.checked ?? true;
     const tBlankMs = parseFloat((document.getElementById('thermTBlankMsInput') as HTMLInputElement)?.value || '0.15');
     const targetOrder = parseInt((document.getElementById('thermOrderSelect') as HTMLSelectElement)?.value || '4', 10);
 
     if (!isFinite(powerW) || powerW <= 0) {
-      this.app.showToast('Power step ΔP (W) must be > 0.', 'error');
+      this.app.showToast('Step Power ΔP (W) 必须严格大于 0，已阻断热阻反演。', 'error');
       return;
     }
 
@@ -675,20 +1091,40 @@ export class ThermalWorkbenchController {
         autoT0,
         tBlankSec: isFinite(tBlankMs) && tBlankMs >= 0 ? tBlankMs * 1e-3 : 0.15e-3,
         targetOrder,
+        thermalPathMode,
+        padSpreadRthCPerW,
       });
 
       this.lastDeconv = res;
-      this.activeCauerStages = res.reducedCauer.map((s) => ({ ...s }));
-      this.activeTambC = res.tBaseC;
-      this.cauerSourceLabel = `Tab 1 Extracted (${res.reducedCauer.length}-Stage, Rth=${res.totalRthCauer.toFixed(3)} °C/W)`;
-      this.updateCauerSummaryBox();
+      const rthTag = res.thermalPathMode === 'pad_ambient' ? 'Rth,pad-a' : 'Rth';
+      const audit = res.physicsAudit;
+      if (audit.status !== 'failed') {
+        this.activeCauerStages = res.reducedCauer.map((s) => ({ ...s }));
+        this.activeTambC = res.tAmbC;
+        this.focModelSource = 'tab1_extracted';
+        this.cauerSourceLabel = `Tab 1 Extracted (${res.reducedCauer.length}-Stage, ${rthTag}=${res.totalRthCauer.toFixed(3)} °C/W)`;
+        this.updateCauerSummaryBox();
+        this.refreshFocModelAndSpice();
+        const tambInp = document.getElementById('thermLossTambInput') as HTMLInputElement | null;
+        if (tambInp) tambInp.value = res.tAmbC.toFixed(1);
+      }
       this.renderDeconvMetricsAndTables(res);
       this.drawDeconvMainCanvas();
       this.drawDeconvSubCanvas();
-      this.app.showToast(
-        `Extracted ${res.reducedCauer.length}-stage Cauer RC (R²=${res.rSquared.toFixed(4)}, Rth=${res.totalRthCauer.toFixed(3)} °C/W)`,
-        'info'
-      );
+
+      if (audit.status === 'failed') {
+        this.app.showToast(`热模型拟合判定失败：${audit.summary}`, 'error');
+      } else if (audit.status === 'reduced') {
+        this.app.showToast(
+          `已自动重拟合并降阶至 ${audit.effectiveOrder} 阶 (${rthTag}=${res.totalRthCauer.toFixed(3)} °C/W, R²=${res.rSquared.toFixed(4)})`,
+          'warn'
+        );
+      } else {
+        this.app.showToast(
+          `Extracted ${res.reducedCauer.length}-stage Cauer RC (R²=${res.rSquared.toFixed(4)}, ${rthTag}=${res.totalRthCauer.toFixed(3)} °C/W)`,
+          'info'
+        );
+      }
     } catch (err: any) {
       this.app.showToast(`Thermal Deconvolution failed: ${err?.message || err}`, 'error');
     }
@@ -699,19 +1135,88 @@ export class ThermalWorkbenchController {
       const el = document.getElementById(id);
       if (el) el.innerText = txt;
     };
-    setText('thermStatRth', `${res.totalRthCauer.toFixed(4)} °C/W`);
+    const isPad = res.thermalPathMode === 'pad_ambient';
+    const audit = res.physicsAudit;
+    const isFailed = audit.status === 'failed';
+    setText('thermStatRthLabel', isPad ? 'Rth,pad-a (焊盘→环境)' : 'Rth Total (Tj→环境)');
+    const rthEl = document.getElementById('thermStatRth');
+    if (rthEl) {
+      rthEl.innerText = isFailed ? `${res.totalRthCauer.toFixed(4)} °C/W (无效)` : `${res.totalRthCauer.toFixed(4)} °C/W`;
+      rthEl.className = isFailed
+        ? 'text-rose-400 font-semibold mt-0.5'
+        : audit.status === 'reduced'
+        ? 'text-amber-300 font-semibold mt-0.5'
+        : 'text-emerald-300 font-semibold mt-0.5';
+    }
     setText('thermStatR2', res.rSquared.toFixed(5));
     setText('thermStatRmse', `${res.rmseC.toFixed(3)} °C`);
     setText('thermStatT0', `${formatEng(res.t0Sec, 's', 3)}`);
     setText('thermStatDt', `${formatEng(res.dtMedSec, 's', 2)} (${res.usedLogBinning ? 'Log-Bin' : 'Raw'})`);
     setText('thermStatLambda', `${res.selectedLambda.toExponential(1)}`);
+    setText('thermSpiceTitle', isPad ? 'LTspice .subckt PAD_THERM (PAD → TAMB)' : 'LTspice .subckt MOS_THERM (TJ → TAMB)');
 
-    // Warnings banner
+    // Physics Audit banner
+    const auditBox = document.getElementById('thermPhysicsAuditBox');
+    const physBadge = document.getElementById('thermPhysicsBadge');
+    const physSum = document.getElementById('thermPhysicsSummary');
+    const physMeta = document.getElementById('thermPhysicsMeta');
+    const physChecks = document.getElementById('thermPhysicsChecks');
+    if (auditBox) {
+      auditBox.classList.remove('hidden');
+      auditBox.className =
+        audit.status === 'valid'
+          ? 'bg-emerald-950/20 border border-emerald-600/40 rounded-sm p-2.5 space-y-1.5 text-[11px]'
+          : audit.status === 'reduced'
+          ? 'bg-amber-950/25 border border-amber-500/50 rounded-sm p-2.5 space-y-1.5 text-[11px]'
+          : 'bg-rose-950/35 border border-rose-500/70 rounded-sm p-2.5 space-y-1.5 text-[11px]';
+    }
+    if (physBadge) {
+      if (audit.status === 'valid') {
+        physBadge.innerText = `PHYSICS VALID (${audit.effectiveOrder}-RC)`;
+        physBadge.className =
+          'px-2 py-0.5 bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-mono text-[10px] font-semibold rounded-xs shrink-0';
+      } else if (audit.status === 'reduced') {
+        physBadge.innerText = `AUTO-REDUCED (${audit.requestedOrder}→${audit.effectiveOrder}-RC)`;
+        physBadge.className =
+          'px-2 py-0.5 bg-amber-950/80 border border-amber-500/60 text-amber-300 font-mono text-[10px] font-semibold rounded-xs shrink-0';
+      } else {
+        physBadge.innerText = 'FIT FAILED (拟合失败)';
+        physBadge.className =
+          'px-2 py-0.5 bg-rose-950/90 border border-rose-500/80 text-rose-200 font-mono text-[10px] font-semibold rounded-xs shrink-0';
+      }
+    }
+    if (physSum) physSum.innerText = audit.summary;
+    if (physMeta) {
+      const extTxt = isFinite(audit.extrapolationRatio) ? `${audit.extrapolationRatio.toFixed(2)}×` : '∞';
+      physMeta.innerText = `外推 ${extTxt} · Z_end=${audit.zMeasuredEnd.toFixed(3)} °C/W · 重拟 ${audit.refitCount} 次`;
+    }
+    if (physChecks) {
+      physChecks.innerHTML = '';
+      for (const ck of audit.checks) {
+        const chip = document.createElement('span');
+        chip.title = ck.detail;
+        chip.className = ck.passed
+          ? 'px-1.5 py-0.5 bg-[#12161c] border border-emerald-700/40 text-emerald-300 rounded-xs'
+          : 'px-1.5 py-0.5 bg-rose-950/70 border border-rose-500/60 text-rose-200 rounded-xs';
+        chip.innerText = `${ck.passed ? '✓' : '✗'} ${ck.label}`;
+        physChecks.appendChild(chip);
+      }
+    }
+
+    const applyBtn = document.getElementById('thermApplyToSimBtn') as HTMLButtonElement | null;
+    if (applyBtn) {
+      applyBtn.disabled = isFailed;
+      applyBtn.classList.toggle('opacity-40', isFailed);
+      applyBtn.classList.toggle('cursor-not-allowed', isFailed);
+    }
+
+    // Warnings banner (skip duplicating audit.summary already displayed in thermPhysicsAuditBox)
     const warnEl = document.getElementById('thermWarningsBox');
     if (warnEl) {
-      if (res.warnings.length > 0) {
+      const extraWarnings = res.warnings.filter((w) => w !== audit.summary);
+      if (extraWarnings.length > 0) {
         warnEl.classList.remove('hidden');
-        warnEl.innerText = res.warnings.join(' | ');
+        warnEl.innerText = extraWarnings.join(' | ');
       } else {
         warnEl.classList.add('hidden');
         warnEl.innerText = '';
@@ -726,7 +1231,7 @@ export class ThermalWorkbenchController {
         const f = res.reducedFoster[i];
         const c = res.reducedCauer[i];
         const tr = document.createElement('tr');
-        tr.className = 'border-t border-[#222933] hover:bg-[#1a222d]/60';
+        tr.className = `border-t border-[#222933] hover:bg-[#1a222d]/60 ${isFailed ? 'opacity-65' : ''}`;
         tr.innerHTML = `
           <td class="px-2 py-1 text-cyan-300 font-semibold">RC${i + 1}</td>
           <td class="px-2 py-1">${f ? f.r.toFixed(4) : '--'}</td>
@@ -734,7 +1239,7 @@ export class ThermalWorkbenchController {
           <td class="px-2 py-1">${f ? formatEng(f.tau, 's', 2) : '--'}</td>
           <td class="px-2 py-1 text-emerald-300">${c.r.toFixed(4)}</td>
           <td class="px-2 py-1 text-emerald-300">${c.c.toExponential(2)}</td>
-          <td class="px-2 py-1 text-slate-300 font-sans">${c.layerLabel}</td>
+          <td class="px-2 py-1 text-slate-300 font-sans">${escapeHtml(c.layerLabel)}</td>
         `;
         tbody.appendChild(tr);
       }
@@ -748,14 +1253,22 @@ export class ThermalWorkbenchController {
     const detail = document.getElementById('thermSpiceValidDetail');
     const v = res.spiceValidation;
     if (badge) {
-      badge.innerText = v.valid ? 'SPICE VALIDATED' : 'NETLIST ERROR';
-      badge.className = v.valid
-        ? 'px-2 py-0.5 bg-emerald-950/70 border border-emerald-500/60 text-emerald-300 font-mono text-[10px] rounded-xs'
-        : 'px-2 py-0.5 bg-red-950/70 border border-red-500/60 text-red-300 font-mono text-[10px] rounded-xs';
+      if (isFailed) {
+        badge.innerText = 'FIT REJECTED';
+        badge.className =
+          'px-2 py-0.5 bg-rose-950/80 border border-rose-500/70 text-rose-200 font-mono text-[10px] rounded-xs';
+      } else {
+        badge.innerText = v.valid ? 'SPICE VALIDATED' : 'NETLIST ERROR';
+        badge.className = v.valid
+          ? 'px-2 py-0.5 bg-emerald-950/70 border border-emerald-500/60 text-emerald-300 font-mono text-[10px] rounded-xs'
+          : 'px-2 py-0.5 bg-red-950/70 border border-red-500/60 text-red-300 font-mono text-[10px] rounded-xs';
+      }
     }
     if (detail) {
-      detail.innerText = v.valid
-        ? `C1@TJ=${v.firstCapAtTJ} · Ck@Nk->0=${v.allCapsGroundedTo0} · NoTAMBShort=${v.noCapOnTamb} · Rn->TAMB=${v.finalResToTamb} · .ic=${v.hasDefensiveIc} · ΣR=${v.totalSpiceR.toFixed(4)}Ω`
+      detail.innerText = isFailed
+        ? `物理审计未通过，请勿直接用于仿真：${audit.summary}`
+        : v.valid
+        ? `C1@${v.heatNodeName}=${v.firstCapAtTJ} · Ck@Nk->0=${v.allCapsGroundedTo0} · NoTAMBShort=${v.noCapOnTamb} · Rn->TAMB=${v.finalResToTamb} · .ic=${v.hasDefensiveIc} · ΣR=${v.totalSpiceR.toFixed(4)}°C/W`
         : v.errors.join('; ');
     }
   }
@@ -877,7 +1390,8 @@ export class ThermalWorkbenchController {
       }
       ctx.textAlign = 'left';
       ctx.fillStyle = th.titleText;
-      ctx.fillText(`Lin-t: Measured (amber) vs ${res.reducedCauer.length}-Stage Smooth Fit (blue) · t0=${formatEng(res.t0Sec, 's', 2)}`, pad.l + 6, pad.t - 6);
+      const pathTag = res.thermalPathMode === 'pad_ambient' ? 'T_pad(t)' : 'T(t)';
+      ctx.fillText(`Lin-t ${pathTag}: Measured (amber) vs ${res.reducedCauer.length}-Stage Smooth Fit (blue) · t0=${formatEng(res.t0Sec, 's', 2)}`, pad.l + 6, pad.t - 6);
     } else {
       // Log-t: Plot Zth(Δt) (°C/W) vs log10(t - t0)
       const pts: Array<{ dt: number; zMeas: number; zPred: number }> = [];
@@ -935,7 +1449,8 @@ export class ThermalWorkbenchController {
       }
       ctx.textAlign = 'left';
       ctx.fillStyle = th.titleText;
-      ctx.fillText(`Log-t: Zth(Δt) [°C/W] vs Δt (s)`, pad.l + 6, pad.t - 6);
+      const zLabel = res.thermalPathMode === 'pad_ambient' ? 'Zth,pad-a(Δt)' : 'Zth(Δt)';
+      ctx.fillText(`Log-t: ${zLabel} [°C/W] vs Δt (s)`, pad.l + 6, pad.t - 6);
     }
   }
 
@@ -1597,17 +2112,30 @@ export class ThermalWorkbenchController {
     const pw = Math.max(20, w - pad.l - pad.r);
     const ph = Math.max(20, h - pad.t - pad.b);
 
+    let maxCurveId = 1000;
+    (Object.keys(this.soaCurveSet.curves) as SoaPulseKey[]).forEach((k) => {
+      for (const p of this.soaCurveSet.curves[k]) {
+        if (isFinite(p.id) && p.id > maxCurveId) maxCurveId = p.id;
+      }
+    });
+    if (this.lastSoaResult) {
+      for (const p of this.lastSoaResult.trajectoryPoints) {
+        if (isFinite(p.id) && p.id > maxCurveId) maxCurveId = p.id;
+      }
+    }
+    const yAxisCap = Math.pow(10, Math.ceil(Math.log10(Math.max(1000, maxCurveId * 1.15))));
+
     const lxMin = Math.log10(0.1);
     const lxMax = Math.log10(Math.max(150, this.soaCurveSet.vdsMaxRated * 1.5));
     const lyMin = Math.log10(0.5);
-    const lyMax = Math.log10(1000);
+    const lyMax = Math.log10(yAxisCap);
     const xOf = (v: number) => pad.l + ((Math.log10(Math.max(0.1, v)) - lxMin) / (lxMax - lxMin)) * pw;
     const yOf = (id: number) => pad.t + ph - ((Math.log10(Math.max(0.5, id)) - lyMin) / (lyMax - lyMin)) * ph;
 
     // Log grid decades
     ctx.strokeStyle = th.grid;
     ctx.lineWidth = 1;
-    [0.1, 1, 10, 100].forEach((d) => {
+    [0.1, 1, 10, 100, 1000].forEach((d) => {
       const gx = xOf(d);
       if (gx >= pad.l && gx <= pad.l + pw) {
         ctx.beginPath();
@@ -1616,7 +2144,8 @@ export class ThermalWorkbenchController {
         ctx.stroke();
       }
     });
-    [1, 10, 100, 1000].forEach((d) => {
+    const yDecades = [1, 10, 100, 1000, 10000].filter((d) => d <= yAxisCap);
+    yDecades.forEach((d) => {
       const gy = yOf(d);
       if (gy >= pad.t && gy <= pad.t + ph) {
         ctx.beginPath();
@@ -1703,12 +2232,12 @@ export class ThermalWorkbenchController {
     ctx.fillStyle = th.axisText;
     ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'center';
-    [0.1, 1, 10, 100].forEach((d) => {
+    [0.1, 1, 10, 100, 1000].forEach((d) => {
       const gx = xOf(d);
       if (gx >= pad.l && gx <= pad.l + pw) ctx.fillText(`${d}V`, gx, pad.t + ph + 16);
     });
     ctx.textAlign = 'right';
-    [1, 10, 100, 1000].forEach((d) => {
+    yDecades.forEach((d) => {
       const gy = yOf(d);
       if (gy >= pad.t && gy <= pad.t + ph) ctx.fillText(`${d}A`, pad.l - 6, gy + 3);
     });
@@ -1804,6 +2333,8 @@ export class ThermalWorkbenchController {
     };
 
     this.app.addTab(newTab);
+    this.userSetPathMode = false;
+    this.userSetPowerMode = false;
     this.populateChannelSelectors();
     const pInp = document.getElementById('thermPowerWInput') as HTMLInputElement | null;
     if (pInp) pInp.value = '50';
@@ -1836,7 +2367,7 @@ export class ThermalWorkbenchController {
       modulation: mod,
       fswHz: Math.max(100, num('focFswKhzInput', 20) * 1e3),
       tDeadNs: Math.max(0, num('focTdeadNsInput', 500)),
-      modDepthM: Math.max(0, Math.min(1.15, num('focModDepthInput', 0.85))),
+      modDepthM: Math.max(0, Math.min(1.2, num('focModDepthInput', 0.85))),
       pfAngleDeg: num('focPfAngleInput', 0),
       tAmbC: num('focTambInput', 25),
       vBusConstV: Math.max(1, num('focVbusConstInput', 48)),
@@ -1853,6 +2384,28 @@ export class ThermalWorkbenchController {
     const badgeEl = document.getElementById('focModelSummaryBadge');
     if (badgeEl) {
       badgeEl.innerText = `JC(${model.zthJC.length})=${rJc.toFixed(3)} + Brd(${model.zthBoard.length})=${rBrd.toFixed(3)} °C/W`;
+    }
+
+    const srcBadge = document.getElementById('focModelSourceBadge');
+    if (srcBadge) {
+      if (this.focModelSource === 'tab1_extracted') {
+        srcBadge.innerText = `来源: Tab 1 反演 (${this.activeCauerStages.length} 阶)`;
+        srcBadge.className =
+          'px-1.5 py-0.5 bg-emerald-950/70 border border-emerald-500/60 text-emerald-300 font-mono text-[10px] rounded-xs';
+      } else if (this.focModelSource === 'default_demo') {
+        srcBadge.innerText = '来源: Demo 自带默认模型';
+        srcBadge.className =
+          'px-1.5 py-0.5 bg-cyan-950/70 border border-cyan-500/60 text-cyan-300 font-mono text-[10px] rounded-xs';
+      } else {
+        srcBadge.innerText = '来源: 系统默认 Fallback 模型';
+        srcBadge.className =
+          'px-1.5 py-0.5 bg-slate-800 border border-slate-600/70 text-slate-300 font-mono text-[10px] rounded-xs';
+      }
+    }
+
+    const singleWarn = document.getElementById('focSingleStageWarning');
+    if (singleWarn) {
+      singleWarn.classList.toggle('hidden', !model.isHeuristicSingleStageSplit);
     }
 
     const netlist = focModelToSpice(model, tAmb, 'INV_6MOS_THERM');
@@ -2368,7 +2921,41 @@ export class ThermalWorkbenchController {
     };
 
     this.app.addTab(newTab);
+    this.activeCauerStages = [];
+    this.focModelSource = 'default_demo';
+    this.cauerSourceLabel = 'FOC Demo Built-in Default (4-Stage Star, JC=0.50 + Brd=1.10 °C/W)';
+    this.updateCauerSummaryBox();
     this.populateChannelSelectors();
+    this.refreshFocModelAndSpice();
+    this.runFocSimulation();
+  }
+
+  public loadExternalFocAnalysis(payload: FocThermalHandoffPayload): void {
+    this.app.addTab(payload.tab);
+    this.openModal();
+    this.switchTab('foc');
+    this.populateChannelSelectors();
+
+    const setVal = (id: string, val: string | number) => {
+      const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+      if (el) el.value = String(val);
+    };
+
+    setVal('focIaSelect', payload.iaChannelId);
+    setVal('focIbSelect', payload.ibChannelId);
+    setVal('focIcSelect', payload.icChannelId);
+    setVal('focVbusSelect', payload.vbusChannelId);
+    setVal('focGateSelect', 'entire');
+    setVal('focVbusConstInput', payload.vBusConstV);
+    setVal('focTambInput', payload.tAmbC);
+    setVal('focModSelect', 'SVPWM');
+    setVal('focModDepthInput', payload.modDepthM);
+    setVal('focPfAngleInput', payload.pfAngleDeg);
+    setVal('focFswKhzInput', payload.fswKhz);
+    setVal('focTdeadNsInput', payload.tDeadNs);
+    setVal('focRdsInput', payload.rdsOnMOhm);
+    setVal('focVsdInput', payload.vsdV);
+
     this.runFocSimulation();
   }
 }

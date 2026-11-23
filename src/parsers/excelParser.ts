@@ -981,6 +981,10 @@ export function parseExcelSheetToChannels(
   let needsSort = false;
   let prevTime = -Infinity;
 
+  let nonMonotonicRawCount = 0;
+  const syntheticClockUsed = overrideFs === null && !hasExplicitTime;
+  const perChannelNanCounts = new Int32Array(activeCols.length);
+
   for (let r = startR; r <= endR; r++) {
     let rowHasAnyValue = false;
     const rowVals = new Float32Array(activeCols.length);
@@ -989,13 +993,14 @@ export function parseExcelSheetToChannels(
       const addr = XLSX.utils.encode_cell({ r, c: colAbs });
       const cell = ws[addr] as XLSX.CellObject | undefined;
       let val = NaN;
+      const targetUnit = activeCols[c].unit;
       if (cell) {
         if (cell.t === 'n' && typeof cell.v === 'number') {
           val = isFinite(cell.v) ? cell.v : NaN;
         } else if (cell.t === 's' || typeof cell.v === 'string') {
-          val = parseNumericCell(String(cell.v ?? cell.w ?? ''));
+          val = parseNumericCell(String(cell.v ?? cell.w ?? ''), targetUnit);
         } else if (cell.w) {
-          val = parseNumericCell(cell.w);
+          val = parseNumericCell(cell.w, targetUnit);
         }
       }
       rowVals[c] = isFinite(val) ? val : NaN;
@@ -1050,11 +1055,14 @@ export function parseExcelSheetToChannels(
 
     if (validCount > 0 && rowT < prevTime) {
       needsSort = true;
+      nonMonotonicRawCount++;
     }
     prevTime = rowT;
     rawTime[validCount] = rowT;
     for (let c = 0; c < activeCols.length; c++) {
-      rawValues[c][validCount] = rowVals[c];
+      const rv = rowVals[c];
+      rawValues[c][validCount] = rv;
+      if (!Number.isFinite(rv)) perChannelNanCounts[c]++;
     }
     validCount++;
   }
@@ -1080,7 +1088,11 @@ export function parseExcelSheetToChannels(
     }
   }
 
-  const quality = analyzeSamplingQuality(finalTime, invalidRows);
+  const totalSignalNanCount = perChannelNanCounts.reduce((a, b) => a + b, 0);
+  const quality = analyzeSamplingQuality(finalTime, invalidRows, totalSignalNanCount);
+  quality.nonMonotonicCount = (quality.nonMonotonicCount || 0) + nonMonotonicRawCount;
+  quality.syntheticClockUsed = syntheticClockUsed;
+  quality.rawGapCount = quality.gapCount;
   if (overrideFs !== null && validCount >= 2) {
     quality.isUniformSampling = true;
     quality.qualityStatus = 'uniform';
@@ -1100,6 +1112,7 @@ export function parseExcelSheetToChannels(
   for (let c = 0; c < activeCols.length; c++) {
     const chMap = activeCols[c];
     const chRawV = orderedValues[c];
+    const chNanCount = perChannelNanCounts[c];
 
     let finiteCount = 0;
     for (let i = 0; i < chRawV.length; i++) {
@@ -1118,6 +1131,7 @@ export function parseExcelSheetToChannels(
       ...quality,
       sampleRate: fs,
       nominalDt: dt,
+      signalNanCount: chNanCount,
     };
 
     if (
@@ -1145,6 +1159,9 @@ export function parseExcelSheetToChannels(
         jitterMax: 0,
         gapCount: 0,
         gapIndices: [],
+        rawGapCount: quality.gapCount,
+        resampledFromNonUniform: true,
+        signalNanCount: chNanCount,
       };
     }
 

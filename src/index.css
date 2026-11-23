@@ -578,3 +578,134 @@ html:not(.dark) textarea {
 html:not(.dark) .modal-overlay.modal-backdrop-dim {
   background-color: rgba(15, 23, 42, 0.35);
 }
+
+/* ==================== FOC DynoLab Multi-Theme Surface & Control Tokens ==================== */
+.dyno-chassis {
+  background-color: var(--bg-chassis);
+  color: var(--text-primary);
+}
+
+.dyno-panel {
+  background-color: var(--bg-panel);
+  border-color: var(--border-subtle);
+}
+
+.dyno-card {
+  background-color: var(--bg-elevated);
+  border-color: var(--border-subtle);
+}
+
+.dyno-well {
+  background-color: var(--bg-well);
+  border-color: var(--border-subtle);
+}
+
+.dyno-border {
+  border-color: var(--border-subtle);
+}
+
+.dyno-divide > :not(:first-child) {
+  border-color: var(--border-subtle);
+}
+
+.dyno-text-primary {
+  color: var(--text-primary);
+}
+
+.dyno-text-secondary {
+  color: var(--text-secondary);
+}
+
+.dyno-text-muted {
+  color: var(--text-muted);
+}
+
+.dyno-accent-text {
+  color: var(--accent);
+}
+
+.dyno-input {
+  background-color: var(--bg-well);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.dyno-input:focus {
+  border-color: var(--accent);
+}
+
+.dyno-btn-primary {
+  background-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.dyno-btn-primary:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+}
+
+.dyno-btn-ghost {
+  background-color: var(--bg-well);
+  border-color: var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.dyno-btn-ghost:hover:not(:disabled) {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+.dyno-seg-active {
+  background-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+.dyno-tab-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.dyno-highlight-row {
+  background-color: var(--accent-soft);
+}
+
+/* Semantic Status Callout Helpers (Non-Hue-Only paired with icons/text) */
+.dyno-alert-info {
+  background-color: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+html.dark .dyno-alert-warn {
+  background-color: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fde68a;
+}
+
+html:not(.dark) .dyno-alert-warn {
+  background-color: rgba(245, 158, 11, 0.12);
+  border-color: rgba(217, 119, 6, 0.45);
+  color: #92400e;
+}
+
+html.dark .dyno-alert-danger {
+  background-color: rgba(244, 63, 94, 0.12);
+  border-color: rgba(244, 63, 94, 0.45);
+  color: #fecdd3;
+}
+
+html:not(.dark) .dyno-alert-danger {
+  background-color: rgba(225, 29, 72, 0.1);
+  border-color: rgba(225, 29, 72, 0.4);
+  color: #9f1239;
+}
+
+html.dark .dyno-alert-ok {
+  color: #34d399;
+}
+
+html:not(.dark) .dyno-alert-ok {
+  color: #047857;
+}
+

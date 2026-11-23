@@ -5,9 +5,12 @@
  * Supports multiple open tools with tabs, Split-2 stacked view, and left-edge resizing.
  */
 
+import { escapeHtml } from '../utils/html';
+
 const TOOL_TAB_LABELS: Record<string, string> = {
   measureModal: 'Measure',
   compareModal: 'Compare',
+  filterModal: 'Filter',
   thermalModal: 'MOS Thermal',
   mathModal: 'Math fx',
   bldcModal: 'BLDC Diag',
@@ -26,6 +29,7 @@ const TOOL_TAB_LABELS: Record<string, string> = {
 const DEFAULT_DRAWER_WIDTH = 440;
 const PREFERRED_TOOL_WIDTHS: Record<string, number> = {
   compareModal: 480,
+  filterModal: 490,
   thermalModal: 720,
 };
 
@@ -332,7 +336,7 @@ class ToolDrawerController {
       const isSecondary = visibleIds.includes(id) && !isPrimary;
       const tabBtn = document.createElement('div');
       tabBtn.className = `tool-drawer-tab ${isPrimary ? 'is-active' : isSecondary ? 'is-secondary' : ''}`;
-      const label = TOOL_TAB_LABELS[id] || id.replace(/Modal$/, '');
+      const label = escapeHtml(TOOL_TAB_LABELS[id] || id.replace(/Modal$/, ''));
       tabBtn.innerHTML = `
         <button type="button" class="tool-drawer-tab-btn" title="${label}">${label}</button>
         <button type="button" class="tool-drawer-tab-close" title="Close ${label}">×</button>

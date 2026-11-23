@@ -12,7 +12,7 @@
  */
 
 import { WaveformChannel } from '../types/models';
-import { CauerStage } from './thermalEngine';
+import { CauerStage, parseSiUnitScale } from './thermalEngine';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 
 export type FocModulationMode = 'SVPWM' | 'DPWM1' | 'SPWM';
@@ -23,6 +23,7 @@ export const MOS_SWITCH_KEYS: MosSwitchKey[] = ['AH', 'AL', 'BH', 'BL', 'CH', 'C
 export interface FocThermalModel {
   zthJC: CauerStage[];
   zthBoard: CauerStage[];
+  isHeuristicSingleStageSplit?: boolean;
 }
 
 export interface FocMosParams {
@@ -149,13 +150,15 @@ export function splitCauerToFocModel(fullCauer: CauerStage[], tauSplitSec = 0.05
     return {
       zthJC: DEFAULT_FOC_MODEL.zthJC.map((s) => ({ ...s })),
       zthBoard: DEFAULT_FOC_MODEL.zthBoard.map((s) => ({ ...s })),
+      isHeuristicSingleStageSplit: false,
     };
   }
   if (fullCauer.length === 1) {
     const s = fullCauer[0];
     return {
-      zthJC: [{ r: s.r * 0.4, c: s.c * 0.25, tauEst: s.r * 0.4 * s.c * 0.25, layerLabel: '芯片/封装 (拆分)' }],
-      zthBoard: [{ r: s.r * 0.6, c: s.c * 0.75, tauEst: s.r * 0.6 * s.c * 0.75, layerLabel: 'PCB/散热器 (拆分)' }],
+      zthJC: [{ r: s.r * 0.4, c: s.c * 0.25, tauEst: s.r * 0.4 * s.c * 0.25, layerLabel: '芯片/封装 (经验拆分)' }],
+      zthBoard: [{ r: s.r * 0.6, c: s.c * 0.75, tauEst: s.r * 0.6 * s.c * 0.75, layerLabel: 'PCB/散热器 (经验拆分)' }],
+      isHeuristicSingleStageSplit: true,
     };
   }
 
@@ -173,7 +176,7 @@ export function splitCauerToFocModel(fullCauer: CauerStage[], tauSplitSec = 0.05
     const last = jc.pop()!;
     brd.push({ ...last });
   }
-  return { zthJC: jc, zthBoard: brd };
+  return { zthJC: jc, zthBoard: brd, isHeuristicSingleStageSplit: false };
 }
 
 /**
@@ -303,7 +306,7 @@ export function reconstructSensorlessDutySample(
   const thetaI = Math.atan2(iBeta, iAlpha);
   const thetaV = thetaI + (pfAngleDeg * Math.PI) / 180;
   const twoPi3 = (2 * Math.PI) / 3;
-  const m = Math.max(0, Math.min(1.15, modDepthM));
+  const m = Math.max(0, Math.min(1.2, modDepthM));
 
   const ua = m * Math.cos(thetaV);
   const ub = m * Math.cos(thetaV - twoPi3);
@@ -585,10 +588,15 @@ export function simulateFoc6Mos(
   ctrl: FocControlParams,
   opts?: FocSimulationOptions
 ): FocSimulationResult {
-  const nFull = Math.min(iaCh.t.length, iaCh.v.length, ibCh.v.length);
+  const nIa = Math.min(iaCh.t.length, iaCh.v.length);
+  const nIb = Math.min(ibCh.t.length, ibCh.v.length);
+  if (nIa < 4 || nIb < 2) {
+    throw new Error('At least 4 Ia samples and 2 Ib samples are required for BLDC FOC 6-MOS thermal evaluation.');
+  }
+
   let i0 = 0;
-  let i1 = nFull - 1;
-  if (opts?.tStart !== undefined) while (i0 < nFull && iaCh.t[i0] < opts.tStart) i0++;
+  let i1 = nIa - 1;
+  if (opts?.tStart !== undefined) while (i0 < nIa && iaCh.t[i0] < opts.tStart) i0++;
   if (opts?.tEnd !== undefined) while (i1 > i0 && iaCh.t[i1] > opts.tEnd) i1--;
   const len = Math.max(0, i1 - i0 + 1);
   if (len < 4) {
@@ -602,9 +610,70 @@ export function simulateFoc6Mos(
   const vbusCh = opts?.vbusCh || null;
   const mVbus = vbusCh && vbusCh.coupling === 'AC' ? computeChannelMean(vbusCh) : 0;
 
+  const iaScale = parseSiUnitScale(iaCh.unit, 'A', iaCh.name);
+  const ibScale = parseSiUnitScale(ibCh.unit, 'A', ibCh.name);
+  const icScale = icCh ? parseSiUnitScale(icCh.unit, 'A', icCh.name) : 1;
+  const vbusScale = vbusCh ? parseSiUnitScale(vbusCh.unit, 'V', vbusCh.name) : 1;
+
   const daCh = opts?.dutyChs?.da || null;
   const dbCh = opts?.dutyChs?.db || null;
   const dcCh = opts?.dutyChs?.dc || null;
+
+  const checkSameTb = (ch: WaveformChannel | null): boolean => {
+    if (!ch) return false;
+    const nc = Math.min(ch.t.length, ch.v.length);
+    if (nc !== nIa) return false;
+    if (ch.t === iaCh.t) return true;
+    return (
+      Math.abs(ch.t[0] - iaCh.t[0]) <= 1e-15 &&
+      Math.abs(ch.t[nc >> 1] - iaCh.t[nIa >> 1]) <= 1e-15 &&
+      Math.abs(ch.t[nc - 1] - iaCh.t[nIa - 1]) <= 1e-15
+    );
+  };
+  const sameIb = checkSameTb(ibCh);
+  const sameIc = checkSameTb(icCh);
+  const sameVbus = checkSameTb(vbusCh);
+  const sameDa = checkSameTb(daCh);
+  const sameDb = checkSameTb(dbCh);
+  const sameDc = checkSameTb(dcCh);
+
+  const sampleCh = (
+    ch: WaveformChannel,
+    scale: number,
+    meanAc: number,
+    targetT: number,
+    idxIfSame: number,
+    isSame: boolean
+  ): number => {
+    if (isSame) {
+      const v = getChannelDisplayValue(ch, idxIfSame, meanAc) * scale;
+      return isFinite(v) ? v : 0;
+    }
+    const nC = Math.min(ch.t.length, ch.v.length);
+    if (nC === 0) return 0;
+    const tArr = ch.t;
+    if (targetT <= tArr[0]) {
+      const v = getChannelDisplayValue(ch, 0, meanAc) * scale;
+      return isFinite(v) ? v : 0;
+    }
+    if (targetT >= tArr[nC - 1]) {
+      const v = getChannelDisplayValue(ch, nC - 1, meanAc) * scale;
+      return isFinite(v) ? v : 0;
+    }
+    let lo = 0;
+    let hi = nC - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (tArr[mid] <= targetT) lo = mid;
+      else hi = mid;
+    }
+    const dt = tArr[hi] - tArr[lo];
+    const frac = dt > 1e-18 ? (targetT - tArr[lo]) / dt : 0;
+    const v0 = getChannelDisplayValue(ch, lo, meanAc) * scale;
+    const v1 = getChannelDisplayValue(ch, hi, meanAc) * scale;
+    const val = v0 + frac * (v1 - v0);
+    return isFinite(val) ? val : 0;
+  };
 
   const time = new Float64Array(len);
   const tj: Record<MosSwitchKey, Float32Array> = {
@@ -653,26 +722,24 @@ export function simulateFoc6Mos(
 
   for (let k = 0; k < len; k++) {
     const idx = i0 + k;
-    time[k] = iaCh.t[idx];
+    const tCurr = iaCh.t[idx];
+    time[k] = tCurr;
 
-    const ia = getChannelDisplayValue(iaCh, idx, mIa);
-    const ib = getChannelDisplayValue(ibCh, idx, mIb);
-    const ic = icCh && idx < icCh.v.length ? getChannelDisplayValue(icCh, idx, mIc) : -(ia + ib);
-    const vbus =
-      vbusCh && idx < vbusCh.v.length
-        ? Math.max(0, getChannelDisplayValue(vbusCh, idx, mVbus))
-        : Math.max(0, ctrl.vBusConstV);
+    const rawIa = getChannelDisplayValue(iaCh, idx, mIa) * iaScale;
+    const ia = isFinite(rawIa) ? rawIa : 0;
+    const ib = sampleCh(ibCh, ibScale, mIb, tCurr, idx, sameIb);
+    const ic = icCh ? sampleCh(icCh, icScale, mIc, tCurr, idx, sameIc) : -(ia + ib);
+    const vbus = vbusCh
+      ? Math.max(0, sampleCh(vbusCh, vbusScale, mVbus, tCurr, idx, sameVbus))
+      : Math.max(0, ctrl.vBusConstV);
 
     let da: number;
     let db: number;
     let dc: number;
-    if (
-      daCh && dbCh && dcCh &&
-      idx < daCh.v.length && idx < dbCh.v.length && idx < dcCh.v.length
-    ) {
-      da = normDuty(getChannelDisplayValue(daCh, idx, 0));
-      db = normDuty(getChannelDisplayValue(dbCh, idx, 0));
-      dc = normDuty(getChannelDisplayValue(dcCh, idx, 0));
+    if (daCh && dbCh && dcCh) {
+      da = normDuty(sampleCh(daCh, 1, 0, tCurr, idx, sameDa));
+      db = normDuty(sampleCh(dbCh, 1, 0, tCurr, idx, sameDb));
+      dc = normDuty(sampleCh(dcCh, 1, 0, tCurr, idx, sameDc));
     } else {
       const rec = reconstructSensorlessDutySample(
         ia,
@@ -812,9 +879,10 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
       const lC = computePhaseMosLosses(ic, rec.dc, opts.vBusV, tjSteady[4], tjSteady[5], opts.modulation, opts.fswHz, opts.tDeadNs, opts.mos);
       const ps = [lA.pHighTotal, lA.pLowTotal, lB.pHighTotal, lB.pLowTotal, lC.pHighTotal, lC.pLowTotal];
       const pSum = ps.reduce((a, b) => a + b, 0);
-      const tBrd = opts.tAmbC + pSum * rBrd;
+      const tBrd = Math.min(2000, opts.tAmbC + pSum * rBrd);
       for (let m = 0; m < 6; m++) {
-        tjSteady[m] = tBrd + ps[m] * rJc;
+        const nextT = tBrd + ps[m] * rJc;
+        tjSteady[m] = isFinite(nextT) ? Math.min(2000, Math.max(-50, nextT)) : 2000;
       }
     }
 

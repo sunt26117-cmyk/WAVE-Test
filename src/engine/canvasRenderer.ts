@@ -12,6 +12,7 @@ import {
   HarmonicMarker,
   CursorMode,
   ChannelMeasurements,
+  CustomMeasurementDefinition,
 } from '../types/models';
 import {
   PlotArea,
@@ -384,17 +385,29 @@ export function getTimeBoundsForView(
       : refCh.t;
   const n = refT.length;
   const dt = refCh.dt || (n > 1 ? (refT[n - 1] - refT[0]) / (n - 1) : 1e-4);
-  const sIdx = Math.max(0, Math.min(n - 1, tab.view.startIndex));
-  const tStart = refT[sIdx];
+  const sIdx = tab.view.startIndex;
   const eIdx = Math.max(sIdx + 1, tab.view.endIndex);
-  let tEnd: number;
-  if (eIdx < n) {
-    tEnd = refT[eIdx];
-  } else if (eIdx === n && n >= 2) {
-    tEnd = refT[n - 1];
+
+  let tStart: number;
+  if (sIdx < 0) {
+    tStart = refT[0] + sIdx * dt;
+  } else if (sIdx < n) {
+    tStart = refT[sIdx];
   } else {
-    tEnd = refT[n - 1] + (eIdx - n + 1) * dt;
+    tStart = refT[n - 1] + (sIdx - n + 1) * dt;
   }
+
+  let tEnd: number;
+  if (eIdx <= 0) {
+    tEnd = refT[0] + eIdx * dt;
+  } else if (eIdx < n) {
+    tEnd = refT[eIdx];
+  } else if (n >= 2) {
+    tEnd = refT[n - 1] + (eIdx - n) * dt;
+  } else {
+    tEnd = refT[0] + eIdx * dt;
+  }
+
   const tSpan = Math.max(dt * 1e-3, tEnd - tStart);
   return { tStart, tEnd, tSpan, dt };
 }
@@ -688,8 +701,8 @@ export function drawChannelWaveform(
   const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
   const usesPrimaryIndex =
     !primaryCh ||
-    (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec) ||
-    (!ch.timeShiftSec && !primaryCh.timeShiftSec && ch.t.length === primaryCh.t.length);
+    ch === primaryCh ||
+    (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec);
   let startIdx: number;
   let endIdx: number;
   if (usesPrimaryIndex) {
@@ -2108,8 +2121,8 @@ export function generateWaveformSVG(
       const { tStart, tSpan } = getTimeBoundsForView(tab, ch);
       const usesPrimaryIndex =
         !primaryCh ||
-        (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec) ||
-        (!ch.timeShiftSec && !primaryCh.timeShiftSec && ch.t.length === primaryCh.t.length);
+        ch === primaryCh ||
+        (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec);
       const rng = usesPrimaryIndex
         ? {
             startIdx: Math.max(0, tab.view.startIndex),
@@ -2231,6 +2244,20 @@ export function formatMeasurementMetricValue(
   return formatEng(raw, signalUnit, 3);
 }
 
+export function formatCustomMeasurementValue(
+  raw: number | null | undefined,
+  def: CustomMeasurementDefinition,
+  signalUnit: string
+): string {
+  if (raw === null || raw === undefined || !isFinite(raw)) return 'N/A';
+  if (def.unitType === 'percent') return `${raw.toFixed(1)}%`;
+  if (def.unitType === 'freq') return formatEng(raw, 'Hz', 3);
+  if (def.unitType === 'time') return formatEng(raw, 's', 3);
+  if (def.unitType === 'ratio') return raw.toPrecision(4);
+  if (def.unitType === 'custom') return formatEng(raw, def.customUnit || '', 3);
+  return formatEng(raw, signalUnit, 3);
+}
+
 /**
  * Draws the active user-checked measurement cards strip cleanly onto a target canvas context (used by PNG screenshot export).
  */
@@ -2240,7 +2267,8 @@ export function drawMeasurementStripOnCanvas(
   width: number,
   yStart: number,
   measByChannel: Record<string, ChannelMeasurements>,
-  theme: RenderTheme = DEFAULT_THEME
+  theme: RenderTheme = DEFAULT_THEME,
+  customValuesByChannel?: Record<string, Record<string, number | null>>
 ): number {
   const items = tab.selectedMeasurements || [];
   if (items.length === 0) return 0;
@@ -2255,12 +2283,27 @@ export function drawMeasurementStripOnCanvas(
   ctx.save();
   for (const item of items) {
     const ch = tab.channels[item.channelId];
-    const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
-    const meas = measByChannel[item.channelId];
-    if (!ch || !def || !meas) continue;
+    if (!ch) continue;
 
-    const valStr = formatMeasurementMetricValue(meas, def, ch.unit);
-    const titleStr = `${ch.name} · ${def.shortLabel}`;
+    let valStr: string | null = null;
+    let shortLabel = '';
+
+    if (typeof item.metric === 'string' && item.metric.startsWith('custom:')) {
+      const customId = item.metric.slice(7);
+      const customDef = (tab.customMeasurements || []).find((d) => d.id === customId);
+      if (!customDef) continue;
+      const val = customValuesByChannel?.[item.channelId]?.[customId];
+      valStr = formatCustomMeasurementValue(val, customDef, ch.unit);
+      shortLabel = customDef.shortLabel || customDef.label;
+    } else {
+      const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
+      const meas = measByChannel[item.channelId];
+      if (!def || !meas) continue;
+      valStr = formatMeasurementMetricValue(meas, def, ch.unit);
+      shortLabel = def.shortLabel;
+    }
+
+    const titleStr = `${ch.name} · ${shortLabel}`;
 
     ctx.font = '10px "IBM Plex Sans", sans-serif';
     const titleW = ctx.measureText(titleStr).width;

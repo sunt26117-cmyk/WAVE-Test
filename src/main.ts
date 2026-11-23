@@ -7,15 +7,16 @@
 import './index.css';
 import { OscilloscopeApp } from './engine/uiController';
 import { runAllTests } from './tests/testSuite';
-import { TabState, WaveformChannel, CursorMode, MeasurementGate, MeasurementMetricKey, ThemeId } from './types/models';
+import { TabState, WaveformChannel, CursorMode, MeasurementGate, MeasurementMetricKey, ThemeId, CustomMeasurementUnitType } from './types/models';
 import { formatEng, getTimeBoundsForView, isComputedChannel } from './engine/canvasRenderer';
 import { getSavedThemeId } from './modules/themeManager';
 import { LtspiceFileWatcher } from './modules/ltspiceWatcher';
 import { setupToolDrawer } from './modules/toolDrawer';
 import { fitChannelTo125 } from './modules/oscilloscopeScale';
-import { MEASUREMENT_DEFINITIONS } from './modules/measurements';
+import { MEASUREMENT_DEFINITIONS, CUSTOM_MEASUREMENT_PRESETS } from './modules/measurements';
 import { estimateSpeedFromSignal, computeTwoChannelPhaseDiff } from './modules/motorAnalysis';
 import { runBatchAnalysisOnFiles, exportBatchResultsCSV, BatchFileRow } from './modules/batchAnalyzer';
+import { escapeHtml } from './utils/html';
 import {
   loadPresets,
   savePresetToStorage,
@@ -27,6 +28,7 @@ import {
   COMPARE_GROUP_THEMES,
   getCompareGroupTraceColor,
   alignAndInterpolateReference,
+  buildMappedReferenceTrace,
   computeAutoTimeAlignShift,
   computeWaveformCompareMetrics,
   parseReferenceFileToChannels,
@@ -43,9 +45,13 @@ import {
   analyzeTorqueAndCurrentRipple,
   computeBldcDerivedTraces,
 } from './modules/bldcAnalysis';
-import { initThermalWorkbench } from './modules/thermalWorkbench';
+import { initThermalWorkbench, ThermalWorkbenchController } from './modules/thermalWorkbench';
+import { FilterWorkbenchController } from './modules/filterWorkbench';
 import { isExcelFileName } from './parsers/excelParser';
 import { excelImportModal } from './modules/excelImportModal';
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { FocDynoLabApp } from './components/focDyno/FocDynoLabApp';
 
 let batchQueuedFiles: File[] = [];
 let lastBatchRows: BatchFileRow[] = [];
@@ -64,6 +70,8 @@ interface CompareQueueEntry {
   computed?: {
     alignedRefV: Float32Array;
     diffV: Float32Array;
+    fullRefT: Float64Array;
+    fullRefV: Float32Array;
     metrics: WaveformCompareMetrics;
     pass: boolean;
     violationCount: number;
@@ -79,6 +87,40 @@ let editingCompareGroupId: string | null = null;
 
 let app: OscilloscopeApp;
 let ltspiceWatcher: LtspiceFileWatcher | null = null;
+let thermalCtrl: ThermalWorkbenchController | null = null;
+let filterCtrl: FilterWorkbenchController | null = null;
+let activeWorkspace: 'scope' | 'focDyno' = 'scope';
+
+function switchWorkspace(target: 'scope' | 'focDyno') {
+  activeWorkspace = target;
+  const scopeMain = document.getElementById('scopeWorkspaceMain');
+  const dynoView = document.getElementById('focDynoLabView');
+  const wsScopeBtn = document.getElementById('wsScopeBtn');
+  const wsDynoBtn = document.getElementById('wsFocDynoBtn');
+  const togglePanelBtn = document.getElementById('togglePanelBtn');
+
+  const isScope = target === 'scope';
+  if (scopeMain) scopeMain.classList.toggle('hidden', !isScope);
+  if (dynoView) dynoView.classList.toggle('hidden', isScope);
+  if (togglePanelBtn) togglePanelBtn.classList.toggle('hidden', !isScope);
+
+  if (wsScopeBtn) {
+    wsScopeBtn.className = isScope
+      ? 'px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold whitespace-nowrap cursor-pointer'
+      : 'px-2 py-0.5 rounded-xs text-slate-300 hover:text-white whitespace-nowrap cursor-pointer';
+  }
+  if (wsDynoBtn) {
+    wsDynoBtn.className = !isScope
+      ? 'px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold whitespace-nowrap cursor-pointer'
+      : 'px-2 py-0.5 rounded-xs text-slate-300 hover:text-white whitespace-nowrap cursor-pointer';
+  }
+
+  if (isScope) {
+    requestAnimationFrame(() => app?.handleResize());
+  } else {
+    window.dispatchEvent(new CustomEvent('wvp-workspace-shown'));
+  }
+}
 
 function syncLtspiceWatchUI() {
   const tab = app?.getActiveTab() || null;
@@ -136,7 +178,7 @@ window.addEventListener('DOMContentLoaded', () => {
     () => syncLtspiceWatchUI()
   );
 
-  // Re-measure Compare live preview canvas when switched/shown inside Tool Drawer
+  // Re-measure Compare / Filter live preview canvas when switched/shown inside Tool Drawer
   window.addEventListener('wvp-drawer-panel-shown', (ev: Event) => {
     const detail = (ev as CustomEvent<{ id: string }>).detail;
     if (detail?.id === 'compareModal') {
@@ -144,14 +186,43 @@ window.addEventListener('DOMContentLoaded', () => {
         const tab = app.getActiveTab();
         if (tab) recomputeComparePanel(tab);
       });
+    } else if (detail?.id === 'filterModal') {
+      requestAnimationFrame(() => filterCtrl?.syncIfOpen());
     }
   });
 
   bindToolbarActions();
   bindFrontPanelControls();
   bindModals();
-  initThermalWorkbench(app);
+  thermalCtrl = initThermalWorkbench(app);
+  filterCtrl = new FilterWorkbenchController(app);
   setupDraggableModals();
+
+  // Workspace switcher buttons
+  document.getElementById('wsScopeBtn')?.addEventListener('click', () => switchWorkspace('scope'));
+  document.getElementById('wsFocDynoBtn')?.addEventListener('click', () => switchWorkspace('focDyno'));
+
+  // Mount embedded FOC DynoLab V2 workspace
+  const dynoRootEl = document.getElementById('focDynoLabView');
+  if (dynoRootEl) {
+    const reactRoot = createRoot(dynoRootEl);
+    reactRoot.render(
+      React.createElement(FocDynoLabApp, {
+        getActiveScopeTab: () => app.getActiveTab(),
+        onSendTabToScope: (tab) => {
+          app.addTab(tab);
+          switchWorkspace('scope');
+        },
+        onSendToSixMosThermal: (payload) => {
+          switchWorkspace('scope');
+          requestAnimationFrame(() => {
+            thermalCtrl?.loadExternalFocAnalysis(payload);
+          });
+        },
+        onNotify: (msg, level = 'info') => app.showToast(msg, level),
+      })
+    );
+  }
 
   syncLtspiceWatchUI();
 
@@ -202,7 +273,10 @@ function bindToolbarActions() {
   });
 
   document.getElementById('tabsContainer')?.addEventListener('click', () => {
-    requestAnimationFrame(() => syncLtspiceWatchUI());
+    requestAnimationFrame(() => {
+      syncLtspiceWatchUI();
+      filterCtrl?.syncIfOpen();
+    });
   });
 
   // Theme Selector
@@ -214,6 +288,7 @@ function bindToolbarActions() {
       const tab = app.getActiveTab();
       if (tab) recomputeComparePanel(tab);
     }
+    filterCtrl?.syncIfOpen();
   });
 
   // Click-toggled header/toolbar dropdowns (Tools, Export, Analyze)
@@ -300,8 +375,14 @@ function bindToolbarActions() {
 
   // AutoSet, Fit, Sync Same-Unit, Undo/Redo, Zoom Box, Annotations
   document.getElementById('syncUnitScaleBtn')?.addEventListener('click', () => app.syncSameUnitScales());
-  document.getElementById('undoBtn')?.addEventListener('click', () => app.undo());
-  document.getElementById('redoBtn')?.addEventListener('click', () => app.redo());
+  document.getElementById('undoBtn')?.addEventListener('click', () => {
+    app.undo();
+    filterCtrl?.syncIfOpen();
+  });
+  document.getElementById('redoBtn')?.addEventListener('click', () => {
+    app.redo();
+    filterCtrl?.syncIfOpen();
+  });
   document.getElementById('autoSetBtn')?.addEventListener('click', () => app.executeAutoSet());
   document.getElementById('fitViewBtn')?.addEventListener('click', () => app.fitView());
   document.getElementById('toolZoomBtn')?.addEventListener('click', () => app.setActiveTool('areaZoom'));
@@ -314,6 +395,12 @@ function bindToolbarActions() {
   document.getElementById('openCompareModalBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (tab) openCompareModal(tab);
+  });
+  document.getElementById('openFilterModalBtn')?.addEventListener('click', () => {
+    filterCtrl?.open(app.getActiveTab());
+  });
+  document.getElementById('openFilterMenuBtn')?.addEventListener('click', () => {
+    filterCtrl?.open(app.getActiveTab());
   });
   document.getElementById('openPhaseModalBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
@@ -795,6 +882,46 @@ function bindModals() {
     app.clearAllMeasurements();
     if (tab) renderMeasureModalCheckboxes(tab);
   });
+  document.getElementById('measureCustomUnitSelect')?.addEventListener('change', (e: any) => {
+    const customInp = document.getElementById('measureCustomUnitCustomInput');
+    if (customInp) {
+      customInp.classList.toggle('hidden', e.target.value !== 'custom');
+    }
+  });
+  document.getElementById('measureCustomAddBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    const chSel = document.getElementById('measureModalChannelSelect') as HTMLSelectElement | null;
+    const labelInp = document.getElementById('measureCustomLabelInput') as HTMLInputElement | null;
+    const exprInp = document.getElementById('measureCustomExprInput') as HTMLInputElement | null;
+    const unitSel = document.getElementById('measureCustomUnitSelect') as HTMLSelectElement | null;
+    const customUnitInp = document.getElementById('measureCustomUnitCustomInput') as HTMLInputElement | null;
+
+    const label = labelInp?.value.trim() || '';
+    const expression = exprInp?.value.trim() || '';
+    const unitType = (unitSel?.value || 'signal') as CustomMeasurementUnitType;
+    const customUnit = unitType === 'custom' ? customUnitInp?.value.trim() || '' : undefined;
+
+    try {
+      const chId = chSel?.value || tab.activeChannelId || tab.drawOrder[0];
+      app.addCustomMeasurement(
+        {
+          label,
+          shortLabel: label.slice(0, 12),
+          expression,
+          unitType,
+          customUnit,
+        },
+        chId
+      );
+      if (labelInp) labelInp.value = '';
+      if (exprInp) exprInp.value = '';
+      renderMeasureModalCheckboxes(tab);
+      app.showToast(`Added custom metric "${label}".`, 'info');
+    } catch (err: any) {
+      app.showToast(err?.message || 'Failed to add custom metric.', 'error');
+    }
+  });
 
   // Waveform Edit & Ref Modal
   const closeEditModal = () => {
@@ -963,6 +1090,26 @@ function bindModals() {
     syncEditTimeShiftUI(tab, false);
   });
   shiftSlider?.addEventListener('change', () => { shiftUndoPushedForDrag = false; });
+  const nudgeEditTimeShift = (deltaPct: number) => {
+    const tab = app.getActiveTab();
+    if (!tab || !shiftSlider) return;
+    const ids = getCheckedShiftIds(tab);
+    if (ids.length === 0) return;
+    const curPct = parseFloat(shiftSlider.value) || 0;
+    const nextPct = Math.max(-100, Math.min(100, Math.round((curPct + deltaPct) * 10) / 10));
+    shiftSlider.value = nextPct.toFixed(1);
+    const primaryCh = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
+    const tView = primaryCh ? getTimeBoundsForView(tab, primaryCh).tSpan : 0;
+    const shiftSec = (nextPct / 100) * tView;
+    app.setChannelsTimeShift(ids, shiftSec, true);
+    syncEditTimeShiftUI(tab, false);
+  };
+  document.getElementById('editTimeShiftDecBtn')?.addEventListener('click', (ev) => {
+    nudgeEditTimeShift((ev as MouseEvent).shiftKey ? -1.0 : -0.1);
+  });
+  document.getElementById('editTimeShiftIncBtn')?.addEventListener('click', (ev) => {
+    nudgeEditTimeShift((ev as MouseEvent).shiftKey ? 1.0 : 0.1);
+  });
   document.getElementById('editTimeShiftResetBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (!tab) return;
@@ -1406,6 +1553,8 @@ function bindModals() {
         color: entry.customColor || getCompareGroupTraceColor(theme.id, idx + colorOffset, paletteMode),
         alignedRefV: entry.computed!.alignedRefV,
         diffV: entry.computed!.diffV,
+        fullRefT: entry.computed!.fullRefT,
+        fullRefV: entry.computed!.fullRefV,
       }));
 
     if (payloadItems.length === 0) return;
@@ -1892,10 +2041,10 @@ function openTestSuiteModal() {
           : 'bg-red-950/30 border-red-700/60 text-red-200'
       }">
         <div class="flex justify-between font-semibold">
-          <span>${r.name}</span>
+          <span>${escapeHtml(r.name)}</span>
           <span>${r.passed ? 'PASS' : 'FAIL'}</span>
         </div>
-        <div class="text-[11px] text-slate-400 mt-1">${r.message}</div>
+        <div class="text-[11px] text-slate-400 mt-1">${escapeHtml(r.message)}</div>
       </div>
     `;
   });
@@ -1947,9 +2096,9 @@ function renderMeasureModalCheckboxes(tab: TabState) {
       label.innerHTML = `
         <span class="flex items-center gap-2 text-slate-200">
           <input type="checkbox" class="accent-cyan-400 cursor-pointer" ${selectedSet.has(id) ? 'checked' : ''} />
-          <span>${def.label}</span>
+          <span>${escapeHtml(def.label)}</span>
         </span>
-        <span class="font-mono text-[10px] text-slate-500">${def.shortLabel}</span>
+        <span class="font-mono text-[10px] text-slate-500">${escapeHtml(def.shortLabel)}</span>
       `;
       label.querySelector('input')?.addEventListener('change', (e: any) => {
         app.toggleMeasurementSelection(chId, def.key, !!e.target.checked);
@@ -1960,6 +2109,67 @@ function renderMeasureModalCheckboxes(tab: TabState) {
 
   buildGroup(voltageBox, 'voltage');
   buildGroup(timingBox, 'timing');
+
+  const presetsWrap = document.getElementById('measureCustomPresets');
+  if (presetsWrap) {
+    presetsWrap.innerHTML = '';
+    CUSTOM_MEASUREMENT_PRESETS.forEach((preset) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className =
+        'px-2 py-0.5 bg-[#12161c] hover:bg-[#1a222d] border border-[#222933] hover:border-emerald-500/60 rounded-xs text-[10px] font-mono text-emerald-200 cursor-pointer';
+      btn.innerText = `+ ${preset.shortLabel}: ${preset.expression}`;
+      btn.title = preset.label;
+      btn.addEventListener('click', () => {
+        const exists = (tab.customMeasurements || []).find(
+          (cm) => cm.expression.trim() === preset.expression.trim() && cm.label.trim() === preset.label.trim()
+        );
+        if (exists) {
+          app.toggleMeasurementSelection(chId, `custom:${exists.id}`, true);
+        } else {
+          app.addCustomMeasurement(preset, chId);
+        }
+        renderMeasureModalCheckboxes(tab);
+      });
+      presetsWrap.appendChild(btn);
+    });
+  }
+
+  const customList = document.getElementById('measureCustomList');
+  if (customList) {
+    customList.innerHTML = '';
+    const defs = tab.customMeasurements || [];
+    if (defs.length === 0) {
+      customList.innerHTML =
+        '<div class="text-[10px] font-mono text-slate-500 py-1">No custom metrics defined yet. Click a preset above or enter a formula.</div>';
+    } else {
+      defs.forEach((cm) => {
+        const metricKey = `custom:${cm.id}`;
+        const selId = `${chId}::${metricKey}`;
+        const row = document.createElement('div');
+        row.className =
+          'flex items-center justify-between gap-2 px-2 py-1 bg-[#12161c] border border-[#222933] rounded-sm text-[11px]';
+        const unitDesc = cm.unitType === 'custom' ? cm.customUnit || '' : cm.unitType;
+        row.innerHTML = `
+          <label class="flex items-center gap-2 min-w-0 flex-1 cursor-pointer">
+            <input type="checkbox" class="measure-custom-chk accent-emerald-400 cursor-pointer shrink-0" ${selectedSet.has(selId) ? 'checked' : ''} />
+            <span class="text-slate-100 truncate">${escapeHtml(cm.label)}</span>
+            <span class="font-mono text-[10px] text-cyan-300 truncate">= ${escapeHtml(cm.expression)}</span>
+            <span class="font-mono text-[10px] text-slate-500 shrink-0">[${escapeHtml(unitDesc)}]</span>
+          </label>
+          <button type="button" class="measure-custom-del px-1.5 py-0.5 text-[10px] font-mono text-slate-400 hover:text-red-300 cursor-pointer" title="Delete custom metric">✕</button>
+        `;
+        row.querySelector('.measure-custom-chk')?.addEventListener('change', (e: any) => {
+          app.toggleMeasurementSelection(chId, metricKey, !!e.target.checked);
+        });
+        row.querySelector('.measure-custom-del')?.addEventListener('click', () => {
+          app.removeCustomMeasurement(cm.id);
+          renderMeasureModalCheckboxes(tab);
+        });
+        customList.appendChild(row);
+      });
+    }
+  }
 }
 
 function openWaveformEditModal(tab: TabState) {
@@ -1996,10 +2206,10 @@ function openWaveformEditModal(tab: TabState) {
       const lbl = document.createElement('label');
       lbl.className = 'flex items-center gap-1.5 px-2 py-0.5 bg-[#0c0f13] border border-[#222933] rounded-xs cursor-pointer text-[11px] font-mono';
       lbl.innerHTML = `
-        <input type="checkbox" class="edit-shift-ch-chk accent-cyan-400 cursor-pointer" value="${id}" ${defaultChecked ? 'checked' : ''} />
-        <span class="w-2 h-2 rounded-xs shrink-0" style="background:${ch.color}"></span>
-        <span class="text-slate-200 truncate max-w-[140px]">${ch.isMath ? '' : `CH${idx + 1}: `}${ch.name}</span>
-        <span class="edit-shift-ch-dt text-[10px] text-cyan-300 tabular-nums" data-dt-id="${id}"></span>
+        <input type="checkbox" class="edit-shift-ch-chk accent-cyan-400 cursor-pointer" value="${escapeHtml(id)}" ${defaultChecked ? 'checked' : ''} />
+        <span class="w-2 h-2 rounded-xs shrink-0" style="background:${escapeHtml(ch.color)}"></span>
+        <span class="text-slate-200 truncate max-w-[140px]">${ch.isMath ? '' : `CH${idx + 1}: `}${escapeHtml(ch.name)}</span>
+        <span class="edit-shift-ch-dt text-[10px] text-cyan-300 tabular-nums" data-dt-id="${escapeHtml(id)}"></span>
       `;
       lbl.querySelector('.edit-shift-ch-chk')?.addEventListener('change', () => {
         syncEditTimeShiftUI(tab, true);
@@ -2136,11 +2346,11 @@ function openCropExportModal(tab: TabState) {
       lbl.className = 'flex items-center justify-between gap-2 px-2 py-1 bg-[#12161c] border border-[#222933] rounded-sm cursor-pointer';
       lbl.innerHTML = `
         <span class="flex items-center gap-2">
-          <input type="checkbox" class="crop-ch-chk accent-cyan-400 cursor-pointer" value="${id}" ${ch.visible ? 'checked' : ''} />
-          <span class="w-2.5 h-2.5 rounded-xs" style="background:${ch.color}"></span>
-          <span class="text-slate-200 font-mono text-[11px]">${ch.isMath ? '[M]' : `CH${idx + 1}:`} ${ch.name}</span>
+          <input type="checkbox" class="crop-ch-chk accent-cyan-400 cursor-pointer" value="${escapeHtml(id)}" ${ch.visible ? 'checked' : ''} />
+          <span class="w-2.5 h-2.5 rounded-xs" style="background:${escapeHtml(ch.color)}"></span>
+          <span class="text-slate-200 font-mono text-[11px]">${ch.isMath ? '[M]' : `CH${idx + 1}:`} ${escapeHtml(ch.name)}</span>
         </span>
-        <span class="text-[10px] font-mono text-slate-400">${ch.hasEdits ? 'Edited+Ref' : ch.unit}</span>
+        <span class="text-[10px] font-mono text-slate-400">${ch.hasEdits ? 'Edited+Ref' : escapeHtml(ch.unit)}</span>
       `;
       chBox.appendChild(lbl);
     });
@@ -2221,7 +2431,7 @@ function computeAndRenderPhaseDiff(tab: TabState) {
 
   const res = computeTwoChannelPhaseDiff(refCh, tgtCh, tStart, tEnd);
   if (res.phaseDeg === null) {
-    card.innerHTML = `<div class="text-amber-300">${res.status}</div>`;
+    card.innerHTML = `<div class="text-amber-300">${escapeHtml(res.status)}</div>`;
     return;
   }
   card.innerHTML = `
@@ -2287,10 +2497,10 @@ function renderAnomalyTable(events: ReturnType<typeof app.scanAnomalies>, unit: 
     tr.className = 'border-b border-[#1b222c] hover:bg-amber-950/30 cursor-pointer text-slate-200';
     tr.innerHTML = `
       <td class="p-1.5 text-slate-400">${idx + 1}</td>
-      <td class="p-1.5 text-amber-300 uppercase">${ev.kind}</td>
+      <td class="p-1.5 text-amber-300 uppercase">${escapeHtml(ev.kind)}</td>
       <td class="p-1.5 text-cyan-300">${formatEng(ev.time, 's', 4)}</td>
       <td class="p-1.5">${formatEng(ev.value, unit, 3)}</td>
-      <td class="p-1.5 text-slate-400">${ev.detail}</td>
+      <td class="p-1.5 text-slate-400">${escapeHtml(ev.detail)}</td>
     `;
     tr.addEventListener('click', () => {
       app.jumpToAnomaly(idx);
@@ -2344,14 +2554,14 @@ function renderBatchTable(rows: BatchFileRow[]) {
         ? 'text-red-400 font-semibold'
         : 'text-slate-400';
     tr.innerHTML = `
-      <td class="p-1.5 max-w-[180px] truncate" title="${r.fileName}">${r.fileName}</td>
-      <td class="p-1.5 text-slate-300">${r.channelName}</td>
+      <td class="p-1.5 max-w-[180px] truncate" title="${escapeHtml(r.fileName)}">${escapeHtml(r.fileName)}</td>
+      <td class="p-1.5 text-slate-300">${escapeHtml(r.channelName)}</td>
       <td class="p-1.5">${r.sampleRateHz ? formatEng(r.sampleRateHz, 'Sa/s', 1) : '--'}</td>
       <td class="p-1.5">${m?.vpp !== null && m?.vpp !== undefined ? formatEng(m.vpp, r.unit, 2) : '--'}</td>
       <td class="p-1.5">${m?.rms !== null && m?.rms !== undefined ? formatEng(m.rms, r.unit, 2) : '--'}</td>
       <td class="p-1.5">${m?.frequency !== null && m?.frequency !== undefined ? formatEng(m.frequency, 'Hz', 2) : '--'}</td>
       <td class="p-1.5">${m?.dutyCycle !== null && m?.dutyCycle !== undefined ? m.dutyCycle.toFixed(1) + '%' : '--'}</td>
-      <td class="p-1.5 ${badgeCls}">${r.status === 'error' ? 'ERR' : r.passStatus || 'OK'}</td>
+      <td class="p-1.5 ${badgeCls}">${r.status === 'error' ? 'ERR' : escapeHtml(r.passStatus || 'OK')}</td>
       <td class="p-1.5 text-right"><button class="batch-open-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 rounded-sm cursor-pointer">Open</button></td>
     `;
     tr.querySelector('.batch-open-btn')?.addEventListener('click', async () => {
@@ -2388,8 +2598,8 @@ function renderPresetsList() {
     row.className = 'flex items-center justify-between gap-2 p-2 bg-[#12161c] border border-[#222933] rounded-sm text-xs';
     row.innerHTML = `
       <div class="min-w-0">
-        <div class="text-slate-100 font-medium truncate">${p.name}</div>
-        <div class="text-[10px] font-mono text-slate-400">${p.mathDefs.length} Math · ${p.selectedMetricsByIndex.length} Metrics · ${p.separateView ? 'Separate' : 'Overlap'} · ${p.renderMode}</div>
+        <div class="text-slate-100 font-medium truncate">${escapeHtml(p.name)}</div>
+        <div class="text-[10px] font-mono text-slate-400">${p.mathDefs.length} Math · ${p.selectedMetricsByIndex.length} Metrics · ${p.separateView ? 'Separate' : 'Overlap'} · ${escapeHtml(p.renderMode)}</div>
       </div>
       <div class="flex items-center gap-1.5 shrink-0">
         <button class="preset-apply-btn px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Apply</button>
@@ -2575,26 +2785,45 @@ function renderComparePreviewCanvas(
   }
 
   const n = targetCh.t.length;
-  const tStart = targetCh.t[0];
-  const tEnd = targetCh.t[n - 1];
-  const tSpan = Math.max(1e-18, tEnd - tStart);
+  const tgtStart = targetCh.t[0];
+  const tgtEnd = targetCh.t[n - 1];
+  let tStart = tgtStart;
+  let tEnd = tgtEnd;
 
-  // Find combined vertical bounds across Target and all aligned queue waves
+  // Adaptive horizontal bounds across Target and all full mapped queue traces
+  for (const entry of compareQueue) {
+    const ft = entry.computed?.fullRefT;
+    if (ft && ft.length > 0) {
+      const f0 = ft[0];
+      const f1 = ft[ft.length - 1];
+      if (isFinite(f0) && f0 < tStart) tStart = f0;
+      if (isFinite(f1) && f1 > tEnd) tEnd = f1;
+    }
+  }
+  const tSpan = Math.max(1e-18, tEnd - tStart);
+  const extendedByCompare = tStart < tgtStart - 1e-15 || tEnd > tgtEnd + 1e-15;
+
+  // Find combined vertical bounds across Target and all full queue traces
   let yMin = Infinity;
   let yMax = -Infinity;
-  const step = Math.max(1, Math.floor(n / 2000));
-  for (let i = 0; i < n; i += step) {
-    const tv = targetCh.v[i];
-    if (isFinite(tv)) {
-      if (tv < yMin) yMin = tv;
-      if (tv > yMax) yMax = tv;
-    }
-    for (const entry of compareQueue) {
-      const rv = entry.computed?.alignedRefV[i];
-      if (rv !== undefined && isFinite(rv)) {
-        if (rv < yMin) yMin = rv;
-        if (rv > yMax) yMax = rv;
+  const scanRange = (vArr: Float32Array) => {
+    const len = vArr.length;
+    if (len === 0) return;
+    const step = Math.max(1, Math.floor(len / 2000));
+    for (let i = 0; i < len; i += step) {
+      const val = vArr[i];
+      if (isFinite(val)) {
+        if (val < yMin) yMin = val;
+        if (val > yMax) yMax = val;
       }
+    }
+  };
+  scanRange(targetCh.v);
+  for (const entry of compareQueue) {
+    if (entry.computed?.fullRefV) {
+      scanRange(entry.computed.fullRefV);
+    } else if (entry.computed?.alignedRefV) {
+      scanRange(entry.computed.alignedRefV);
     }
   }
   if (!isFinite(yMin) || !isFinite(yMax)) {
@@ -2610,9 +2839,11 @@ function renderComparePreviewCanvas(
   yMax += pad;
   const ySpan = yMax - yMin;
 
-  const plotSeries = (vArr: Float32Array, stroke: string, lineWidth: number, dashed: boolean) => {
-    const buckets = Math.min(w, n);
-    const ptsPerBucket = n / buckets;
+  const plotSeries = (tArr: Float64Array, vArr: Float32Array, stroke: string, lineWidth: number, dashed: boolean) => {
+    const len = Math.min(tArr.length, vArr.length);
+    if (len < 2) return;
+    const buckets = Math.min(w, len);
+    const ptsPerBucket = len / buckets;
     ctx.save();
     ctx.strokeStyle = stroke;
     ctx.lineWidth = lineWidth;
@@ -2621,7 +2852,7 @@ function renderComparePreviewCanvas(
     let started = false;
     for (let b = 0; b < buckets; b++) {
       const i0 = Math.floor(b * ptsPerBucket);
-      const i1 = Math.max(i0 + 1, Math.min(n, Math.floor((b + 1) * ptsPerBucket)));
+      const i1 = Math.max(i0 + 1, Math.min(len, Math.floor((b + 1) * ptsPerBucket)));
       let bMin = Infinity;
       let bMax = -Infinity;
       let bLast = NaN;
@@ -2636,7 +2867,7 @@ function renderComparePreviewCanvas(
         started = false;
         continue;
       }
-      const x = ((targetCh.t[i0] - tStart) / tSpan) * w;
+      const x = ((tArr[i0] - tStart) / tSpan) * w;
       const yTop = h - ((bMax - yMin) / ySpan) * h;
       const yBot = h - ((bMin - yMin) / ySpan) * h;
       if (!started) {
@@ -2654,15 +2885,17 @@ function renderComparePreviewCanvas(
   };
 
   // Draw Target baseline first
-  plotSeries(targetCh.v, targetCh.color || app.getRawColors()[0], 1.8, isComputedChannel(targetCh));
+  plotSeries(targetCh.t, targetCh.v, targetCh.color || app.getRawColors()[0], 1.8, isComputedChannel(targetCh));
 
-  // Draw each queued waveform in its assigned color
+  // Draw each queued waveform in its assigned color across its full mapped duration
   let scaledCount = 0;
   let unscaledMismatchCount = 0;
   compareQueue.forEach((entry, idx) => {
     const color = entry.customColor || getCompareGroupTraceColor(themeId, idx + colorOffset, paletteMode);
-    if (entry.computed?.alignedRefV) {
-      plotSeries(entry.computed.alignedRefV, color, 1.4, isComputedChannel(entry.channel));
+    if (entry.computed?.fullRefT && entry.computed?.fullRefV) {
+      plotSeries(entry.computed.fullRefT, entry.computed.fullRefV, color, 1.4, isComputedChannel(entry.channel));
+    } else if (entry.computed?.alignedRefV) {
+      plotSeries(targetCh.t, entry.computed.alignedRefV, color, 1.4, isComputedChannel(entry.channel));
     }
     if (Math.abs((entry.timeScale || 1) - 1) > 1e-6) {
       scaledCount++;
@@ -2673,7 +2906,7 @@ function renderComparePreviewCanvas(
   });
 
   if (banner) {
-    banner.innerText = `Preview: Base "${targetCh.name}" (${formatEng(tSpan, 's', 2)}, t0=${formatEng(tStart, 's', 2)}) + ${compareQueue.length} ref(s)`;
+    banner.innerText = `Preview: Base "${targetCh.name}" + ${compareQueue.length} ref(s) · Span ${formatEng(tSpan, 's', 2)} (${formatEng(tStart, 's', 2)} ~ ${formatEng(tEnd, 's', 2)})${extendedByCompare ? ' [Auto-Extended]' : ''}`;
   }
   if (warnBanner) {
     if (unscaledMismatchCount > 0) {
@@ -2752,6 +2985,15 @@ function recomputeComparePanel(tab: TabState) {
   compareQueue.forEach((entry, idx) => {
     const scale = isFinite(entry.timeScale) && entry.timeScale > 0 ? entry.timeScale : 1;
     const aligned = alignAndInterpolateReference(targetCh, entry.channel, entry.timeShiftSec || 0, removeDc, scale);
+    const mappedFull = buildMappedReferenceTrace(
+      targetCh,
+      entry.channel,
+      entry.timeShiftSec || 0,
+      removeDc,
+      scale,
+      aligned.targetMeanApplied,
+      aligned.refMeanApplied
+    );
     const metrics = computeWaveformCompareMetrics(targetCh, aligned.alignedRefV, removeDc);
     const golden = evaluateGoldenTolerance(targetCh, {
       enabled: true,
@@ -2765,6 +3007,8 @@ function recomputeComparePanel(tab: TabState) {
     entry.computed = {
       alignedRefV: aligned.alignedRefV,
       diffV: aligned.diffV,
+      fullRefT: mappedFull.t,
+      fullRefV: mappedFull.v,
       metrics,
       pass: golden.pass,
       violationCount: golden.violationCount,
@@ -2787,14 +3031,14 @@ function recomputeComparePanel(tab: TabState) {
     tr.innerHTML = `
       <td class="p-1.5">
         <div class="flex items-center gap-1">
-          <span class="w-1 h-5 rounded-xs shrink-0" style="background:${theme.badgeColor}" title="Group [${groupName}]"></span>
-          <input type="color" class="cmp-row-color w-6 h-5 bg-transparent border border-[#2c3543] rounded-xs cursor-pointer p-0" value="${assignedColor}" title="Trace color in group [${groupName}]" />
+          <span class="w-1 h-5 rounded-xs shrink-0" style="background:${escapeHtml(theme.badgeColor)}" title="Group [${escapeHtml(groupName)}]"></span>
+          <input type="color" class="cmp-row-color w-6 h-5 bg-transparent border border-[#2c3543] rounded-xs cursor-pointer p-0" value="${escapeHtml(assignedColor)}" title="Trace color in group [${escapeHtml(groupName)}]" />
         </div>
       </td>
       <td class="p-1.5 max-w-[180px]">
-        <div class="flex items-center gap-1 truncate" title="[${groupName}] ${entry.label}">
-          <span class="text-[9px] font-bold px-1 rounded-xs border shrink-0" style="color:${theme.badgeColor};border-color:${theme.badgeColor}">${groupName}</span>
-          <span class="truncate text-slate-100">${entry.label}</span>
+        <div class="flex items-center gap-1 truncate" title="[${escapeHtml(groupName)}] ${escapeHtml(entry.label)}">
+          <span class="text-[9px] font-bold px-1 rounded-xs border shrink-0" style="color:${escapeHtml(theme.badgeColor)};border-color:${escapeHtml(theme.badgeColor)}">${escapeHtml(groupName)}</span>
+          <span class="truncate text-slate-100">${escapeHtml(entry.label)}</span>
         </div>
         <div class="text-[9px] text-slate-400 truncate">
           Span ${formatEng(refDur, 's', 2)} · dt ${formatEng(refDt, 's', 1)} · t0=${formatEng(entry.channel.t[0] || 0, 's', 1)}
@@ -2812,8 +3056,10 @@ function recomputeComparePanel(tab: TabState) {
         </select>
       </td>
       <td class="p-1.5">
-        <div class="flex items-center gap-1.5">
-          <span class="text-slate-300 tabular-nums min-w-[64px]">${formatEng(entry.timeShiftSec || 0, 's', 2)}</span>
+        <div class="flex items-center gap-1">
+          <button type="button" class="cmp-row-dt-dec px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-bold rounded-xs cursor-pointer select-none" title="Shift Δt −0.1% span (Shift+Click: −1%)">−</button>
+          <span class="text-slate-300 tabular-nums min-w-[58px] text-center">${formatEng(entry.timeShiftSec || 0, 's', 2)}</span>
+          <button type="button" class="cmp-row-dt-inc px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-bold rounded-xs cursor-pointer select-none" title="Shift Δt +0.1% span (Shift+Click: +1%)">+</button>
           <button type="button" class="cmp-row-xcorr px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-amber-300 rounded-xs cursor-pointer" title="Auto XCorr align this trace">Auto</button>
         </div>
       </td>
@@ -2851,6 +3097,18 @@ function recomputeComparePanel(tab: TabState) {
         const parsedScale = parseFloat(val);
         entry.timeScale = isFinite(parsedScale) && parsedScale > 0 ? parsedScale : 1;
       }
+      recomputeComparePanel(tab);
+    });
+    tr.querySelector('.cmp-row-dt-dec')?.addEventListener('click', (ev) => {
+      const stepSpan = tgtDur > 1e-18 ? tgtDur : refDur;
+      const frac = (ev as MouseEvent).shiftKey ? 0.01 : 0.001;
+      entry.timeShiftSec = (entry.timeShiftSec || 0) - stepSpan * frac;
+      recomputeComparePanel(tab);
+    });
+    tr.querySelector('.cmp-row-dt-inc')?.addEventListener('click', (ev) => {
+      const stepSpan = tgtDur > 1e-18 ? tgtDur : refDur;
+      const frac = (ev as MouseEvent).shiftKey ? 0.01 : 0.001;
+      entry.timeShiftSec = (entry.timeShiftSec || 0) + stepSpan * frac;
       recomputeComparePanel(tab);
     });
     tr.querySelector('.cmp-row-xcorr')?.addEventListener('click', () => {
@@ -3095,7 +3353,7 @@ function renderBldcBalance(tab: TabState) {
         .map(
           (p) => `
         <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
-          <div class="text-slate-200 font-semibold truncate">${p.name}</div>
+          <div class="text-slate-200 font-semibold truncate">${escapeHtml(p.name)}</div>
           <div class="text-slate-400">RMS: <span class="text-slate-100">${formatEng(p.rms, unit, 2)}</span></div>
           <div class="text-slate-400">Vpp: <span class="text-slate-100">${formatEng(p.vpp, unit, 2)}</span></div>
           <div class="text-slate-400">DC: <span class="text-slate-100">${formatEng(p.mean, unit, 2)}</span></div>
@@ -3181,7 +3439,7 @@ function renderBldcHall(tab: TabState) {
               .map(
                 (ev) => `
               <button type="button" class="bldc-hall-jump w-full text-left px-2 py-1 bg-[#161b22] hover:bg-amber-950/40 border border-[#222933] rounded-xs text-[10px] flex justify-between cursor-pointer" data-idx="${ev.index}">
-                <span class="text-amber-300">${ev.detail}</span>
+                <span class="text-amber-300">${escapeHtml(ev.detail)}</span>
                 <span class="text-cyan-300">@ ${formatEng(ev.time, 's', 4)}</span>
               </button>`
               )

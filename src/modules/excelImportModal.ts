@@ -17,6 +17,7 @@ import {
 } from '../parsers/excelParser';
 import { WaveformChannel, SamplingMetadata } from '../types/models';
 import { formatEng } from '../engine/canvasRenderer';
+import { escapeHtml } from '../utils/html';
 
 export type ExcelImportMode = 'main' | 'compare' | 'batch';
 
@@ -453,11 +454,11 @@ class ExcelImportModalController {
           <div class="flex items-center justify-between gap-1.5">
             <label class="flex items-center gap-2 min-w-0 flex-1 cursor-pointer">
               <input type="checkbox" class="xls-sheet-chk accent-cyan-400 cursor-pointer shrink-0" ${sh.selected ? 'checked' : ''} />
-              <span class="font-mono font-semibold truncate ${sh.hasNumericData ? 'text-slate-100' : 'text-slate-500'}" title="${sh.sheetName}">${sh.sheetName}</span>
+              <span class="font-mono font-semibold truncate ${sh.hasNumericData ? 'text-slate-100' : 'text-slate-500'}" title="${escapeHtml(sh.sheetName)}">${escapeHtml(sh.sheetName)}</span>
             </label>
             ${sh.timeSourceKind === 'excel-date' ? '<span class="px-1 py-0.2 bg-amber-950/60 border border-amber-500/40 text-amber-300 font-mono text-[9px] rounded-xs shrink-0">DATE</span>' : ''}
           </div>
-          <div class="text-[10px] font-mono mt-1 pl-5 truncate ${sh.hasNumericData ? 'text-slate-400' : 'text-slate-600'}">${statusMeta}</div>
+          <div class="text-[10px] font-mono mt-1 pl-5 truncate ${sh.hasNumericData ? 'text-slate-400' : 'text-slate-600'}">${escapeHtml(statusMeta)}</div>
         `;
 
         const chk = item.querySelector('.xls-sheet-chk') as HTMLInputElement;
@@ -581,7 +582,7 @@ class ExcelImportModalController {
         : '';
       html += `<th class="p-1.5 border border-[#222933] text-left align-top min-w-[132px] ${thCls}">
         <div class="flex items-center justify-between gap-1 mb-1">
-          <span class="truncate max-w-[110px]" title="${col.header}">${col.colLetter}: ${col.header}</span>${textBadge}
+          <span class="truncate max-w-[110px]" title="${escapeHtml(col.header)}">${escapeHtml(col.colLetter)}: ${escapeHtml(col.header)}</span>${textBadge}
         </div>
         <div class="flex items-center gap-1">
           <select class="xls-col-role-sel flex-1 min-w-0 text-[10px] bg-[#0c0f13] border border-[#2c3543] rounded-xs px-1 py-0.5 text-slate-100 cursor-pointer" data-col="${cIdx}">
@@ -617,9 +618,9 @@ class ExcelImportModalController {
       html += `<tr class="${rowCls}">`;
       html += `<td class="px-2 py-1 border-r border-[#222933] text-center text-[10px] text-slate-400 select-none whitespace-nowrap">${rowTag}</td>`;
       for (let c = 0; c < sh.totalCols; c++) {
-        const val = rowCells[c] ?? '';
+        const val = escapeHtml(rowCells[c] ?? '');
         const isIgnoredCol = sh.columnMappings[c]?.role === 'ignore';
-        html += `<td class="px-2 py-1 border-r border-[#1f2631] whitespace-nowrap max-w-[200px] truncate ${isIgnoredCol && !isHeader ? 'text-slate-500' : ''}" title="${val.replace(/"/g, '&quot;')}">${val}</td>`;
+        html += `<td class="px-2 py-1 border-r border-[#1f2631] whitespace-nowrap max-w-[200px] truncate ${isIgnoredCol && !isHeader ? 'text-slate-500' : ''}" title="${val}">${val}</td>`;
       }
       html += '</tr>';
     }
