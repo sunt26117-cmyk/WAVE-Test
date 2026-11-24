@@ -77,7 +77,11 @@ export interface EfficiencyGrid2D {
   maxEta: number;
 }
 
+export type CalibrationStatus = 'ok' | 'warn' | 'failed';
+
 export interface CalibrationReport {
+  status: CalibrationStatus;
+  warnings: string[];
   kePrime: number;
   n0Rpm: number;
   p0A: number;
@@ -119,6 +123,53 @@ export function detectHeaderEtaFormat(etaColName: string, rows: Array<Record<str
   }
   if (vals.length > 0 && Math.max(...vals) > 1.05) return 'percent';
   return null;
+}
+
+export function detectHeaderPowerScaleW(colName: string): { scaleW: number; invalidToken: string | null } {
+  const raw = (colName || '').trim();
+  if (!raw) return { scaleW: 1, invalidToken: null };
+  const br = raw.match(/[\(\[\{（]\s*([^\)\]\}）]+?)\s*[\)\]\}）]/);
+  const tok = br ? br[1].trim() : '';
+  const parsePow = (t: string): number | null => {
+    if (!t) return null;
+    if (/^(?:W|watt|watts)$/i.test(t)) return 1;
+    if (/^(?:kW|kilowatt|kilowatts)$/i.test(t)) return 1e3;
+    if (/^(?:MW|megawatt|megawatts)$/.test(t) || /^(?:megawatt|megawatts)$/i.test(t)) return 1e6;
+    if (/^(?:mW|mw|milliwatt|milliwatts)$/.test(t)) return 1e-3;
+    if (/^(?:uW|µW|μW|uw|µw|μw|microwatt|microwatts)$/i.test(t)) return 1e-6;
+    return null;
+  };
+  if (tok) {
+    const sc = parsePow(tok);
+    return sc !== null ? { scaleW: sc, invalidToken: null } : { scaleW: 1, invalidToken: tok };
+  }
+  const sfx = raw.match(/(?:^|[_\s])(kW|MW|mW|uW|µW|μW|W)$/);
+  if (sfx) {
+    const sc = parsePow(sfx[1]);
+    if (sc !== null) return { scaleW: sc, invalidToken: null };
+  }
+  return { scaleW: 1, invalidToken: null };
+}
+
+function parsePowerCellW(raw: unknown, defaultScaleW: number): number {
+  if (raw === null || raw === undefined || typeof raw === 'boolean') return Number.NaN;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw * defaultScaleW : Number.NaN;
+  const s = String(raw).trim();
+  if (!s) return Number.NaN;
+  const num = Number(s);
+  if (Number.isFinite(num)) return num * defaultScaleW;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(kW|MW|mW|uW|µW|μW|W)$/i.exec(s);
+  if (m) {
+    const v = Number(m[1]);
+    if (!Number.isFinite(v)) return Number.NaN;
+    const u = m[2];
+    if (/^kw$/i.test(u)) return v * 1e3;
+    if (u === 'MW') return v * 1e6;
+    if (/^mw$/i.test(u)) return v * 1e-3;
+    if (/^[uµμ]w$/i.test(u)) return v * 1e-6;
+    return v;
+  }
+  return Number.NaN;
 }
 
 export function parseCsvText(csvText: string, fileName = 'data.csv'): TabularDataset {
@@ -194,7 +245,7 @@ export function autoMapColumns(headers: string[]): DynoColumnMapping {
 
   return {
     n_rpm: findCol([/^n_?rpm$/, /rpm/, /speed/, /转速/]),
-    T_Nm: findCol([/^t_?nm$/, /^t_?mnm$/, /torque/, /^t_/, /扭矩/, /转矩/]),
+    T_Nm: findCol([/^t_?nm$/, /^t_?mnm$/, /torque/, /^t_load$/, /^trq$/, /扭矩/, /转矩/]),
     V_bus: findCol([/^v_?bus$/, /v_?meas/, /vbus/, /voltage/, /电压/]),
     I_bus: findCol([/^i_?bus$/, /ibus/, /current/, /电流/]),
     P_in: findCol([/^p_?in/, /pin/, /input.?power/, /输入功率/]),
@@ -221,6 +272,15 @@ export function normalizeDynoDataset(
   const rawEtas: number[] = [];
   const poutDiscrepancies: number[] = [];
 
+  const pInUnitInfo = mapping.P_in ? detectHeaderPowerScaleW(mapping.P_in) : { scaleW: 1, invalidToken: null };
+  const pOutUnitInfo = mapping.P_out ? detectHeaderPowerScaleW(mapping.P_out) : { scaleW: 1, invalidToken: null };
+  if (pInUnitInfo.invalidToken) {
+    warnings.push(`P_in 列 "${mapping.P_in}" 括号单位 "${pInUnitInfo.invalidToken}" 非标准功率单位 (W/kW/mW/MW)，已按 W 处理。`);
+  }
+  if (pOutUnitInfo.invalidToken) {
+    warnings.push(`P_out 列 "${mapping.P_out}" 括号单位 "${pOutUnitInfo.invalidToken}" 非标准功率单位 (W/kW/mW/MW)，已按 W 处理。`);
+  }
+
   for (const row of dataset.rows) {
     const num = (col: string): number => {
       if (!col) return Number.NaN;
@@ -241,18 +301,18 @@ export function normalizeDynoDataset(
       continue;
     }
 
-    let pInW = num(mapping.P_in);
+    let pInW = mapping.P_in ? parsePowerCellW(row[mapping.P_in], pInUnitInfo.scaleW) : Number.NaN;
     if (!Number.isFinite(pInW)) {
       pInW = vBusV * iBusA;
     }
 
-    let pOutW = num(mapping.P_out);
+    let pOutW = mapping.P_out ? parsePowerCellW(row[mapping.P_out], pOutUnitInfo.scaleW) : Number.NaN;
     if (!Number.isFinite(tNm) && Number.isFinite(pOutW) && Math.abs(nRpm) > 1e-6) {
       tNm = pOutW / calcOmegaM(nRpm);
     }
 
     if (!Number.isFinite(tNm)) {
-      if (options.requireTorque && mapping.T_Nm) {
+      if (options.requireTorque) {
         droppedTorqueCount++;
         continue;
       }
@@ -277,8 +337,12 @@ export function normalizeDynoDataset(
       if (etaFormat === 'percent') {
         etaMeas = etaMeas / 100;
       }
+    } else if (pInW > 1e-6 && pOutW >= 0) {
+      etaMeas = pOutW / pInW;
+    } else if (pInW < -1e-6 && pOutW < -1e-6) {
+      etaMeas = Math.abs(pInW / pOutW);
     } else {
-      etaMeas = pInW > 1e-6 && pOutW >= 0 ? pOutW / pInW : 0;
+      etaMeas = 0;
     }
 
     out.push({
@@ -293,7 +357,11 @@ export function normalizeDynoDataset(
   }
 
   if (droppedTorqueCount > 0) {
-    warnings.push(`已剔除 ${droppedTorqueCount} 条缺失扭矩的无效行（避免被当成 0 N·m 污染标定与 MAE）`);
+    if (!mapping.T_Nm && !mapping.P_out) {
+      warnings.push(`闭环数据未映射扭矩列 (T_Nm) 且无 P_out 可反算，已拦截 ${droppedTorqueCount} 条无效行（请先映射扭矩列）。`);
+    } else {
+      warnings.push(`已剔除 ${droppedTorqueCount} 条缺失扭矩的无效行（避免被当成 0 N·m 污染标定与 MAE）`);
+    }
   }
   if (rawEtas.length > 0) {
     const maxRaw = Math.max(...rawEtas);
@@ -385,6 +453,11 @@ export function runStepwiseCalibration(
   }
 ): CalibrationReport {
   const fitNotes: string[] = [];
+  const warnings: string[] = [];
+  let status: CalibrationStatus = 'ok';
+  const elevateStatus = (next: CalibrationStatus) => {
+    if (next === 'failed' || (next === 'warn' && status === 'ok')) status = next;
+  };
 
   // Step 1: Determine Ke' and n0Rpm
   let kePrime = baseParams.kePrime;
@@ -404,10 +477,22 @@ export function runStepwiseCalibration(
       const top = sortedBySpeed[0];
       kePrime = calcKeFromNoLoad(top.vBusV, top.nRpm);
       calibratedN0Rpm = top.nRpm;
-      fitNotes.push(`Step 1: 由开环最高空载点 (${top.nRpm.toFixed(0)} RPM @ ${top.vBusV.toFixed(2)} V) 提取 Ke' = ${kePrime.toFixed(5)} Vpeak/(rad/s)`);
+      fitNotes.push(
+        `Step 1: 由开环最高空载点 (${top.nRpm.toFixed(0)} RPM @ ${top.vBusV.toFixed(2)} V) 提取 Ke' = ${kePrime.toFixed(5)} Vpeak/(rad/s)（假设该点处于满调制 m_norm≈1；若受占空比限幅请手动指定 n0/V_test 或 KV）`
+      );
+    } else {
+      elevateStatus('warn');
+      warnings.push(`开环数据缺少 n > 50 RPM 且 V_bus > 0.5V 的有效空载点，无法自动提取 Ke'，已沿用设定值 Ke' = ${kePrime.toFixed(5)}。`);
+      fitNotes.push(`Step 1: 开环有效空载点不足，沿用设定 Ke' = ${kePrime.toFixed(5)} Vpeak/(rad/s)`);
     }
   } else {
     fitNotes.push(`Step 1: 沿用当前设定 Ke' = ${kePrime.toFixed(5)} Vpeak/(rad/s)`);
+  }
+
+  if (!Number.isFinite(kePrime) || kePrime <= 0) {
+    elevateStatus('failed');
+    warnings.push(`Ke' 物理参数无效 (${kePrime})，请检查空载转速/电压或手动 KV 输入。`);
+    kePrime = Math.max(1e-5, baseParams.kePrime || 0.05);
   }
 
   const rsAnchorOhm = calcRsAnchorOhm(baseParams.rLL25Ohm, baseParams.tCoilC);
@@ -454,8 +539,15 @@ export function runStepwiseCalibration(
     fitNotes.push(`Step 2: 结合轻载测功点 (共 ${p0Samples.length} 点) 拟合非负 P0(n)`);
   }
 
-  const { a: p0A, b: p0B } = fitNonNegLinearP0(p0Samples);
-  fitNotes.push(`Step 2 结果: a = ${p0A.toExponential(3)} W/RPM, b = ${p0B.toExponential(3)} W/RPM²`);
+  const { a: p0A, b: p0B } =
+    p0Samples.length >= 2
+      ? fitNonNegLinearP0(p0Samples)
+      : { a: Math.max(0, baseParams.p0A), b: Math.max(0, baseParams.p0B) };
+  fitNotes.push(
+    p0Samples.length >= 2
+      ? `Step 2 结果: a = ${p0A.toExponential(3)} W/RPM, b = ${p0B.toExponential(3)} W/RPM²`
+      : `Step 2 有效拟合点不足 2 个，沿用基准 P0 参数: a = ${p0A.toExponential(3)}, b = ${p0B.toExponential(3)}`
+  );
 
   // Step 3: Anti-overfitting fitting of beta (>=0) and locked or +/-15% bounded Rs_eff
   const step3ParamsBase: MotorParams = {
@@ -554,8 +646,12 @@ export function runStepwiseCalibration(
     rsEffOverrideOhm: bestRs,
   };
 
+  let unsolvedCount = 0;
   const evaluatedPoints: EvaluatedDynoPoint[] = closedLoopPoints.map((pt) => {
     const res = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, finalParams);
+    if (!Number.isFinite(res.tEstNm)) {
+      unsolvedCount++;
+    }
     const pInvLossW = Math.max(0, pt.pInW - res.pElecW);
     const pCuLossW = Number.isFinite(res.pCuW) ? res.pCuW : 0;
     const pIronWindLossW = res.p0W;
@@ -612,9 +708,44 @@ export function runStepwiseCalibration(
     mapeEtaPct: countPctEta > 0 ? sumPctEta / countPctEta : 0,
   };
 
+  if (closedLoopPoints.length === 0) {
+    elevateStatus('failed');
+    warnings.push('闭环测功有效测点为空，无法完成 Step 3 磁饱和与效率 Map 标定（请核对闭环数据及扭矩列映射）。');
+  } else {
+    if (!Number.isFinite(rsAnchorOhm) || rsAnchorOhm <= 0 || !Number.isFinite(bestRs) || bestRs <= 0 || !Number.isFinite(bestBeta) || bestBeta < 0) {
+      elevateStatus('failed');
+      warnings.push(`标定电阻/饱和系数越界 (Rs_eff=${bestRs}, β=${bestBeta})，请检查 R_LL@25°C 与 T_coil 参数。`);
+    }
+    if (unsolvedCount === closedLoopPoints.length) {
+      elevateStatus('failed');
+      warnings.push(`全部 ${unsolvedCount} 个闭环测功点求解失败（母线塌陷或超发电极限），标定不可信。`);
+    } else if (unsolvedCount > 0) {
+      elevateStatus('warn');
+      warnings.push(`有 ${unsolvedCount}/${closedLoopPoints.length} 个闭环测点物理求解失败 (NaN)，已按惩罚项跳过拟合。`);
+    }
+    const maxAbsT = Math.max(...closedLoopPoints.map((p) => Math.abs(p.tNm)), 0.05);
+    if (metrics.maeTorqueNm > Math.max(0.25, 0.8 * maxAbsT)) {
+      elevateStatus('failed');
+      warnings.push(
+        `扭矩回代误差过大 (MAE=${metrics.maeTorqueNm.toFixed(4)} N·m, MAPE=${metrics.mapeTorquePct.toFixed(1)}%)，模型未能收敛到有效物理匹配；请核对扭矩单位、极对数或改用手动 KV/n0。`
+      );
+    } else if (metrics.maeTorqueNm > Math.max(0.05, 0.25 * maxAbsT) || metrics.mapeTorquePct > 25) {
+      elevateStatus('warn');
+      warnings.push(
+        `扭矩回代偏差较高 (MAE=${metrics.maeTorqueNm.toFixed(4)} N·m, MAPE=${metrics.mapeTorquePct.toFixed(1)}%)${
+          options.keSource === 'open_loop_auto'
+            ? '；若开环最高空载点受调制比/限幅约束未达 m_norm≈1，提取的 Ke\' 会偏高，建议切换手动 KV 或 (n0, V_test)。'
+            : '，请核对扭矩/功率单位及电机基础参数。'
+        }`
+      );
+    }
+  }
+
   const grid2D = buildEfficiencyGrid2D(evaluatedPoints, finalParams);
 
   return {
+    status,
+    warnings,
     kePrime,
     n0Rpm: calibratedN0Rpm,
     p0A,
@@ -708,11 +839,11 @@ export function buildEfficiencyGrid2D(
     nx: (p.nRpm - minN) / spanN,
     ny: (p.tNm - minT) / spanT,
     etaM: p.etaMeas * 100,
-    etaP: p.etaEst * 100,
+    vBus: p.vBusV,
   }));
   const hull = convexHull(normPts.map((p) => [p.nx, p.ny]));
 
-  const interpAt = (nx: number, ny: number, field: 'etaM' | 'etaP'): number => {
+  const interpAt = (nx: number, ny: number, field: 'etaM' | 'vBus'): number => {
     let wSum = 0;
     let vSum = 0;
     for (const p of normPts) {
@@ -729,7 +860,6 @@ export function buildEfficiencyGrid2D(
   const zPredicted: Array<Array<number | null>> = [];
   let minEta = Infinity;
   let maxEta = -Infinity;
-  const avgVbus = points.reduce((acc, p) => acc + p.vBusV, 0) / points.length;
 
   for (let j = 0; j < tGrid; j++) {
     const rowM: Array<number | null> = [];
@@ -746,34 +876,39 @@ export function buildEfficiencyGrid2D(
       }
 
       const valM = Math.max(0, Math.min(99.5, interpAt(nx, ny, 'etaM')));
+      const localVbus = interpAt(nx, ny, 'vBus');
       const omegaM = calcOmegaM(speeds[i]);
       const p0 = calcP0LossW(speeds[i], params.p0A, params.p0B);
       const tEm = torques[j] + (Math.abs(omegaM) > 1e-6 ? p0 / omegaM : 0);
       const kt0 = Math.max(1e-6, 1.5 * params.kePrime);
       const beta = Math.max(0, params.betaSat);
 
-      let iq: number;
+      let iq: number | null = null;
       if (beta * Math.abs(tEm) < 1e-9) {
         iq = tEm / kt0;
       } else {
         const discSat = kt0 * kt0 - 4 * beta * tEm * tEm;
         if (discSat >= 0) {
           iq = (kt0 - Math.sqrt(discSat)) / (2 * beta * tEm);
-        } else {
-          iq = (tEm >= 0 ? 1 : -1) / Math.sqrt(beta);
         }
       }
 
-      const fwd = forwardVerifyPoint(iq, speeds[i], avgVbus, params);
-      const valP =
-        !fwd.alerts.invalidBus && Number.isFinite(fwd.etaEst)
-          ? Math.max(0, Math.min(99.5, fwd.etaEst * 100))
-          : 0;
+      let valP: number | null = null;
+      if (iq !== null && Number.isFinite(iq)) {
+        const fwd = forwardVerifyPoint(iq, speeds[i], localVbus, params);
+        if (!fwd.alerts.invalidBus && !fwd.alerts.cmdSat && Number.isFinite(fwd.etaEst)) {
+          valP = Math.max(0, Math.min(99.5, fwd.etaEst * 100));
+        }
+      }
 
       rowM.push(valM);
       rowP.push(valP);
-      minEta = Math.min(minEta, valM, valP);
-      maxEta = Math.max(maxEta, valM, valP);
+      minEta = Math.min(minEta, valM);
+      maxEta = Math.max(maxEta, valM);
+      if (valP !== null) {
+        minEta = Math.min(minEta, valP);
+        maxEta = Math.max(maxEta, valP);
+      }
     }
     zMeasured.push(rowM);
     zPredicted.push(rowP);

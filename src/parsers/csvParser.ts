@@ -26,6 +26,9 @@ function parseUnitToken(unitStr?: string): { family: string; scale: number } | n
   if (!unitStr) return null;
   const clean = unitStr.trim().replace(/^[\[\(]|[\]\)]$/g, '').trim();
   if (!clean) return null;
+  if (clean === '%' || /^(pct|percent)$/i.test(clean)) {
+    return { family: 'ratio', scale: 0.01 };
+  }
   const m = /^(p|n|u|µ|μ|m|k|K|M|meg|G)?(V|A|W|Hz|Ω|ohm|s)$/i.exec(clean);
   if (!m) return null;
   const prefix = m[1] || '';
@@ -94,6 +97,36 @@ export function parseNumericCell(raw: string, targetUnit?: string): number {
   }
 
   return NaN;
+}
+
+export function inferCsvChannelUnit(header: string): string {
+  const h = (header || '').trim();
+  if (!h) return 'V';
+  const bracketMatch = h.match(/[\(\[\{]\s*([µμunmk]?[VAW]|°C|degC|C|K|Hz|kHz|MHz|Ω|Ohm|rpm|%|pct|percent)\s*[\)\]\}]/i);
+  if (bracketMatch) {
+    const u = bracketMatch[1];
+    if (/^(%|pct|percent)$/i.test(u)) return '%';
+    if (/^(degc|°c|c)$/i.test(u)) return '°C';
+    if (/^k$/i.test(u)) return 'K';
+    if (/^mv$/i.test(u)) return 'mV';
+    if (/^[µμu]v$/i.test(u)) return 'µV';
+    if (/^kv$/i.test(u)) return 'kV';
+    if (/^v$/i.test(u)) return 'V';
+    if (/^ma$/i.test(u)) return 'mA';
+    if (/^[µμu]a$/i.test(u)) return 'µA';
+    if (/^ka$/i.test(u)) return 'kA';
+    if (/^a$/i.test(u)) return 'A';
+    if (/^mw$/i.test(u)) return 'mW';
+    if (/^[µμu]w$/i.test(u)) return 'µW';
+    if (/^kw$/i.test(u)) return 'kW';
+    if (/^w$/i.test(u)) return 'W';
+    return u;
+  }
+  if (/duty|pwm_?(?:[abcuvw123]|d)|^d_?[abcuvw]$/i.test(h)) return /%|pct|percent/i.test(h) ? '%' : '';
+  if (/^(t_?pcb|t_?pad|t_?j|temp|ntc|t_?case)/i.test(h) || /temp|°c|degc/i.test(h)) return '°C';
+  if (/^(i_?[a-z0-9]*|ids|i_ds|curr)/i.test(h)) return 'A';
+  if (/^(p_?[a-z0-9]*|pwr|power)/i.test(h)) return 'W';
+  return 'V';
 }
 
 /**
@@ -401,34 +434,6 @@ export function previewCsv(text: string): CsvPreviewInfo {
       }
     }
   }
-
-  const inferCsvChannelUnit = (header: string): string => {
-    const h = (header || '').trim();
-    if (!h) return 'V';
-    const bracketMatch = h.match(/[\(\[\{]\s*([µμunmk]?[VAW]|°C|degC|C|K|Hz|kHz|MHz|Ω|Ohm|rpm)\s*[\)\]\}]/i);
-    if (bracketMatch) {
-      const u = bracketMatch[1];
-      if (/^(degc|°c|c)$/i.test(u)) return '°C';
-      if (/^k$/i.test(u)) return 'K';
-      if (/^mv$/i.test(u)) return 'mV';
-      if (/^[µμu]v$/i.test(u)) return 'µV';
-      if (/^kv$/i.test(u)) return 'kV';
-      if (/^v$/i.test(u)) return 'V';
-      if (/^ma$/i.test(u)) return 'mA';
-      if (/^[µμu]a$/i.test(u)) return 'µA';
-      if (/^ka$/i.test(u)) return 'kA';
-      if (/^a$/i.test(u)) return 'A';
-      if (/^mw$/i.test(u)) return 'mW';
-      if (/^[µμu]w$/i.test(u)) return 'µW';
-      if (/^kw$/i.test(u)) return 'kW';
-      if (/^w$/i.test(u)) return 'W';
-      return u;
-    }
-    if (/^(t_?pcb|t_?pad|t_?j|temp|ntc|t_?case)/i.test(h) || /temp|°c|degc/i.test(h)) return '°C';
-    if (/^(i_?[a-z0-9]*|ids|i_ds|curr)/i.test(h)) return 'A';
-    if (/^(p_?[a-z0-9]*|pwr|power)/i.test(h)) return 'W';
-    return 'V';
-  };
 
   const columnMappings: CsvColumnMapping[] = headers.map((header, idx) => {
     if (idx === timeColIndex) {

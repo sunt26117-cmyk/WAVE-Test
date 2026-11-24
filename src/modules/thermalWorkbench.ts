@@ -167,8 +167,10 @@ export class ThermalWorkbenchController {
   // Phase 2: BLDC FOC 6-MOS State
   private focCanvasMode: FocCanvasMode = 'tj';
   private lastFocSim: FocSimulationResult | null = null;
+  private lastFocSimFingerprint: string | null = null;
   private lastFocStall: FocStallSweepResult | null = null;
   private lastFocSweep: FocControlSweepResult | null = null;
+  private activeFocHandoffNote: string | null = null;
 
   constructor(app: OscilloscopeApp) {
     this.app = app;
@@ -183,12 +185,17 @@ export class ThermalWorkbenchController {
     const modal = document.getElementById('thermalModal');
     if (!modal) return;
     const activeTab = this.app.getActiveTab();
-    if (activeTab && activeTab.id !== this.lastActiveTabId) {
+    const tabChanged = Boolean(activeTab && activeTab.id !== this.lastActiveTabId);
+    if (tabChanged && activeTab) {
       this.lastActiveTabId = activeTab.id;
       this.userSetPathMode = false;
       this.userSetPowerMode = false;
+      this.invalidateFocCaches(true);
     }
     this.populateChannelSelectors();
+    if (this.lastFocSim && this.lastFocSimFingerprint !== this.computeFocInputFingerprint()) {
+      this.invalidateFocCaches(true);
+    }
     modal.style.display = 'flex';
     this.switchTab(this.activeTab);
     requestAnimationFrame(() => {
@@ -251,6 +258,9 @@ export class ThermalWorkbenchController {
       'focIbSelect',
       'focIcSelect',
       'focVbusSelect',
+      'focDaSelect',
+      'focDbSelect',
+      'focDcSelect',
     ];
     if (!tab) {
       selIds.forEach((id) => {
@@ -319,8 +329,22 @@ export class ThermalWorkbenchController {
     fill('thermSoaVdsSelect', isVoltCh, 0);
     fill('thermSoaIdsSelect', isCurrCh, 1);
 
-    fill('focIaSelect', (c) => /\bia\b|i_a|phase.?a.*a/i.test(`${c.name} ${c.unit}`) || /^ia$/i.test(c.name), 0);
-    fill('focIbSelect', (c) => /\bib\b|i_b|phase.?b.*a/i.test(`${c.name} ${c.unit}`) || /^ib$/i.test(c.name), 1);
+    fill(
+      'focIaSelect',
+      (c) => !isTempCh(c) && (/\bia\b|i_a|phase.?a/i.test(`${c.name} ${c.unit}`) || /^ia$/i.test(c.name)),
+      -1,
+      { value: '', label: '-- 请选择相电流 Ia (A/mA) --' }
+    );
+    const selectedIaId = (document.getElementById('focIaSelect') as HTMLSelectElement | null)?.value || '';
+    fill(
+      'focIbSelect',
+      (c) =>
+        c.id !== selectedIaId &&
+        !isTempCh(c) &&
+        (/\bib\b|i_b|phase.?b/i.test(`${c.name} ${c.unit}`) || /^ib$/i.test(c.name)),
+      -1,
+      { value: '', label: '-- 请选择相电流 Ib (A/mA) --' }
+    );
     fill(
       'focIcSelect',
       (c) => /\bic\b|i_c|phase.?c.*a/i.test(`${c.name} ${c.unit}`) || /^ic$/i.test(c.name),
@@ -332,6 +356,24 @@ export class ThermalWorkbenchController {
       (c) => /vbus|v_bus|vdc|v_dc|dc.?link/i.test(`${c.name} ${c.unit}`),
       3,
       { value: '__const__', label: 'Use Vbus Const (V)' }
+    );
+    fill(
+      'focDaSelect',
+      (c) => /(?:duty|pwm)[\s_-]*(?:a|u)(?:$|[\s_(\[])|^d_?(?:a|u)(?:$|[\s_(\[])/i.test(c.name.trim()),
+      -1,
+      { value: '__auto__', label: 'Auto: 无传感器重构' }
+    );
+    fill(
+      'focDbSelect',
+      (c) => /(?:duty|pwm)[\s_-]*(?:b|v)(?:$|[\s_(\[])|^d_?(?:b|v)(?:$|[\s_(\[])/i.test(c.name.trim()),
+      -1,
+      { value: '__auto__', label: 'Auto: 无传感器重构' }
+    );
+    fill(
+      'focDcSelect',
+      (c) => /(?:duty|pwm)[\s_-]*(?:c|w)(?:$|[\s_(\[])|^d_?(?:c|w)(?:$|[\s_(\[])/i.test(c.name.trim()),
+      -1,
+      { value: '__auto__', label: 'Auto: 无传感器重构' }
     );
 
     // Smart auto-detection of Thermal Path (PCB/Pad vs Junction) & Power Source (Auto V*I vs Power Ch)
@@ -788,6 +830,7 @@ export class ThermalWorkbenchController {
       }
       this.updateCauerSummaryBox();
       this.refreshFocModelAndSpice();
+      this.invalidateFocCaches(true);
       this.switchTab('loss');
       this.app.showToast('Applied Cauer RC ladder to Closed-Loop simulator.', 'info');
     });
@@ -838,7 +881,8 @@ export class ThermalWorkbenchController {
     });
     const nudgeDeskew = (deltaNs: number) => {
       if (!deskewInput) return;
-      const cur = parseFloat(deskewInput.value) || 0;
+      const parsed = parseFloat(deskewInput.value);
+      const cur = Number.isFinite(parsed) ? parsed : 0;
       const next = Math.max(-100, Math.min(100, Math.round((cur + deltaNs) * 10) / 10));
       deskewInput.value = String(next);
       if (deskewSlider) deskewSlider.value = String(next);
@@ -919,6 +963,25 @@ export class ThermalWorkbenchController {
     document.getElementById('focRunStallBtn')?.addEventListener('click', () => this.runFocStallAnalysis());
     document.getElementById('focTauSplitMsInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focTambInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
+
+    const stallOnlyInputIds = new Set([
+      'focStallIpkInput',
+      'focStallLimitInput',
+      'focStallRsInput',
+      'focStallDutyModeSelect',
+    ]);
+    const handleFocPanelMutation = (ev: Event) => {
+      const target = ev.target as HTMLElement | null;
+      if (!target || !target.id) return;
+      if (stallOnlyInputIds.has(target.id)) {
+        this.invalidateFocCaches(false);
+      } else {
+        this.invalidateFocCaches(true);
+      }
+    };
+    const focPanel = document.getElementById('thermalPanelFoc');
+    focPanel?.addEventListener('input', handleFocPanelMutation);
+    focPanel?.addEventListener('change', handleFocPanelMutation);
 
     document.getElementById('focViewTjBtn')?.addEventListener('click', () => {
       this.focCanvasMode = 'tj';
@@ -1064,7 +1127,8 @@ export class ThermalWorkbenchController {
 
     const mode = ((document.getElementById('thermModeSelect') as HTMLSelectElement)?.value || 'heating') as ThermalInputMode;
     const thermalPathMode = ((document.getElementById('thermPathModeSelect') as HTMLSelectElement)?.value || 'junction_ambient') as ThermalPathMode;
-    const padSpreadRthCPerW = Math.max(0, parseFloat((document.getElementById('thermPadSpreadInput') as HTMLInputElement)?.value || '0') || 0);
+    const rawPadSpread = parseFloat((document.getElementById('thermPadSpreadInput') as HTMLInputElement)?.value ?? '0');
+    const padSpreadRthCPerW = Number.isFinite(rawPadSpread) ? Math.max(0, rawPadSpread) : 0;
     const powerW = parseFloat((document.getElementById('thermPowerWInput') as HTMLInputElement)?.value || '');
     const gate = ((document.getElementById('thermGateSelect') as HTMLSelectElement)?.value || 'entire') as 'entire' | 'view' | 'cursors';
     const autoT0 = (document.getElementById('thermAutoT0Chk') as HTMLInputElement)?.checked ?? true;
@@ -2348,6 +2412,87 @@ export class ThermalWorkbenchController {
     return splitCauerToFocModel(this.activeCauerStages, isFinite(tauSplitMs) && tauSplitMs > 0 ? tauSplitMs * 1e-3 : 0.05);
   }
 
+  private computeFocInputFingerprint(): string {
+    const tab = this.app.getActiveTab();
+    const valOf = (id: string) => (document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null)?.value || '';
+    const chSig = (chId: string) => {
+      const ch = tab?.channels[chId];
+      if (!ch) return chId;
+      const n = ch.t.length;
+      const t0 = n > 0 ? ch.t[0] : 0;
+      const t1 = n > 0 ? ch.t[n - 1] : 0;
+      return `${ch.id}:${ch.unit}:${ch.coupling}:${n}:${t0}:${t1}`;
+    };
+    const iaId = valOf('focIaSelect');
+    const ibId = valOf('focIbSelect');
+    const icId = valOf('focIcSelect');
+    const vbusId = valOf('focVbusSelect');
+    const daId = valOf('focDaSelect');
+    const dbId = valOf('focDbSelect');
+    const dcId = valOf('focDcSelect');
+    const gate = valOf('focGateSelect');
+    const gateInit = valOf('focGateInitSelect');
+    const cauerSig = this.activeCauerStages.map((s) => `${s.r.toFixed(6)}:${s.c.toFixed(6)}`).join('|');
+    const paramIds = [
+      'focVbusConstInput',
+      'focTambInput',
+      'focModSelect',
+      'focModDepthInput',
+      'focPfAngleInput',
+      'focFswKhzInput',
+      'focTdeadNsInput',
+      'focRdsInput',
+      'focAlphaInput',
+      'focVsdInput',
+      'focEswInput',
+      'focEossInput',
+      'focQrrInput',
+      'focVrefInput',
+      'focIrefInput',
+      'focTauSplitMsInput',
+    ];
+    return JSON.stringify({
+      tabId: tab?.id || '',
+      view: tab?.view ? `${tab.view.startIndex}:${tab.view.endIndex}` : '',
+      cursors: tab?.cursors ? `${tab.cursors.enabled}:${tab.cursors.x1}:${tab.cursors.x2}` : '',
+      chs: [chSig(iaId), chSig(ibId), chSig(icId), chSig(vbusId), chSig(daId), chSig(dbId), chSig(dcId)],
+      gate,
+      gateInit,
+      focModelSource: this.focModelSource,
+      cauerSig,
+      params: paramIds.map((id) => valOf(id)),
+    });
+  }
+
+  private invalidateFocCaches(clearSim: boolean = true): void {
+    this.lastFocStall = null;
+    const stallAngEl = document.getElementById('focKpiStallAngle');
+    const stallSafeEl = document.getElementById('focKpiStallSafe');
+    if (stallAngEl) stallAngEl.innerText = '--';
+    if (stallSafeEl) {
+      stallSafeEl.innerText = '--';
+      stallSafeEl.className = 'text-emerald-300 font-semibold mt-0.5';
+    }
+    if (clearSim) {
+      this.lastFocSim = null;
+      this.lastFocSimFingerprint = null;
+      this.lastFocSweep = null;
+      const hotEl = document.getElementById('focKpiHottest');
+      const pwrEl = document.getElementById('focKpiPower');
+      if (hotEl) hotEl.innerText = '--';
+      if (pwrEl) pwrEl.innerText = '--';
+      const tbody = document.getElementById('focSwitchTableBody');
+      if (tbody) {
+        tbody.innerHTML =
+          '<tr><td colspan="8" class="px-2 py-3 text-center text-slate-500 font-sans">参数或通道已变更，请重新点击 Run 6-MOS Coupled Tj(t) 刷新结果。</td></tr>';
+      }
+      this.renderFocWarnings();
+    }
+    if (this.activeTab === 'foc') {
+      this.drawFocCanvas();
+    }
+  }
+
   private readFocParams(): { mos: FocMosParams; ctrl: FocControlParams; model: FocThermalModel } {
     const num = (id: string, fallback: number) => {
       const v = parseFloat((document.getElementById(id) as HTMLInputElement)?.value || '');
@@ -2359,6 +2504,7 @@ export class ThermalWorkbenchController {
       tempCoeffAlphaPerC: num('focAlphaInput', 0.45) / 100,
       vsdV: Math.max(0, num('focVsdInput', 0.9)),
       eonPlusEoffUj: Math.max(0, num('focEswInput', 35)),
+      eossUj: Math.max(0, num('focEossInput', 0)),
       qrrNc: Math.max(0, num('focQrrInput', 60)),
       vRefV: Math.max(1, num('focVrefInput', 48)),
       iRefA: Math.max(1, num('focIrefInput', 30)),
@@ -2375,9 +2521,41 @@ export class ThermalWorkbenchController {
     return { mos, ctrl, model: this.getActiveFocModel() };
   }
 
+  private readFiniteInput(id: string, fallback: number): number {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (!el) return fallback;
+    const raw = el.value.trim();
+    if (!raw) return fallback;
+    const parsed = parseFloat(raw);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  private renderFocWarnings(extra: string[] = []): void {
+    const box = document.getElementById('focSimWarningsBox');
+    if (!box) return;
+    const msgs: string[] = [];
+    const model = this.getActiveFocModel();
+    if (model.splitMeta?.warning && !model.isHeuristicSingleStageSplit) {
+      msgs.push(`▲ Cauer 拆分提示: ${model.splitMeta.warning}`);
+    }
+    if (this.activeFocHandoffNote) {
+      msgs.push(`ℹ DynoLab 数据传递边界: ${this.activeFocHandoffNote}`);
+    }
+    for (const m of extra) {
+      msgs.push(`▲ ${m}`);
+    }
+    if (msgs.length === 0) {
+      box.classList.add('hidden');
+      box.innerHTML = '';
+      return;
+    }
+    box.classList.remove('hidden');
+    box.innerHTML = msgs.map((m) => `<div>${m}</div>`).join('');
+  }
+
   private refreshFocModelAndSpice(): void {
     const model = this.getActiveFocModel();
-    const tAmb = parseFloat((document.getElementById('focTambInput') as HTMLInputElement)?.value || '25') || 25;
+    const tAmb = this.readFiniteInput('focTambInput', 25);
     const rJc = model.zthJC.reduce((s, c) => s + c.r, 0);
     const rBrd = model.zthBoard.reduce((s, c) => s + c.r, 0);
 
@@ -2409,13 +2587,20 @@ export class ThermalWorkbenchController {
     }
 
     const netlist = focModelToSpice(model, tAmb, 'INV_6MOS_THERM');
-    const val = validateFocSpiceNetlist(netlist);
+    const val = validateFocSpiceNetlist(netlist, model);
     const box = document.getElementById('focSpiceTextarea') as HTMLTextAreaElement | null;
     if (box) box.value = netlist;
 
     const spBadge = document.getElementById('focSpiceValidBadge');
     if (spBadge) {
-      spBadge.innerText = val.valid ? '7-PORT VALIDATED' : 'NETLIST ERROR';
+      spBadge.innerText = val.valid
+        ? val.nodalMathVerified
+          ? 'NETLIST & NODAL VERIFIED'
+          : 'SYNTAX VALID'
+        : 'NETLIST ERROR';
+      spBadge.title = val.valid
+        ? `Rjc=${val.rJcParsed.toFixed(4)} °C/W, Rbrd=${val.rBrdParsed.toFixed(4)} °C/W, DC nodal err=${val.dcCommonModeError.toExponential(1)}`
+        : val.errors.join('; ');
       spBadge.className = val.valid
         ? 'px-1.5 py-0.5 bg-emerald-950/70 border border-emerald-500/60 text-emerald-300 font-mono text-[10px] rounded-xs'
         : 'px-1.5 py-0.5 bg-red-950/70 border border-red-500/60 text-red-300 font-mono text-[10px] rounded-xs';
@@ -2442,6 +2627,10 @@ export class ThermalWorkbenchController {
     ibCh: WaveformChannel;
     icCh: WaveformChannel | null;
     vbusCh: WaveformChannel | null;
+    daCh: WaveformChannel | null;
+    dbCh: WaveformChannel | null;
+    dcCh: WaveformChannel | null;
+    gateThermalMode: 'preheat' | 'cold';
     rng: { tStart?: number; tEnd?: number };
   } | null {
     const tab = this.app.getActiveTab();
@@ -2449,14 +2638,21 @@ export class ThermalWorkbenchController {
     const ibId = (document.getElementById('focIbSelect') as HTMLSelectElement)?.value;
     const icId = (document.getElementById('focIcSelect') as HTMLSelectElement)?.value;
     const vbusId = (document.getElementById('focVbusSelect') as HTMLSelectElement)?.value;
+    const daId = (document.getElementById('focDaSelect') as HTMLSelectElement)?.value;
+    const dbId = (document.getElementById('focDbSelect') as HTMLSelectElement)?.value;
+    const dcId = (document.getElementById('focDcSelect') as HTMLSelectElement)?.value;
     const gate = ((document.getElementById('focGateSelect') as HTMLSelectElement)?.value || 'entire') as 'entire' | 'view' | 'cursors';
+    const gateThermalMode = ((document.getElementById('focGateInitSelect') as HTMLSelectElement)?.value || 'preheat') as 'preheat' | 'cold';
     const iaCh = tab?.channels[iaId];
     const ibCh = tab?.channels[ibId];
     if (!tab || !iaCh || !ibCh) return null;
     const icCh = icId && icId !== '__auto__' ? tab.channels[icId] || null : null;
     const vbusCh = vbusId && vbusId !== '__const__' ? tab.channels[vbusId] || null : null;
+    const daCh = daId && daId !== '__auto__' ? tab.channels[daId] || null : null;
+    const dbCh = dbId && dbId !== '__auto__' ? tab.channels[dbId] || null : null;
+    const dcCh = dcId && dcId !== '__auto__' ? tab.channels[dcId] || null : null;
     const rng = getChannelGateRange(tab, iaCh, gate);
-    return { tab, iaCh, ibCh, icCh, vbusCh, rng };
+    return { tab, iaCh, ibCh, icCh, vbusCh, daCh, dbCh, dcCh, gateThermalMode, rng };
   }
 
   private runFocSimulation(): void {
@@ -2465,23 +2661,43 @@ export class ThermalWorkbenchController {
       this.app.showToast('Please select Ia & Ib phase current channels (or click Load FOC 3-Ph Demo).', 'warn');
       return;
     }
+    if (sel.iaCh.id === sel.ibCh.id) {
+      this.app.showToast(
+        'Ia 与 Ib 不能选择同一通道：单电阻 (Single-Shunt) 采样系统需先重构三相相电流 Ia/Ib/Ic 后再仿真。',
+        'error'
+      );
+      return;
+    }
     try {
       this.refreshFocModelAndSpice();
       const { mos, ctrl, model } = this.readFocParams();
       const res = simulateFoc6Mos(sel.iaCh, sel.ibCh, model, mos, ctrl, {
         tStart: sel.rng.tStart,
         tEnd: sel.rng.tEnd,
+        gateThermalMode: sel.gateThermalMode,
         icCh: sel.icCh,
         vbusCh: sel.vbusCh,
+        dutyChs: sel.daCh || sel.dbCh || sel.dcCh ? { da: sel.daCh, db: sel.dbCh, dc: sel.dcCh } : undefined,
       });
       this.lastFocSim = res;
+      this.lastFocSimFingerprint = this.computeFocInputFingerprint();
+      this.lastFocStall = null;
       this.focCanvasMode = 'tj';
       this.syncFocViewButtons();
+      this.renderFocWarnings(res.warnings);
 
       const hotEl = document.getElementById('focKpiHottest');
-      if (hotEl) hotEl.innerText = `${res.hottestKey}: ${res.tjMaxGlobalC.toFixed(2)} °C`;
+      if (hotEl) {
+        hotEl.innerText = `${res.hottestKey}: ${res.tjMaxGlobalC.toFixed(2)}°C (${
+          res.steadyThermalRunaway ? '稳态热失控!' : `稳态~${res.tjSteadyMaxEstC.toFixed(1)}°C`
+        })`;
+      }
       const pwrEl = document.getElementById('focKpiPower');
-      if (pwrEl) pwrEl.innerText = `${res.pInvMeanW.toFixed(2)} W / ${res.tBoardFinalC.toFixed(1)} °C`;
+      if (pwrEl) {
+        pwrEl.innerText = `${res.pInvMeanW.toFixed(2)} W / ${res.tBoardFinalC.toFixed(1)}°C (${
+          res.steadyThermalRunaway ? '不收敛' : `稳态~${res.tBoardSteadyEstC.toFixed(1)}°C`
+        }, ${res.thermalConvergencePct.toFixed(0)}%)`;
+      }
 
       const tbody = document.getElementById('focSwitchTableBody');
       if (tbody) {
@@ -2505,9 +2721,11 @@ export class ThermalWorkbenchController {
       }
 
       this.drawFocCanvas();
+      const dutyNote = res.dutySource === 'external' ? '外部 Duty_A/B/C' : ctrl.modulation;
+      const steadyNote = res.steadyThermalRunaway ? '稳态热失控!' : `稳态~${res.tjSteadyMaxEstC.toFixed(1)}°C`;
       this.app.showToast(
-        `6-MOS FOC evaluation done (${ctrl.modulation}): hottest ${res.hottestKey} = ${res.tjMaxGlobalC.toFixed(2)} °C, P_inv = ${res.pInvMeanW.toFixed(2)} W`,
-        'info'
+        `6-MOS FOC (${dutyNote}): ${res.hottestKey} Peak=${res.tjMaxGlobalC.toFixed(2)}°C (${steadyNote}), P_inv=${res.pInvMeanW.toFixed(2)}W`,
+        res.overmodulatedCount > 0 || res.warnings.length > 0 ? 'warn' : 'info'
       );
     } catch (err: any) {
       this.app.showToast(`FOC 6-MOS simulation failed: ${err?.message || err}`, 'error');
@@ -2550,50 +2768,97 @@ export class ThermalWorkbenchController {
     });
     this.app.injectThermalTraces(specs as any, {
       separateView: true,
-      toastMessage: `Injected Tj_AH..Tj_CL & P_inv_total (${sim.hottestKey} Peak=${sim.tjMaxGlobalC.toFixed(2)} °C) to scope.`,
+      toastMessage: `Injected Tj_AH..CL & P_inv_total (${sim.hottestKey} Peak=${sim.tjMaxGlobalC.toFixed(2)} °C) to scope.`,
     });
   }
 
   private runFocStallAnalysis(): void {
-    this.refreshFocModelAndSpice();
-    const { mos, ctrl, model } = this.readFocParams();
-    const iPeakA = Math.max(0.5, parseFloat((document.getElementById('focStallIpkInput') as HTMLInputElement)?.value || '35'));
-    const tjLimitC = Math.max(40, parseFloat((document.getElementById('focStallLimitInput') as HTMLInputElement)?.value || '150'));
+    try {
+      this.refreshFocModelAndSpice();
+      const { mos, ctrl, model } = this.readFocParams();
+      const iPeakA = Math.max(0.5, this.readFiniteInput('focStallIpkInput', 35));
+      const tjLimitC = Math.max(40, this.readFiniteInput('focStallLimitInput', 150));
+      const rPhaseOhm = Math.max(0.001, this.readFiniteInput('focStallRsInput', 0.25));
+      const stallDutyMode = ((document.getElementById('focStallDutyModeSelect') as HTMLSelectElement)?.value || 'resistive') as 'resistive' | 'user_m';
 
-    const res = runFocStallSweep({
-      iPeakA,
-      tjLimitC,
-      tAmbC: ctrl.tAmbC,
-      modulation: ctrl.modulation,
-      modDepthM: ctrl.modDepthM,
-      fswHz: ctrl.fswHz,
-      tDeadNs: ctrl.tDeadNs,
-      mos,
-      model,
-      vBusV: ctrl.vBusConstV,
-      horizonSec: 120,
-    });
-    this.lastFocStall = res;
-    this.focCanvasMode = 'stall';
-    this.syncFocViewButtons();
+      const currentFingerprint = this.computeFocInputFingerprint();
+      const validHotSim =
+        this.lastFocSim && this.lastFocSimFingerprint === currentFingerprint ? this.lastFocSim : null;
+      if (!validHotSim && this.lastFocSim) {
+        this.lastFocSim = null;
+        this.lastFocSimFingerprint = null;
+      }
 
-    const angEl = document.getElementById('focKpiStallAngle');
-    if (angEl) angEl.innerText = `${res.worstAngleDeg}° (${res.worstSwitch}: ${res.worstSteadyTjC.toFixed(1)}°C)`;
-    const safeEl = document.getElementById('focKpiStallSafe');
-    if (safeEl) {
-      safeEl.innerText = res.steadySafe
-        ? `SAFE (Steady ≤ ${tjLimitC}°C)`
-        : res.tSafeSec !== null
-        ? `t_safe=${res.tSafeSec.toFixed(2)}s · I²t=${res.i2tThresholdA2s?.toFixed(0)} A²s`
-        : `EXCEEDS >120s`;
-      safeEl.className = res.steadySafe ? 'text-emerald-300 font-semibold' : 'text-rose-300 font-semibold';
+      const res = runFocStallSweep({
+        iPeakA,
+        tjLimitC,
+        tAmbC: ctrl.tAmbC,
+        tInitialBoardC: validHotSim ? validHotSim.tBoardFinalC : undefined,
+        initialThermalState: validHotSim ? validHotSim.finalThermalState : undefined,
+        modulation: ctrl.modulation,
+        modDepthM: ctrl.modDepthM,
+        pfAngleDeg: ctrl.pfAngleDeg,
+        fswHz: ctrl.fswHz,
+        tDeadNs: ctrl.tDeadNs,
+        mos,
+        model,
+        vBusV: ctrl.vBusConstV,
+        horizonSec: 120,
+        stallDutyMode,
+        rPhaseOhm,
+      });
+      this.lastFocStall = res;
+      this.focCanvasMode = 'stall';
+      this.syncFocViewButtons();
+
+      const stallWarnings: string[] = [
+        `堵转扫描条件: ${res.effectiveStallModulation} (m_eff=${res.effectiveStallModDepthM.toFixed(3)}, PF φ=${res.effectiveStallPfAngleDeg.toFixed(1)}°, R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω), t_safe/I²t 基于宏观 Cauer Tj_limit=${tjLimitC}°C 热稳态/瞬态越限（非数据手册绝热短路 SOA 极限）。`,
+      ];
+      if (res.inheritedHotState) {
+        stallWarnings.push(
+          `热态初温继承: 已加载最近一次 6-MOS 瞬态完整热网络节点状态 (T_board_init=${res.inheritedBoardTempC.toFixed(1)}°C, Tj_max_init=${res.inheritedMaxTjC.toFixed(1)}°C)。`
+        );
+      } else {
+        stallWarnings.push(
+          `冷态初温: 当前无有效 6-MOS 瞬态仿真历史，堵转扫描从环境温度 T_amb=${ctrl.tAmbC.toFixed(1)}°C 冷启动。`
+        );
+      }
+      if (res.stallVoltageLimited) {
+        stallWarnings.push(
+          `▲ 堵转目标电流 I_pk=${iPeakA.toFixed(1)}A 在 R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω 下所需调制比已触及 SVPWM 线性上限 (${res.effectiveStallModDepthM.toFixed(3)})，实际母线可能受限压能力约束。`
+        );
+      }
+      if (res.stallThermalRunaway) {
+        stallWarnings.push(
+          `▲ 最热电角度 (${res.worstAngleDeg}°, ${res.worstSwitch}) 在 Rds(on) 正温度反馈下发生热失控或稳态未收敛。`
+        );
+      }
+      this.renderFocWarnings(stallWarnings);
+
+      const angEl = document.getElementById('focKpiStallAngle');
+      if (angEl) {
+        angEl.innerText = `${res.worstAngleDeg}° (${res.worstSwitch}: ${
+          res.stallThermalRunaway ? '热失控!' : `${res.worstSteadyTjC.toFixed(1)}°C`
+        })`;
+      }
+      const safeEl = document.getElementById('focKpiStallSafe');
+      if (safeEl) {
+        safeEl.innerText = res.steadySafe
+          ? `SAFE (Steady ≤ ${tjLimitC}°C)`
+          : res.tSafeSec !== null
+          ? `t=${res.tSafeSec.toFixed(2)}s · RMS:${res.i2tRmsA2s?.toFixed(0)} / 臂:${res.i2tWorstLegA2s?.toFixed(0)} A²s`
+          : `EXCEEDS >120s`;
+        safeEl.className = res.steadySafe ? 'text-emerald-300 font-semibold' : 'text-rose-300 font-semibold';
+      }
+
+      this.drawFocCanvas();
+      this.app.showToast(
+        `Stall Sweep (${res.effectiveStallModulation}, m=${res.effectiveStallModDepthM.toFixed(3)}, R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω, init=${res.inheritedBoardTempC.toFixed(1)}°C): Worst ${res.worstSwitch} @ θ=${res.worstAngleDeg}° (${res.stallThermalRunaway ? '热失控' : `${res.worstSteadyTjC.toFixed(1)}°C steady`})`,
+        res.steadySafe && !res.stallVoltageLimited ? 'info' : 'warn'
+      );
+    } catch (err: any) {
+      this.app.showToast(`Stall sweep failed: ${err?.message || err}`, 'error');
     }
-
-    this.drawFocCanvas();
-    this.app.showToast(
-      `Stall Sweep: Worst ${res.worstSwitch} @ θ=${res.worstAngleDeg}° (Steady=${res.worstSteadyTjC.toFixed(1)}°C${res.tSafeSec ? `, t_safe=${res.tSafeSec.toFixed(2)}s` : ''})`,
-      res.steadySafe ? 'info' : 'warn'
-    );
   }
 
   private runFocControlSweepAnalysis(): void {
@@ -2602,24 +2867,42 @@ export class ThermalWorkbenchController {
       this.app.showToast('Please select Ia & Ib channels first (or Load FOC 3-Ph Demo).', 'warn');
       return;
     }
-    this.refreshFocModelAndSpice();
-    const { mos, ctrl, model } = this.readFocParams();
-    const res = runFocControlSweep(sel.iaCh, sel.ibCh, model, mos, ctrl, {
-      tStart: sel.rng.tStart,
-      tEnd: sel.rng.tEnd,
-      icCh: sel.icCh,
-      vbusCh: sel.vbusCh,
-    });
-    this.lastFocSweep = res;
-    this.focCanvasMode = 'sweep';
-    this.syncFocViewButtons();
-    this.drawFocCanvas();
+    if (sel.iaCh.id === sel.ibCh.id) {
+      this.app.showToast(
+        'Ia 与 Ib 不能选择同一通道：单电阻 (Single-Shunt) 采样系统需先重构三相相电流 Ia/Ib/Ic 后再扫频。',
+        'error'
+      );
+      return;
+    }
+    try {
+      this.refreshFocModelAndSpice();
+      const { mos, ctrl, model } = this.readFocParams();
+      const res = runFocControlSweep(sel.iaCh, sel.ibCh, model, mos, ctrl, {
+        tStart: sel.rng.tStart,
+        tEnd: sel.rng.tEnd,
+        gateThermalMode: sel.gateThermalMode,
+        icCh: sel.icCh,
+        vbusCh: sel.vbusCh,
+      });
+      this.lastFocSweep = res;
+      this.focCanvasMode = 'sweep';
+      this.syncFocViewButtons();
 
-    const pSave = res.svpwm.pInvMeanW - res.dpwm1.pInvMeanW;
-    this.app.showToast(
-      `SVPWM (${res.svpwm.pInvMeanW.toFixed(2)}W, ${res.svpwm.tjMaxGlobalC.toFixed(2)}°C) vs DPWM1 (${res.dpwm1.pInvMeanW.toFixed(2)}W, ${res.dpwm1.tjMaxGlobalC.toFixed(2)}°C) -> Saves ${pSave.toFixed(2)} W`,
-      'info'
-    );
+      const extraNotes = [...res.svpwm.alignmentWarnings];
+      if (sel.daCh && sel.dbCh && sel.dcCh) {
+        extraNotes.push('调制策略扫频仅比较理论重构波形 (SVPWM vs DPWM1 vs SPWM)，已忽略外部 Duty_A/B/C 选择。');
+      }
+      this.renderFocWarnings(extraNotes);
+      this.drawFocCanvas();
+
+      const pSave = res.svpwm.pInvMeanW - res.dpwm1.pInvMeanW;
+      this.app.showToast(
+        `SVPWM (${res.svpwm.pInvMeanW.toFixed(2)}W, ${res.svpwm.tjMaxGlobalC.toFixed(2)}°C) vs DPWM1 (${res.dpwm1.pInvMeanW.toFixed(2)}W, ${res.dpwm1.tjMaxGlobalC.toFixed(2)}°C) -> Saves ${pSave.toFixed(2)} W`,
+        'info'
+      );
+    } catch (err: any) {
+      this.app.showToast(`FOC control sweep failed: ${err?.message || err}`, 'error');
+    }
   }
 
   private drawFocCanvas(): void {
@@ -2746,7 +3029,7 @@ export class ThermalWorkbenchController {
         return;
       }
       drawGrid();
-      const tjLimit = parseFloat((document.getElementById('focStallLimitInput') as HTMLInputElement)?.value || '150') || 150;
+      const tjLimit = Math.max(40, this.readFiniteInput('focStallLimitInput', 150));
       let yMin = Math.min(...st.steadyMaxTjPerAngle);
       let yMax = Math.max(tjLimit * 1.05, ...st.steadyMaxTjPerAngle);
       const ys = Math.max(5, yMax - yMin);
@@ -2921,10 +3204,13 @@ export class ThermalWorkbenchController {
     };
 
     this.app.addTab(newTab);
+    this.lastActiveTabId = newTab.id;
     this.activeCauerStages = [];
     this.focModelSource = 'default_demo';
+    this.activeFocHandoffNote = null;
     this.cauerSourceLabel = 'FOC Demo Built-in Default (4-Stage Star, JC=0.50 + Brd=1.10 °C/W)';
     this.updateCauerSummaryBox();
+    this.invalidateFocCaches(true);
     this.populateChannelSelectors();
     this.refreshFocModelAndSpice();
     this.runFocSimulation();
@@ -2932,8 +3218,10 @@ export class ThermalWorkbenchController {
 
   public loadExternalFocAnalysis(payload: FocThermalHandoffPayload): void {
     this.app.addTab(payload.tab);
+    this.lastActiveTabId = payload.tab.id;
     this.openModal();
     this.switchTab('foc');
+    this.invalidateFocCaches(true);
     this.populateChannelSelectors();
 
     const setVal = (id: string, val: string | number) => {
@@ -2945,16 +3233,26 @@ export class ThermalWorkbenchController {
     setVal('focIbSelect', payload.ibChannelId);
     setVal('focIcSelect', payload.icChannelId);
     setVal('focVbusSelect', payload.vbusChannelId);
+    setVal('focDaSelect', payload.daChannelId || '__auto__');
+    setVal('focDbSelect', payload.dbChannelId || '__auto__');
+    setVal('focDcSelect', payload.dcChannelId || '__auto__');
     setVal('focGateSelect', 'entire');
     setVal('focVbusConstInput', payload.vBusConstV);
     setVal('focTambInput', payload.tAmbC);
-    setVal('focModSelect', 'SVPWM');
+    setVal('focModSelect', payload.modulation || 'SVPWM');
     setVal('focModDepthInput', payload.modDepthM);
     setVal('focPfAngleInput', payload.pfAngleDeg);
     setVal('focFswKhzInput', payload.fswKhz);
     setVal('focTdeadNsInput', payload.tDeadNs);
     setVal('focRdsInput', payload.rdsOnMOhm);
     setVal('focVsdInput', payload.vsdV);
+    if (typeof payload.rsPhaseOhm === 'number' && Number.isFinite(payload.rsPhaseOhm) && payload.rsPhaseOhm > 0) {
+      setVal('focStallRsInput', payload.rsPhaseOhm.toFixed(4));
+    }
+
+    this.activeFocHandoffNote =
+      payload.handoffNote ||
+      '已从外部导入波形与基本参数；开关/热系数 α、Esw、Eoss、Qrr、Vref、Iref 仍采用当前 MOS Thermal 面板数值。';
 
     this.runFocSimulation();
   }

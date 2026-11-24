@@ -10,9 +10,21 @@ import {
   validateCauerSpiceNetlist,
 } from './thermalEngine';
 import { evaluateDynamicSoa, SOA_PRESETS } from './dynamicSoa';
-import { DEFAULT_FOC_MODEL, runFocStallSweep, simulateFoc6Mos } from './focThermal';
+import {
+  DEFAULT_FOC_MODEL,
+  computePhaseMosLosses,
+  focModelToSpice,
+  getModulationLinearCeiling,
+  reconstructSensorlessDutySample,
+  runFocStallSweep,
+  simulateFoc6Mos,
+  splitCauerToFocModel,
+  validateFocSpiceNetlist,
+} from './focThermal';
 
 import { analyzeSamplingQuality } from './qualityCheck';
+import { inferCsvChannelUnit, previewCsv } from '../parsers/csvParser';
+import { inferUnitFromHeader } from '../parsers/excelParser';
 
 function makeChannel(
   id: string,
@@ -426,4 +438,474 @@ test('Dynamic SOA and BLDC FOC scale mA currents identically to A currents and g
   });
   assert.ok(Number.isFinite(extremeStall.worstSteadyTjC));
 });
+
+test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat, overmod, Cauer split, SPICE nodal parity & dual I2t', () => {
+  const mos = {
+    rdsOn25Mohm: 4.5,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.9,
+    eonPlusEoffUj: 35,
+    vRefV: 48,
+    iRefA: 30,
+    qrrNc: 60,
+  };
+  const ctrl = {
+    modulation: 'SVPWM' as const,
+    fswHz: 20000,
+    tDeadNs: 500,
+    modDepthM: 0.85,
+    pfAngleDeg: 0,
+    tAmbC: 25,
+    vBusConstV: 48,
+  };
+
+  // 1. Strict alignment catches interior timestamp shift (same endpoints/midpoint + same length) & coverage gap
+  const nA = 21;
+  const tA = Float64Array.from({ length: nA }, (_, i) => i * 0.01); // 0..0.20s
+  const tBShift = Float64Array.from({ length: nA }, (_, i) => (i === 0 || i === 10 || i === 20 ? i * 0.01 : i * 0.01 + 0.0045));
+  const iaShift = Float32Array.from({ length: nA }, (_, i) => 20 * Math.cos(2 * Math.PI * 5 * tA[i]));
+  const ibExactAtTa = Float32Array.from({ length: nA }, (_, i) => 20 * Math.cos(2 * Math.PI * 5 * tA[i] - (2 * Math.PI) / 3));
+  const ibAtTbShift = Float32Array.from({ length: nA }, (_, i) => 20 * Math.cos(2 * Math.PI * 5 * tBShift[i] - (2 * Math.PI) / 3));
+  const rExact = simulateFoc6Mos(makeChannel('ia0', 'Ia', 'A', tA, iaShift), makeChannel('ib0', 'Ib', 'A', tA, ibExactAtTa), DEFAULT_FOC_MODEL, mos, ctrl);
+  const rResamp = simulateFoc6Mos(makeChannel('ia1', 'Ia', 'A', tA, iaShift), makeChannel('ib1', 'Ib', 'A', tBShift, ibAtTbShift), DEFAULT_FOC_MODEL, mos, ctrl);
+  // Strict time-interpolation keeps power error tiny despite interior shift
+  assert.ok(Math.abs(rResamp.pInvMeanW - rExact.pInvMeanW) < 0.08);
+  // Coverage gap warning emitted when auxiliary channel spans smaller interval
+  const tShort = Float64Array.from({ length: 11 }, (_, i) => 0.05 + i * 0.01);
+  const ibShort = Float32Array.from({ length: 11 }, () => -10);
+  const rCov = simulateFoc6Mos(makeChannel('ia2', 'Ia', 'A', tA, iaShift), makeChannel('ib2', 'Ib', 'A', tShort, ibShort), DEFAULT_FOC_MODEL, mos, ctrl);
+  assert.ok(rCov.alignmentWarnings.some((w) => w.includes('未完整覆盖仿真区间')));
+
+  // 2. Non-uniform time-weighted mean (100 pts @ 1ms at 5A + 1 final pt at 1.0s at 40A -> step holds ~0.6W over 0.901s tail)
+  const tNu = new Float64Array(101);
+  const iaNu = new Float32Array(101);
+  const ibNu = new Float32Array(101);
+  const icNu = new Float32Array(101);
+  for (let i = 0; i < 100; i++) {
+    tNu[i] = i * 0.001;
+    iaNu[i] = 5;
+    ibNu[i] = -2.5;
+    icNu[i] = -2.5;
+  }
+  tNu[100] = 1.0;
+  iaNu[100] = 40;
+  ibNu[100] = -20;
+  icNu[100] = -20;
+  const rNu = simulateFoc6Mos(
+    makeChannel('ian', 'Ia', 'A', tNu, iaNu),
+    makeChannel('ibn', 'Ib', 'A', tNu, ibNu),
+    DEFAULT_FOC_MODEL,
+    mos,
+    ctrl,
+    { icCh: makeChannel('icn', 'Ic', 'A', tNu, icNu) }
+  );
+  // True step-energy average should stay near 0.60W (not inflated by the final 40A point!)
+  assert.ok(Math.abs(rNu.pInvMeanW - rNu.pInvTotal[0]) < 0.05, `Expected ~0.6W, got ${rNu.pInvMeanW}`);
+
+  // 3. Time-gate continuous preheat vs explicit cold reset
+  const tGate = Float64Array.from({ length: 2000 }, (_, i) => i * 0.001);
+  const iaGate = Float32Array.from({ length: 2000 }, (_, i) => 40 * Math.cos(2 * Math.PI * 50 * tGate[i]));
+  const ibGate = Float32Array.from({ length: 2000 }, (_, i) => 40 * Math.cos(2 * Math.PI * 50 * tGate[i] - (2 * Math.PI) / 3));
+  const fullGate = simulateFoc6Mos(makeChannel('iag', 'Ia', 'A', tGate, iaGate), makeChannel('ibg', 'Ib', 'A', tGate, ibGate), DEFAULT_FOC_MODEL, mos, ctrl);
+  const preheatGate = simulateFoc6Mos(makeChannel('iag2', 'Ia', 'A', tGate, iaGate), makeChannel('ibg2', 'Ib', 'A', tGate, ibGate), DEFAULT_FOC_MODEL, mos, ctrl, {
+    tStart: 1.5,
+    tEnd: 2.0,
+    gateThermalMode: 'preheat',
+  });
+  const coldGate = simulateFoc6Mos(makeChannel('iag3', 'Ia', 'A', tGate, iaGate), makeChannel('ibg3', 'Ib', 'A', tGate, ibGate), DEFAULT_FOC_MODEL, mos, ctrl, {
+    tStart: 1.5,
+    tEnd: 2.0,
+    gateThermalMode: 'cold',
+  });
+  assert.ok(Math.abs(preheatGate.tj.AH[0] - fullGate.tj.AH[1500]) < 1e-3);
+  assert.ok(Math.abs(coldGate.tj.AH[0] - 25.0) < 1e-4);
+  assert.ok(preheatGate.tjMaxGlobalC > coldGate.tjMaxGlobalC + 2.0);
+  // Transient convergence & steady-state projection populated
+  assert.ok(preheatGate.tjSteadyMaxEstC > preheatGate.tjMaxGlobalC);
+  assert.ok(preheatGate.thermalConvergencePct > 0 && preheatGate.thermalConvergencePct < 100);
+
+  // 4. Modulation ceiling & overmodulation reporting + m=0 DPWM1 safety
+  assert.equal(getModulationLinearCeiling('SPWM'), 1.0);
+  assert.ok(Math.abs(getModulationLinearCeiling('SVPWM') - 2 / Math.sqrt(3)) < 1e-12);
+  const spwmOver = reconstructSensorlessDutySample(20, -10, -10, 'SPWM', 1.12, 0);
+  assert.equal(spwmOver.overmodulated, true);
+  const dpwmZeroM = reconstructSensorlessDutySample(20, -10, -10, 'DPWM1', 0, 0);
+  assert.deepEqual({ da: dpwmZeroM.da, db: dpwmZeroM.db, dc: dpwmZeroM.dc }, { da: 0.5, db: 0.5, dc: 0.5 });
+
+  // 5. Contiguous Cauer split & SPICE nodal matrix parity check (including 0°C Tamb)
+  const unordered = [
+    { r: 0.2, c: 0.5, tauEst: 0.1, layerLabel: 'L1' },
+    { r: 0.3, c: 0.02, tauEst: 0.006, layerLabel: 'L2' },
+    { r: 0.5, c: 2.0, tauEst: 1.0, layerLabel: 'L3' },
+  ];
+  const sp = splitCauerToFocModel(unordered, 0.05);
+  assert.deepEqual(sp.zthJC.map((s) => s.layerLabel), ['L1']);
+  assert.deepEqual(sp.zthBoard.map((s) => s.layerLabel), ['L2', 'L3']);
+  assert.equal(sp.splitMeta?.nonMonotonicTau, true);
+
+  const spiceZeroAmb = focModelToSpice(DEFAULT_FOC_MODEL, 0);
+  assert.match(spiceZeroAmb, /T_amb=0\.00/);
+  const nodalVal = validateFocSpiceNetlist(spiceZeroAmb, DEFAULT_FOC_MODEL);
+  assert.equal(nodalVal.valid, true);
+  assert.equal(nodalVal.nodalMathVerified, true);
+  assert.ok(Math.abs(nodalVal.rJcParsed - 0.5) < 1e-5);
+  assert.ok(Math.abs(nodalVal.rBrdParsed - 1.1) < 1e-5);
+
+  // 6. Dual I^2*t stall protection & resistive low-speed stall duty (winding Rs + Rds(on))
+  const stall = runFocStallSweep({
+    iPeakA: 135,
+    tjLimitC: 120,
+    tAmbC: 25,
+    modulation: 'DPWM1',
+    modDepthM: 0.85,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 120,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.025,
+  });
+  assert.equal(stall.effectiveStallModulation, 'SVPWM');
+  assert.ok(Math.abs(stall.rPhaseUsedOhm - 0.025) < 1e-9);
+  assert.ok(stall.effectiveStallModDepthM > 0.12 && stall.effectiveStallModDepthM < 0.25);
+  assert.equal(stall.stallVoltageLimited, false);
+  assert.ok(stall.i2tRmsA2s !== null && stall.i2tWorstLegA2s !== null);
+  assert.ok(Math.abs(stall.i2tWorstLegA2s! - stall.phaseSquaredRatioAtWorst * stall.i2tRmsA2s!) < 1e-6);
+
+  // High Rs stall hits SVPWM ceiling and raises stallVoltageLimited without falling back to 2*Rds(on)
+  const stallDefaultRs = runFocStallSweep({
+    iPeakA: 135,
+    tjLimitC: 120,
+    tAmbC: 25,
+    modulation: 'SVPWM',
+    modDepthM: 0.85,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 120,
+    stallDutyMode: 'resistive',
+  });
+  assert.equal(stallDefaultRs.rPhaseUsedOhm, 0.25);
+  assert.equal(stallDefaultRs.stallVoltageLimited, true);
+  assert.ok(Math.abs(stallDefaultRs.effectiveStallModDepthM - getModulationLinearCeiling('SVPWM')) < 1e-6);
+});
+
+test('Round-3: External Duty % resolution handles <=1.5% cleanly, NaN/non-monotonic robustness, runaway detection & CSV/Excel Duty unit inference', () => {
+  // 1. Parser Duty/% unit inference
+  assert.equal(inferCsvChannelUnit('Duty_A (%)'), '%');
+  assert.equal(inferCsvChannelUnit('Duty_A'), '');
+  assert.equal(inferCsvChannelUnit('PWM_B [pct]'), '%');
+  assert.equal(inferUnitFromHeader('Duty_A (%)'), '%');
+  assert.equal(inferUnitFromHeader('PWM_C'), '');
+  const dutyPreview = previewCsv('Time,Ia,Duty_A (%)\n0,10,0.8\n0.001,10,1.2\n');
+  assert.equal(dutyPreview.columnMappings[2].unit, '%');
+
+  // 2. Small percentage Duty (0.8%, 1.2%, 50%, 98%) with '%' vs unitless max > 1.05 must scale consistently by 0.01
+  const n = 200;
+  const t = Float64Array.from({ length: n }, (_, i) => i * 1e-4);
+  const ia = Float32Array.from({ length: n }, () => 15);
+  const ib = Float32Array.from({ length: n }, () => -15);
+  const ic = Float32Array.from({ length: n }, () => 0);
+
+  // Build channels where Duty_A has values 0.8 -> 1.2 -> 90 (testing <= 1.5% samples!)
+  const daPctArr = Float32Array.from({ length: n }, (_, i) => (i < 100 ? 1.2 : 85));
+  const dbPctArr = Float32Array.from({ length: n }, () => 0.8);
+  const dcPctArr = Float32Array.from({ length: n }, () => 50);
+  const daFracArr = Float32Array.from(daPctArr, (v) => v * 0.01);
+  const dbFracArr = Float32Array.from(dbPctArr, (v) => v * 0.01);
+  const dcFracArr = Float32Array.from(dcPctArr, (v) => v * 0.01);
+
+  const mos = {
+    rdsOn25Mohm: 5.0,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.8,
+    eonPlusEoffUj: 30,
+    vRefV: 48,
+    iRefA: 20,
+    qrrNc: 25,
+  };
+  const ctrl = {
+    modulation: 'SVPWM' as const,
+    fswHz: 20000,
+    tDeadNs: 200,
+    modDepthM: 0.8,
+    pfAngleDeg: 0,
+    tAmbC: 25,
+    vBusConstV: 48,
+  };
+
+  const rFrac = simulateFoc6Mos(makeChannel('iaf', 'Ia', 'A', t, ia), makeChannel('ibf', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    icCh: makeChannel('icf', 'Ic', 'A', t, ic),
+    dutyChs: {
+      da: makeChannel('daf', 'Duty_A', '', t, daFracArr),
+      db: makeChannel('dbf', 'Duty_B', '', t, dbFracArr),
+      dc: makeChannel('dcf', 'Duty_C', '', t, dcFracArr),
+    },
+  });
+  const rPctExplicit = simulateFoc6Mos(makeChannel('iap', 'Ia', 'A', t, ia), makeChannel('ibp', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    icCh: makeChannel('icp', 'Ic', 'A', t, ic),
+    dutyChs: {
+      da: makeChannel('dap', 'Duty_A', '%', t, daPctArr),
+      db: makeChannel('dbp', 'Duty_B', '%', t, dbPctArr),
+      dc: makeChannel('dcp', 'Duty_C', '%', t, dcPctArr),
+    },
+  });
+  const rPctUnitless = simulateFoc6Mos(makeChannel('iau', 'Ia', 'A', t, ia), makeChannel('ibu', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    icCh: makeChannel('icu', 'Ic', 'A', t, ic),
+    dutyChs: {
+      da: makeChannel('dau', 'Duty_A', '', t, daPctArr),
+      db: makeChannel('dbu', 'Duty_B', '', t, dbPctArr),
+      dc: makeChannel('dcu', 'Duty_C', '', t, dcPctArr),
+    },
+  });
+
+  // Previously val > 1.5 treated 1.2% as 100% and 0.8% as 80%! Now all three match cleanly.
+  assert.ok(Math.abs(rPctExplicit.duty.a[10] - 0.012) < 1e-6);
+  assert.ok(Math.abs(rPctExplicit.duty.b[10] - 0.008) < 1e-6);
+  assert.ok(Math.abs(rPctUnitless.pInvMeanW - rFrac.pInvMeanW) < 1e-5);
+  assert.ok(Math.abs(rPctExplicit.pInvMeanW - rFrac.pInvMeanW) < 1e-5);
+  assert.ok(rPctUnitless.warnings.some((w) => w.includes('按百分比')));
+
+  // 3. Partial Duty selection triggers explicit fallback warning
+  const rPartial = simulateFoc6Mos(makeChannel('iaP', 'Ia', 'A', t, ia), makeChannel('ibP', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    dutyChs: { da: makeChannel('daP', 'Duty_A', '', t, daFracArr), db: null, dc: null },
+  });
+  assert.equal(rPartial.dutySource, 'reconstructed');
+  assert.ok(rPartial.warnings.some((w) => w.includes('部分外部 Duty')));
+
+  // 4. Consecutive NaNs in aux channel interpolate safely instead of zeroing; backward/NaN Ia timestamps throw
+  const vbusGap = Float32Array.from({ length: n }, (_, i) => (i >= 40 && i <= 80 ? Number.NaN : 48.0));
+  const rGap = simulateFoc6Mos(makeChannel('iaG', 'Ia', 'A', t, ia), makeChannel('ibG', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    vbusCh: makeChannel('vbG', 'Vbus', 'V', t, vbusGap),
+  });
+  assert.ok(Number.isFinite(rGap.pInvMeanW) && rGap.pInvMeanW > 0);
+  assert.ok(rGap.warnings.some((w) => w.includes('NaN/Inf 异常值')));
+
+  const tBack = Float64Array.from(t);
+  tBack[50] = tBack[48];
+  assert.throws(() => simulateFoc6Mos(makeChannel('iaB', 'Ia', 'A', tBack, ia), makeChannel('ibB', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl));
+
+  const tNanMain = Float64Array.from(t);
+  tNanMain[12] = Number.NaN;
+  assert.throws(() => simulateFoc6Mos(makeChannel('iaN', 'Ia', 'A', tNanMain, ia), makeChannel('ibN', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl));
+
+  // 5. Thermal runaway detection under excessive alpha & current (steadyThermalRunaway = true, finite output)
+  const rRunaway = simulateFoc6Mos(
+    makeChannel('iaR', 'Ia', 'A', t, Float32Array.from({ length: n }, () => 140)),
+    makeChannel('ibR', 'Ib', 'A', t, Float32Array.from({ length: n }, () => -70)),
+    DEFAULT_FOC_MODEL,
+    { ...mos, rdsOn25Mohm: 20, tempCoeffAlphaPerC: 0.015 },
+    ctrl,
+    { icCh: makeChannel('icR', 'Ic', 'A', t, Float32Array.from({ length: n }, () => -70)) }
+  );
+  assert.equal(rRunaway.steadyThermalRunaway, true);
+  assert.equal(rRunaway.steadyConverged, false);
+  assert.ok(Number.isFinite(rRunaway.tjSteadyMaxEstC));
+  assert.ok(rRunaway.warnings.some((w) => w.includes('热失控')));
+});
+
+test('Audit items #4, #5, #8, #9, #11, #13, #15, #16: strict units, single-shunt guard, Eoss, cycle resolution, hot-stall vector & substep convergence', () => {
+  // #9: strict parseSiUnitScale throws on incompatible physical unit families
+  assert.equal(parseSiUnitScale('mA', 'A', 'Ia', { strict: true }), 1e-3);
+  assert.throws(() => parseSiUnitScale('°C', 'A', 'Temp', { strict: true }), /不匹配/);
+  assert.throws(() => parseSiUnitScale('V', 'A', 'Vbus', { strict: true }), /不匹配/);
+  assert.throws(() => parseSiUnitScale('%', 'V', 'Duty_A', { strict: true }), /不匹配/);
+  assert.throws(() => parseSiUnitScale('', 'A', 'Motor_RPM', { strict: true }), /疑似非 A/);
+
+  const mosBase = {
+    rdsOn25Mohm: 4.5,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.9,
+    eonPlusEoffUj: 35,
+    vRefV: 48,
+    iRefA: 30,
+    qrrNc: 60,
+    eossUj: 0,
+  };
+  const ctrlBase = {
+    modulation: 'SVPWM' as const,
+    fswHz: 20000,
+    tDeadNs: 500,
+    modDepthM: 0.85,
+    pfAngleDeg: 0,
+    tAmbC: 25,
+    vBusConstV: 48,
+  };
+
+  // #8: reject duplicate Ia === Ib with single-shunt guidance
+  const t20 = Float64Array.from({ length: 20 }, (_, i) => i * 1e-3);
+  const i20 = Float32Array.from({ length: 20 }, (_, i) => 15 * Math.cos(2 * Math.PI * 10 * t20[i]));
+  const dupCh = makeChannel('same_ch', 'I_shunt', 'A', t20, i20);
+  assert.throws(() => simulateFoc6Mos(dupCh, dupCh, DEFAULT_FOC_MODEL, mosBase, ctrlBase), /单电阻/);
+
+  // #13: active-FET Eoss scales as (Vbus/Vref)^2 once per cycle and is suppressed during clamping
+  const mosEoss = { ...mosBase, eonPlusEoffUj: 0, qrrNc: 0, eossUj: 10 };
+  const lZero48 = computePhaseMosLosses(0.0, 0.5, 48, 25, 25, 'SVPWM', 20000, 0, mosEoss);
+  assert.ok(Math.abs(lZero48.pHighSw - 20000 * 10e-6) < 1e-9);
+  assert.equal(lZero48.pLowSw, 0);
+
+  const lPos96 = computePhaseMosLosses(1e-4, 0.5, 96, 25, 25, 'SVPWM', 20000, 0, mosEoss);
+  assert.ok(Math.abs(lPos96.pHighSw - 4 * lZero48.pHighSw) < 1e-9);
+  assert.equal(lPos96.pLowSw, 0);
+
+  const lNeg48 = computePhaseMosLosses(-1e-4, 0.5, 48, 25, 25, 'SVPWM', 20000, 0, mosEoss);
+  assert.equal(lNeg48.pHighSw, 0);
+  assert.ok(Math.abs(lNeg48.pLowSw - 20000 * 10e-6) < 1e-9);
+
+  const lClamped = computePhaseMosLosses(10, 1.0, 48, 25, 25, 'DPWM1', 20000, 0, mosEoss);
+  assert.equal(lClamped.pHighSw, 0);
+  assert.equal(lClamped.pLowSw, 0);
+
+  // #4 & #11: zero-current center duty fallback warning + < 6 pts/elec-cycle resolution warning (NOT PWM Nyquist)
+  const nCoarse = 16;
+  const tCoarse = Float64Array.from({ length: nCoarse }, (_, i) => i * 0.001);
+  // ~4 electrical cycles in 16 samples => ~4 pts/elec-cycle < 6 pts/elec-cycle, plus zero-current middle interval
+  const iaCoarse = Float32Array.from({ length: nCoarse }, (_, i) =>
+    i >= 10 && i <= 12 ? 0 : 15 * Math.cos(2 * Math.PI * 260 * tCoarse[i])
+  );
+  const ibCoarse = Float32Array.from({ length: nCoarse }, (_, i) =>
+    i >= 10 && i <= 12 ? 0 : 15 * Math.cos(2 * Math.PI * 260 * tCoarse[i] - (2 * Math.PI) / 3)
+  );
+  const rCoarse = simulateFoc6Mos(
+    makeChannel('iac', 'Ia', 'A', tCoarse, iaCoarse),
+    makeChannel('ibc', 'Ib', 'A', tCoarse, ibCoarse),
+    DEFAULT_FOC_MODEL,
+    mosBase,
+    ctrlBase
+  );
+  assert.ok(rCoarse.zeroCurrentFallbackCount >= 3);
+  assert.ok(rCoarse.warnings.some((w) => w.includes('零电流') && w.includes('0.50')));
+  assert.ok(rCoarse.pointsPerElecCycle !== null && rCoarse.pointsPerElecCycle < 6);
+  assert.ok(rCoarse.warnings.some((w) => w.includes('电周期') && w.includes('并非开关载波')));
+
+  // #5 & #16: Hot-stall inherits complete multi-node ThermalNetworkStateSnapshot & routes PF in user_m mode only
+  const nPre = 400;
+  const tPre = Float64Array.from({ length: nPre }, (_, i) => i * 0.001);
+  const iaPre = Float32Array.from({ length: nPre }, (_, i) => 60 * Math.cos(2 * Math.PI * 50 * tPre[i]));
+  const ibPre = Float32Array.from({ length: nPre }, (_, i) => 60 * Math.cos(2 * Math.PI * 50 * tPre[i] - (2 * Math.PI) / 3));
+  const simHot = simulateFoc6Mos(
+    makeChannel('iah', 'Ia', 'A', tPre, iaPre),
+    makeChannel('ibh', 'Ib', 'A', tPre, ibPre),
+    DEFAULT_FOC_MODEL,
+    mosBase,
+    ctrlBase
+  );
+  assert.ok(simHot.finalThermalState.tjMaxC > simHot.finalThermalState.tBoardC + 2.0);
+
+  const coldStall = runFocStallSweep({
+    iPeakA: 120,
+    tjLimitC: 110,
+    tAmbC: 25,
+    modulation: 'SVPWM',
+    modDepthM: 0.85,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: mosBase,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 60,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.04,
+  });
+  const hotStall = runFocStallSweep({
+    iPeakA: 120,
+    tjLimitC: 110,
+    tAmbC: 25,
+    tInitialBoardC: simHot.tBoardFinalC,
+    initialThermalState: simHot.finalThermalState,
+    modulation: 'SVPWM',
+    modDepthM: 0.85,
+    pfAngleDeg: 45,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: mosBase,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 60,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.04,
+  });
+  assert.equal(coldStall.inheritedHotState, false);
+  assert.equal(hotStall.inheritedHotState, true);
+  assert.equal(hotStall.effectiveStallPfAngleDeg, 0); // resistive ignores PF=45
+  assert.ok(hotStall.inheritedMaxTjC > hotStall.inheritedBoardTempC + 2.0);
+  assert.ok(
+    hotStall.tSafeSec !== null && coldStall.tSafeSec !== null && hotStall.tSafeSec < coldStall.tSafeSec,
+    `Hot stall t_safe (${hotStall.tSafeSec}) must be shorter than cold stall (${coldStall.tSafeSec})`
+  );
+
+  // user_m stall forwards pfAngleDeg and shifts worst steady Tj
+  const stallPf0 = runFocStallSweep({
+    iPeakA: 80,
+    tjLimitC: 150,
+    tAmbC: 25,
+    modulation: 'DPWM1',
+    modDepthM: 0.9,
+    pfAngleDeg: 0,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: mosBase,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    stallDutyMode: 'user_m',
+  });
+  const stallPf60 = runFocStallSweep({
+    iPeakA: 80,
+    tjLimitC: 150,
+    tAmbC: 25,
+    modulation: 'DPWM1',
+    modDepthM: 0.9,
+    pfAngleDeg: 60,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: mosBase,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    stallDutyMode: 'user_m',
+  });
+  assert.equal(stallPf60.effectiveStallPfAngleDeg, 60);
+  assert.ok(Math.abs(stallPf60.worstSteadyTjC - stallPf0.worstSteadyTjC) > 0.1);
+
+  // #15: Step-refinement convergence (coarse dt=10ms vs fine dt=1ms, zero alpha) + Cauer energy conservation
+  const mosConstR = { ...mosBase, tempCoeffAlphaPerC: 0 };
+  const makeStepConv = (dt: number, dur: number) => {
+    const n = Math.round(dur / dt) + 1;
+    const tArr = Float64Array.from({ length: n }, (_, i) => i * dt);
+    const iaArr = Float32Array.from({ length: n }, () => 40);
+    const ibArr = Float32Array.from({ length: n }, () => -20);
+    const icArr = Float32Array.from({ length: n }, () => -20);
+    return simulateFoc6Mos(makeChannel(`iac_${dt}`, 'Ia', 'A', tArr, iaArr), makeChannel(`ibc_${dt}`, 'Ib', 'A', tArr, ibArr), DEFAULT_FOC_MODEL, mosConstR, ctrlBase, {
+      icCh: makeChannel(`icc_${dt}`, 'Ic', 'A', tArr, icArr),
+    });
+  };
+  const coarseSim = makeStepConv(0.01, 0.2); // dt=10ms vs minTau=0.49ms (>20x minTau, resolved cleanly by <=512 substeps!)
+  const fineSim = makeStepConv(0.001, 0.2);
+  assert.ok(coarseSim.maxSubDtOverTau <= 0.1);
+  assert.ok(
+    Math.abs(coarseSim.tjMaxGlobalC - fineSim.tjMaxGlobalC) < 0.05,
+    `Coarse vs fine step Tj mismatch: ${coarseSim.tjMaxGlobalC} vs ${fineSim.tjMaxGlobalC}`
+  );
+  // Cauer energy balance over 20s to steady state: at steady state dT/dt -> 0, T_board - T_amb ~= P_inv * R_brd, Tj_avg - T_board ~= P_mos * R_jc
+  const steadySim = makeStepConv(0.05, 40.0);
+  const rJcTot = DEFAULT_FOC_MODEL.zthJC.reduce((s, c) => s + c.r, 0);
+  const rBrdTot = DEFAULT_FOC_MODEL.zthBoard.reduce((s, c) => s + c.r, 0);
+  const expectedBrdFinal = 25 + steadySim.pInvMeanW * rBrdTot;
+  assert.ok(
+    Math.abs(steadySim.tBoardFinalC - expectedBrdFinal) < 0.3,
+    `Board thermal balance mismatch: ${steadySim.tBoardFinalC} vs ${expectedBrdFinal}`
+  );
+  const ahFinal = steadySim.summaries.find((s) => s.key === 'AH')!;
+  const expectedAhTj = expectedBrdFinal + ahFinal.pAvgW * rJcTot;
+  assert.ok(
+    Math.abs(ahFinal.tjFinalC - expectedAhTj) < 0.3,
+    `Junction thermal balance mismatch: ${ahFinal.tjFinalC} vs ${expectedAhTj}`
+  );
+});
+
+
+
 

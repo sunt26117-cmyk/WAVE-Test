@@ -201,11 +201,12 @@ function inspectCellForPreview(cell: XLSX.CellObject | undefined): PreviewCellMe
   };
 }
 
-function inferUnitFromHeader(header: string, fallbackUnit: string = 'V'): string {
+export function inferUnitFromHeader(header: string, fallbackUnit: string = 'V'): string {
   const h = (header || '').trim();
   const bracketMatch = /[\(\[]\s*([a-zA-Z°℃µ%·/]+)\s*[\)\]]\s*$/.exec(h);
   if (bracketMatch && bracketMatch[1]) {
     const tok = bracketMatch[1];
+    if (/^(%|pct|percent)$/i.test(tok)) return '%';
     if (/^(v|mv|uv|µv|kv)$/i.test(tok)) return 'V';
     if (/^(a|ma|ua|µa|ka)$/i.test(tok)) return 'A';
     if (/^(w|mw|kw)$/i.test(tok)) return 'W';
@@ -215,6 +216,7 @@ function inferUnitFromHeader(header: string, fallbackUnit: string = 'V'): string
     return tok;
   }
   const lower = h.toLowerCase();
+  if (/duty|pwm_?(?:[abcuvw123]|d)|^d_?[abcuvw]$/i.test(lower)) return /%|pct|percent/.test(lower) ? '%' : '';
   if (/^(i_|ia|ib|ic|id|iq|curr|current|i\b)/.test(lower)) return 'A';
   if (/^(p_|pwr|power|loss|ploss)/.test(lower)) return 'W';
   if (/^(t_?j|temp|tj|tcase|temperature)/.test(lower)) return '°C';

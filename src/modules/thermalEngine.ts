@@ -191,8 +191,10 @@ export interface ViPowerResult {
 export function parseSiUnitScale(
   unit: string | undefined,
   expectedKind: 'V' | 'A' | 'W',
-  channelNameFallback?: string
+  channelNameFallback?: string,
+  options?: { strict?: boolean }
 ): number {
+  const strict = Boolean(options?.strict);
   const checkStr = (rawStr: string | undefined): number | null => {
     const raw = (rawStr || '').trim();
     if (!raw) return null;
@@ -200,10 +202,10 @@ export function parseSiUnitScale(
     const k = expectedKind.toLowerCase();
     const m = normalized.match(new RegExp(`^(u|n|m|k|meg|m)?\\s*(${k}|volt|volts|amp|amps|watt|watts)$`, 'i'));
     if (!m) {
-      if (new RegExp(`^u${k}`, 'i').test(normalized)) return 1e-6;
-      if (new RegExp(`^n${k}`, 'i').test(normalized)) return 1e-9;
-      if (new RegExp(`^m${k}`, 'i').test(normalized)) return 1e-3;
-      if (new RegExp(`^k${k}`, 'i').test(normalized)) return 1e3;
+      if (new RegExp(`^u${k}$`, 'i').test(normalized)) return 1e-6;
+      if (new RegExp(`^n${k}$`, 'i').test(normalized)) return 1e-9;
+      if (new RegExp(`^m${k}$`, 'i').test(normalized)) return 1e-3;
+      if (new RegExp(`^k${k}$`, 'i').test(normalized)) return 1e3;
       return null;
     }
     const pfx = m[1] || '';
@@ -219,17 +221,41 @@ export function parseSiUnitScale(
 
   // If unit matches expectedKind directly (e.g. 'mA' for 'A'), use it;
   // otherwise if unit is empty or generic default 'V' while expectedKind is 'A'/'W', inspect bracketed unit in channelName!
-  const direct = checkStr(unit);
-  if (direct !== null && (direct !== 1 || new RegExp(`^(${expectedKind}|volt|amp|watt)`, 'i').test((unit || '').trim()))) {
+  const trimmedUnit = (unit || '').trim();
+  const direct = checkStr(trimmedUnit);
+  if (direct !== null && (direct !== 1 || new RegExp(`^(${expectedKind}|volt|amp|watt)`, 'i').test(trimmedUnit))) {
     return direct;
   }
+
+  let bracketToken: string | null = null;
   if (channelNameFallback) {
-    const br = channelNameFallback.match(/[\(\[\{]\s*([µμunmk]?[VAW])\s*[\)\]\}]/i);
+    const br = channelNameFallback.match(/[\(\[\{]\s*([µμunmk]?[VAW]|°C|degC|C|K|Hz|kHz|MHz|Ω|Ohm|rpm|%|pct|percent)\s*[\)\]\}]/i);
     if (br) {
-      const fromName = checkStr(br[1]);
+      bracketToken = br[1];
+      const fromName = checkStr(bracketToken);
       if (fromName !== null) return fromName;
     }
   }
+
+  if (strict) {
+    const chLabel = channelNameFallback ? `"${channelNameFallback}" ` : '';
+    const badUnit = trimmedUnit || bracketToken || '';
+    if (badUnit) {
+      throw new Error(
+        `通道 ${chLabel}单位 "${badUnit}" 与期望物理量 (${expectedKind}) 不匹配，请确认选择的通道类型及单位。`
+      );
+    }
+    if (
+      channelNameFallback &&
+      (/^(t_?pcb|t_?pad|t_?j|temp|ntc|t_?case)|°c|degc/i.test(channelNameFallback) ||
+        /(?:^|[^a-z0-9])(rpm|freq|duty|pwm|speed|temp|temperature)(?:$|[^a-z0-9])/i.test(channelNameFallback))
+    ) {
+      throw new Error(
+        `通道 ${chLabel}疑似非 ${expectedKind} 物理量通道且缺少有效单位，已拒绝代入仿真。`
+      );
+    }
+  }
+
   return direct ?? 1;
 }
 

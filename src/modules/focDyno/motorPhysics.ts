@@ -6,7 +6,7 @@
  * - Phase inductance: Lq = (L_LL_mH * 1e-3) / 2 [H]
  * - Amplitude-invariant Clarke/Park:
  *     Kt(Iq) = 1.5 * Ke' * K_sat(Iq), K_sat(Iq) = 1 / (1 + beta * Iq^2)
- *     P_elec = 1.5 * (Eq * Iq + Rs * Iq^2), Eq = Ke' * omega_m
+ *     Eq(Iq) = Ke' * omega_m * K_sat(Iq), P_elec = 1.5 * (Eq(Iq) * Iq + Rs * Iq^2)
  *     I_ph_RMS = |Iq| / sqrt(2), P_cu = 1.5 * Rs * Iq^2 = 3 * Rs * I_ph_RMS^2
  * - SVPWM Linear Modulation Limit: 2 / sqrt(3) ≈ 1.154700538
  *     m = V_ph_peak / (V_bus_cap / 2), m_norm = m / (2 / sqrt(3)) = sqrt(3) * V_ph_peak / V_bus_cap
@@ -49,6 +49,7 @@ export interface EngineeringAlerts {
   regenLimit: boolean;             // Delta < 0
   zeroDrift: boolean;              // |I_net| < iDeadbandA
   invalidBus: boolean;             // V_meas - I_bus * R_line <= 0.1 V
+  iqSignAmbiguous: boolean;        // Multiple quadratic roots (regen) or symmetric ±Iq at stall (Eq=0)
 }
 
 export interface SinglePointResult {
@@ -218,11 +219,13 @@ export function solveSinglePoint(
   const rsOhm = getEffectiveRsOhm(params);
   const lqH = calcLqH(params.lLLmH);
 
-  const vBusCapRaw = vMeasV - iBusA * params.rLineOhm;
+  const rLineOhm = Math.max(0, params.rLineOhm);
+  const vBusCapRaw = vMeasV - iBusA * rLineOhm;
   const invalidBus = !Number.isFinite(vBusCapRaw) || vBusCapRaw <= 0.1;
   const vBusCapV = invalidBus ? Number.NaN : vBusCapRaw;
 
-  const eqV = params.kePrime * omegaM;
+  const eq0 = params.kePrime * omegaM;
+  let eqV = eq0;
   const p0W = calcP0LossW(nRpm, params.p0A, params.p0B);
   const pInW = vMeasV * iBusA;
   const iNetA = iBusA - params.iIdleA;
@@ -246,7 +249,7 @@ export function solveSinglePoint(
     pElecW = (vBusCapV * iNetA) / etaInv;
   }
 
-  const delta = invalidBus ? Number.NaN : eqV * eqV + (8 / 3) * rsOhm * pElecW;
+  let delta = invalidBus ? Number.NaN : eq0 * eq0 + (8 / 3) * rsOhm * pElecW;
 
   let iqA = Number.NaN;
   let iphRmsA = Number.NaN;
@@ -276,14 +279,21 @@ export function solveSinglePoint(
     kSat = 1;
     ktNmPerA = 1.5 * params.kePrime;
     pCuW = 0;
-    tEstNm = Math.abs(nRpm) > 1e-6 && Math.abs(omegaM) > 1e-6 ? -p0W / omegaM : 0;
-    pOutW = Math.abs(nRpm) > 1e-6 ? -p0W : 0;
+    if (Math.abs(nRpm) > 1e-6 && Math.abs(omegaM) > 1e-6) {
+      // Spinning coast-down at Iq = 0: shaft absorbs speed-dependent iron+windage loss -P0
+      // maintaining exact power balance P_elec = 0 = P_cu(0) + P0 + P_out and parity with forwardVerifyPoint(0, n)
+      tEstNm = -p0W / omegaM;
+      pOutW = -p0W;
+    } else {
+      tEstNm = 0;
+      pOutW = 0;
+    }
     etaEst = 0;
-    vqMotorV = eqV;
-    vqCmdV = eqV;
+    vqMotorV = eq0;
+    vqCmdV = eq0;
     vdV = 0;
-    vPhPeakMotorV = Math.abs(eqV);
-    vPhPeakCmdV = Math.abs(eqV);
+    vPhPeakMotorV = Math.abs(eq0);
+    vPhPeakCmdV = Math.abs(eq0);
     mMotor = vPhPeakMotorV / (vBusCapV / 2);
     mNormMotor = (Math.sqrt(3) * vPhPeakMotorV) / vBusCapV;
     mCmd = mMotor;
@@ -293,49 +303,115 @@ export function solveSinglePoint(
   } else if (delta < 0) {
     mode = 'regen_limit';
   } else {
-    if (Math.abs(eqV) < 1e-12) {
+    if (Math.abs(eq0) < 1e-12) {
       iqA = pElecW >= 0 ? Math.sqrt((2 * pElecW) / (3 * rsOhm)) : -Math.sqrt((-2 * pElecW) / (3 * rsOhm));
+      kSat = calcKsat(iqA, params.betaSat);
+      eqV = 0;
     } else {
-      const signEq = eqV >= 0 ? 1 : -1;
-      iqA = (-eqV + signEq * Math.sqrt(delta)) / (2 * rsOhm);
+      const signEq = eq0 >= 0 ? 1 : -1;
+      const beta = Math.max(0, params.betaSat);
+      iqA = (-eq0 + signEq * Math.sqrt(delta)) / (2 * rsOhm);
+
+      if (beta > 0 && Number.isFinite(iqA)) {
+        let hitRegenLimit = false;
+        for (let iter = 0; iter < 30; iter++) {
+          const iqSq = iqA * iqA;
+          const denom = 1 + beta * iqSq;
+          const ks = 1 / denom;
+          const eqCur = eq0 * ks;
+          const residual = 1.5 * (eqCur * iqA + rsOhm * iqSq) - pElecW;
+          if (Math.abs(residual) <= 1e-11 * (1 + Math.abs(pElecW))) {
+            eqV = eqCur;
+            delta = Math.max(0, eqCur * eqCur + (8 / 3) * rsOhm * pElecW);
+            break;
+          }
+
+          const dEqTerm = (eq0 * (1 - beta * iqSq)) / (denom * denom);
+          const df = 1.5 * (dEqTerm + 2 * rsOhm * iqA);
+          const dIter = eqCur * eqCur + (8 / 3) * rsOhm * pElecW;
+
+          let nextIq = Number.NaN;
+          if (Math.abs(df) > 1e-9 && Number.isFinite(df)) {
+            const cand = iqA - residual / df;
+            const candSq = cand * cand;
+            const candRes = 1.5 * ((eq0 / (1 + beta * candSq)) * cand + rsOhm * candSq) - pElecW;
+            if (Number.isFinite(candRes) && Math.abs(candRes) < Math.abs(residual)) {
+              nextIq = cand;
+            }
+          }
+          if (!Number.isFinite(nextIq)) {
+            if (dIter < 0) {
+              delta = dIter;
+              hitRegenLimit = true;
+              break;
+            }
+            const fp = (-eqCur + signEq * Math.sqrt(dIter)) / (2 * rsOhm);
+            nextIq = 0.5 * iqA + 0.5 * fp;
+          }
+          iqA = nextIq;
+        }
+
+        const ksFinal = calcKsat(iqA, beta);
+        eqV = eq0 * ksFinal;
+        const dFinal = eqV * eqV + (8 / 3) * rsOhm * pElecW;
+        const finalRes = 1.5 * (eqV * iqA + rsOhm * iqA * iqA) - pElecW;
+        if (hitRegenLimit || dFinal < -1e-9 || !Number.isFinite(iqA) || Math.abs(finalRes) > 1e-3 * (1 + Math.abs(pElecW))) {
+          mode = 'regen_limit';
+          iqA = Number.NaN;
+          if (dFinal < delta) delta = dFinal;
+        } else {
+          delta = Math.max(0, dFinal);
+        }
+      }
     }
 
-    iphRmsA = Math.abs(iqA) / Math.SQRT2;
-    kSat = calcKsat(iqA, params.betaSat);
-    ktNmPerA = 1.5 * params.kePrime * kSat;
-    pCuW = 1.5 * rsOhm * iqA * iqA;
+    if (mode !== 'regen_limit' && Number.isFinite(iqA)) {
+      iphRmsA = Math.abs(iqA) / Math.SQRT2;
+      kSat = calcKsat(iqA, params.betaSat);
+      eqV = eq0 * kSat;
+      ktNmPerA = 1.5 * params.kePrime * kSat;
+      pCuW = 1.5 * rsOhm * iqA * iqA;
 
-    if (Math.abs(nRpm) > 1e-6 && Math.abs(omegaM) > 1e-6) {
-      tEstNm = ktNmPerA * iqA - p0W / omegaM;
-      pOutW = tEstNm * omegaM;
-    } else {
-      tEstNm = ktNmPerA * iqA;
-      pOutW = 0;
+      if (Math.abs(nRpm) > 1e-6 && Math.abs(omegaM) > 1e-6) {
+        tEstNm = ktNmPerA * iqA - p0W / omegaM;
+        pOutW = tEstNm * omegaM;
+      } else {
+        tEstNm = ktNmPerA * iqA;
+        pOutW = 0;
+      }
+
+      if (pInW > 1e-6 && pOutW >= 0) {
+        etaEst = pOutW / pInW;
+      } else if (pInW < -1e-6 && pOutW < -1e-6) {
+        etaEst = Math.abs(pInW / pOutW);
+      } else {
+        etaEst = 0;
+      }
+
+      vqMotorV = eqV + rsOhm * iqA;
+      vqCmdV = calcVqCmd(vqMotorV, iqA, vBusCapV, params);
+      vdV = -omegaE * lqH * iqA;
+
+      vPhPeakMotorV = Math.hypot(vdV, vqMotorV);
+      vPhPeakCmdV = Math.hypot(vdV, vqCmdV);
+
+      mMotor = vPhPeakMotorV / (vBusCapV / 2);
+      mNormMotor = (Math.sqrt(3) * vPhPeakMotorV) / vBusCapV;
+      mCmd = vPhPeakCmdV / (vBusCapV / 2);
+      mNormCmd = (Math.sqrt(3) * vPhPeakCmdV) / vBusCapV;
+
+      phiDeg = calcPhiDeg(vqMotorV, vdV, iqA);
+      phiCmdDeg = calcPhiDeg(vqCmdV, vdV, iqA);
     }
-
-    if (pInW > 1e-6 && pOutW >= 0) {
-      etaEst = pOutW / pInW;
-    } else if (pInW < -1e-6 && pOutW < 0) {
-      etaEst = pInW / pOutW;
-    } else {
-      etaEst = 0;
-    }
-
-    vqMotorV = eqV + rsOhm * iqA;
-    vqCmdV = calcVqCmd(vqMotorV, iqA, vBusCapV, params);
-    vdV = -omegaE * lqH * iqA;
-
-    vPhPeakMotorV = Math.hypot(vdV, vqMotorV);
-    vPhPeakCmdV = Math.hypot(vdV, vqCmdV);
-
-    mMotor = vPhPeakMotorV / (vBusCapV / 2);
-    mNormMotor = (Math.sqrt(3) * vPhPeakMotorV) / vBusCapV;
-    mCmd = vPhPeakCmdV / (vBusCapV / 2);
-    mNormCmd = (Math.sqrt(3) * vPhPeakCmdV) / vBusCapV;
-
-    phiDeg = calcPhiDeg(vqMotorV, vdV, iqA);
-    phiCmdDeg = calcPhiDeg(vqCmdV, vdV, iqA);
   }
+
+  const iqSignAmbiguous =
+    mode !== 'invalid_bus' &&
+    mode !== 'regen_limit' &&
+    mode !== 'zero_drift' &&
+    Number.isFinite(iqA) &&
+    ((mode === 'regen' && pElecW < -1e-12 && delta > 1e-12) ||
+      (Math.abs(eq0) < 1e-12 && Math.abs(iqA) > 1e-9));
 
   const alerts: EngineeringAlerts = {
     lowSpeed: Math.abs(nRpm) < 0.08 * params.n0Rpm,
@@ -345,6 +421,7 @@ export function solveSinglePoint(
     regenLimit: mode === 'regen_limit',
     zeroDrift: mode === 'zero_drift',
     invalidBus: mode === 'invalid_bus',
+    iqSignAmbiguous,
   };
 
   return {
@@ -399,7 +476,8 @@ export function forwardVerifyPoint(
   const rsOhm = getEffectiveRsOhm(params);
   const lqH = calcLqH(params.lLLmH);
 
-  const eqV = params.kePrime * omegaM;
+  const kSat = calcKsat(iqA, params.betaSat);
+  const eqV = params.kePrime * omegaM * kSat;
   const pElecW = 1.5 * (eqV * iqA + rsOhm * iqA * iqA);
   const etaInv = Math.min(0.999, Math.max(0.1, params.etaInv));
 
@@ -430,7 +508,6 @@ export function forwardVerifyPoint(
   const invalidBus = lineCollapse || !Number.isFinite(vBusCapRaw) || vBusCapRaw <= 0.1;
   const vBusCapV = invalidBus ? Number.NaN : vBusCapRaw;
 
-  const kSat = calcKsat(iqA, params.betaSat);
   const p0W = calcP0LossW(nRpm, params.p0A, params.p0B);
   const tEstNm =
     Math.abs(nRpm) > 1e-6 && Math.abs(omegaM) > 1e-6
@@ -444,8 +521,8 @@ export function forwardVerifyPoint(
       ? Number.NaN
       : pInW > 1e-6 && pOutW >= 0
       ? pOutW / pInW
-      : pInW < -1e-6 && pOutW < 0
-      ? pInW / pOutW
+      : pInW < -1e-6 && pOutW < -1e-6
+      ? Math.abs(pInW / pOutW)
       : 0;
 
   const vqMotorV = eqV + rsOhm * iqA;
@@ -472,6 +549,7 @@ export function forwardVerifyPoint(
     regenLimit: false,
     zeroDrift: Math.abs(iNet) < params.iDeadbandA,
     invalidBus,
+    iqSignAmbiguous: false,
   };
 
   return {
@@ -498,36 +576,112 @@ export function forwardVerifyPoint(
   };
 }
 
+export function isMonotonicTimestamps(timesS: number[]): boolean {
+  if (timesS.length < 2) return true;
+  for (let i = 1; i < timesS.length; i++) {
+    if (!Number.isFinite(timesS[i]) || !Number.isFinite(timesS[i - 1]) || timesS[i] < timesS[i - 1]) {
+      return false;
+    }
+  }
+  return timesS[timesS.length - 1] > timesS[0];
+}
+
 export function movingAverageFilter(
   values: number[],
   timesS: number[],
   windowMs: number
 ): number[] {
-  if (values.length === 0 || windowMs <= 0) return [...values];
-  let avgDt = 0.001;
-  if (timesS.length >= 2) {
-    const span = timesS[timesS.length - 1] - timesS[0];
-    if (span > 0) {
-      avgDt = span / (timesS.length - 1);
-    }
-  }
-  const winSamples = Math.max(1, Math.round((windowMs * 1e-3) / avgDt));
-  if (winSamples <= 1) return [...values];
+  const n = values.length;
+  if (n === 0 || windowMs <= 0) return [...values];
 
-  const half = Math.floor(winSamples / 2);
-  const out = new Array<number>(values.length);
-  const prefix = new Float64Array(values.length + 1);
-  const validPrefix = new Int32Array(values.length + 1);
-
-  for (let i = 0; i < values.length; i++) {
+  const halfWinS = (windowMs * 1e-3) * 0.5;
+  const prefix = new Float64Array(n + 1);
+  const validPrefix = new Int32Array(n + 1);
+  for (let i = 0; i < n; i++) {
     const finite = Number.isFinite(values[i]);
     prefix[i + 1] = prefix[i] + (finite ? values[i] : 0);
     validPrefix[i + 1] = validPrefix[i] + (finite ? 1 : 0);
   }
 
-  for (let i = 0; i < values.length; i++) {
+  const out = new Array<number>(n);
+  if (timesS.length === n && isMonotonicTimestamps(timesS)) {
+    // True centered time-window [t - W/2, t + W/2] trapezoidal time-weighted average (accurate for non-uniform dt)
+    const hasNan = validPrefix[n] < n;
+    const trapPrefix = hasNan ? null : new Float64Array(n);
+    if (trapPrefix) {
+      for (let i = 1; i < n; i++) {
+        const dt = timesS[i] - timesS[i - 1];
+        trapPrefix[i] = trapPrefix[i - 1] + 0.5 * (values[i - 1] + values[i]) * dt;
+      }
+    }
+
+    let left = 0;
+    let right = 0;
+    for (let i = 0; i < n; i++) {
+      const ti = timesS[i];
+      while (left < i && ti - timesS[left] > halfWinS + 1e-12) {
+        left++;
+      }
+      if (right < i) right = i;
+      while (right + 1 < n && timesS[right + 1] - ti <= halfWinS + 1e-12) {
+        right++;
+      }
+      if (trapPrefix) {
+        const span = timesS[right] - timesS[left];
+        if (span > 1e-12) {
+          out[i] = (trapPrefix[right] - trapPrefix[left]) / span;
+        } else {
+          const cnt = right - left + 1;
+          out[i] = (prefix[right + 1] - prefix[left]) / cnt;
+        }
+      } else {
+        let area = 0;
+        let firstT = Number.NaN;
+        let lastT = Number.NaN;
+        let prevT = Number.NaN;
+        let prevV = Number.NaN;
+        let finiteSum = 0;
+        let finiteCnt = 0;
+        for (let k = left; k <= right; k++) {
+          const vk = values[k];
+          if (!Number.isFinite(vk)) continue;
+          const tk = timesS[k];
+          finiteSum += vk;
+          finiteCnt++;
+          if (!Number.isFinite(firstT)) {
+            firstT = tk;
+          } else {
+            area += 0.5 * (prevV + vk) * (tk - prevT);
+          }
+          lastT = tk;
+          prevT = tk;
+          prevV = vk;
+        }
+        const span = Number.isFinite(firstT) && Number.isFinite(lastT) ? lastT - firstT : 0;
+        out[i] = span > 1e-12 ? area / span : finiteCnt > 0 ? finiteSum / finiteCnt : Number.NaN;
+      }
+    }
+    return out;
+  }
+
+  // Fallback for non-monotonic or missing timestamps: estimate positive median dt safely
+  const posDts: number[] = [];
+  for (let i = 1; i < Math.min(timesS.length, n); i++) {
+    const dt = timesS[i] - timesS[i - 1];
+    if (Number.isFinite(dt) && dt > 1e-9) posDts.push(dt);
+  }
+  let medianDt = 0.002;
+  if (posDts.length > 0) {
+    posDts.sort((a, b) => a - b);
+    medianDt = posDts[Math.floor(posDts.length / 2)];
+  }
+  const winSamples = Math.max(1, Math.round((windowMs * 1e-3) / medianDt));
+  if (winSamples <= 1) return [...values];
+
+  const half = Math.floor(winSamples / 2);
+  for (let i = 0; i < n; i++) {
     const start = Math.max(0, i - half);
-    const end = Math.min(values.length - 1, i + half);
+    const end = Math.min(n - 1, i + half);
     const cnt = validPrefix[end + 1] - validPrefix[start];
     out[i] = cnt > 0 ? (prefix[end + 1] - prefix[start]) / cnt : Number.NaN;
   }

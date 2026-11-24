@@ -225,9 +225,6 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
   syncLtspiceWatchUI();
-
-  const testResults = runAllTests();
-  console.log('Oscilloscope Verification Test Results:', testResults);
 });
 
 function bindToolbarActions() {

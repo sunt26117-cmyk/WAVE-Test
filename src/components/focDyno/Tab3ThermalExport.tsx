@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Activity, AlertTriangle, Check, Copy, Download, Flame } from 'lucide-react';
 import { MotorParams, SVPWM_LINEAR_LIMIT } from '../../modules/focDyno/motorPhysics';
-import { MAX_EXPORT_SAMPLES, synthesizeSixMosWaveform } from '../../modules/focDyno/thermalExporter';
+import { MAX_EXPORT_SAMPLES, ExporterModulationMode, synthesizeSixMosWaveform } from '../../modules/focDyno/thermalExporter';
 import {
   FocThermalHandoffPayload,
   buildOscilloscopeTabFromSixMos,
@@ -33,6 +33,8 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
   const [tAmbC, setTAmbC] = useState(25);
   const [fsHz, setFsHz] = useState(20000);
   const [durationS, setDurationS] = useState(0.5);
+  const [modulation, setModulation] = useState<ExporterModulationMode>('SVPWM');
+  const [includeDuty, setIncludeDuty] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const synth = useMemo(
@@ -45,10 +47,12 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
           tAmbC,
           fsHz,
           durationS,
+          modulation,
+          includeDuty,
         },
         params
       ),
-    [exportPoint, tAmbC, fsHz, durationS, params]
+    [exportPoint, tAmbC, fsHz, durationS, modulation, includeDuty, params]
   );
 
   const previewSamples = useMemo(() => {
@@ -108,7 +112,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
     { key: 'ic', label: 'Phase Ic (or -Ia-Ib)', value: 'Ic', hint: 'Auto: Ic = -(Ia + Ib)' },
     { key: 'vbus', label: 'Vbus (V)', value: fmt(summary.vBusCapV, 3), hint: '自动映射 Vbus_cap 通道与常值备选' },
     { key: 'tamb', label: 'T_amb (°C)', value: summary.tAmbC.toFixed(1) },
-    { key: 'mod', label: 'Modulation', value: 'SVPWM / DPWM1', hint: summary.modulationNote },
+    { key: 'mod', label: 'Modulation', value: includeDuty ? `${modulation} (含 Duty_A/B/C)` : modulation, hint: summary.modulationNote },
     {
       key: 'm_cmd',
       label: 'Mod Depth m_cmd [上限 1.1547] (热评估写入值)',
@@ -236,10 +240,10 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
             <SmoothNumberInput
               step={0.05}
               min={0.05}
-              max={5}
+              max={20}
               value={durationS}
               ariaLabel="导出时长"
-              onChange={(v) => setDurationS(Math.max(0.05, Math.min(5, v)))}
+              onChange={(v) => setDurationS(Math.max(0.05, Math.min(20, v)))}
               className="dyno-input w-full rounded-sm border px-2.5 py-1.5 font-mono text-xs tabular-nums focus:outline-none"
             />
           </label>
@@ -303,6 +307,25 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
             >
               n=0 堵转直流偏相
             </button>
+            <span className="mx-1 dyno-text-muted">|</span>
+            <select
+              aria-label="PWM 调制方式"
+              value={modulation}
+              onChange={(e) => setModulation(e.target.value as ExporterModulationMode)}
+              className="dyno-input rounded-xs border px-1.5 py-0.5 font-mono text-[11px] focus:outline-none"
+            >
+              <option value="SVPWM">SVPWM</option>
+              <option value="DPWM1">DPWM1</option>
+            </select>
+            <label className="inline-flex items-center gap-1.5 cursor-pointer select-none text-[11px] dyno-text-secondary">
+              <input
+                type="checkbox"
+                checked={includeDuty}
+                onChange={(e) => setIncludeDuty(e.target.checked)}
+                className="accent-cyan-500 cursor-pointer"
+              />
+              <span>导出 Duty_A/B/C</span>
+            </label>
           </div>
           <div className="font-mono text-[11px] tabular-nums dyno-text-muted">
             Iq={fmt(summary.iqPeakA, 3)} A · T_est={fmt(pointResult.tEstNm, 4)} N·m · Rds={params.rdsOnMOhm.toFixed(1)} mΩ
@@ -318,7 +341,8 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
         {synth.error && <div className="dyno-alert-danger rounded-sm border px-3.5 py-2 text-xs">✖ {synth.error}</div>}
         {synth.clampedByLimit && (
           <div className="dyno-alert-warn rounded-sm border px-3.5 py-2 text-xs">
-            ▲ 请求采样点超出 {MAX_EXPORT_SAMPLES.toLocaleString()} 点安全上限，已自动截断至 {MAX_EXPORT_SAMPLES.toLocaleString()} 行。
+            ▲ 请求时长 {synth.requestedDurationS.toFixed(3)} s（需 {synth.requestedSamples.toLocaleString()} 点）超出 {MAX_EXPORT_SAMPLES.toLocaleString()} 点上限，实际仅导出{' '}
+            <strong className="font-mono">{synth.actualDurationS.toFixed(3)} s</strong>（{synth.exportedSamples.toLocaleString()} 行），会直接缩短后续热预热与稳态收敛观察窗口。
           </div>
         )}
       </div>
@@ -366,7 +390,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
           <div className="mb-2 border-b dyno-border pb-2">
             <h4 className="text-sm font-semibold dyno-text-primary">对齐 6-MOS 结温评估参数摘要卡</h4>
             <p className="mt-1 text-xs leading-relaxed dyno-text-muted">
-              导入时自动同步 Vbus_cap、m_cmd (≤ 1.20)、φ_cmd (-180~+180°)、f_sw、t_dead、Rds(on) 与 V_sd
+              自动同步 Vbus_cap、m_cmd (SVPWM 线性上限 {SVPWM_LINEAR_LIMIT.toFixed(4)})、φ_cmd、f_sw、t_dead、Rds25、V_SD{includeDuty ? ' 与 Duty_A/B/C' : ''}；开关/热系数 α、Esw、Qrr、Vref、Iref 仍以 MOS Thermal 面板数据手册设定的为准。
             </p>
           </div>
 

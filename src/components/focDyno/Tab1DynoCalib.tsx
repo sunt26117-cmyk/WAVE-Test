@@ -159,6 +159,21 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
               <span className="font-mono font-medium dyno-text-primary">{closedLoopRaw.fileName}</span>
               <span className="ml-1 font-mono tabular-nums dyno-accent-text">({closedNormCount}点)</span>
             </div>
+            <span
+              className={`rounded-xs border px-2 py-0.5 font-mono text-[11px] font-semibold ${
+                report.status === 'failed'
+                  ? 'dyno-alert-danger'
+                  : report.status === 'warn'
+                  ? 'dyno-alert-warn'
+                  : 'dyno-alert-ok border-emerald-500/40'
+              }`}
+            >
+              {report.status === 'failed'
+                ? '✖ 标定失败'
+                : report.status === 'warn'
+                ? '▲ 标定存疑'
+                : '✓ 标定收敛'}
+            </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -363,9 +378,11 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
         )}
       </div>
 
-      {/* Data Quality / Unit Warnings */}
+      {/* Data Quality / Unit / Convergence Warnings */}
       {warnings.length > 0 && (
-        <div className="dyno-alert-warn rounded-sm border px-4 py-2.5 text-xs space-y-1">
+        <div
+          className={`${report.status === 'failed' ? 'dyno-alert-danger' : 'dyno-alert-warn'} rounded-sm border px-4 py-2.5 text-xs space-y-1`}
+        >
           {warnings.map((w, i) => (
             <div key={i}>▲ {w}</div>
           ))}
@@ -447,17 +464,20 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
       <div>
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-semibold dyno-text-primary">二维效率 Map η(n, T) 实测与模型重构对比</h3>
-          <span className="text-xs dyno-text-muted">基于实测凸包安全插值，边界外不盲目外推</span>
+          <span className="text-xs dyno-text-muted">基于实测凸包安全插值与本地母线压降；超出饱和峰值或超调不可达区留白不外推</span>
         </div>
         <EfficiencyHeatmap2D grid={report.grid2D} points={report.evaluatedPoints} />
       </div>
 
       {/* Stepwise Fit Audit Log */}
-      <div className="dyno-card rounded-sm border px-4 py-3 text-xs dyno-text-secondary">
+      <div className="dyno-card rounded-sm border px-4 py-3 text-xs dyno-text-secondary space-y-1.5">
         <div className="flex flex-wrap items-center gap-x-6 gap-y-1 font-mono text-[11px]">
           {report.fitNotes.map((note, idx) => (
             <span key={idx}>{note}</span>
           ))}
+        </div>
+        <div className="text-[11px] dyno-text-muted">
+          模型适用边界：稳态集总参数代数模型，假定 Y 型接法非凸极 SPMSM 且 Id = 0（不含高速弱磁 Id &lt; 0 与转子电感瞬态 dI/dt）。
         </div>
       </div>
     </div>

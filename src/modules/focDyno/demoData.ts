@@ -102,12 +102,12 @@ export function buildDemoClosedLoopDataset(): TabularDataset {
 
   for (const n of speedGrid) {
     const omegaM = calcOmegaM(n);
-    const eq = keTrue * omegaM;
     for (const tTarget of torqueGrid) {
       if (n >= 1350 && tTarget > 0.16) continue;
       if (n >= 1200 && tTarget > 0.21) continue;
 
       const iq = solveTrueIqForTorque(tTarget, n, keTrue, betaTrue, p0A, p0B);
+      const eq = keTrue * omegaM * calcKsat(iq, betaTrue);
       const pElec = 1.5 * (eq * iq + rsTrue * iq * iq);
       const vBusCap = 13.5 - 0.04 * (pElec / (13.5 * 0.95));
       const iBusTrue = DEMO_MOTOR_PARAMS.iIdleA + pElec / (DEMO_MOTOR_PARAMS.etaInv * vBusCap);
@@ -179,7 +179,7 @@ export function buildDemoRuntimeLog(): RawRuntimeLogEntry[] {
       vMeas = 13.52 + (rand() - 0.5) * 0.02;
     } else {
       const omegaM = calcOmegaM(nRpm);
-      const eq = keTrue * omegaM;
+      const eq = keTrue * omegaM * calcKsat(iqCmd, betaTrue);
       const pElec = 1.5 * (eq * iqCmd + rsTrue * iqCmd * iqCmd);
       const pDc = pElec >= 0 ? pElec / DEMO_MOTOR_PARAMS.etaInv : pElec * DEMO_MOTOR_PARAMS.etaInv;
       const vCap = 13.5;
@@ -187,7 +187,6 @@ export function buildDemoRuntimeLog(): RawRuntimeLogEntry[] {
       const ripple = 0.08 * Math.sin(2 * Math.PI * 140 * t);
       iBus = iBusTrue + ripple + (rand() - 0.5) * 0.06;
       vMeas = vCap + iBus * DEMO_MOTOR_PARAMS.rLineOhm + (rand() - 0.5) * 0.04;
-      void calcKsat(iqCmd, betaTrue);
     }
 
     rows.push({

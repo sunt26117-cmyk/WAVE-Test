@@ -106,7 +106,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
     });
     return {
       calibReport: report,
-      normWarnings: [...olRes.warnings, ...clRes.warnings],
+      normWarnings: [...olRes.warnings, ...clRes.warnings, ...report.warnings],
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -121,16 +121,23 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
     manualVTestV,
     manualKv,
     rsFitMode,
+    params.polePairs,
     params.rLL25Ohm,
     params.tCoilC,
+    params.lLLmH,
     params.iIdleA,
     params.etaInv,
     params.iDeadbandA,
     params.rLineOhm,
+    params.rdsOnMOhm,
+    params.tDeadNs,
+    params.fSwKhz,
+    params.vSdV,
     calibTrigger,
   ]);
 
   useEffect(() => {
+    if (calibReport.status === 'failed') return;
     setParams((prev) => {
       const nextRsOverride = rsFitMode === 'locked' ? null : calibReport.rsEffOhm;
       if (

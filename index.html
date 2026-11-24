@@ -9,12 +9,27 @@
     <meta property="og:description" content="Engineering web oscilloscope and waveform analyzer for CSV and WFM data with 1-2-5 V/div & s/div controls, X/Y/Track cursors, radix-2 FFT, Math channels, Trigger, Clarke/Park transforms, and automated measurements." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <style>
+      html, body {
+        background-color: #0c0f13;
+        color: #e2e8f0;
+        margin: 0;
+      }
+    </style>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
       rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
     />
+    <noscript>
+      <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+        rel="stylesheet"
+      />
+    </noscript>
   </head>
   <body class="h-full flex flex-col overflow-hidden bg-[#0c0f13] text-slate-200">
     <!-- Top Instrument Chassis Header & File Tabs -->
@@ -2062,6 +2077,28 @@
                 </div>
               </div>
 
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Duty_A (Optional)</label>
+                  <select id="focDaSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-purple-200 font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Duty_B (Optional)</label>
+                  <select id="focDbSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-purple-200 font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Duty_C (Optional)</label>
+                  <select id="focDcSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-purple-200 font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Gate Thermal Init</label>
+                  <select id="focGateInitSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]">
+                    <option value="preheat" selected>继承门控前温升 (连续热历史)</option>
+                    <option value="cold">冷启动重置至 T_amb</option>
+                  </select>
+                </div>
+              </div>
+
               <div class="grid grid-cols-2 sm:grid-cols-6 gap-2">
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">Time Gate</label>
@@ -2097,7 +2134,7 @@
                 </div>
               </div>
 
-              <div class="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-10 gap-1.5 pt-1 border-t border-[#1b222c]">
+              <div class="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-11 gap-1.5 pt-1 border-t border-[#1b222c]">
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">f_sw (kHz)</label>
                   <input id="focFswKhzInput" type="number" step="1" min="1" value="20" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
@@ -2121,6 +2158,10 @@
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">Esw (µJ)</label>
                   <input id="focEswInput" type="number" step="1" min="0" value="35" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="零电流 Coss 电容充放电损耗 Eoss (µJ @ Vref)，按 (Vbus/Vref)² 计入每次硬开关主导通管（钳位时不计）；默认 0 µJ 以避免与数据手册 Eon 重复计算；忽略非线性 Coss(V) 电压依赖差异。">Eoss (µJ)</label>
+                  <input id="focEossInput" type="number" step="0.5" min="0" value="0" title="零电流 Coss 电容损耗 (µJ @ Vref)，默认 0 避免与 Eon 重复计算，按 (Vbus/Vref)² 缩放（标称近似，非非线性 Coss(V) 积分）。" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">Qrr (nC)</label>
@@ -2167,17 +2208,28 @@
                     <input id="focStallLimitInput" type="number" step="5" min="40" value="150" class="w-16 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-rose-300 font-mono" />
                     <span>°C</span>
                   </label>
+                  <label class="flex items-center gap-1 text-slate-400">
+                    <span>R_s</span>
+                    <input id="focStallRsInput" type="number" step="0.01" min="0.001" value="0.25" class="w-16 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200 font-mono" title="电机单相定子绕组电阻 R_s (Ω)，用于计算堵转电压调制比 m ≈ 2·I_pk·(R_s+Rds)/Vbus" />
+                    <span>Ω</span>
+                  </label>
+                  <select id="focStallDutyModeSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200 font-mono text-[10px]">
+                    <option value="resistive" selected>零速堵转 SVPWM (压降 m≈2·I·(R_s+Rds)/Vbus)</option>
+                    <option value="user_m">强制使用设定 m 与调制方式</option>
+                  </select>
                 </div>
                 <button id="focRunStallBtn" type="button" class="px-3 py-1 bg-rose-950/60 hover:bg-rose-900/70 border border-rose-600/60 text-rose-200 rounded-sm text-[11px] font-semibold cursor-pointer">Run Stall Sweep &amp; I²t Protection</button>
               </div>
             </div>
 
+            <div id="focSimWarningsBox" class="hidden bg-amber-950/45 border border-amber-500/50 text-amber-200 px-2.5 py-2 rounded-xs font-mono text-[10px] space-y-1"></div>
+
             <!-- Card 2: KPI Bar -->
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px] tabular-nums">
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Hottest Switch</div><div id="focKpiHottest" class="text-pink-300 font-semibold mt-0.5">--</div></div>
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">P_inv Mean / T_board</div><div id="focKpiPower" class="text-amber-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">P_inv Mean / T_board (稳态预测)</div><div id="focKpiPower" class="text-amber-300 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Stall Worst Angle</div><div id="focKpiStallAngle" class="text-rose-300 font-semibold mt-0.5">--</div></div>
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Safe Stall t_safe / I²t</div><div id="focKpiStallSafe" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Macro Tj_limit t_safe / I²t (RMS &amp; 最热臂)</div><div id="focKpiStallSafe" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
             </div>
 
             <!-- Card 3: Plot Switcher + Canvas -->

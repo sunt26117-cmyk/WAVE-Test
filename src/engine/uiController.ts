@@ -3997,7 +3997,7 @@ export class OscilloscopeApp {
 
       const summary = computePowerSummary(pCh.t, pCh.v);
       this.showToast(
-        `P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, E=${formatEng(summary.energyJ, 'J', 3)}`,
+        `P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_diss=${formatEng(summary.avgDissipationW, 'W', 3)}, E=${formatEng(summary.energyJ, 'J', 3)}`,
         'info'
       );
     } catch (err: any) {
@@ -4342,10 +4342,10 @@ export class OscilloscopeApp {
     }
     if (mode === 'y' || mode === 'xy' || mode === 'track') {
       html += `
-        <div class="flex justify-between"><span class="text-violet-400">Y1:</span><span>${y1 !== null ? formatEng(y1, unit, 2) : '--'}</span></div>
-        <div class="flex justify-between"><span class="text-violet-400">Y2:</span><span>${y2 !== null ? formatEng(y2, unit, 2) : '--'}</span></div>
-        <div class="flex justify-between"><span class="text-slate-400">ΔY:</span><span class="text-slate-100 font-semibold">${dy !== null ? formatEng(dy, unit, 2) : '--'}</span></div>
-        <div class="flex justify-between"><span class="text-slate-400">ΔY/ΔX:</span><span>${slope}</span></div>
+        <div class="flex justify-between"><span class="text-violet-400">Y1:</span><span>${escapeHtml(y1 !== null ? formatEng(y1, unit, 2) : '--')}</span></div>
+        <div class="flex justify-between"><span class="text-violet-400">Y2:</span><span>${escapeHtml(y2 !== null ? formatEng(y2, unit, 2) : '--')}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔY:</span><span class="text-slate-100 font-semibold">${escapeHtml(dy !== null ? formatEng(dy, unit, 2) : '--')}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔY/ΔX:</span><span>${escapeHtml(slope)}</span></div>
       `;
     }
     html += '</div>';
@@ -4394,8 +4394,8 @@ export class OscilloscopeApp {
         if (xyReadout && xCh && yCh) {
           const m = computeXYMetrics(xCh, yCh, tab.view.startIndex, tab.view.endIndex);
           xyReadout.innerHTML = `
-            <div class="flex justify-between"><span>X Span:</span><span>${formatEng(m.xMax - m.xMin, xCh.unit, 2)}</span></div>
-            <div class="flex justify-between"><span>Y Span:</span><span>${formatEng(m.yMax - m.yMin, yCh.unit, 2)}</span></div>
+            <div class="flex justify-between"><span>X Span:</span><span>${escapeHtml(formatEng(m.xMax - m.xMin, xCh.unit, 2))}</span></div>
+            <div class="flex justify-between"><span>Y Span:</span><span>${escapeHtml(formatEng(m.yMax - m.yMin, yCh.unit, 2))}</span></div>
             <div class="flex justify-between"><span>Circularity:</span><span class="text-cyan-300">${m.circularityPct !== null ? m.circularityPct.toFixed(1) + '%' : '--'}</span></div>
             <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-amber-300">${m.lissajousPhaseDeg !== null ? m.lissajousPhaseDeg.toFixed(1) + '°' : '--'}</span></div>
           `;

@@ -8,7 +8,7 @@ plotly>=5.22.0
 openpyxl>=3.1.2
 `;
 
-const MOTOR_PHYSICS_PY = `"""
+const MOTOR_PHYSICS_PY = String.raw`"""
 motor_physics.py - Core BLDC/FOC Physics Engine (V2.0)
 Amplitude-invariant Clarke/Park transformation + SI units.
 Fixes:
@@ -132,11 +132,13 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
     rs = get_effective_rs(params)
     lq = calc_lq_h(params.l_ll_mh)
 
-    v_bus_cap_raw = v_meas - i_bus * params.r_line
+    r_line = max(0.0, params.r_line)
+    v_bus_cap_raw = v_meas - i_bus * r_line
     invalid_bus = (not math.isfinite(v_bus_cap_raw)) or (v_bus_cap_raw <= 0.1)
     v_bus_cap = float("nan") if invalid_bus else v_bus_cap_raw
 
-    eq = params.ke_prime * omega_m
+    eq0 = params.ke_prime * omega_m
+    eq = eq0
     p0 = calc_p0_loss(n_rpm, params.p0_a, params.p0_b)
     p_in = v_meas * i_bus
 
@@ -157,7 +159,7 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
         mode = "regen"
         p_elec = (v_bus_cap * i_net) / eta_inv
 
-    delta = float("nan") if invalid_bus else (eq * eq + (8.0 / 3.0) * rs * p_elec)
+    delta = float("nan") if invalid_bus else (eq0 * eq0 + (8.0 / 3.0) * rs * p_elec)
 
     iq = float("nan")
     iph_rms = float("nan")
@@ -183,13 +185,17 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
         iq = 0.0
         iph_rms = 0.0
         p_cu = 0.0
-        t_est = (-p0 / omega_m) if (abs(n_rpm) > 1e-6 and abs(omega_m) > 1e-6) else 0.0
-        p_out = -p0 if abs(n_rpm) > 1e-6 else 0.0
+        if abs(n_rpm) > 1e-6 and abs(omega_m) > 1e-6:
+            t_est = -p0 / omega_m
+            p_out = -p0
+        else:
+            t_est = 0.0
+            p_out = 0.0
         eta_est = 0.0
-        vq_motor = eq
-        vq_cmd = eq
+        vq_motor = eq0
+        vq_cmd = eq0
         vd = 0.0
-        v_ph = abs(eq)
+        v_ph = abs(eq0)
         m_motor = v_ph / (v_bus_cap / 2.0)
         m_norm_motor = math.sqrt(3.0) * v_ph / v_bus_cap
         m_cmd = m_motor
@@ -199,40 +205,93 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
     elif delta < 0:
         mode = "regen_limit"
     else:
-        if abs(eq) < 1e-12:
+        if abs(eq0) < 1e-12:
             iq = math.sqrt((2.0 * p_elec) / (3.0 * rs)) if p_elec >= 0 else -math.sqrt((-2.0 * p_elec) / (3.0 * rs))
+            eq = 0.0
         else:
-            iq = (-eq + math.copysign(1.0, eq) * math.sqrt(delta)) / (2.0 * rs)
-        iph_rms = abs(iq) / math.sqrt(2.0)
-        k_sat = calc_ksat(iq, params.beta_sat)
-        kt = 1.5 * params.ke_prime * k_sat
-        p_cu = 1.5 * rs * (iq ** 2)
-        if abs(n_rpm) > 1e-6 and abs(omega_m) > 1e-6:
-            t_est = kt * iq - p0 / omega_m
-            p_out = t_est * omega_m
-        else:
-            t_est = kt * iq
-            p_out = 0.0
+            sign_eq = 1.0 if eq0 >= 0.0 else -1.0
+            beta = max(0.0, params.beta_sat)
+            iq = (-eq0 + sign_eq * math.sqrt(delta)) / (2.0 * rs)
+            if beta > 0.0 and math.isfinite(iq):
+                hit_regen_limit = False
+                for _ in range(30):
+                    iq_sq = iq * iq
+                    denom = 1.0 + beta * iq_sq
+                    ks = 1.0 / denom
+                    eq_cur = eq0 * ks
+                    residual = 1.5 * (eq_cur * iq + rs * iq_sq) - p_elec
+                    if abs(residual) <= 1e-11 * (1.0 + abs(p_elec)):
+                        eq = eq_cur
+                        delta = max(0.0, eq_cur * eq_cur + (8.0 / 3.0) * rs * p_elec)
+                        break
+                    d_eq_term = eq0 * ((1.0 - beta * iq_sq) / (denom * denom))
+                    df = 1.5 * (d_eq_term + 2.0 * rs * iq)
+                    d_iter = eq_cur * eq_cur + (8.0 / 3.0) * rs * p_elec
+                    next_iq = float("nan")
+                    if abs(df) > 1e-9 and math.isfinite(df):
+                        cand = iq - residual / df
+                        cand_sq = cand * cand
+                        cand_res = 1.5 * ((eq0 / (1.0 + beta * cand_sq)) * cand + rs * cand_sq) - p_elec
+                        if math.isfinite(cand_res) and abs(cand_res) < abs(residual):
+                            next_iq = cand
+                    if not math.isfinite(next_iq):
+                        if d_iter < 0.0:
+                            delta = d_iter
+                            hit_regen_limit = True
+                            break
+                        fp = (-eq_cur + sign_eq * math.sqrt(d_iter)) / (2.0 * rs)
+                        next_iq = 0.5 * iq + 0.5 * fp
+                    iq = next_iq
+                ks_final = calc_ksat(iq, beta)
+                eq = eq0 * ks_final
+                d_final = eq * eq + (8.0 / 3.0) * rs * p_elec
+                final_res = 1.5 * (eq * iq + rs * iq * iq) - p_elec
+                if hit_regen_limit or d_final < -1e-9 or (not math.isfinite(iq)) or abs(final_res) > 1e-3 * (1.0 + abs(p_elec)):
+                    mode = "regen_limit"
+                    iq = float("nan")
+                    if d_final < delta:
+                        delta = d_final
+                else:
+                    delta = max(0.0, d_final)
 
-        if p_in > 1e-6 and p_out >= 0:
-            eta_est = p_out / p_in
-        elif p_in < -1e-6 and p_out < 0:
-            eta_est = p_in / p_out
-        else:
-            eta_est = 0.0
+        if mode != "regen_limit" and math.isfinite(iq):
+            iph_rms = abs(iq) / math.sqrt(2.0)
+            k_sat = calc_ksat(iq, params.beta_sat)
+            eq = eq0 * k_sat
+            kt = 1.5 * params.ke_prime * k_sat
+            p_cu = 1.5 * rs * (iq ** 2)
+            if abs(n_rpm) > 1e-6 and abs(omega_m) > 1e-6:
+                t_est = kt * iq - p0 / omega_m
+                p_out = t_est * omega_m
+            else:
+                t_est = kt * iq
+                p_out = 0.0
 
-        vq_motor = eq + rs * iq
-        vq_cmd = calc_vq_cmd(vq_motor, iq, v_bus_cap, params)
-        vd = -omega_e * lq * iq
-        v_ph_motor = math.hypot(vd, vq_motor)
-        v_ph_cmd = math.hypot(vd, vq_cmd)
+            if p_in > 1e-6 and p_out >= 0:
+                eta_est = p_out / p_in
+            elif p_in < -1e-6 and p_out < -1e-6:
+                eta_est = abs(p_in / p_out)
+            else:
+                eta_est = 0.0
 
-        m_motor = v_ph_motor / (v_bus_cap / 2.0)
-        m_norm_motor = math.sqrt(3.0) * v_ph_motor / v_bus_cap
-        m_cmd = v_ph_cmd / (v_bus_cap / 2.0)
-        m_norm_cmd = math.sqrt(3.0) * v_ph_cmd / v_bus_cap
-        phi_deg = calc_phi_deg(vq_motor, vd, iq)
-        phi_cmd_deg = calc_phi_deg(vq_cmd, vd, iq)
+            vq_motor = eq + rs * iq
+            vq_cmd = calc_vq_cmd(vq_motor, iq, v_bus_cap, params)
+            vd = -omega_e * lq * iq
+            v_ph_motor = math.hypot(vd, vq_motor)
+            v_ph_cmd = math.hypot(vd, vq_cmd)
+
+            m_motor = v_ph_motor / (v_bus_cap / 2.0)
+            m_norm_motor = math.sqrt(3.0) * v_ph_motor / v_bus_cap
+            m_cmd = v_ph_cmd / (v_bus_cap / 2.0)
+            m_norm_cmd = math.sqrt(3.0) * v_ph_cmd / v_bus_cap
+            phi_deg = calc_phi_deg(vq_motor, vd, iq)
+            phi_cmd_deg = calc_phi_deg(vq_cmd, vd, iq)
+
+    iq_sign_ambiguous = (
+        mode not in ("invalid_bus", "regen_limit", "zero_drift")
+        and math.isfinite(iq)
+        and ((mode == "regen" and p_elec < -1e-12 and delta > 1e-12) or (abs(eq0) < 1e-12 and abs(iq) > 1e-9))
+    )
 
     return {
         "v_meas": v_meas,
@@ -270,6 +329,7 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
         "alert_regen_limit": mode == "regen_limit",
         "alert_zero_drift": mode == "zero_drift",
         "alert_invalid_bus": mode == "invalid_bus",
+        "alert_iq_sign_ambiguous": iq_sign_ambiguous,
     }
 
 
@@ -278,37 +338,42 @@ def forward_verify_point(iq: float, n_rpm: float, v_meas: float, params: MotorPa
     omega_e = calc_omega_e(n_rpm, params.pole_pairs)
     rs = get_effective_rs(params)
     lq = calc_lq_h(params.l_ll_mh)
-    eq = params.ke_prime * omega_m
+    k_sat = calc_ksat(iq, params.beta_sat)
+    eq = params.ke_prime * omega_m * k_sat
     p_elec = 1.5 * (eq * iq + rs * iq * iq)
     eta_inv = min(0.999, max(0.1, params.eta_inv))
     p_dc = p_elec / eta_inv if p_elec >= 0 else p_elec * eta_inv
 
+    r_line = max(0.0, params.r_line)
     i_bus_est = float("nan")
     line_collapse = False
-    if params.r_line < 1e-9:
+    if r_line < 1e-9:
         if v_meas <= 0.1:
             line_collapse = True
         else:
             i_bus_est = params.i_idle + p_dc / v_meas
     else:
-        b = -(v_meas + params.r_line * params.i_idle)
+        b = -(v_meas + r_line * params.i_idle)
         c = v_meas * params.i_idle + p_dc
-        disc = b * b - 4.0 * params.r_line * c
+        disc = b * b - 4.0 * r_line * c
         if disc < 0.0 or not math.isfinite(disc):
             line_collapse = True
         else:
-            i_bus_est = (-b - math.sqrt(disc)) / (2.0 * params.r_line)
+            i_bus_est = (-b - math.sqrt(disc)) / (2.0 * r_line)
 
-    v_bus_cap_raw = float("nan") if line_collapse else (v_meas - i_bus_est * params.r_line)
+    v_bus_cap_raw = float("nan") if line_collapse else (v_meas - i_bus_est * r_line)
     invalid_bus = line_collapse or (not math.isfinite(v_bus_cap_raw)) or (v_bus_cap_raw <= 0.1)
     v_bus_cap = float("nan") if invalid_bus else v_bus_cap_raw
 
-    k_sat = calc_ksat(iq, params.beta_sat)
     p0 = calc_p0_loss(n_rpm, params.p0_a, params.p0_b)
     t_est = (1.5 * params.ke_prime * k_sat * iq - p0 / omega_m) if (abs(n_rpm) > 1e-6 and abs(omega_m) > 1e-6) else (1.5 * params.ke_prime * k_sat * iq)
     p_in = float("nan") if invalid_bus else (v_meas * i_bus_est)
     p_out = t_est * omega_m if abs(n_rpm) > 1e-6 else 0.0
-    eta_est = float("nan") if not math.isfinite(p_in) else ((p_out / p_in) if (p_in > 1e-6 and p_out >= 0) else ((p_in / p_out) if (p_in < -1e-6 and p_out < 0) else 0.0))
+    eta_est = (
+        float("nan")
+        if not math.isfinite(p_in)
+        else ((p_out / p_in) if (p_in > 1e-6 and p_out >= 0) else (abs(p_in / p_out) if (p_in < -1e-6 and p_out < -1e-6) else 0.0))
+    )
 
     vq_motor = eq + rs * iq
     vq_cmd = float("nan") if invalid_bus else calc_vq_cmd(vq_motor, iq, v_bus_cap, params)
@@ -336,11 +401,80 @@ def forward_verify_point(iq: float, n_rpm: float, v_meas: float, params: MotorPa
     }
 
 
+def is_monotonic_timestamps(times: np.ndarray) -> bool:
+    if len(times) < 2:
+        return True
+    return bool(np.all(np.isfinite(times)) and np.all(np.diff(times) >= 0.0) and (times[-1] > times[0]))
+
+
 def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: MotorParams) -> pd.DataFrame:
     times = df["Time"].to_numpy(dtype=float)
-    avg_dt = (times[-1] - times[0]) / max(1, len(times) - 1) if len(times) >= 2 else 0.001
-    win_samples = max(1, int(round((filter_window_ms * 1e-3) / max(1e-6, avg_dt))))
-    i_bus_filt = pd.Series(df["I_bus"].to_numpy(dtype=float)).rolling(window=win_samples, min_periods=1, center=True).mean().to_numpy()
+    raw_i = df["I_bus"].to_numpy(dtype=float)
+    n_pts = len(times)
+    monotonic = is_monotonic_timestamps(times)
+
+    if n_pts == 0 or filter_window_ms <= 0.0:
+        i_bus_filt = raw_i.copy()
+    elif monotonic:
+        half_w = (filter_window_ms * 1e-3) * 0.5
+        i_bus_filt = np.empty(n_pts, dtype=float)
+        finite = np.isfinite(raw_i)
+        prefix = np.concatenate([[0.0], np.cumsum(np.where(finite, raw_i, 0.0))])
+        valid_prefix = np.concatenate([[0], np.cumsum(finite.astype(int))])
+        has_nan = bool(valid_prefix[-1] < n_pts)
+        if not has_nan:
+            dts = np.diff(times)
+            trap_segs = 0.5 * (raw_i[:-1] + raw_i[1:]) * dts
+            trap_prefix = np.concatenate([[0.0], np.cumsum(trap_segs)])
+        else:
+            trap_prefix = None
+        left = 0
+        right = 0
+        for i in range(n_pts):
+            ti = times[i]
+            while left < i and ti - times[left] > half_w + 1e-12:
+                left += 1
+            if right < i:
+                right = i
+            while right + 1 < n_pts and times[right + 1] - ti <= half_w + 1e-12:
+                right += 1
+            if trap_prefix is not None:
+                span = times[right] - times[left]
+                if span > 1e-12:
+                    i_bus_filt[i] = (trap_prefix[right] - trap_prefix[left]) / span
+                else:
+                    cnt = right - left + 1
+                    i_bus_filt[i] = (prefix[right + 1] - prefix[left]) / cnt
+            else:
+                area = 0.0
+                first_t = float("nan")
+                last_t = float("nan")
+                prev_t = float("nan")
+                prev_v = float("nan")
+                f_sum = 0.0
+                f_cnt = 0
+                for k in range(left, right + 1):
+                    vk = raw_i[k]
+                    if not math.isfinite(vk):
+                        continue
+                    tk = times[k]
+                    f_sum += vk
+                    f_cnt += 1
+                    if not math.isfinite(first_t):
+                        first_t = tk
+                    else:
+                        area += 0.5 * (prev_v + vk) * (tk - prev_t)
+                    last_t = tk
+                    prev_t = tk
+                    prev_v = vk
+                span = (last_t - first_t) if (math.isfinite(first_t) and math.isfinite(last_t)) else 0.0
+                i_bus_filt[i] = (area / span) if span > 1e-12 else ((f_sum / f_cnt) if f_cnt > 0 else float("nan"))
+    else:
+        diffs = np.diff(times)
+        pos_diffs = diffs[np.isfinite(diffs) & (diffs > 1e-9)]
+        med_dt = float(np.median(pos_diffs)) if len(pos_diffs) > 0 else 0.002
+        win_samples = max(1, int(round((filter_window_ms * 1e-3) / max(1e-6, med_dt))))
+        i_bus_filt = pd.Series(raw_i).rolling(window=win_samples, min_periods=1, center=True).mean().to_numpy()
 
     records = []
     for t, v, ib_raw, ib_f, n in zip(times, df["V_bus"], df["I_bus"], i_bus_filt, df["n_rpm"]):
@@ -349,10 +483,12 @@ def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: Motor
         res["i_bus_raw"] = float(ib_raw)
         res["i_bus_filt"] = float(ib_f)
         records.append(res)
-    return pd.DataFrame(records)
+    out_df = pd.DataFrame(records)
+    out_df.attrs["time_monotonic"] = monotonic
+    return out_df
 `;
 
-const DYNO_CALIBRATOR_PY = `"""
+const DYNO_CALIBRATOR_PY = String.raw`"""
 dyno_calibrator.py - Stepwise Anti-Overfitting Dyno Calibration & 2D Efficiency Map
 Fixes:
 - Empty closed-loop DataFrame protection (returns structured empty eval_df with columns & status)
@@ -374,7 +510,10 @@ from motor_physics import (
     MotorParams,
     calc_ke_from_kv,
     calc_ke_from_no_load,
+    calc_omega_m,
+    calc_p0_loss,
     calc_rs_anchor,
+    forward_verify_point,
     solve_single_point,
 )
 
@@ -394,7 +533,7 @@ EVAL_COLUMNS = [
 def auto_map_columns(headers: list[str]) -> dict[str, str]:
     patterns = {
         "n_rpm": [r"^n_?rpm$", r"rpm", r"speed", r"转速"],
-        "T_Nm": [r"^t_?nm$", r"^t_?mnm$", r"torque", r"^t_", r"扭矩", r"转矩"],
+        "T_Nm": [r"^t_?nm$", r"^t_?mnm$", r"torque", r"^t_load$", r"^trq$", r"扭矩", r"转矩"],
         "V_bus": [r"^v_?bus$", r"v_?meas", r"vbus", r"voltage", r"电压"],
         "I_bus": [r"^i_?bus$", r"ibus", r"current", r"电流"],
         "P_in": [r"^p_?in", r"pin", r"input.?power", r"输入功率"],
@@ -413,6 +552,53 @@ def auto_map_columns(headers: list[str]) -> dict[str, str]:
                 break
         mapping[field] = matched
     return mapping
+
+
+def _detect_power_scale_w(col_name: str) -> tuple[float, str | None]:
+    raw = str(col_name or "").strip()
+    if not raw:
+        return 1.0, None
+
+    def _parse_pow(tok: str) -> float | None:
+        if re.fullmatch(r"(?:W|watt|watts)", tok, flags=re.IGNORECASE):
+            return 1.0
+        if re.fullmatch(r"(?:kW|kilowatt|kilowatts)", tok, flags=re.IGNORECASE):
+            return 1e3
+        if tok == "MW" or re.fullmatch(r"(?:megawatt|megawatts)", tok, flags=re.IGNORECASE):
+            return 1e6
+        if tok in ("mW", "mw") or re.fullmatch(r"(?:milliwatt|milliwatts)", tok, flags=re.IGNORECASE):
+            return 1e-3
+        if re.fullmatch(r"(?:uW|µW|μW|microwatt|microwatts)", tok, flags=re.IGNORECASE):
+            return 1e-6
+        return None
+
+    br = re.search(r"[\(\[\{（]\s*([^\)\]\}）]+?)\s*[\)\]\}）]", raw)
+    if br:
+        tok = br.group(1).strip()
+        sc = _parse_pow(tok)
+        return (sc, None) if sc is not None else (1.0, tok)
+    sfx = re.search(r"(?:^|[_\s])(kW|MW|mW|uW|µW|μW|W)$", raw)
+    if sfx:
+        sc = _parse_pow(sfx.group(1))
+        if sc is not None:
+            return sc, None
+    return 1.0, None
+
+
+def _parse_power_series_w(series: pd.Series, default_scale_w: float) -> pd.Series:
+    num = pd.to_numeric(series, errors="coerce") * default_scale_w
+    need_str = num.isna() & series.notna()
+    if need_str.any():
+        unit_scales = {"kw": 1e3, "mw": 1e-3, "uw": 1e-6, "µw": 1e-6, "μw": 1e-6, "w": 1.0}
+        for idx, raw in series.loc[need_str].items():
+            s = str(raw).strip()
+            m = re.match(r"^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(kW|MW|mW|uW|µW|μW|W)$", s, flags=re.IGNORECASE)
+            if m:
+                val = float(m.group(1))
+                u = m.group(2)
+                sc = 1e6 if u == "MW" else unit_scales.get(u.lower(), 1.0)
+                num.loc[idx] = val * sc
+    return num
 
 
 def normalize_dyno_df(
@@ -442,14 +628,20 @@ def normalize_dyno_df(
         out["T_Nm"] = np.nan
 
     if col_map.get("P_in"):
-        out["P_in"] = pd.to_numeric(df[col_map["P_in"]], errors="coerce")
+        pin_scale, pin_bad = _detect_power_scale_w(col_map["P_in"])
+        if pin_bad:
+            warnings.append(f"P_in 列 \"{col_map['P_in']}\" 括号单位 \"{pin_bad}\" 非标准功率单位 (W/kW/mW/MW)，已按 W 处理。")
+        out["P_in"] = _parse_power_series_w(df[col_map["P_in"]], pin_scale)
     else:
         out["P_in"] = out["V_bus"] * out["I_bus"]
     out["P_in"] = out["P_in"].fillna(out["V_bus"] * out["I_bus"])
 
     pout_mapped = bool(col_map.get("P_out"))
     if pout_mapped:
-        out["P_out"] = pd.to_numeric(df[col_map["P_out"]], errors="coerce")
+        pout_scale, pout_bad = _detect_power_scale_w(col_map["P_out"])
+        if pout_bad:
+            warnings.append(f"P_out 列 \"{col_map['P_out']}\" 括号单位 \"{pout_bad}\" 非标准功率单位 (W/kW/mW/MW)，已按 W 处理。")
+        out["P_out"] = _parse_power_series_w(df[col_map["P_out"]], pout_scale)
     else:
         out["P_out"] = np.nan
 
@@ -459,16 +651,19 @@ def normalize_dyno_df(
     missing_t = out["T_Nm"].isna() & out["P_out"].notna() & (out["n_rpm"].abs() > 1e-6)
     out.loc[missing_t, "T_Nm"] = out.loc[missing_t, "P_out"] / omega_m.loc[missing_t]
 
-    # Issue 7 fix: Do NOT silently fill missing T_Nm with 0.0 on mapped closed-loop datasets
-    if t_mapped and require_torque:
+    # Do NOT silently fill missing T_Nm with 0.0 when require_torque=True (even if unmapped)
+    if require_torque:
         n_missing_t = int(out["T_Nm"].isna().sum())
         if n_missing_t > 0:
-            warnings.append(f"已剔除 {n_missing_t} 条缺失扭矩的无效行（避免被当成 0 N·m 污染标定与 MAE）")
+            if not t_mapped and not pout_mapped:
+                warnings.append(f"闭环数据未映射扭矩列 (T_Nm) 且无 P_out 可反算，已拦截 {n_missing_t} 条无效行（请先映射扭矩列）。")
+            else:
+                warnings.append(f"已剔除 {n_missing_t} 条缺失扭矩的无效行（避免被当成 0 N·m 污染标定与 MAE）")
             out = out.dropna(subset=["T_Nm"])
     else:
         out["T_Nm"] = out["T_Nm"].fillna(0.0)
 
-    # Issue 9 fix: Check consistency between mapped P_out and T_Nm * omega_m
+    # Check consistency between mapped P_out and T_Nm * omega_m
     pout_calc = out["T_Nm"] * (2.0 * math.pi * out["n_rpm"] / 60.0)
     if pout_mapped and len(out) > 0:
         denom = np.maximum(out["P_out"].abs(), pout_calc.abs())
@@ -479,7 +674,13 @@ def normalize_dyno_df(
                 warnings.append(f"实测 P_out 列与换算后的 T_Nm × ω_m 偏差达 {rel_diff * 100:.0f}%，请核对扭矩单位或 P_out 单位是否为 W")
     out["P_out"] = out["P_out"].fillna(pout_calc)
 
-    # Issue 8 fix: Detect eta_format mismatch before clipping
+    fallback_eta = np.where(
+        (out["P_in"] > 1e-6) & (out["P_out"] >= 0),
+        out["P_out"] / out["P_in"],
+        np.where((out["P_in"] < -1e-6) & (out["P_out"] < -1e-6), np.abs(out["P_in"] / out["P_out"]), 0.0),
+    )
+
+    # Detect eta_format mismatch before clipping
     if col_map.get("eta"):
         eta_raw = pd.to_numeric(df.loc[out.index, col_map["eta"]], errors="coerce")
         valid_eta = eta_raw.dropna()
@@ -489,10 +690,9 @@ def normalize_dyno_df(
             elif eta_format == "percent" and 0.0 < float(valid_eta.median()) < 1.0:
                 warnings.append(f"效率列中位数 ({valid_eta.median():.3f}) < 1.0，按 % 换算后不足 1%，疑似本就是「0-1」格式")
         out["eta"] = (eta_raw / 100.0) if eta_format == "percent" else eta_raw
-        fallback_eta = np.where((out["P_in"] > 1e-6) & (out["P_out"] >= 0), out["P_out"] / out["P_in"], 0.0)
         out["eta"] = out["eta"].fillna(pd.Series(fallback_eta, index=out.index))
     else:
-        out["eta"] = np.where((out["P_in"] > 1e-6) & (out["P_out"] >= 0), out["P_out"] / out["P_in"], 0.0)
+        out["eta"] = fallback_eta
 
     out["eta"] = out["eta"].clip(0.0, 1.0)
     out = out.dropna(subset=["n_rpm", "V_bus", "I_bus"]).reset_index(drop=True)
@@ -510,6 +710,14 @@ def run_stepwise_calibration(
     manual_kv: float = 107.4,
     rs_fit_mode: str = "locked",
 ) -> dict:
+    calib_warnings: list[str] = []
+    status = "ok"
+
+    def _elevate(nxt: str) -> None:
+        nonlocal status
+        if nxt == "failed" or (nxt == "warn" and status == "ok"):
+            status = nxt
+
     # Step 1: Ke' & n0_rpm
     calibrated_n0 = base_params.n0_rpm
     if ke_source == "manual_n0_vtest":
@@ -525,8 +733,15 @@ def run_stepwise_calibration(
             calibrated_n0 = float(top["n_rpm"])
         else:
             ke_prime = base_params.ke_prime
+            _elevate("warn")
+            calib_warnings.append("开环数据缺少 n > 50 RPM 且 V_bus > 0.5V 的有效空载点，已沿用当前设定 Ke'。")
     else:
         ke_prime = base_params.ke_prime
+
+    if not math.isfinite(ke_prime) or ke_prime <= 0.0:
+        _elevate("failed")
+        calib_warnings.append(f"Ke' 物理参数无效 ({ke_prime})，请核对空载点或 KV 参数。")
+        ke_prime = max(1e-5, float(base_params.ke_prime or 0.05))
 
     rs_anchor = calc_rs_anchor(base_params.r_ll_25, base_params.t_coil)
 
@@ -567,6 +782,9 @@ def run_stepwise_calibration(
         n_arr = np.array(p0_n)
         y_arr = np.array(p0_obs)
         res_p0 = least_squares(lambda c: c[0] * n_arr + c[1] * (n_arr ** 2) - y_arr, x0=[5e-4, 5e-7], bounds=([0.0, 0.0], [1.0, 1e-2]))
+        if not bool(res_p0.success):
+            _elevate("warn")
+            calib_warnings.append(f"Step 2 P0(n) 最小二乘拟合未完全收敛: {res_p0.message}")
         p0_a, p0_b = float(res_p0.x[0]), float(res_p0.x[1])
     else:
         p0_a, p0_b = base_params.p0_a, base_params.p0_b
@@ -584,6 +802,7 @@ def run_stepwise_calibration(
         })
         return {
             "status": "empty_data",
+            "warnings": calib_warnings + ["闭环有效测功点为空，无法执行 Step 3 标定。"],
             "params": final_params,
             "rs_anchor": rs_anchor,
             "rs_eff": best_rs,
@@ -609,8 +828,13 @@ def run_stepwise_calibration(
         errs = []
         for _, row in df_closed.iterrows():
             r = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), p_cand)
-            # Issue 11 fix: large penalty for degenerate non-finite points instead of 0.0
-            errs.append((r["t_est"] - float(row["T_Nm"])) if math.isfinite(r["t_est"]) else 1e3)
+            if math.isfinite(r["t_est"]):
+                eta_err = (r["eta_est"] - float(row["eta"])) if math.isfinite(r["eta_est"]) else 0.0
+                errs.append(r["t_est"] - float(row["T_Nm"]))
+                errs.append(0.1 * eta_err)
+            else:
+                errs.append(1e3)
+                errs.append(1e2)
         return np.array(errs, dtype=float)
 
     if rs_fit_mode == "locked":
@@ -622,6 +846,10 @@ def run_stepwise_calibration(
         best_beta = float(opt.x[0])
         best_rs = float(opt.x[1])
 
+    if not bool(opt.success):
+        _elevate("warn")
+        calib_warnings.append(f"Step 3 优化器未完全收敛: {opt.message}")
+
     final_params = MotorParams(**{
         **step3_base.__dict__,
         "beta_sat": best_beta,
@@ -629,8 +857,11 @@ def run_stepwise_calibration(
     })
 
     eval_rows = []
+    unsolved_count = 0
     for _, row in df_closed.iterrows():
         r = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), final_params)
+        if not math.isfinite(r["t_est"]):
+            unsolved_count += 1
         p_inv = max(0.0, float(row["P_in"]) - r["p_elec"]) if math.isfinite(r["p_elec"]) else 0.0
         p_cu = r["p_cu"] if math.isfinite(r["p_cu"]) else 0.0
         t_est = r["t_est"] if math.isfinite(r["t_est"]) else 0.0
@@ -658,7 +889,26 @@ def run_stepwise_calibration(
     mask_eta = df_eval["eta"] > 0.1
     mape_eta = float(((df_eval.loc[mask_eta, "err_eta"].abs() / df_eval.loc[mask_eta, "eta"]) * 100.0).mean()) if mask_eta.any() else 0.0
 
-    # Safe 2D Efficiency Map via scipy.interpolate.griddata (guarded against 1D collinear / QhullError)
+    if not math.isfinite(rs_anchor) or rs_anchor <= 0.0 or not math.isfinite(best_rs) or best_rs <= 0.0 or not math.isfinite(best_beta) or best_beta < 0.0:
+        _elevate("failed")
+        calib_warnings.append(f"标定电阻或饱和系数越界 (Rs_eff={best_rs}, β={best_beta})。")
+    if unsolved_count == len(df_closed):
+        _elevate("failed")
+        calib_warnings.append(f"全部 {unsolved_count} 个闭环测点物理求解失败 (母线塌陷或超发电极限)。")
+    elif unsolved_count > 0:
+        _elevate("warn")
+        calib_warnings.append(f"有 {unsolved_count}/{len(df_closed)} 个闭环测点物理求解失败 (NaN)。")
+
+    max_abs_t = max(0.05, float(df_eval["T_Nm"].abs().max()))
+    if mae_t > max(0.25, 0.8 * max_abs_t):
+        _elevate("failed")
+        calib_warnings.append(f"扭矩回代误差过大 (MAE={mae_t:.4f} N·m, MAPE={mape_t:.1f}%)，未能收敛至有效匹配。")
+    elif mae_t > max(0.05, 0.25 * max_abs_t) or mape_t > 25.0:
+        _elevate("warn")
+        extra = "；若开环最高点受限幅未达 m_norm≈1，请改用手动 KV 或 (n0, V_test)。" if ke_source == "open_loop_auto" else "。"
+        calib_warnings.append(f"扭矩回代偏差较高 (MAE={mae_t:.4f} N·m, MAPE={mape_t:.1f}%){extra}")
+
+    # Safe 2D Efficiency Map via convex hull interpolation + true model forward reconstruction
     grid_n = grid_t = z_meas = z_pred = None
     if len(df_eval) >= 4 and df_eval["n_rpm"].nunique() >= 2 and df_eval["T_Nm"].nunique() >= 2:
         try:
@@ -666,12 +916,37 @@ def run_stepwise_calibration(
             grid_t = np.linspace(df_eval["T_Nm"].min(), df_eval["T_Nm"].max(), 24)
             gn, gt = np.meshgrid(grid_n, grid_t)
             z_meas = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["eta"] * 100.0, (gn, gt), method="linear")
-            z_pred = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["eta_est"] * 100.0, (gn, gt), method="linear")
+            z_vbus = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["V_bus"], (gn, gt), method="linear")
+            z_pred = np.full_like(z_meas, np.nan, dtype=float)
+            kt0 = max(1e-6, 1.5 * final_params.ke_prime)
+            beta = max(0.0, final_params.beta_sat)
+            for j in range(len(grid_t)):
+                t_val = float(grid_t[j])
+                for i in range(len(grid_n)):
+                    if not math.isfinite(float(z_meas[j, i])):
+                        continue
+                    n_val = float(grid_n[i])
+                    v_local = float(z_vbus[j, i]) if math.isfinite(float(z_vbus[j, i])) else float(df_eval["V_bus"].mean())
+                    omega_m = calc_omega_m(n_val)
+                    p0_val = calc_p0_loss(n_val, final_params.p0_a, final_params.p0_b)
+                    t_em = t_val + (p0_val / omega_m if abs(omega_m) > 1e-6 else 0.0)
+                    if beta * abs(t_em) < 1e-9:
+                        iq_val = t_em / kt0
+                    else:
+                        disc_sat = kt0 * kt0 - 4.0 * beta * t_em * t_em
+                        if disc_sat < 0.0:
+                            continue
+                        iq_val = (kt0 - math.sqrt(disc_sat)) / (2.0 * beta * t_em)
+                    fwd = forward_verify_point(iq_val, n_val, v_local, final_params)
+                    m_norm_c = fwd["m_norm_cmd"]
+                    if (not fwd["invalid_bus"]) and math.isfinite(m_norm_c) and m_norm_c <= 1.0 + 1e-6 and math.isfinite(fwd["eta_est"]):
+                        z_pred[j, i] = min(99.5, max(0.0, float(fwd["eta_est"]) * 100.0))
         except Exception:
             grid_n = grid_t = z_meas = z_pred = None
 
     return {
-        "status": "ok",
+        "status": status,
+        "warnings": calib_warnings,
         "params": final_params,
         "rs_anchor": rs_anchor,
         "rs_eff": best_rs,
@@ -691,7 +966,7 @@ def run_stepwise_calibration(
     }
 `;
 
-const THERMAL_EXPORTER_PY = `"""
+const THERMAL_EXPORTER_PY = String.raw`"""
 thermal_exporter.py - Pure 6-MOS Transient Thermal Simulator Waveform & Summary Exporter
 Fixes:
 - Raises ValueError on regen_limit / invalid_bus instead of silently exporting all-zero waveforms
@@ -722,7 +997,12 @@ def _compute_pwm_duties(
     phi_rad: float,
     modulation: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not math.isfinite(m_norm) or m_norm > 1.0 + 1e-6:
+        raise ValueError(f"工况超调：m_norm={m_norm:.3f} > 1.0，超出线性 SVPWM 调制极限，拒绝裁剪并合成 PWM 占空比。")
     v_amp = min(1.0, max(0.0, m_norm)) / math.sqrt(3.0)
+    if v_amp <= 1e-6:
+        half = np.full_like(theta, 0.5, dtype=float)
+        return half.copy(), half.copy(), half.copy()
     ang = theta + phi_rad
     va = v_amp * np.sin(ang)
     vb = v_amp * np.sin(ang - 2.0 * math.pi / 3.0)
@@ -758,20 +1038,32 @@ def synthesize_6mos_csv(
 ) -> tuple[pd.DataFrame, dict]:
     res = solve_single_point(v_meas, i_bus, n_rpm, params)
 
-    if res["mode"] in ("regen_limit", "invalid_bus") or not math.isfinite(res["iq"]):
+    is_over_mod = (
+        res["alert_cmd_sat"]
+        or res["alert_motor_sat"]
+        or (math.isfinite(res["m_norm_cmd"]) and res["m_norm_cmd"] > 1.0 + 1e-6)
+        or (math.isfinite(res["m_norm_motor"]) and res["m_norm_motor"] > 1.0 + 1e-6)
+    )
+    if res["mode"] in ("regen_limit", "invalid_bus") or is_over_mod or not math.isfinite(res["iq"]):
         if res["mode"] == "invalid_bus":
             raise ValueError(f"母线压降异常 (V_meas={v_meas:.2f}V, Vbus_cap<=0.1V)，无法合成波形。")
+        if is_over_mod:
+            m_show = res["m_norm_cmd"] if math.isfinite(res["m_norm_cmd"]) else res["m_norm_motor"]
+            raise ValueError(f"工况超调：调制深度 m_norm={m_show:.3f} > 1.0，超出线性 SVPWM 能力（电压饱和），无法导出物理可信的波形。")
         raise ValueError("该工况已超出发电回馈最大制动功率极限 Eq²/(4·Rs) (Δ < 0)，无法反推相电流。")
 
     iq = float(res["iq"])
     v_bus = float(res["v_bus_cap"])
     is_stall = abs(n_rpm) < 1e-6
 
-    n_samples = min(MAX_EXPORT_SAMPLES, max(2, int(round(fs_hz * duration_s))))
+    req_samples = max(2, int(round(fs_hz * duration_s)))
+    clamped_by_limit = req_samples > MAX_EXPORT_SAMPLES
+    n_samples = min(MAX_EXPORT_SAMPLES, req_samples)
+    actual_duration_s = (n_samples - 1) / float(fs_hz) if n_samples > 1 else 0.0
     t_arr = np.arange(n_samples, dtype=float) / float(fs_hz)
 
     if is_stall:
-        theta = np.zeros(n_samples, dtype=float)
+        theta = np.full(n_samples, math.pi / 2.0, dtype=float)
         ia = np.full(n_samples, iq, dtype=float)
         ib = np.full(n_samples, -0.5 * iq, dtype=float)
         ic = np.full(n_samples, -0.5 * iq, dtype=float)
@@ -783,7 +1075,7 @@ def synthesize_6mos_csv(
         ic = -(ia + ib)
 
     data = {
-        "Time": np.round(t_arr, 6),
+        "Time": np.round(t_arr, 9),
         "Ia": np.round(ia, 5),
         "Ib": np.round(ib, 5),
         "Ic": np.round(ic, 5),
@@ -793,7 +1085,8 @@ def synthesize_6mos_csv(
     if include_duty:
         phi_rad = math.radians(res["phi_cmd_deg"]) if math.isfinite(res["phi_cmd_deg"]) else 0.0
         m_norm = res["m_norm_cmd"] if math.isfinite(res["m_norm_cmd"]) else 0.0
-        da, db, dc = _compute_pwm_duties(theta, m_norm, phi_rad, modulation)
+        iq_phase_shift = 0.0 if iq >= 0.0 else math.pi
+        da, db, dc = _compute_pwm_duties(theta + iq_phase_shift, m_norm, phi_rad, modulation)
         data["Duty_A"] = np.round(da, 5)
         data["Duty_B"] = np.round(db, 5)
         data["Duty_C"] = np.round(dc, 5)
@@ -815,18 +1108,22 @@ def synthesize_6mos_csv(
         "Mod Depth m [Vph/(Vbus/2), max 1.1547] (cmd)": _safe_round(res["m_cmd"], 4),
         "Mod Depth m_norm [sqrt(3)*Vph/Vbus, max 1.0] (cmd)": _safe_round(res["m_norm_cmd"], 4),
         "PF Angle φ (°)": _safe_round(res["phi_deg"], 2),
+        "requested_duration_s": _safe_round(duration_s, 4),
+        "actual_duration_s": _safe_round(actual_duration_s, 4),
+        "clamped_by_limit": clamped_by_limit,
         "mode": res["mode"],
     }
     return df_wave, summary
 `;
 
-const APP_PY = `"""
+const APP_PY = String.raw`"""
 app.py - BLDC/FOC Dyno Calibration, Runtime Iq/Vq Estimation & 6-MOS Exporter (V2.0)
 Run locally with: streamlit run app.py
 """
 from __future__ import annotations
 
 import math
+import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -862,6 +1159,19 @@ def read_uploaded_table(uploaded_file) -> pd.DataFrame:
     return pd.read_excel(uploaded_file)
 
 
+def _detect_time_scale_sec(header: str) -> float:
+    low = str(header).strip().lower()
+    if re.search(r"(?:^|[\s_(\[（])(?:ms|msec|毫秒)(?:$|[\s_)\]）])", low):
+        return 1e-3
+    if re.search(r"(?:^|[\s_(\[（])(?:us|usec|µs|μs|微秒)(?:$|[\s_)\]）])", low):
+        return 1e-6
+    if re.search(r"(?:^|[\s_(\[（])(?:ns|nsec|纳秒)(?:$|[\s_)\]）])", low):
+        return 1e-9
+    if re.search(r"(?:^|[\s_(\[（])(?:min|mins|minute|minutes|分钟)(?:$|[\s_)\]）])", low):
+        return 60.0
+    return 1.0
+
+
 def make_demo_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(13530)
     ke_true = calc_ke_from_no_load(13.5, 1450.0)
@@ -884,7 +1194,6 @@ def make_demo_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     cl_rows = []
     for n in [300, 500, 750, 1000, 1200, 1350]:
         om = calc_omega_m(n)
-        eq = ke_true * om
         for t_tgt in [0.03, 0.06, 0.10, 0.15, 0.21, 0.27]:
             if n >= 1350 and t_tgt > 0.16:
                 continue
@@ -894,6 +1203,7 @@ def make_demo_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             iq = t_em / (1.5 * ke_true)
             for _ in range(15):
                 iq = t_em / (1.5 * ke_true * calc_ksat(iq, beta_true))
+            eq = ke_true * om * calc_ksat(iq, beta_true)
             p_elec = 1.5 * (eq * iq + rs_true * iq * iq)
             v_cap = 13.5 - 0.04 * (p_elec / (13.5 * 0.95))
             i_true = 0.06 + p_elec / (0.95 * v_cap)
@@ -922,7 +1232,7 @@ def make_demo_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             else:
                 n, iq = 18.0, 2.4
             om = calc_omega_m(n)
-            eq = ke_true * om
+            eq = ke_true * om * calc_ksat(iq, beta_true)
             p_elec = 1.5 * (eq * iq + rs_true * iq * iq)
             p_dc = p_elec / 0.95 if p_elec >= 0 else p_elec * 0.95
             i_bus = 0.06 + p_dc / 13.5 + 0.08 * np.sin(2.0 * np.pi * 140.0 * t) + rng.uniform(-0.03, 0.03)
@@ -945,7 +1255,7 @@ def trigger_calibration(ol_map: dict[str, str], cl_map: dict[str, str], torque_u
         manual_kv=man_kv,
         rs_fit_mode=rs_mode,
     )
-    report["warnings"] = list(norm_ol.attrs.get("warnings", [])) + list(norm_cl.attrs.get("warnings", []))
+    report["warnings"] = list(norm_ol.attrs.get("warnings", [])) + list(norm_cl.attrs.get("warnings", [])) + list(report.get("warnings", []))
     st.session_state["calib_report"] = report
     st.session_state["params"] = report["params"]
 
@@ -987,7 +1297,7 @@ if hdr_r.button("载入 13.5V/30W Demo 数据", type="primary"):
 with st.sidebar:
     st.header("电机与逆变器参数")
     p = st.session_state["params"]
-    p.pole_pairs = int(st.number_input("极对数 p", 1, 30, int(p.pole_pairs)))
+    p.pole_pairs = int(st.number_input("极对数 p", 1, 40, int(p.pole_pairs)))
     p.r_ll_25 = st.number_input("线电阻 R_LL@25°C (Ω)", 0.005, 50.0, float(p.r_ll_25), format="%.4f")
     p.t_coil = st.number_input("绕组温度 T_coil (°C)", -20.0, 180.0, float(p.t_coil))
     p.l_ll_mh = st.number_input("线电感 L_LL (mH)", 0.01, 50.0, float(p.l_ll_mh), format="%.3f")
@@ -1073,6 +1383,11 @@ with tab1:
         st.rerun()
 
     report = st.session_state["calib_report"]
+    calib_status = report.get("status", "ok")
+    if calib_status == "failed":
+        st.error("标定状态：FAILED（参数或残差异常，结果不可信，请检查下方告警）")
+    elif calib_status == "warn":
+        st.warning("标定状态：WARN（存在收敛/偏差/数据源提示，请核对下方告警）")
     for w in report.get("warnings", []):
         st.warning(w)
 
@@ -1154,7 +1469,9 @@ with tab2:
     if res["alert_regen_limit"]:
         st.error(f"超出最大发电回馈功率极限 Eq²/(4·Rs) (Δ = {res['delta']:.3f} < 0)，反推相电流无实数解。")
     if res["alert_zero_drift"]:
-        st.info(f"空载零漂区 (|I_net| < {st.session_state['params'].i_deadband:.3f} A)：按零转矩空载处理，避免误判为发电回馈。")
+        st.info(f"空载零漂区 (|I_net| < {st.session_state['params'].i_deadband:.3f} A)：按 Iq=0 空载滑行处理（T_est = -P0/ω_m），避免误判为发电回馈。")
+    if res["alert_iq_sign_ambiguous"]:
+        st.warning("相电流符号/多根歧义：零速堵转 (±Iq 功耗对称) 或发电制动存在二次方程双根（当前取铜耗较小根），请结合相电流/转速方向确认。")
     if res["alert_low_speed"]:
         st.warning(f"低速信噪比告警：|n|={abs(n_pt):.0f} < 0.08·n0 ({0.08 * st.session_state['params'].n0_rpm:.0f} RPM)")
     if res["alert_cmd_sat"] or res["alert_motor_sat"]:
@@ -1167,23 +1484,42 @@ with tab2:
     up_log = st.file_uploader("上传运行日志 CSV (Time, V_bus, I_bus, n_rpm)", type=["csv", "xlsx", "xls", "txt"], key="up_log")
     if up_log is not None:
         df_raw_log = read_uploaded_table(up_log)
-        col_norm = {c.lower(): c for c in df_raw_log.columns}
-        rename_map = {}
-        for target, cands in [("Time", ["time", "t", "时间"]), ("V_bus", ["v_bus", "v_meas", "vbus", "电压"]), ("I_bus", ["i_bus", "ibus", "电流"]), ("n_rpm", ["n_rpm", "rpm", "speed", "转速"])]:
-            for cand in cands:
-                if cand in col_norm:
-                    rename_map[col_norm[cand]] = target
-                    break
-        df_raw_log = df_raw_log.rename(columns=rename_map)
-        if {"V_bus", "I_bus", "n_rpm"}.issubset(df_raw_log.columns):
-            if "Time" not in df_raw_log.columns:
-                df_raw_log["Time"] = np.arange(len(df_raw_log)) * 0.001
-            st.session_state["df_log"] = df_raw_log
+        t_col = ""
+        v_col = ""
+        i_col = ""
+        n_col = ""
+        for col in df_raw_log.columns:
+            low = str(col).strip().lower()
+            if not t_col and re.search(r"^(time|t(_?(s|ms|us|usec|µs|μs|ns|min))?(\s*[\[(（].*[\])）])?)$|time|timestamp|t_?sec|时间", low):
+                t_col = col
+            elif not v_col and re.search(r"v_?bus|v_?meas|vbus|volt|电压", low):
+                v_col = col
+            elif not i_col and re.search(r"i_?bus|ibus|curr|电流", low):
+                i_col = col
+            elif not n_col and re.search(r"n_?rpm|rpm|speed|转速", low):
+                n_col = col
+        if v_col and i_col and n_col:
+            df_clean = pd.DataFrame({
+                "V_bus": pd.to_numeric(df_raw_log[v_col], errors="coerce"),
+                "I_bus": pd.to_numeric(df_raw_log[i_col], errors="coerce"),
+                "n_rpm": pd.to_numeric(df_raw_log[n_col], errors="coerce"),
+            })
+            if t_col:
+                t_scale = _detect_time_scale_sec(t_col)
+                df_clean["Time"] = pd.to_numeric(df_raw_log[t_col], errors="coerce") * t_scale
+            else:
+                df_clean["Time"] = np.arange(len(df_clean)) * 0.002
+            df_clean = df_clean.dropna(subset=["V_bus", "I_bus", "n_rpm"]).reset_index(drop=True)
+            if df_clean["Time"].isna().any():
+                df_clean["Time"] = np.arange(len(df_clean)) * 0.002
+            st.session_state["df_log"] = df_clean
         else:
             st.error("日志缺少 V_bus / I_bus / n_rpm 列。")
 
-    win_ms = st.slider("滑动平均滤波窗口 (ms)", 5, 20, 10)
+    win_ms = st.slider("滑动平均滤波窗口 (ms，离线零相位中心窗)", 5, 20, 10)
     df_log_out = process_runtime_log(st.session_state["df_log"], win_ms, st.session_state["params"])
+    if not df_log_out.attrs.get("time_monotonic", True):
+        st.warning("检测到日志时间戳非严格单调递增，已降级为按正中位步长点数滑动滤波。")
     n_regen_lim = int(df_log_out["alert_regen_limit"].sum())
     n_inv_bus = int(df_log_out["alert_invalid_bus"].sum())
     if n_regen_lim > 0 or n_inv_bus > 0:
@@ -1219,12 +1555,13 @@ with tab3:
 
     d1, d2, d3, d4 = st.columns(4)
     fs_hz = int(d1.number_input("采样率 fs (Hz)", 1000, 200000, 20000, step=1000))
-    dur_s = float(d2.number_input("导出时长 (s)", 0.05, 5.0, 0.5, step=0.05))
+    dur_s = float(d2.number_input("导出时长 (s)", 0.05, 20.0, 0.5, step=0.05))
     t_amb = float(d3.number_input("环境温度 T_amb (°C)", -20.0, 120.0, 25.0))
     inc_duty = d4.checkbox("附加 Duty_A/B/C 占空比列", value=False)
 
     if fs_hz * dur_s > MAX_EXPORT_SAMPLES:
-        st.warning(f"采样点数超过 {MAX_EXPORT_SAMPLES:,} 上限，将自动截断以防浏览器卡顿。")
+        act_dur = (MAX_EXPORT_SAMPLES - 1) / float(fs_hz)
+        st.warning(f"请求点数超过 {MAX_EXPORT_SAMPLES:,} 上限，实际导出时长已由 {dur_s:.3f} s 缩短为 {act_dur:.3f} s（将影响热预热与稳态收敛估算）。")
 
     try:
         df_wave, summary = synthesize_6mos_csv(

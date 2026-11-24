@@ -2487,6 +2487,7 @@ export function runAllTests(): TestResult[] {
       model: DEFAULT_FOC_MODEL,
       vBusV: 48,
       horizonSec: 120,
+      rPhaseOhm: 0.05,
     });
     const stallOk =
       Math.abs(stallRes.phaseSquaredRatioAtWorst - 2.0) < 0.05 &&

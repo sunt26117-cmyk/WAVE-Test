@@ -13,6 +13,7 @@ import {
   SVPWM_LINEAR_LIMIT,
   SinglePointResult,
   forwardVerifyPoint,
+  isMonotonicTimestamps,
   processRuntimeLog,
   solveSinglePoint,
 } from '../../modules/focDyno/motorPhysics';
@@ -104,6 +105,7 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
     let regenLimit = 0;
     let zeroDrift = 0;
     let invalidBus = 0;
+    let iqSignAmbiguous = 0;
     for (const r of logProcessed) {
       if (r.result.alerts.lowSpeed) lowSpeed++;
       if (r.result.alerts.cmdSat) cmdSat++;
@@ -112,16 +114,22 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
       if (r.result.alerts.regenLimit) regenLimit++;
       if (r.result.alerts.zeroDrift) zeroDrift++;
       if (r.result.alerts.invalidBus) invalidBus++;
+      if (r.result.alerts.iqSignAmbiguous) iqSignAmbiguous++;
     }
-    return { lowSpeed, cmdSat, motorSat, lowFreq, regenLimit, zeroDrift, invalidBus };
+    return { lowSpeed, cmdSat, motorSat, lowFreq, regenLimit, zeroDrift, invalidBus, iqSignAmbiguous };
   }, [logProcessed]);
+
+  const isLogTimeMonotonic = useMemo(
+    () => isMonotonicTimestamps(logRows.map((r) => r.timeS)),
+    [logRows]
+  );
 
   const handleLogUpload = async (file: File | undefined) => {
     if (!file) return;
     try {
       const ds = await parseSpreadsheetFile(file);
-      const find = (re: RegExp) => ds.headers.find((h) => re.test(h.toLowerCase())) || '';
-      const tCol = find(/time|t_s|sec|时间/);
+      const find = (re: RegExp) => ds.headers.find((h) => re.test(h.trim().toLowerCase())) || '';
+      const tCol = find(/^(time|t(_?(s|ms|us|µs|μs|ns|min))?(\s*[\[(（].*[\])）])?)$|time|timestamp|t_?sec|时间/);
       const vCol = find(/v_?bus|v_?meas|vbus|volt|电压/);
       const iCol = find(/i_?bus|ibus|curr|电流/);
       const nCol = find(/n_?rpm|rpm|speed|转速/);
@@ -131,9 +139,40 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
         return;
       }
 
+      const detectTimeMultiplier = (header: string): number => {
+        const lower = header.toLowerCase();
+        if (/(\bms\b|msec|\(ms\)|\[ms\]|_ms$|毫秒)/.test(lower)) return 1e-3;
+        if (/(\bus\b|usec|µs|μs|\(us\)|\[us\]|_us$|微秒)/.test(lower)) return 1e-6;
+        if (/(\bns\b|nsec|\(ns\)|\[ns\]|_ns$|纳秒)/.test(lower)) return 1e-9;
+        if (/(\bmin\b|\(min\)|\[min\]|分钟)/.test(lower)) return 60;
+        return 1;
+      };
+      const tMult = tCol ? detectTimeMultiplier(tCol) : 1;
+
+      const parseTimeStringSec = (raw: unknown): number => {
+        if (typeof raw !== 'string') return Number.NaN;
+        const m = raw.trim().match(/^(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)$/);
+        if (!m) return Number.NaN;
+        return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+      };
+
+      let tStrBase = Number.NaN;
       const parsed: RawRuntimeLogEntry[] = [];
       ds.rows.forEach((row, idx) => {
-        const t = tCol ? Number(row[tCol]) : idx * 0.002;
+        let t = idx * 0.002;
+        if (tCol) {
+          const rawT = row[tCol];
+          const numT = Number(rawT);
+          if (Number.isFinite(numT) && String(rawT).trim() !== '') {
+            t = numT * tMult;
+          } else {
+            const hms = parseTimeStringSec(rawT);
+            if (Number.isFinite(hms)) {
+              if (!Number.isFinite(tStrBase)) tStrBase = hms;
+              t = hms - tStrBase;
+            }
+          }
+        }
         const v = Number(row[vCol]);
         const i = Number(row[iCol]);
         const n = Number(row[nCol]);
@@ -212,7 +251,8 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
       res.alerts.motorSat ||
       res.alerts.lowFreqThermal ||
       res.alerts.regenLimit ||
-      res.alerts.invalidBus;
+      res.alerts.invalidBus ||
+      res.alerts.iqSignAmbiguous;
 
     return (
       <div className="dyno-card rounded-sm border p-4 space-y-3">
@@ -242,6 +282,12 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
           </div>
         )}
 
+        {res.alerts.iqSignAmbiguous && (
+          <div className="dyno-alert-warn rounded-sm border px-3.5 py-2 text-xs">
+            ▲ 相电流方向/多根歧义：零速堵转 (±Iq 母线功耗对称) 或发电回馈工况存在二次方程双根（默认取铜耗更小解），请结合实际控制指令或转速方向核实。
+          </div>
+        )}
+
         <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
           <div
             className={`flex items-start gap-2 rounded-sm border px-3 py-2 text-xs ${
@@ -253,7 +299,7 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
               <div className="font-medium dyno-text-primary">微电流零漂保护 (|I_net| &lt; {params.iDeadbandA.toFixed(3)} A)</div>
               <div className="mt-0.5 font-mono text-[11px] tabular-nums">
                 {res.alerts.zeroDrift
-                  ? `零漂死区 (I_net=${res.iNetA.toFixed(3)}A)，强制 Iq=0`
+                  ? `零漂死区 (I_net=${res.iNetA.toFixed(3)}A)，Iq=0 空载滑行 (-P0)`
                   : `正常区间 (I_net=${res.iNetA.toFixed(3)} A)`}
               </div>
             </div>
@@ -736,9 +782,19 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
             </div>
           )}
 
-          {(batchAlertsSummary.regenLimit > 0 || batchAlertsSummary.invalidBus > 0) && (
+          {!isLogTimeMonotonic && (
             <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">
-              ▲ 日志检测到 {batchAlertsSummary.regenLimit} 个超发电极限点、{batchAlertsSummary.invalidBus} 个母线压降异常点（在波形中断点留白）。
+              ▲ 检测到日志时间戳非严格单调递增（可能拼接了多段采集或存在时间戳回绕），滑动窗口已自动降级为按正中位步长点数滤波。
+            </div>
+          )}
+
+          <div className="dyno-well rounded-sm border px-3.5 py-1.5 text-[11px] dyno-text-muted">
+            离线分析说明：I_bus 采用零相位双向中心时间窗 [t−W/2, t+W/2] 平滑（适合离线日志，实时控制器需考虑 W/2 相位延迟）；物理模型按稳态 Y 型接法 Id = 0 反推。
+          </div>
+
+          {(batchAlertsSummary.regenLimit > 0 || batchAlertsSummary.invalidBus > 0 || batchAlertsSummary.iqSignAmbiguous > 0) && (
+            <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">
+              ▲ 日志检测到 {batchAlertsSummary.regenLimit} 个超发电极限点、{batchAlertsSummary.invalidBus} 个母线压降异常点（在波形中断点留白），以及 {batchAlertsSummary.iqSignAmbiguous} 个多根/符号歧义点（发电回馈双根或零速 ±Iq 对称）。
             </div>
           )}
 
