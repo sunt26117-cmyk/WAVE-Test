@@ -109,8 +109,12 @@ import {
   computePhaseMosLosses,
   simulateFoc6Mos,
   runFocStallSweep,
+  splitCauerToFocModel,
 } from '../modules/focThermal';
 import { createDefaultFilterConfig, applyWaveformFilter } from '../modules/filter';
+import { alignChannelsToCommonTimebase } from '../modules/timeSync';
+import { analyzeDoublePulseTest, generateDptDemoChannels, interpolateDptSwitchingLoss } from '../modules/dptAnalyzer';
+import { reconstructSingleShuntPhaseCurrents } from '../modules/singleShuntRecon';
 
 export interface TestResult {
   name: string;
@@ -3452,6 +3456,127 @@ export function runAllTests(): TestResult[] {
   } catch (err: any) {
     results.push({
       name: 'SI Unit Cell Parsing, .graphx Strict Validation & XSS/CSV Formula Escaping',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 52: Round-2 Fail-Closed Timebase, SOA INDETERMINATE, Loss Incomplete/Preheat, FOC splitFeasible/Qrr, DPT LUT & Single-Shunt Recon
+  try {
+    const mkTestCh = (id: string, name: string, unit: string, t: Float64Array, v: Float32Array): WaveformChannel => ({
+      id,
+      name,
+      unit,
+      color: '#22d3ee',
+      visible: true,
+      t,
+      v,
+      fs: 1000,
+      dt: 0.001,
+      isMath: false,
+      sourceChannelIds: [],
+      metadata: analyzeSamplingQuality(t),
+      vMin: -100,
+      vMax: 100,
+    });
+
+    // 1. timeSync fail-closed on non-monotonic timestamps
+    const syncFail = alignChannelsToCommonTimebase([
+      mkTestCh('ts1', 'V1', 'V', new Float64Array([0, 1e-3, 2e-3, 3e-3]), new Float32Array([1, 2, 3, 4])),
+      mkTestCh('ts2', 'V2', 'V', new Float64Array([0, 2e-3, 1e-3, 3e-3]), new Float32Array([1, 2, 3, 4])),
+    ]);
+
+    // 2. Dynamic SOA INDETERMINATE on partial NaN
+    const tSoa = Float64Array.from({ length: 40 }, (_, i) => i * 1e-4);
+    const soaIndet = evaluateDynamicSoa(
+      mkTestCh('sv', 'Vds', 'V', tSoa, new Float32Array(40).fill(24)),
+      mkTestCh('si', 'Ids', 'A', tSoa, Float32Array.from({ length: 40 }, (_, i) => (i === 15 ? Number.NaN : 10))),
+      SOA_PRESETS[0],
+      { forcedPulseKey: '1ms' }
+    );
+
+    // 3. Loss INCOMPLETE on partial NaN + Preheat initialTjC + Pad mode
+    const lossInc = computeLossWithDeskewAndEoss(
+      mkTestCh('lv1', 'Vds', 'V', tSoa, new Float32Array(40).fill(20)),
+      mkTestCh('li1', 'Ids', 'A', tSoa, Float32Array.from({ length: 40 }, (_, i) => (i === 10 ? Number.NaN : 10))),
+      [{ r: 1, c: 0.01, tauEst: 0.01, layerLabel: 'Die' }],
+      { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
+    );
+    const lossPre = computeLossWithDeskewAndEoss(
+      mkTestCh('lv2', 'Vds', 'V', tSoa, new Float32Array(40).fill(20)),
+      mkTestCh('li2', 'Ids', 'A', tSoa, new Float32Array(40).fill(10)),
+      [{ r: 1, c: 0.01, tauEst: 0.01, layerLabel: 'Die' }],
+      { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25, initialTjC: 60, pathMode: 'pad_ambient' }
+    );
+
+    // 4. FOC splitFeasible & eonIncludesQrr
+    const badSplit = splitCauerToFocModel([{ r: 0.4, c: 0.05, tauEst: 0.02, layerLabel: 'Single' }], 0.05, {
+      pathMode: 'junction_ambient',
+      rJcDatasheetOhm: 0.5,
+    });
+    const demoDpt = generateDptDemoChannels();
+    const dptRes = analyzeDoublePulseTest(demoDpt.vgsCh, demoDpt.vdsCh, demoDpt.idsCh);
+    const lutPt = interpolateDptSwitchingLoss(
+      [
+        { id: 'a', vBusV: 40, iLoadA: 20, tjC: 25, rgOhm: 5, eOnUj: 30, eOffUj: 20, qRrNc: 40, eOnSansQrrUj: 25 },
+        { id: 'b', vBusV: 80, iLoadA: 40, tjC: 25, rgOhm: 5, eOnUj: 90, eOffUj: 60, qRrNc: 80, eOnSansQrrUj: 75 },
+      ],
+      60,
+      30
+    );
+
+    // 5. Single-shunt SVPWM reconstruction
+    const nSs = 100;
+    const tSs = Float64Array.from({ length: nSs }, (_, i) => i * 1e-4);
+    const da = new Float32Array(nSs);
+    const db = new Float32Array(nSs);
+    const dc = new Float32Array(nSs);
+    const idc = new Float32Array(nSs);
+    for (let k = 0; k < nSs; k++) {
+      const th = 2 * Math.PI * 50 * tSs[k];
+      const ia = 15 * Math.sin(th);
+      const ib = 15 * Math.sin(th - (2 * Math.PI) / 3);
+      const ic = -(ia + ib);
+      const va = 0.4 * Math.sin(th);
+      const vb = 0.4 * Math.sin(th - (2 * Math.PI) / 3);
+      const vc = -(va + vb);
+      const vcm = -0.5 * (Math.max(va, vb, vc) + Math.min(va, vb, vc));
+      da[k] = 0.5 + va + vcm;
+      db[k] = 0.5 + vb + vcm;
+      dc[k] = 0.5 + vc + vcm;
+      idc[k] = ia * da[k] + ib * db[k] + ic * dc[k];
+    }
+    const ssRes = reconstructSingleShuntPhaseCurrents(
+      mkTestCh('ss_i', 'Idc', 'A', tSs, idc),
+      mkTestCh('ss_a', 'Da', '', tSs, da),
+      mkTestCh('ss_b', 'Db', '', tSs, db),
+      mkTestCh('ss_c', 'Dc', '', tSs, dc),
+      { fswHz: 20000, tMinSec: 3e-6 }
+    );
+
+    const passed =
+      !syncFail.valid &&
+      soaIndet.status === 'INDETERMINATE' &&
+      !soaIndet.pass &&
+      lossInc.incomplete &&
+      !lossPre.incomplete &&
+      Math.abs(lossPre.tjC[0] - 60) < 1e-3 &&
+      lossPre.thermalPathMode === 'pad_ambient' &&
+      badSplit.splitFeasible === false &&
+      dptRes.eonIncludesQrr === true &&
+      lutPt !== null &&
+      Math.abs(lutPt.eOnUj - 60) < 1e-5 &&
+      ssRes.valid &&
+      ssRes.blindCount > 0;
+
+    results.push({
+      name: 'Round-2 Audit Guards: Fail-Closed Timebase, SOA INDETERMINATE, Loss Incomplete/Preheat, SplitFeasible, DPT LUT & 1-Shunt Recon',
+      passed,
+      message: `syncValid=${syncFail.valid}, soa=${soaIndet.status}, lossInc=${lossInc.incomplete}, tj0=${lossPre.tjC[0].toFixed(1)}C, splitFeasible=${badSplit.splitFeasible}, dptQrr=${dptRes.eonIncludesQrr}, ssBlind=${ssRes.blindCount}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Round-2 Audit Guards: Fail-Closed Timebase, SOA INDETERMINATE, Loss Incomplete/Preheat, SplitFeasible, DPT LUT & 1-Shunt Recon',
       passed: false,
       message: `Exception: ${err.message}`,
     });

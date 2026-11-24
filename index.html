@@ -1522,6 +1522,44 @@
             <div id="bldcBalResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
               <div class="text-slate-400">Select 3 phase voltage or current channels to evaluate amplitude unbalance %, 120° phase symmetry, and zero-sequence offset.</div>
             </div>
+
+            <!-- Single-Shunt Idc + Duty_A/B/C -> Ia/Ib/Ic Phase Reconstruction -->
+            <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span class="text-[11px] font-semibold text-cyan-300">单电阻母线电流三相重构 (Single-Shunt Idc + Duty_A/B/C → Ia/Ib/Ic)</span>
+                <span class="text-[10px] font-mono text-slate-400">自动识别 SVPWM 扇区盲区 ΔD·Tsw &lt; T_min</span>
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-6 gap-2">
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">DC Shunt Idc</label>
+                  <select id="bldcSsIdcSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Duty/PWM A</label>
+                  <select id="bldcSsDaSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Duty/PWM B</label>
+                  <select id="bldcSsDbSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Duty/PWM C</label>
+                  <select id="bldcSsDcSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">f_sw (kHz)</label>
+                  <input id="bldcSsFswKhzInput" type="number" step="1" min="1" value="20" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">T_min (µs)</label>
+                  <input id="bldcSsTminUsInput" type="number" step="0.1" min="0" value="1.5" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-amber-200 font-mono text-[11px]" />
+                </div>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <button id="bldcSsRunBtn" type="button" class="px-3 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm text-[11px] cursor-pointer">重构 Ia / Ib / Ic 并注入示波器</button>
+                <div id="bldcSsResultCard" class="text-[10px] font-mono text-slate-400 truncate">选择单电阻 Idc 与三路占空比/PWM 信号进行重构。</div>
+              </div>
+            </div>
           </div>
 
           <!-- Panel 2: 6-Step Hall / Back-EMF Commutation Audit -->
@@ -1544,23 +1582,49 @@
                 <input id="bldcHallPolesInput" type="number" min="1" step="1" value="4" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono" />
               </div>
             </div>
+            <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+              <div class="sm:col-span-5">
+                <label class="block text-[10px] text-slate-400 mb-1">Hall 换相序表 (电机专用配置)</label>
+                <select id="bldcHallSeqPresetSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-cyan-200 font-mono text-[11px]">
+                  <option value="std_120" selected>标准 120° Hall [5,1,3,2,6,4]</option>
+                  <option value="alt_120">换相序 120° [5,4,6,2,3,1]</option>
+                  <option value="gray_60">60° 排布 Hall [1,3,7,6,4,0]</option>
+                  <option value="custom">自定义 6 态序列...</option>
+                </select>
+              </div>
+              <div class="sm:col-span-4">
+                <label class="block text-[10px] text-slate-400 mb-1">自定义序列 (6个0~7态)</label>
+                <input id="bldcHallCustomSeqInput" type="text" value="5,1,3,2,6,4" placeholder="5,1,3,2,6,4" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono text-[11px]" />
+              </div>
+              <div class="sm:col-span-3">
+                <label class="block text-[10px] text-slate-400 mb-1">电角度偏置 (°)</label>
+                <input id="bldcHallOffsetInput" type="number" step="1" min="-180" max="180" value="0" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono text-[11px]" />
+              </div>
+            </div>
             <div>
               <button id="bldcHallRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Audit 6-Step Sectors &amp; Jitter</button>
             </div>
             <div id="bldcHallResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
-              <div class="text-slate-400">Measures each 60° electrical Hall sector width, sensor mounting error, CW/CCW sequence direction, illegal states (000/111), and cycle RPM ripple.</div>
+              <div class="text-slate-400">Measures each 60° electrical Hall sector width, sensor mounting error, CW/CCW sequence direction, illegal states, and cycle RPM ripple.</div>
             </div>
           </div>
 
           <!-- Panel 3: PWM Switching, Dead-Time & Ringing -->
           <div id="bldcPanelPwm" class="hidden space-y-3">
-            <div class="grid grid-cols-2 gap-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
               <div>
-                <label class="block text-[10px] text-slate-400 mb-1">High-Side / Phase Node (PWM_H / SW)</label>
+                <label class="block text-[10px] text-slate-400 mb-1">Channel 1 (High Gate or SW)</label>
                 <select id="bldcPwmHighSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
               </div>
               <div>
-                <label class="block text-[10px] text-slate-400 mb-1">Complementary Low-Side (Optional Dead-Time)</label>
+                <label class="block text-[10px] text-slate-400 mb-1">Channel 1 物理定义</label>
+                <select id="bldcPwmRoleSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-cyan-200 font-mono text-[11px]">
+                  <option value="gate_h" selected>高侧栅极/驱动 (Vgs_H / PWM_H)</option>
+                  <option value="sw_node">相节点电压 (SW Node, 禁用死区/直通判别)</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Complementary Low-Side Gate</label>
                 <select id="bldcPwmLowSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
               </div>
             </div>
@@ -1568,7 +1632,7 @@
               <button id="bldcPwmRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Inspect PWM, Dead-Time &amp; Ringing</button>
             </div>
             <div id="bldcPwmResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
-              <div class="text-slate-400">Extracts switching carrier frequency (kHz), duty cycle modulation range, edge dV/dt, overshoot %, LC ringing frequency (MHz), dead-time (ns), and shoot-through overlaps.</div>
+              <div class="text-slate-400">Extracts switching carrier frequency (kHz), duty cycle modulation range, edge dV/dt, overshoot %, LC ringing frequency (MHz); dead-time &amp; shoot-through require true Vgs_H + Vgs_L gate signals.</div>
             </div>
           </div>
 
@@ -1576,7 +1640,7 @@
           <div id="bldcPanelRipple" class="hidden space-y-3">
             <div class="grid grid-cols-2 gap-3">
               <div>
-                <label class="block text-[10px] text-slate-400 mb-1">Current / Torque / Power Channel (Ia, Iq, Ibus, P)</label>
+                <label class="block text-[10px] text-slate-400 mb-1">Signal Channel (Torque / Current / Power)</label>
                 <select id="bldcRippleChSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2 py-1.5 text-white font-mono"></select>
               </div>
               <div>
@@ -1585,10 +1649,10 @@
               </div>
             </div>
             <div>
-              <button id="bldcRippleRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Analyze Torque Ripple &amp; 6× Harmonic</button>
+              <button id="bldcRippleRunBtn" type="button" class="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Analyze Signal Ripple &amp; 6× Harmonic</button>
             </div>
             <div id="bldcRippleResultCard" class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 font-mono tabular-nums space-y-2">
-              <div class="text-slate-400">Quantifies Peak-to-Peak &amp; RMS ripple factor %, plus 1×, 2×, 6× (6-step commutation), and 12× harmonic amplitudes.</div>
+              <div class="text-slate-400">Quantifies Peak-to-Peak &amp; RMS ripple factor %, plus 1×, 2×, 6×, and 12× harmonic amplitudes (explicitly separates current/power ripple from true shaft torque).</div>
             </div>
           </div>
         </div>
@@ -1642,12 +1706,13 @@
           </div>
         </div>
 
-        <!-- Pinned 4-Tab Segmented Switcher -->
-        <div class="grid grid-cols-4 gap-1 bg-[#0c0f13] border border-[#222933] rounded-sm p-1 mb-3 shrink-0">
+        <!-- Pinned 5-Tab Segmented Switcher -->
+        <div class="grid grid-cols-5 gap-1 bg-[#0c0f13] border border-[#222933] rounded-sm p-1 mb-3 shrink-0">
           <button id="thermalTabDeconvBtn" type="button" class="py-1.5 px-2 rounded-sm bg-cyan-600 text-slate-950 font-semibold text-xs cursor-pointer truncate">1. 热阻反演与网表</button>
           <button id="thermalTabLossBtn" type="button" class="py-1.5 px-2 rounded-sm text-slate-300 hover:text-white text-xs cursor-pointer truncate">2. 损耗剥离与 Tj(t)</button>
           <button id="thermalTabSoaBtn" type="button" class="py-1.5 px-2 rounded-sm text-slate-300 hover:text-white text-xs cursor-pointer truncate">3. Dynamic SOA</button>
           <button id="thermalTabFocBtn" type="button" class="py-1.5 px-2 rounded-sm text-slate-300 hover:text-white text-xs cursor-pointer truncate">4. BLDC FOC 6-MOS</button>
+          <button id="thermalTabDptBtn" type="button" class="py-1.5 px-2 rounded-sm text-slate-300 hover:text-white text-xs cursor-pointer truncate">5. 双脉冲 DPT</button>
         </div>
 
         <!-- Scrollable Uniform Workbench Body -->
@@ -1867,7 +1932,7 @@
                 <span class="text-slate-200 font-semibold">Active Cauer Network:</span>
                 <span id="thermLossCauerSummary" class="font-mono text-emerald-300 text-[11px] tabular-nums">Default 3-Stage</span>
               </div>
-              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-1">Drain Voltage Vds (V)</label>
                   <select id="thermLossVdsSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono"></select>
@@ -1887,6 +1952,10 @@
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-1">T_amb / Base (°C)</label>
                   <input id="thermLossTambInput" type="number" step="0.5" value="25" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-1" title="脉冲前预热初始结温 Tj(0)；留空则等同于 T_amb 冷启动">脉冲前初温 Tj(0) (°C)</label>
+                  <input id="thermLossInitTjInput" type="number" step="0.5" placeholder="= T_amb" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-pink-200 font-mono" />
                 </div>
               </div>
 
@@ -1918,10 +1987,15 @@
               </div>
 
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1b222c]">
-                <span class="text-[11px] text-slate-400">Closed-loop Tridiagonal Thomas solver updates Rds(on)(Tj) &amp; injects P_loss (W) + Tj (°C) onto scope.</span>
+                <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer" title="当 Vds 波形在 25°C 冷态测得时勾选此项以按 ΔTj 放大导通压降；若 Vds 已在高温稳态采集，请取消勾选以免重复放大。">
+                  <input id="thermLossRdsFeedbackChk" type="checkbox" class="accent-cyan-400 cursor-pointer" checked />
+                  <span>计入 Rds(on)(Tj) 温升增阻（高温实测 Vds 请取消以免重复计入）</span>
+                </label>
                 <button id="thermRunLossBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer shrink-0">Run Loss &amp; Tj(t)</button>
               </div>
             </div>
+
+            <div id="thermLossWarningsBox" class="hidden bg-amber-950/50 border border-amber-500/60 text-amber-200 px-2.5 py-1.5 rounded-sm font-mono text-[10px] space-y-0.5"></div>
 
             <!-- Card 2: KPI Readout Strip -->
             <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 font-mono tabular-nums">
@@ -1929,16 +2003,16 @@
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">E_deskewed</div><div id="thermLossDeskewE" class="text-cyan-300 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">E_stripped</div><div id="thermLossStrippedE" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">P_loss Mean</div><div id="thermLossPmean" class="text-amber-300 font-semibold mt-0.5">--</div></div>
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">Tj Max</div><div id="thermLossTjMax" class="text-pink-300 font-semibold mt-0.5">--</div></div>
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">ΔTj Peak</div><div id="thermLossDeltaTj" class="text-slate-100 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermLossTjMaxLabel" class="text-[10px] text-slate-400">Tj Max</div><div id="thermLossTjMax" class="text-pink-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermLossDeltaTjLabel" class="text-[10px] text-slate-400">ΔTj Peak</div><div id="thermLossDeltaTj" class="text-slate-100 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">SW Events</div><div id="thermLossSwCount" class="text-slate-300 font-semibold mt-0.5">--</div></div>
             </div>
 
             <!-- Card 3: Instantaneous P_loss(t) & Closed-Loop Tj(t) Preview -->
             <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2">
               <div class="flex items-center justify-between mb-1.5">
-                <span class="text-[11px] font-semibold text-slate-200">Stripped Switching Power P_loss(t) &amp; Closed-Loop Junction Temp Tj(t)</span>
-                <span class="text-[10px] font-mono text-slate-400"><span class="text-amber-300">■ P_loss (W)</span> · <span class="text-pink-300">■ Tj (°C)</span></span>
+                <span id="thermLossPlotTitle" class="text-[11px] font-semibold text-slate-200">Stripped Switching Power P_loss(t) &amp; Closed-Loop Junction Temp Tj(t)</span>
+                <span class="text-[10px] font-mono text-slate-400"><span class="text-amber-300">■ P_loss (W)</span> · <span id="thermLossTjLegend" class="text-pink-300">■ Tj (°C)</span></span>
               </div>
               <canvas id="thermLossCanvas" class="w-full h-[250px] block rounded-xs"></canvas>
             </div>
@@ -2017,6 +2091,7 @@
                   <button id="thermSoaJumpBtn" type="button" disabled class="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900/70 disabled:opacity-40 border border-rose-500/60 text-rose-200 rounded-sm cursor-pointer disabled:cursor-not-allowed">Jump to Worst</button>
                 </div>
               </div>
+              <div id="thermSoaWarningsBox" class="hidden bg-amber-950/50 border border-amber-500/60 text-amber-200 px-2 py-1 rounded-xs font-mono text-[10px]"></div>
               <canvas id="thermSoaCanvas" class="w-full h-[270px] block rounded-xs"></canvas>
             </div>
 
@@ -2181,6 +2256,26 @@
                 </div>
               </div>
 
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-[#1b222c]">
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="可选：输入器件数据手册 RθJC (Ω=°C/W) 约束 JC 与 Board 的物理拆分边界；留空则按 τ_split 自动拆分。">手册 RθJC 约束 (Ω, 可选)</label>
+                  <input id="focRjcOverrideInput" type="number" step="0.02" min="0.01" placeholder="Auto (τ_split)" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="PCB 空间非对称热阻：用于模拟三相中臂 (B相) 铜箔散热受限或边缘管更凉 (如 +15% 则 B相 +15%，C相 -7.5%)。">PCB 热路径非对称 (%)</label>
+                  <input id="focRjcSpreadPctInput" type="number" step="5" min="0" max="60" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]" />
+                </div>
+                <div class="col-span-2 flex flex-col justify-end gap-1 pb-0.5">
+                  <label class="inline-flex items-center gap-1.5 text-[11px] text-emerald-200 cursor-pointer" title="当 Esw 来自双脉冲波形实测积分 Eon+Eoff 时，Eon 已包含二极管反向恢复功耗，勾选后可防止与 Qrr 重复叠加。">
+                    <input id="focEonIncludesQrrChk" type="checkbox" class="accent-emerald-400 cursor-pointer" />
+                    <span>Esw 已含反向恢复 Qrr 损耗（避免与 Qrr 重复叠加）</span>
+                  </label>
+                  <div class="text-[10px] font-mono text-slate-400 leading-snug">
+                    若 Tab 1 反演为焊盘→环境 (Pad→Amb)，请填写手册 RθJC 或明确其仅反映板级温升偏差。
+                  </div>
+                </div>
+              </div>
+
               <!-- Action Row + Locked-Rotor Stall Sweep Inline -->
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1b222c]">
                 <div class="flex flex-wrap items-center gap-1.5">
@@ -2190,6 +2285,7 @@
                 </div>
                 <div class="flex flex-wrap items-center gap-2 min-w-0">
                   <span id="focModelSourceBadge" class="px-1.5 py-0.5 bg-[#12161c] border border-[#222933] text-amber-300 font-mono text-[10px] rounded-xs">来源: 系统默认 Fallback 模型</span>
+                  <span id="focZthValidBadge" class="px-1.5 py-0.5 bg-[#12161c] border border-[#222933] text-slate-300 font-mono text-[10px] rounded-xs">Zth Ready</span>
                   <span id="focModelSummaryBadge" class="text-[10px] font-mono text-slate-400 truncate">ZthJC + Zth_board Ready</span>
                 </div>
               </div>
@@ -2277,6 +2373,117 @@
                 </div>
               </div>
               <textarea id="focSpiceTextarea" readonly rows="4" class="w-full bg-[#07090e] border border-[#222933] rounded-xs p-2 font-mono text-[10px] text-emerald-200 focus:outline-none"></textarea>
+            </div>
+          </div>
+
+          <!-- Tab 5: Double Pulse Test (DPT) Synchronized Vgs/Vds/Ids Analyzer -->
+          <div id="thermalPanelDpt" class="hidden space-y-3">
+            <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2.5">
+              <div class="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-[#222933]">
+                <span class="text-[11px] font-semibold text-cyan-300 uppercase tracking-wider">P1 Double Pulse Test (DPT) · Vgs / Vds / Ids 同步提取 Eon / Eoff / Qrr / Miller / dv/dt</span>
+                <button id="dptLoadDemoBtn" type="button" class="px-2.5 py-0.5 bg-[#162229] hover:bg-[#1d303a] border border-cyan-600/50 text-cyan-200 font-mono text-[10px] rounded-xs cursor-pointer">Load DPT Demo (48V/45A)</button>
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-6 gap-2 items-end">
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Gate Vgs (V)</label>
+                  <select id="dptVgsSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-amber-200 font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Drain Vds (V)</label>
+                  <select id="dptVdsSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Current Ids (A)</label>
+                  <select id="dptIdsSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]"></select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Time Gate</label>
+                  <select id="dptGateSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]">
+                    <option value="entire" selected>Entire</option>
+                    <option value="view">View</option>
+                    <option value="cursors">X1~X2</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Ids Deskew (ns)</label>
+                  <input id="dptDeskewInput" type="number" step="0.5" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-300 font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5">Vbus Override (V)</label>
+                  <input id="dptVbusOverrideInput" type="number" step="1" min="0" placeholder="Auto" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+              </div>
+              <div class="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1b222c]">
+                <div class="flex items-center gap-2">
+                  <button id="dptRunBtn" type="button" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Analyze DPT Pulse</button>
+                  <button id="dptApplyToFocBtn" type="button" disabled class="px-3 py-1.5 bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-40 border border-emerald-600/60 text-emerald-200 rounded-sm text-[11px] cursor-pointer disabled:cursor-not-allowed">同步 Esw / Qrr / Vref / Iref 到 Tab 4 FOC</button>
+                </div>
+                <span class="text-[10px] font-mono text-slate-400">基于统一时间轴线性插值同步 + Vgs 门限/米勒平台识别</span>
+              </div>
+            </div>
+
+            <div id="dptWarningsBox" class="hidden bg-amber-950/50 border border-amber-500/60 text-amber-200 px-2.5 py-1.5 rounded-sm font-mono text-[10px] space-y-0.5"></div>
+
+            <!-- DPT KPI Grid -->
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 font-mono text-[11px] tabular-nums">
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">E_on (Turn-On)</div><div id="dptKpiEon" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">E_off (Turn-Off)</div><div id="dptKpiEoff" class="text-amber-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">E_sw Total (Eon+Eoff)</div><div id="dptKpiEsw" class="text-cyan-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Vds Peak / Overshoot</div><div id="dptKpiVdsPeak" class="text-rose-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Turn-Off dv/dt &amp; di/dt</div><div id="dptKpiDvDiOff" class="text-slate-200 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Turn-On dv/dt &amp; di/dt</div><div id="dptKpiDvDiOn" class="text-slate-200 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Miller Plateau (Vgp / t)</div><div id="dptKpiMiller" class="text-purple-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[9px] text-slate-400">Irr / Qrr / Erec</div><div id="dptKpiQrr" class="text-pink-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm col-span-2 sm:col-span-1 lg:col-span-2"><div class="text-[9px] text-slate-400">Ringing Freq (Off / On)</div><div id="dptKpiRing" class="text-sky-300 font-semibold mt-0.5">--</div></div>
+            </div>
+
+            <!-- Dual-Window DPT Zoom Canvas -->
+            <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2">
+              <div class="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                <span class="text-[11px] font-semibold text-slate-200">Turn-Off Window (左) &amp; Turn-On + Reverse Recovery Window (右)</span>
+                <span class="text-[10px] font-mono text-slate-400"><span class="text-amber-300">■ Vgs</span> · <span class="text-cyan-300">■ Vds</span> · <span class="text-emerald-300">■ Ids</span> · <span class="text-pink-300">▒ 损耗积分区</span></span>
+              </div>
+              <canvas id="dptPreviewCanvas" class="w-full h-[250px] block rounded-xs"></canvas>
+            </div>
+
+            <!-- Multi-Point DPT Operating Matrix LUT -->
+            <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span class="text-[11px] font-semibold text-cyan-300">多工况 DPT 查找表矩阵 (Vbus, Iload, Tj, Rg → Eon / Eoff / Qrr LUT)</span>
+                <div class="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
+                  <label class="flex items-center gap-1 text-slate-400">
+                    <span>Tj(°C)</span>
+                    <input id="dptMatrixTjInput" type="number" step="5" value="25" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" />
+                  </label>
+                  <label class="flex items-center gap-1 text-slate-400">
+                    <span>Rg(Ω)</span>
+                    <input id="dptMatrixRgInput" type="number" step="0.5" min="0" value="4.7" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" />
+                  </label>
+                  <button id="dptAddToMatrixBtn" type="button" class="px-2 py-0.5 bg-cyan-950/60 hover:bg-cyan-900/70 border border-cyan-500/60 text-cyan-200 rounded-xs cursor-pointer">+ 保存当前点到矩阵</button>
+                  <button id="dptApplyMatrixToFocBtn" type="button" disabled class="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-40 border border-emerald-500/60 text-emerald-200 rounded-xs cursor-pointer disabled:cursor-not-allowed">LUT 多点插值注入 FOC</button>
+                  <button id="dptClearMatrixBtn" type="button" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-xs cursor-pointer">清空</button>
+                </div>
+              </div>
+              <div class="overflow-x-auto max-h-36 overflow-y-auto border border-[#222933] rounded-xs">
+                <table class="w-full text-left font-mono text-[10px] tabular-nums">
+                  <thead class="bg-[#161b22] text-slate-400">
+                    <tr>
+                      <th class="px-2 py-1">Vbus (V)</th>
+                      <th class="px-2 py-1">Iload (A)</th>
+                      <th class="px-2 py-1">Tj (°C)</th>
+                      <th class="px-2 py-1">Rg (Ω)</th>
+                      <th class="px-2 py-1 text-emerald-300">Eon (µJ)</th>
+                      <th class="px-2 py-1 text-amber-300">Eoff (µJ)</th>
+                      <th class="px-2 py-1 text-cyan-300">Esw (µJ)</th>
+                      <th class="px-2 py-1 text-pink-300">Qrr (nC)</th>
+                      <th class="px-2 py-1"></th>
+                    </tr>
+                  </thead>
+                  <tbody id="dptMatrixTableBody">
+                    <tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」积累多电压/电流插值表。</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>

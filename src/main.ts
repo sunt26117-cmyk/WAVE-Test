@@ -44,7 +44,11 @@ import {
   analyzePwmSwitchingAndDeadTime,
   analyzeTorqueAndCurrentRipple,
   computeBldcDerivedTraces,
+  HALL_SEQUENCE_PRESETS,
+  parseHallSequenceText,
+  PwmHighSignalRole,
 } from './modules/bldcAnalysis';
+import { reconstructSingleShuntPhaseCurrents } from './modules/singleShuntRecon';
 import { initThermalWorkbench, ThermalWorkbenchController } from './modules/thermalWorkbench';
 import { FilterWorkbenchController } from './modules/filterWorkbench';
 import { isExcelFileName } from './parsers/excelParser';
@@ -1764,6 +1768,19 @@ function bindModals() {
     if (!document.getElementById('bldcPanelRipple')?.classList.contains('hidden')) renderBldcRipple(tab);
   });
 
+  document.getElementById('bldcHallSeqPresetSelect')?.addEventListener('change', (e) => {
+    const val = (e.target as HTMLSelectElement).value;
+    const preset = HALL_SEQUENCE_PRESETS.find((p) => p.id === val);
+    const customInp = document.getElementById('bldcHallCustomSeqInput') as HTMLInputElement | null;
+    if (preset && customInp) {
+      customInp.value = preset.ring.join(',');
+    }
+  });
+  document.getElementById('bldcHallCustomSeqInput')?.addEventListener('input', () => {
+    const sel = document.getElementById('bldcHallSeqPresetSelect') as HTMLSelectElement | null;
+    if (sel) sel.value = 'custom';
+  });
+
   const getSelected3PhaseForBldc = (tab: TabState) => {
     const uId = (document.getElementById('bldcBalUSelect') as HTMLSelectElement)?.value;
     const vId = (document.getElementById('bldcBalVSelect') as HTMLSelectElement)?.value;
@@ -1780,12 +1797,17 @@ function bindModals() {
     const ph = getSelected3PhaseForBldc(tab);
     if (!ph) return;
     const derived = computeBldcDerivedTraces(ph.chU, ph.chV, ph.chW);
-    const unit = ph.chU.unit || 'V';
+    if (!derived.valid || derived.time.length < 2) {
+      app.showToast(derived.warnings[0] || 'No valid synchronized timebase or compatible units for 3-phase traces.', 'error');
+      return;
+    }
+    const unit = derived.unit || ph.chU.unit || 'V';
     app.createDerivedMathTraces([
       {
         name: `Uuv (${ph.chU.name}-${ph.chV.name})`,
         unit,
         baseChannelId: ph.chU.id,
+        time: derived.time,
         values: derived.uuv,
         expr: `${ph.chU.name} - ${ph.chV.name}`,
         color: app.getNextComputedColor(0),
@@ -1795,6 +1817,7 @@ function bindModals() {
         name: `Uvw (${ph.chV.name}-${ph.chW.name})`,
         unit,
         baseChannelId: ph.chV.id,
+        time: derived.time,
         values: derived.uvw,
         expr: `${ph.chV.name} - ${ph.chW.name}`,
         color: app.getNextComputedColor(1),
@@ -1804,13 +1827,17 @@ function bindModals() {
         name: `Uwu (${ph.chW.name}-${ph.chU.name})`,
         unit,
         baseChannelId: ph.chW.id,
+        time: derived.time,
         values: derived.uwu,
         expr: `${ph.chW.name} - ${ph.chU.name}`,
         color: app.getNextComputedColor(2),
         sourceIds: [ph.chW.id, ph.chU.id],
       },
     ]);
-    app.showToast('Added Line-to-Line traces: Uuv, Uvw, Uwu', 'info');
+    app.showToast(
+      derived.warnings.length > 0 ? `Added Line-to-Line traces (${derived.warnings[0]})` : 'Added Line-to-Line traces: Uuv, Uvw, Uwu',
+      derived.warnings.length > 0 ? 'warn' : 'info'
+    );
   });
 
   document.getElementById('bldcGenZeroSeqBtn')?.addEventListener('click', () => {
@@ -1819,18 +1846,27 @@ function bindModals() {
     const ph = getSelected3PhaseForBldc(tab);
     if (!ph) return;
     const derived = computeBldcDerivedTraces(ph.chU, ph.chV, ph.chW);
+    if (!derived.valid || derived.time.length < 2) {
+      app.showToast(derived.warnings[0] || 'No valid synchronized timebase or compatible units for 3-phase traces.', 'error');
+      return;
+    }
+    const unit = derived.unit || ph.chU.unit || 'V';
     app.createDerivedMathTraces([
       {
         name: 'Zero-Seq V0 ((U+V+W)/3)',
-        unit: ph.chU.unit || 'V',
+        unit,
         baseChannelId: ph.chU.id,
+        time: derived.time,
         values: derived.v0,
         expr: `(${ph.chU.name}+${ph.chV.name}+${ph.chW.name})/3`,
         color: app.getNextComputedColor(0),
         sourceIds: [ph.chU.id, ph.chV.id, ph.chW.id],
       },
     ]);
-    app.showToast('Added Zero-Sequence V0 trace', 'info');
+    app.showToast(
+      derived.warnings.length > 0 ? `Added Zero-Sequence V0 (${derived.warnings[0]})` : 'Added Zero-Sequence V0 trace',
+      derived.warnings.length > 0 ? 'warn' : 'info'
+    );
   });
 
   document.getElementById('bldcGenSvmMagBtn')?.addEventListener('click', () => {
@@ -1839,18 +1875,98 @@ function bindModals() {
     const ph = getSelected3PhaseForBldc(tab);
     if (!ph) return;
     const derived = computeBldcDerivedTraces(ph.chU, ph.chV, ph.chW);
+    if (!derived.valid || derived.time.length < 2) {
+      app.showToast(derived.warnings[0] || 'No valid synchronized timebase or compatible units for 3-phase traces.', 'error');
+      return;
+    }
+    const unit = derived.unit || ph.chU.unit || 'V';
     app.createDerivedMathTraces([
       {
         name: 'Space Vector |Vs|',
-        unit: ph.chU.unit || 'V',
+        unit,
         baseChannelId: ph.chU.id,
+        time: derived.time,
         values: derived.svmMag,
         expr: 'sqrt(Clarke_alpha^2 + Clarke_beta^2)',
         color: app.getNextComputedColor(0),
         sourceIds: [ph.chU.id, ph.chV.id, ph.chW.id],
       },
     ]);
-    app.showToast('Added Space Vector Magnitude |Vs| trace', 'info');
+    app.showToast(
+      derived.warnings.length > 0 ? `Added Space Vector |Vs| (${derived.warnings[0]})` : 'Added Space Vector Magnitude |Vs| trace',
+      derived.warnings.length > 0 ? 'warn' : 'info'
+    );
+  });
+
+  document.getElementById('bldcSsRunBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    const idcId = (document.getElementById('bldcSsIdcSelect') as HTMLSelectElement)?.value;
+    const daId = (document.getElementById('bldcSsDaSelect') as HTMLSelectElement)?.value;
+    const dbId = (document.getElementById('bldcSsDbSelect') as HTMLSelectElement)?.value;
+    const dcId = (document.getElementById('bldcSsDcSelect') as HTMLSelectElement)?.value;
+    const chIdc = tab.channels[idcId];
+    const chDa = tab.channels[daId];
+    const chDb = tab.channels[dbId];
+    const chDc = tab.channels[dcId];
+    const resEl = document.getElementById('bldcSsResultCard');
+    if (!chIdc || !chDa || !chDb || !chDc) {
+      if (resEl) resEl.innerHTML = '<span class="text-amber-300">请选择 Idc 与三路 Duty/PWM 通道。</span>';
+      return;
+    }
+    const fswKhz = parseFloat((document.getElementById('bldcSsFswKhzInput') as HTMLInputElement)?.value || '20');
+    const tMinUs = parseFloat((document.getElementById('bldcSsTminUsInput') as HTMLInputElement)?.value || '1.5');
+    const { tStart, tEnd } = getBldcGateBounds(tab, chIdc);
+    const res = reconstructSingleShuntPhaseCurrents(chIdc, chDa, chDb, chDc, {
+      fswHz: Number.isFinite(fswKhz) && fswKhz > 0 ? fswKhz * 1e3 : 20000,
+      tMinSec: Number.isFinite(tMinUs) && tMinUs >= 0 ? tMinUs * 1e-6 : 1.5e-6,
+      tStart,
+      tEnd,
+    });
+    if (!res.valid) {
+      if (resEl) resEl.innerHTML = `<span class="text-red-300">✖ ${escapeHtml(res.warnings[0] || '重构失败')}</span>`;
+      app.showToast(res.warnings[0] || '单电阻相电流重构失败 (Fail-Closed)', 'error');
+      return;
+    }
+    app.createDerivedMathTraces([
+      {
+        name: 'Ia (1-Shunt Recon)',
+        unit: 'A',
+        baseChannelId: chIdc.id,
+        time: res.time,
+        values: res.ia,
+        expr: `SingleShunt(${chIdc.name},${chDa.name})`,
+        color: app.getNextComputedColor(0),
+        sourceIds: [chIdc.id, chDa.id, chDb.id, chDc.id],
+      },
+      {
+        name: 'Ib (1-Shunt Recon)',
+        unit: 'A',
+        baseChannelId: chIdc.id,
+        time: res.time,
+        values: res.ib,
+        expr: `SingleShunt(${chIdc.name},${chDb.name})`,
+        color: app.getNextComputedColor(1),
+        sourceIds: [chIdc.id, chDa.id, chDb.id, chDc.id],
+      },
+      {
+        name: 'Ic (1-Shunt Recon)',
+        unit: 'A',
+        baseChannelId: chIdc.id,
+        time: res.time,
+        values: res.ic,
+        expr: `SingleShunt(${chIdc.name},${chDc.name})`,
+        color: app.getNextComputedColor(2),
+        sourceIds: [chIdc.id, chDa.id, chDb.id, chDc.id],
+      },
+    ]);
+    const modeLabel = res.mode === 'switching_states' ? '开关态门限解码' : 'SVPWM 占空比投影';
+    const blindNote = `盲区占比 ${res.blindZoneFractionPct.toFixed(1)}% (${res.blindCount}/${res.time.length})`;
+    if (resEl) {
+      resEl.innerHTML = `<span class="${res.blindZoneFractionPct > 5 ? 'text-amber-300' : 'text-emerald-300'}">✓ 已注入 Ia/Ib/Ic (${modeLabel} · ${blindNote})</span>`;
+      resEl.title = res.warnings.join('\n');
+    }
+    app.showToast(`已重构并注入 Ia/Ib/Ic (${modeLabel}, ${blindNote})`, res.blindZoneFractionPct > 5 ? 'warn' : 'info');
   });
 
   // Keyboard Shortcuts Modal
@@ -3302,6 +3418,15 @@ function openBldcModal(tab: TabState, initialTab: 'balance' | 'hall' | 'pwm' | '
   );
   populateSelect('bldcRippleChSelect', currIdx >= 0 ? currIdx : maxIdx);
 
+  const idcIdx = tab.drawOrder.findIndex((id) => /ibus|i_bus|idc|i_dc|shunt/i.test(tab.channels[id]?.name || ''));
+  const daIdx = tab.drawOrder.findIndex((id) => /(?:duty|pwm)[\s_-]*(?:a|u)|\bda\b/i.test(tab.channels[id]?.name || ''));
+  const dbIdx = tab.drawOrder.findIndex((id) => /(?:duty|pwm)[\s_-]*(?:b|v)|\bdb\b/i.test(tab.channels[id]?.name || ''));
+  const dcIdx = tab.drawOrder.findIndex((id) => /(?:duty|pwm)[\s_-]*(?:c|w)|\bdc\b/i.test(tab.channels[id]?.name || ''));
+  populateSelect('bldcSsIdcSelect', idcIdx >= 0 ? idcIdx : (currIdx >= 0 ? currIdx : 0));
+  populateSelect('bldcSsDaSelect', daIdx >= 0 ? daIdx : Math.min(1, maxIdx));
+  populateSelect('bldcSsDbSelect', dbIdx >= 0 ? dbIdx : Math.min(2, maxIdx));
+  populateSelect('bldcSsDcSelect', dcIdx >= 0 ? dcIdx : Math.min(3, maxIdx));
+
   setBldcTab(initialTab);
   modal.style.display = 'flex';
   renderBldcBalance(tab);
@@ -3322,11 +3447,25 @@ function renderBldcBalance(tab: TabState) {
   }
   const { tStart, tEnd } = getBldcGateBounds(tab, chU);
   const res = analyzeThreePhaseBalance(chU, chV, chW, tStart, tEnd);
-  const unit = chU.unit || 'V';
+  if (!res.valid) {
+    card.innerHTML = `
+      <div class="bg-red-950/55 border border-red-500/60 text-red-200 px-3 py-2 rounded-xs text-[11px] space-y-1">
+        <div class="font-bold text-red-300">INVALID · 三相诊断已拒绝执行 (Fail-Closed)</div>
+        ${res.warnings.map((w) => `<div>✖ ${escapeHtml(w)}</div>`).join('')}
+      </div>
+    `;
+    return;
+  }
+  const unit = res.unit || chU.unit || 'V';
   const unbalOk = res.vppUnbalancePct <= 3 && res.rmsUnbalancePct <= 3;
   const angOk = res.maxPhaseErrorDeg === null || res.maxPhaseErrorDeg <= 3;
+  const warnBanner =
+    res.warnings.length > 0
+      ? `<div class="bg-amber-950/45 border border-amber-500/50 text-amber-200 px-2.5 py-1.5 rounded-xs text-[10px] space-y-0.5">${res.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('')}</div>`
+      : '';
 
   card.innerHTML = `
+    ${warnBanner}
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] pb-2 border-b border-[#222933]">
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
         <div class="text-slate-400">Vpp Unbalance</div>
@@ -3374,6 +3513,13 @@ function renderBldcHall(tab: TabState) {
   const bId = (document.getElementById('bldcHallBSelect') as HTMLSelectElement)?.value;
   const cId = (document.getElementById('bldcHallCSelect') as HTMLSelectElement)?.value;
   const poles = parseInt((document.getElementById('bldcHallPolesInput') as HTMLInputElement)?.value || '4', 10) || 4;
+  const presetVal = (document.getElementById('bldcHallSeqPresetSelect') as HTMLSelectElement)?.value || 'std_120';
+  const customSeqRaw = (document.getElementById('bldcHallCustomSeqInput') as HTMLInputElement)?.value || '';
+  const offsetDeg = parseFloat((document.getElementById('bldcHallOffsetInput') as HTMLInputElement)?.value || '0') || 0;
+  const presetRing = HALL_SEQUENCE_PRESETS.find((p) => p.id === presetVal)?.ring;
+  const customRing = parseHallSequenceText(customSeqRaw) || undefined;
+  const activeCustomRing = presetVal === 'custom' ? customRing : presetRing ?? customRing;
+
   const chA = tab.channels[aId];
   const chB = tab.channels[bId];
   const chC = tab.channels[cId];
@@ -3382,22 +3528,44 @@ function renderBldcHall(tab: TabState) {
     return;
   }
   const { tStart, tEnd } = getBldcGateBounds(tab, chA);
-  const res = analyzeBldcHallCommutation(chA, chB, chC, poles, tStart, tEnd);
+  const res = analyzeBldcHallCommutation(chA, chB, chC, poles, {
+    tStart,
+    tEnd,
+    customSequence: activeCustomRing,
+    hallOffsetDeg: offsetDeg,
+  });
+
+  if (!res.valid) {
+    card.innerHTML = `
+      <div class="bg-red-950/55 border border-red-500/60 text-red-200 px-3 py-2 rounded-xs text-[11px] space-y-1">
+        <div class="font-bold text-red-300">INVALID · Hall 换相解码已拒绝执行 (Fail-Closed)</div>
+        ${res.warnings.map((w) => `<div>✖ ${escapeHtml(w)}</div>`).join('')}
+      </div>
+    `;
+    return;
+  }
+
+  const warnBanner =
+    res.warnings.length > 0
+      ? `<div class="bg-amber-950/45 border border-amber-500/50 text-amber-200 px-2.5 py-1.5 rounded-xs text-[10px] space-y-0.5">${res.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('')}</div>`
+      : '';
 
   if (res.commutationCount === 0) {
     card.innerHTML = `
+      ${warnBanner}
       <div class="text-amber-300">No full 6-step commutation sectors detected in the selected gate window.</div>
-      <div class="text-slate-400 text-[11px]">Illegal States: ${res.illegalStateCount} · Sequence Jumps: ${res.sequenceJumpCount} (Ensure digital Hall or BEMF signals span at least several transitions)</div>
+      <div class="text-slate-400 text-[11px]">Illegal States: ${res.illegalStateCount} · Sequence Jumps: ${res.sequenceJumpCount} · Ring: [${res.activeRing.join('→')}]</div>
     `;
     return;
   }
 
   card.innerHTML = `
+    ${warnBanner}
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] pb-2 border-b border-[#222933]">
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
         <div class="text-slate-400">Direction / Seq</div>
         <div class="font-bold text-cyan-300">${res.direction}</div>
-        <div class="text-[10px] text-slate-400">${res.sequence.join('→') || '--'}</div>
+        <div class="text-[10px] text-slate-400">${res.sequence.join('→') || '--'} (Ref: ${res.activeRing.join('→')})</div>
       </div>
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
         <div class="text-slate-400">Speed / Elec Freq</div>
@@ -3410,9 +3578,9 @@ function renderBldcHall(tab: TabState) {
         <div class="text-[10px] text-slate-400">RPM Ripple: ${res.rpmRipplePct !== null ? res.rpmRipplePct.toFixed(2) + '%' : '--'}</div>
       </div>
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
-        <div class="text-slate-400">Faults (000/111/Skip)</div>
+        <div class="text-slate-400">Faults (Illegal/Skip)</div>
         <div class="font-bold ${res.illegalStateCount + res.sequenceJumpCount === 0 ? 'text-emerald-400' : 'text-red-400'}">${res.illegalStateCount} Illegal / ${res.sequenceJumpCount} Skip</div>
-        <div class="text-[10px] text-slate-400">Sectors: ${res.commutationCount}</div>
+        <div class="text-[10px] text-slate-400">Sectors: ${res.commutationCount} · Offset: ${res.hallOffsetDeg.toFixed(1)}°</div>
       </div>
     </div>
     <div class="grid grid-cols-3 md:grid-cols-6 gap-1.5 text-[10px] pt-1">
@@ -3459,16 +3627,40 @@ function renderBldcPwm(tab: TabState) {
   if (!card) return;
   const hId = (document.getElementById('bldcPwmHighSelect') as HTMLSelectElement)?.value;
   const lId = (document.getElementById('bldcPwmLowSelect') as HTMLSelectElement)?.value;
+  const role = ((document.getElementById('bldcPwmRoleSelect') as HTMLSelectElement)?.value || 'gate_h') as PwmHighSignalRole;
   const chH = tab.channels[hId];
   const chL = lId ? tab.channels[lId] || null : null;
   if (!chH) {
-    card.innerHTML = '<div class="text-amber-300">Select a High-Side / Switch Node channel.</div>';
+    card.innerHTML = '<div class="text-amber-300">Select a High-Side Gate or SW Node channel.</div>';
     return;
   }
   const { tStart, tEnd } = getBldcGateBounds(tab, chH);
-  const res = analyzePwmSwitchingAndDeadTime(chH, chL, tStart, tEnd);
+  const res = analyzePwmSwitchingAndDeadTime(chH, chL, {
+    tStart,
+    tEnd,
+    highSignalRole: role,
+  });
+
+  if (!res.valid) {
+    card.innerHTML = `
+      <div class="bg-red-950/55 border border-red-500/60 text-red-200 px-3 py-2 rounded-xs text-[11px] space-y-1">
+        <div class="font-bold text-red-300">INVALID · PWM / 死区分析已拒绝执行 (Fail-Closed)</div>
+        ${res.warnings.map((w) => `<div>✖ ${escapeHtml(w)}</div>`).join('')}
+      </div>
+    `;
+    return;
+  }
+
+  const warnBanner =
+    res.warnings.length > 0
+      ? `<div class="bg-amber-950/45 border border-amber-500/50 text-amber-200 px-2.5 py-1.5 rounded-xs text-[10px] space-y-0.5">${res.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('')}</div>`
+      : '';
+  const deadTimeDisableReason =
+    res.warnings.find((w) => w.includes('死区') || w.includes('直通') || w.includes('SW') || w.includes('单位') || w.includes('摆幅')) ||
+    '死区与直通判定已禁用：请确认双路均为有效 Vgs_H / Vgs_L 电压栅极驱动信号（电压单位 V/mV 且摆幅匹配）。';
 
   card.innerHTML = `
+    ${warnBanner}
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] pb-2 border-b border-[#222933]">
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
         <div class="text-slate-400">Carrier Freq / Pulses</div>
@@ -3493,28 +3685,30 @@ function renderBldcPwm(tab: TabState) {
     </div>
     ${
       chL
-        ? `<div class="flex flex-wrap items-center justify-between gap-2 pt-2 text-[11px]">
-            <div>
-              Dead-Time (Min / Avg / Max):
-              <strong class="text-emerald-300">
-                ${res.deadTimeMinSec !== null ? formatEng(res.deadTimeMinSec, 's', 2) : '--'} /
-                ${res.deadTimeAvgSec !== null ? formatEng(res.deadTimeAvgSec, 's', 2) : '--'} /
-                ${res.deadTimeMaxSec !== null ? formatEng(res.deadTimeMaxSec, 's', 2) : '--'}
-              </strong>
-              <span class="text-slate-400">(${res.deadTimeCount} edges)</span>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="${res.shootThroughCount > 0 ? 'text-red-400 font-bold' : 'text-emerald-400'}">
-                Shoot-Through Overlaps: ${res.shootThroughCount}
-              </span>
-              ${
-                res.worstEventIndex !== null
-                  ? `<button id="bldcPwmJumpWorstBtn" type="button" class="px-2 py-0.5 bg-[#161b22] hover:bg-amber-950/50 border border-amber-500/60 text-amber-300 rounded-xs cursor-pointer">Jump to Min/Fault @ ${formatEng(res.worstEventTime || 0, 's', 3)}</button>`
-                  : ''
-              }
-            </div>
-          </div>`
-        : '<div class="text-[11px] text-slate-400 pt-1">Tip: Select a complementary Low-Side gate channel above to compute dead-time (ns) and shoot-through overlaps.</div>'
+        ? res.deadTimeReliable
+          ? `<div class="flex flex-wrap items-center justify-between gap-2 pt-2 text-[11px]">
+              <div>
+                Dead-Time (Min / Avg / Max):
+                <strong class="text-emerald-300">
+                  ${res.deadTimeMinSec !== null ? formatEng(res.deadTimeMinSec, 's', 2) : '--'} /
+                  ${res.deadTimeAvgSec !== null ? formatEng(res.deadTimeAvgSec, 's', 2) : '--'} /
+                  ${res.deadTimeMaxSec !== null ? formatEng(res.deadTimeMaxSec, 's', 2) : '--'}
+                </strong>
+                <span class="text-slate-400">(${res.deadTimeCount} edges)</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="${res.shootThroughCount > 0 ? 'text-red-400 font-bold' : 'text-emerald-400'}">
+                  Shoot-Through Overlaps: ${res.shootThroughCount}
+                </span>
+                ${
+                  res.worstEventIndex !== null
+                    ? `<button id="bldcPwmJumpWorstBtn" type="button" class="px-2 py-0.5 bg-[#161b22] hover:bg-amber-950/50 border border-amber-500/60 text-amber-300 rounded-xs cursor-pointer">Jump to Min/Fault @ ${formatEng(res.worstEventTime || 0, 's', 3)}</button>`
+                    : ''
+                }
+              </div>
+            </div>`
+          : `<div class="text-[11px] text-amber-300 pt-1">${escapeHtml(deadTimeDisableReason)}</div>`
+        : '<div class="text-[11px] text-slate-400 pt-1">Tip: Select a complementary Low-Side gate channel above (with Vgs_H) to compute dead-time (ns) and shoot-through overlaps.</div>'
     }
   `;
 
@@ -3537,8 +3731,20 @@ function renderBldcRipple(tab: TabState) {
   const { tStart, tEnd } = getBldcGateBounds(tab, ch);
   const res = analyzeTorqueAndCurrentRipple(ch, feOverride, tStart, tEnd);
   const unit = ch.unit || 'A';
+  const kindBadge =
+    res.isTrueMechanicalTorque
+      ? '<span class="px-1.5 py-0.5 bg-emerald-950/70 border border-emerald-500/50 text-emerald-300 rounded-xs text-[10px]">机械轴转矩 (Torque)</span>'
+      : res.signalKind === 'current'
+      ? '<span class="px-1.5 py-0.5 bg-amber-950/70 border border-amber-500/50 text-amber-200 rounded-xs text-[10px]">电流纹波 (非机械转矩)</span>'
+      : res.signalKind === 'power'
+      ? '<span class="px-1.5 py-0.5 bg-amber-950/70 border border-amber-500/50 text-amber-200 rounded-xs text-[10px]">电功率脉动 (非机械转矩)</span>'
+      : '<span class="px-1.5 py-0.5 bg-[#161b22] border border-[#2c3543] text-slate-300 rounded-xs text-[10px]">通用通道脉动</span>';
 
   card.innerHTML = `
+    <div class="flex flex-wrap items-center gap-2">
+      ${kindBadge}
+      ${res.warning ? `<span class="text-[10px] text-amber-300">${escapeHtml(res.warning)}</span>` : ''}
+    </div>
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] pb-2 border-b border-[#222933]">
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
         <div class="text-slate-400">Mean / RMS</div>

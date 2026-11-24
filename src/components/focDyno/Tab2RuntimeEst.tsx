@@ -23,7 +23,7 @@ import {
   ScopeCurrentUnit,
   ScopeSpeedUnit,
   buildOscilloscopeTabFromBatchLog,
-  extractRuntimeLogFromScopeChannels,
+  extractRuntimeLogWithAudit,
 } from '../../modules/focDyno/scopeBridge';
 import { TabState } from '../../types/models';
 import { MultiChannelWaveChart } from './Charts';
@@ -88,6 +88,8 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
   const [selSpeedId, setSelSpeedId] = useState<string>('__const__');
   const [constSpeedRpm, setConstSpeedRpm] = useState<number>(1000);
   const [speedUnit, setSpeedUnit] = useState<ScopeSpeedUnit>('rpm');
+  const [scopeExtractWarnings, setScopeExtractWarnings] = useState<string[]>([]);
+  const [scopeVbusScaleNote, setScopeVbusScaleNote] = useState<string | null>(null);
 
   const singleRes = useMemo(() => solveSinglePoint(vMeas, iBus, nRpm, params), [vMeas, iBus, nRpm, params]);
   const fwdRes = useMemo(() => forwardVerifyPoint(fwdIq, fwdN, fwdV, params), [fwdIq, fwdN, fwdV, params]);
@@ -185,10 +187,17 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
         onNotify('未解析出有效的运行日志数值行。');
         return;
       }
+      setScopeExtractWarnings([]);
+      setScopeVbusScaleNote(null);
       onUpdateLog(parsed, ds.fileName);
     } catch (err) {
       onNotify(`读取运行日志失败：${err instanceof Error ? err.message : String(err)}`);
     }
+  };
+
+  const detectUnitFromChannel = (chId: string): ScopeCurrentUnit => {
+    const ch = activeScopeTab?.channels[chId];
+    return ch && /\bma\b/i.test((ch.unit || '').trim()) ? 'mA' : 'A';
   };
 
   const openScopeChannelImporter = () => {
@@ -203,6 +212,7 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
 
     setSelVbusId(vGuess || '__const__');
     setSelIbusId(iGuess);
+    setCurrentUnit(detectUnitFromChannel(iGuess));
     setSelSpeedId(sGuess || '__const__');
     setShowScopePicker(true);
   };
@@ -216,7 +226,7 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
     }
     const vbusCh = selVbusId !== '__const__' ? activeScopeTab.channels[selVbusId] || null : null;
     const speedCh = selSpeedId !== '__const__' ? activeScopeTab.channels[selSpeedId] || null : null;
-    const rows = extractRuntimeLogFromScopeChannels({
+    const audit = extractRuntimeLogWithAudit({
       vbusCh,
       vbusConstV: constVbusV,
       ibusCh,
@@ -227,11 +237,17 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
       polePairs: params.polePairs,
       maxPoints: 4000,
     });
-    if (rows.length < 2) {
+    if (audit.rows.length < 2) {
       onNotify('提取到的有效采样点少于 2 个，无法生成运行日志。');
       return;
     }
-    onUpdateLog(rows, `Scope_${activeScopeTab.fileName}`);
+    setScopeExtractWarnings(audit.warnings);
+    setScopeVbusScaleNote(
+      vbusCh && audit.vbusScaleV !== 1
+        ? `已按 Vbus 通道单位 "${vbusCh.unit}" 自动乘以 ${audit.vbusScaleV} 换算为 V`
+        : null
+    );
+    onUpdateLog(audit.rows, `Scope_${activeScopeTab.fileName}`);
     setShowScopePicker(false);
   };
 
@@ -713,7 +729,11 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
                   <div className="flex gap-1.5">
                     <select
                       value={selIbusId}
-                      onChange={(e) => setSelIbusId(e.target.value)}
+                      onChange={(e) => {
+                        const nextId = e.target.value;
+                        setSelIbusId(nextId);
+                        setCurrentUnit(detectUnitFromChannel(nextId));
+                      }}
                       className="dyno-input flex-1 rounded-sm border px-2 py-1 font-mono text-xs"
                     >
                       {scopeChannels.map((c) => (
@@ -785,6 +805,20 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
           {!isLogTimeMonotonic && (
             <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">
               ▲ 检测到日志时间戳非严格单调递增（可能拼接了多段采集或存在时间戳回绕），滑动窗口已自动降级为按正中位步长点数滤波。
+            </div>
+          )}
+
+          {scopeVbusScaleNote && (
+            <div className="dyno-alert-info rounded-sm border px-4 py-2 text-xs">
+              ⓘ {scopeVbusScaleNote}
+            </div>
+          )}
+
+          {scopeExtractWarnings.length > 0 && (
+            <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs space-y-1">
+              {scopeExtractWarnings.map((w, idx) => (
+                <div key={idx}>▲ {w}</div>
+              ))}
             </div>
           )}
 

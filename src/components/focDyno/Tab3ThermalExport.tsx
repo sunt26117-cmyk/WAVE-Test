@@ -35,6 +35,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
   const [durationS, setDurationS] = useState(0.5);
   const [modulation, setModulation] = useState<ExporterModulationMode>('SVPWM');
   const [includeDuty, setIncludeDuty] = useState(false);
+  const [rdsRefTempC, setRdsRefTempC] = useState(25);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const synth = useMemo(
@@ -88,8 +89,14 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
     onSendTabToScope(tab);
   };
 
+  const convertedRds25MOhm = useMemo(() => {
+    if (rdsRefTempC === 25) return params.rdsOnMOhm;
+    const factor = Math.max(0.4, 1 + 0.0045 * (rdsRefTempC - 25));
+    return params.rdsOnMOhm / factor;
+  }, [params.rdsOnMOhm, rdsRefTempC]);
+
   const handleImportToThermal = () => {
-    const payload = buildThermalHandoffFromSixMos(synth, params, exportPoint.nRpm, tAmbC);
+    const payload = buildThermalHandoffFromSixMos(synth, params, exportPoint.nRpm, tAmbC, { rdsRefTempC });
     if (!payload) {
       onNotify(synth.error || '当前工况无物理实数解，无法导入 6-MOS 热评估。');
       return;
@@ -338,6 +345,43 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
           </div>
         </div>
 
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t dyno-border pt-2.5 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="dyno-text-muted">Dyno Rds 参考结温 (导出至热评估时自动折算为 Rds25):</span>
+            {[25, 85, 100].map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setRdsRefTempC(t)}
+                className={`rounded-xs border px-2 py-0.5 font-mono text-[11px] cursor-pointer ${
+                  rdsRefTempC === t ? 'dyno-seg-active border-transparent' : 'dyno-btn-ghost'
+                }`}
+              >
+                {t}°C{t === 25 ? ' (Rds25)' : ' (热态)'}
+              </button>
+            ))}
+            <SmoothNumberInput
+              value={rdsRefTempC}
+              min={-40}
+              max={175}
+              step={5}
+              ariaLabel="Rds 参考结温"
+              onChange={(v) => setRdsRefTempC(Math.max(-40, Math.min(175, v)))}
+              className="dyno-input w-16 rounded-sm border px-2 py-0.5 font-mono text-[11px] text-right tabular-nums"
+            />
+            <span className="font-mono text-[11px] dyno-accent-text">
+              → 导出 Rds25 = {convertedRds25MOhm.toFixed(2)} mΩ
+            </span>
+          </div>
+          <span className="text-[11px] dyno-text-muted">
+            防止热态 Rds 叠加 6-MOS α 温升系数造成双重放大
+          </span>
+        </div>
+
+        <div className="dyno-alert-info rounded-sm border px-3.5 py-2 text-xs">
+          ⓘ 合成波形边界提示：此处生成的 Ia/Ib/Ic 与 Duty 为理想对称稳态正弦/直流偏置合成信号，不含死区开关纹波、MOS 寄生振铃与三相不平衡，仅用于 6-MOS 热预估，不可替代实测示波器电流探头采集。
+        </div>
+
         {synth.error && <div className="dyno-alert-danger rounded-sm border px-3.5 py-2 text-xs">✖ {synth.error}</div>}
         {synth.clampedByLimit && (
           <div className="dyno-alert-warn rounded-sm border px-3.5 py-2 text-xs">
@@ -390,7 +434,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
           <div className="mb-2 border-b dyno-border pb-2">
             <h4 className="text-sm font-semibold dyno-text-primary">对齐 6-MOS 结温评估参数摘要卡</h4>
             <p className="mt-1 text-xs leading-relaxed dyno-text-muted">
-              自动同步 Vbus_cap、m_cmd (SVPWM 线性上限 {SVPWM_LINEAR_LIMIT.toFixed(4)})、φ_cmd、f_sw、t_dead、Rds25、V_SD{includeDuty ? ' 与 Duty_A/B/C' : ''}；开关/热系数 α、Esw、Qrr、Vref、Iref 仍以 MOS Thermal 面板数据手册设定的为准。
+              自动同步 Vbus_cap、m_cmd (SVPWM 线性上限 {SVPWM_LINEAR_LIMIT.toFixed(4)})、φ_cmd、f_sw、t_dead、Rds25 ({convertedRds25MOhm.toFixed(2)} mΩ @ 25°C)、V_SD{includeDuty ? ' 与 Duty_A/B/C' : ''}；其中 Ke&apos;/P0/β 由 Dyno 标定，I_idle/η_inv 为手动基准；开关损耗/热系数 α、Esw、Qrr、Vref、Iref 仍以 MOS Thermal 面板为准。
             </p>
           </div>
 

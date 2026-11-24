@@ -60,7 +60,15 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
   const [manualVTestV, setManualVTestV] = useState<number>(13.5);
   const [manualKv, setManualKv] = useState<number>(107.4);
   const [rsFitMode, setRsFitMode] = useState<RsFitMode>('locked');
+  const [openLoopModDepth, setOpenLoopModDepth] = useState<number>(1.0);
   const [calibTrigger, setCalibTrigger] = useState(0);
+
+  // Explicit provenance flags so demo baselines can never be mistaken for real hardware measurements
+  const [isOpenLoopDemo, setIsOpenLoopDemo] = useState(true);
+  const [isClosedLoopDemo, setIsClosedLoopDemo] = useState(true);
+  const [isParamsDemo, setIsParamsDemo] = useState(true);
+  const [isLogDemo, setIsLogDemo] = useState(true);
+  const [isExportPointDemo, setIsExportPointDemo] = useState(true);
 
   // Tab 2 Runtime state
   const [logRows, setLogRows] = useState<RawRuntimeLogEntry[]>(() => buildDemoRuntimeLog());
@@ -103,6 +111,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
       manualVTestV,
       manualKv,
       rsFitMode,
+      openLoopModDepth,
     });
     return {
       calibReport: report,
@@ -121,6 +130,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
     manualVTestV,
     manualKv,
     rsFitMode,
+    openLoopModDepth,
     params.polePairs,
     params.rLL25Ohm,
     params.tCoilC,
@@ -174,9 +184,15 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
     setEtaFormat('0-1');
     setKeSource('open_loop_auto');
     setRsFitMode('locked');
+    setOpenLoopModDepth(1.0);
     setLogRows(buildDemoRuntimeLog());
     setLogFileName('demo_runtime_log_13V5_30W.csv');
     setExportPoint({ vMeasV: 13.5, iBusA: 1.06, nRpm: 1000 });
+    setIsOpenLoopDemo(true);
+    setIsClosedLoopDemo(true);
+    setIsParamsDemo(true);
+    setIsLogDemo(true);
+    setIsExportPointDemo(true);
     setCalibTrigger((c) => c + 1);
     showToast('已载入 13.5V / 30W / 1000 RPM / 0.1 N·m 演示数据集并完成分步标定');
   };
@@ -243,14 +259,66 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
         </div>
       </div>
 
+      {/* Explicit Data Provenance Strip */}
+      <div className="dyno-panel border-b px-5 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="dyno-text-muted font-medium">数据来源追踪:</span>
+          {activeTab === 'tab1' && (
+            <>
+              <span
+                className={`rounded-xs border px-2 py-0.5 font-mono ${
+                  isOpenLoopDemo || isClosedLoopDemo ? 'dyno-alert-warn' : 'dyno-alert-ok border-emerald-500/40'
+                }`}
+              >
+                {isOpenLoopDemo && isClosedLoopDemo
+                  ? 'DEMO 示例测功数据 (13.5V/30W) — 请勿直接作为实机台架结论'
+                  : isOpenLoopDemo || isClosedLoopDemo
+                  ? `混合数据: 开环[${isOpenLoopDemo ? 'Demo' : '实测'}] · 闭环[${isClosedLoopDemo ? 'Demo' : '实测'}]`
+                  : `用户实测台架表 (${openLoopRaw.fileName} / ${closedLoopRaw.fileName})`}
+              </span>
+              {isParamsDemo && (
+                <span className="rounded-xs border px-2 py-0.5 dyno-alert-info">
+                  电机基准参数仍为 Demo 默认值
+                </span>
+              )}
+            </>
+          )}
+          {activeTab === 'tab2' && (
+            <span
+              className={`rounded-xs border px-2 py-0.5 font-mono ${
+                isLogDemo || isParamsDemo ? 'dyno-alert-warn' : 'dyno-alert-ok border-emerald-500/40'
+              }`}
+            >
+              日志: {isLogDemo ? `DEMO (${logFileName})` : `实测/示波器 (${logFileName})`} · 电机参数: {isParamsDemo && isClosedLoopDemo ? 'DEMO 基准' : '已标定/用户修改'}
+            </span>
+          )}
+          {activeTab === 'tab3' && (
+            <span
+              className={`rounded-xs border px-2 py-0.5 font-mono ${
+                isExportPointDemo || isParamsDemo ? 'dyno-alert-warn' : 'dyno-alert-ok border-emerald-500/40'
+              }`}
+            >
+              工况点: {isExportPointDemo ? 'DEMO 额定工况 (13.5V / 1.06A / 1000RPM)' : '用户设定/日志传参'} · 波形属性: 理想对称稳态合成（非实测采样）
+            </span>
+          )}
+        </div>
+        <span className="dyno-text-muted hidden md:inline">
+          实时辨识与逆向反推基于稳态 Y 型非凸极 Id=0 模型
+        </span>
+      </div>
+
       {/* Main Split Console */}
       <div className="flex flex-1 flex-col lg:flex-row">
         {sidebarOpen && (
           <SidebarParams
             params={params}
-            onChange={setParams}
+            onChange={(next) => {
+              setIsParamsDemo(false);
+              setParams(next);
+            }}
             onResetDemoParams={() => {
               setParams({ ...DEMO_MOTOR_PARAMS });
+              setIsParamsDemo(true);
               showToast('已重置为 13.5V / 30W 电机物理基准参数');
             }}
           />
@@ -271,16 +339,19 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               manualVTestV={manualVTestV}
               manualKv={manualKv}
               rsFitMode={rsFitMode}
+              openLoopModDepth={openLoopModDepth}
               report={calibReport}
               warnings={normWarnings}
               onUpdateOpenLoop={(ds, map) => {
                 setOpenLoopRaw(ds);
                 setOpenLoopMap(map);
+                setIsOpenLoopDemo(false);
                 showToast(`已导入开环表 ${ds.fileName}，自动完成分步标定`);
               }}
               onUpdateClosedLoop={(ds, map, detUnit, detEta) => {
                 setClosedLoopRaw(ds);
                 setClosedLoopMap(map);
+                setIsClosedLoopDemo(false);
                 const notes: string[] = [];
                 if (detUnit) {
                   setTorqueUnit(detUnit);
@@ -305,6 +376,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
                 setManualKv(kv);
               }}
               onChangeRsFitMode={setRsFitMode}
+              onChangeOpenLoopModDepth={setOpenLoopModDepth}
               onRunCalibration={() => {
                 setCalibTrigger((c) => c + 1);
                 showToast('分步标定已重新执行');
@@ -322,10 +394,12 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               onUpdateLog={(rows, fname) => {
                 setLogRows(rows);
                 setLogFileName(fname);
+                setIsLogDemo(false);
                 showToast(`已载入运行日志 ${fname} (${rows.length} 行)`);
               }}
               onSendPointToExport={(pt) => {
                 setExportPoint(pt);
+                setIsExportPointDemo(false);
                 setActiveTab('tab3');
                 showToast('已将该稳态工况点同步至 Tab 3 波形合成区');
               }}
@@ -340,9 +414,15 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
           {activeTab === 'tab3' && (
             <Tab3ThermalExport
               params={params}
-              onChangeParams={setParams}
+              onChangeParams={(next) => {
+                setIsParamsDemo(false);
+                setParams(next);
+              }}
               exportPoint={exportPoint}
-              onChangeExportPoint={setExportPoint}
+              onChangeExportPoint={(pt) => {
+                setIsExportPointDemo(false);
+                setExportPoint(pt);
+              }}
               onSendTabToScope={(tab) => {
                 onSendTabToScope(tab);
                 showToast(`已打开 ${tab.fileName} 三相波形`);

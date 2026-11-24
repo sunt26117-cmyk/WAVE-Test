@@ -77,6 +77,27 @@ export interface EfficiencyGrid2D {
   maxEta: number;
 }
 
+export interface CalibrationValidationMetrics {
+  holdoutCount: number;
+  valMaeTorqueNm: number;
+  valMapeTorquePct: number;
+  valMaeEtaPct: number;
+}
+
+export interface OperatingEnvelopeBounds {
+  minRpm: number;
+  maxRpm: number;
+  minTorqueNm: number;
+  maxTorqueNm: number;
+  minVbusV: number;
+  maxVbusV: number;
+}
+
+export interface CalibrationSensitivity {
+  rsPlus10PctDeltaMaeNm: number;
+  kePlus5PctDeltaMaeNm: number;
+}
+
 export type CalibrationStatus = 'ok' | 'warn' | 'failed';
 
 export interface CalibrationReport {
@@ -92,6 +113,9 @@ export interface CalibrationReport {
   rsFitMode: RsFitMode;
   evaluatedPoints: EvaluatedDynoPoint[];
   metrics: ErrorMetrics;
+  validationMetrics?: CalibrationValidationMetrics;
+  operatingEnvelope?: OperatingEnvelopeBounds;
+  paramSensitivity?: CalibrationSensitivity;
   grid2D: EfficiencyGrid2D;
   fitNotes: string[];
 }
@@ -269,6 +293,8 @@ export function normalizeDynoDataset(
   const out: NormalizedDynoPoint[] = [];
   const warnings: string[] = [];
   let droppedTorqueCount = 0;
+  let quarantinedEtaCount = 0;
+  let clampedEtaNoiseCount = 0;
   const rawEtas: number[] = [];
   const poutDiscrepancies: number[] = [];
 
@@ -345,6 +371,15 @@ export function normalizeDynoDataset(
       etaMeas = 0;
     }
 
+    let etaClean = etaMeas;
+    if (!Number.isFinite(etaMeas) || etaMeas < -0.02 || etaMeas > 1.05) {
+      quarantinedEtaCount++;
+      etaClean = Number.NaN;
+    } else if (etaMeas < 0 || etaMeas > 1.0) {
+      clampedEtaNoiseCount++;
+      etaClean = Math.max(0, Math.min(1.0, etaMeas));
+    }
+
     out.push({
       nRpm,
       tNm,
@@ -352,7 +387,7 @@ export function normalizeDynoDataset(
       iBusA,
       pInW,
       pOutW,
-      etaMeas: Math.max(0, Math.min(1.0, etaMeas)),
+      etaMeas: etaClean,
     });
   }
 
@@ -372,6 +407,12 @@ export function normalizeDynoDataset(
     } else if (etaFormat === 'percent' && medRaw > 0 && medRaw < 1.0) {
       warnings.push(`效率列中位数 (${medRaw.toFixed(3)}) < 1.0，按 % 换算后不足 1%，疑似本就是「小数 (0–1)」`);
     }
+  }
+  if (quarantinedEtaCount > 0) {
+    warnings.push(`检测到 ${quarantinedEtaCount} 条物理越界效率读数 (< -2% 或 > 105%)，已隔离标记为 NaN（未静默截断，不计入效率误差）。`);
+  }
+  if (clampedEtaNoiseCount > 0) {
+    warnings.push(`有 ${clampedEtaNoiseCount} 条测点效率存在微小传感器零漂越界 (-2%~0% 或 100%~105%)，已微调至 [0, 1]。`);
   }
   if (poutDiscrepancies.length > 0) {
     const medDisc = [...poutDiscrepancies].sort((a, b) => a - b)[Math.floor(poutDiscrepancies.length / 2)];
@@ -450,6 +491,7 @@ export function runStepwiseCalibration(
     manualVTestV: number;
     manualKv: number;
     rsFitMode: RsFitMode;
+    openLoopModDepth?: number;
   }
 ): CalibrationReport {
   const fitNotes: string[] = [];
@@ -462,6 +504,10 @@ export function runStepwiseCalibration(
   // Step 1: Determine Ke' and n0Rpm
   let kePrime = baseParams.kePrime;
   let calibratedN0Rpm = baseParams.n0Rpm;
+  const modScale =
+    options.openLoopModDepth !== undefined && Number.isFinite(options.openLoopModDepth)
+      ? Math.max(0.1, Math.min(1.1547, options.openLoopModDepth))
+      : 1.0;
 
   if (options.keSource === 'manual_n0_vtest') {
     kePrime = calcKeFromNoLoad(options.manualVTestV, options.manualN0Rpm);
@@ -475,11 +521,23 @@ export function runStepwiseCalibration(
     if (validOl.length > 0) {
       const sortedBySpeed = [...validOl].sort((a, b) => b.nRpm - a.nRpm);
       const top = sortedBySpeed[0];
-      kePrime = calcKeFromNoLoad(top.vBusV, top.nRpm);
+      kePrime = calcKeFromNoLoad(top.vBusV * modScale, top.nRpm);
       calibratedN0Rpm = top.nRpm;
       fitNotes.push(
-        `Step 1: 由开环最高空载点 (${top.nRpm.toFixed(0)} RPM @ ${top.vBusV.toFixed(2)} V) 提取 Ke' = ${kePrime.toFixed(5)} Vpeak/(rad/s)（假设该点处于满调制 m_norm≈1；若受占空比限幅请手动指定 n0/V_test 或 KV）`
+        `Step 1: 由开环最高空载点 (${top.nRpm.toFixed(0)} RPM @ ${top.vBusV.toFixed(2)} V, m_norm=${modScale.toFixed(2)}) 提取 Ke' = ${kePrime.toFixed(5)} Vpeak/(rad/s)`
       );
+      if (validOl.length >= 2) {
+        const ratios = validOl.map((p) => (p.vBusV * modScale) / p.nRpm);
+        const rMin = Math.min(...ratios);
+        const rMax = Math.max(...ratios);
+        const rMean = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+        if (rMean > 1e-9 && (rMax - rMin) / rMean > 0.12) {
+          elevateStatus('warn');
+          warnings.push(
+            `开环多点 V_bus/n 线性离散度达 ${(((rMax - rMin) / rMean) * 100).toFixed(1)}% (>12%)，说明部分测点非同油门/满调制，建议检查开环占空比或改用手动 KV。`
+          );
+        }
+      }
     } else {
       elevateStatus('warn');
       warnings.push(`开环数据缺少 n > 50 RPM 且 V_bus > 0.5V 的有效空载点，无法自动提取 Ke'，已沿用设定值 Ke' = ${kePrime.toFixed(5)}。`);
@@ -689,24 +747,112 @@ export function runStepwiseCalibration(
       sumPctT += (Math.abs(p.errTorqueNm) / Math.abs(p.tNm)) * 100;
       countPctT++;
     }
-    const etaDiffPct = (p.etaEst - p.etaMeas) * 100;
-    sumAbsEta += Math.abs(etaDiffPct);
-    sumSqEta += etaDiffPct * etaDiffPct;
-    if (p.etaMeas > 0.1) {
-      sumPctEta += (Math.abs(p.etaEst - p.etaMeas) / p.etaMeas) * 100;
-      countPctEta++;
+    const etaDiffPct = Number.isFinite(p.etaMeas) ? (p.etaEst - p.etaMeas) * 100 : Number.NaN;
+    if (Number.isFinite(etaDiffPct)) {
+      sumAbsEta += Math.abs(etaDiffPct);
+      sumSqEta += etaDiffPct * etaDiffPct;
+      if (p.etaMeas > 0.1) {
+        sumPctEta += (Math.abs(p.etaEst - p.etaMeas) / p.etaMeas) * 100;
+        countPctEta++;
+      }
     }
   }
 
+  let validEtaCount = 0;
+  for (const p of evaluatedPoints) {
+    if (Number.isFinite(p.etaMeas)) validEtaCount++;
+  }
   const nPts = Math.max(1, evaluatedPoints.length);
+  const nEtaPts = Math.max(1, validEtaCount);
   const metrics: ErrorMetrics = {
     maeTorqueNm: sumAbsT / nPts,
     rmseTorqueNm: Math.sqrt(sumSqT / nPts),
     mapeTorquePct: countPctT > 0 ? sumPctT / countPctT : 0,
-    maeEtaPct: sumAbsEta / nPts,
-    rmseEtaPct: Math.sqrt(sumSqEta / nPts),
+    maeEtaPct: validEtaCount > 0 ? sumAbsEta / nEtaPts : 0,
+    rmseEtaPct: validEtaCount > 0 ? Math.sqrt(sumSqEta / nEtaPts) : 0,
     mapeEtaPct: countPctEta > 0 ? sumPctEta / countPctEta : 0,
   };
+
+  // Holdout cross-validation (20% stratified stride) + Parameter sensitivity + Operating Envelope
+  let validationMetrics: CalibrationValidationMetrics | undefined;
+  if (closedLoopPoints.length >= 10) {
+    const trainPts: NormalizedDynoPoint[] = [];
+    const valPts: NormalizedDynoPoint[] = [];
+    const sortedCl = [...closedLoopPoints].sort((a, b) => a.nRpm - b.nRpm || a.tNm - b.tNm);
+    sortedCl.forEach((p, idx) => {
+      if (idx % 5 === 2) valPts.push(p);
+      else trainPts.push(p);
+    });
+    if (valPts.length >= 2 && trainPts.length >= 6) {
+      let valBeta = bestBeta;
+      let bestValObj = Infinity;
+      for (let bi = 0; bi <= 50; bi++) {
+        const bCand = bi * 0.002;
+        const tp: MotorParams = { ...step3ParamsBase, betaSat: bCand, rsEffOverrideOhm: bestRs };
+        let l = 0;
+        for (const p of trainPts) {
+          const r = solveSinglePoint(p.vBusV, p.iBusA, p.nRpm, tp);
+          l += Number.isFinite(r.tEstNm) ? (r.tEstNm - p.tNm) ** 2 : 1e6;
+        }
+        if (l < bestValObj) {
+          bestValObj = l;
+          valBeta = bCand;
+        }
+      }
+      const valParams: MotorParams = { ...step3ParamsBase, betaSat: valBeta, rsEffOverrideOhm: bestRs };
+      let vAbsT = 0;
+      let vPctT = 0;
+      let vPctCnt = 0;
+      let vAbsEta = 0;
+      let vEtaCnt = 0;
+      for (const p of valPts) {
+        const r = solveSinglePoint(p.vBusV, p.iBusA, p.nRpm, valParams);
+        const te = Number.isFinite(r.tEstNm) ? r.tEstNm : 0;
+        const ee = Number.isFinite(r.etaEst) ? r.etaEst : 0;
+        vAbsT += Math.abs(te - p.tNm);
+        if (Math.abs(p.tNm) > 0.015) {
+          vPctT += (Math.abs(te - p.tNm) / Math.abs(p.tNm)) * 100;
+          vPctCnt++;
+        }
+        if (Number.isFinite(p.etaMeas)) {
+          vAbsEta += Math.abs((ee - p.etaMeas) * 100);
+          vEtaCnt++;
+        }
+      }
+      validationMetrics = {
+        holdoutCount: valPts.length,
+        valMaeTorqueNm: vAbsT / valPts.length,
+        valMapeTorquePct: vPctCnt > 0 ? vPctT / vPctCnt : 0,
+        valMaeEtaPct: vEtaCnt > 0 ? vAbsEta / vEtaCnt : 0,
+      };
+    }
+  }
+
+  let operatingEnvelope: OperatingEnvelopeBounds | undefined;
+  let paramSensitivity: CalibrationSensitivity | undefined;
+  if (closedLoopPoints.length > 0) {
+    operatingEnvelope = {
+      minRpm: Math.min(...closedLoopPoints.map((p) => p.nRpm)),
+      maxRpm: Math.max(...closedLoopPoints.map((p) => p.nRpm)),
+      minTorqueNm: Math.min(...closedLoopPoints.map((p) => p.tNm)),
+      maxTorqueNm: Math.max(...closedLoopPoints.map((p) => p.tNm)),
+      minVbusV: Math.min(...closedLoopPoints.map((p) => p.vBusV)),
+      maxVbusV: Math.max(...closedLoopPoints.map((p) => p.vBusV)),
+    };
+    const maeWith = (override: Partial<MotorParams>) => {
+      const pTest: MotorParams = { ...finalParams, ...override };
+      let s = 0;
+      for (const pt of closedLoopPoints) {
+        const r = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, pTest);
+        s += Math.abs((Number.isFinite(r.tEstNm) ? r.tEstNm : 0) - pt.tNm);
+      }
+      return s / closedLoopPoints.length;
+    };
+    paramSensitivity = {
+      rsPlus10PctDeltaMaeNm: maeWith({ rsEffOverrideOhm: bestRs * 1.1 }) - metrics.maeTorqueNm,
+      kePlus5PctDeltaMaeNm: maeWith({ kePrime: kePrime * 1.05 }) - metrics.maeTorqueNm,
+    };
+  }
 
   if (closedLoopPoints.length === 0) {
     elevateStatus('failed');
@@ -756,6 +902,9 @@ export function runStepwiseCalibration(
     rsFitMode: options.rsFitMode,
     evaluatedPoints,
     metrics,
+    validationMetrics,
+    operatingEnvelope,
+    paramSensitivity,
     grid2D,
     fitNotes,
   };
@@ -835,10 +984,10 @@ export function buildEfficiencyGrid2D(
   const speeds = Array.from({ length: nGrid }, (_, i) => minN + (spanN * i) / (nGrid - 1));
   const torques = Array.from({ length: tGrid }, (_, j) => minT + (spanT * j) / (tGrid - 1));
 
-  const normPts = points.map((p) => ({
+    const normPts = points.map((p) => ({
     nx: (p.nRpm - minN) / spanN,
     ny: (p.tNm - minT) / spanT,
-    etaM: p.etaMeas * 100,
+    etaM: Number.isFinite(p.etaMeas) ? p.etaMeas * 100 : Number.NaN,
     vBus: p.vBusV,
   }));
   const hull = convexHull(normPts.map((p) => [p.nx, p.ny]));
@@ -847,13 +996,15 @@ export function buildEfficiencyGrid2D(
     let wSum = 0;
     let vSum = 0;
     for (const p of normPts) {
+      const val = p[field];
+      if (!Number.isFinite(val)) continue;
       const d2 = (nx - p.nx) ** 2 + (ny - p.ny) ** 2;
-      if (d2 < 1e-8) return p[field];
+      if (d2 < 1e-8) return val;
       const w = 1 / Math.pow(d2, 1.5);
       wSum += w;
-      vSum += w * p[field];
+      vSum += w * val;
     }
-    return wSum > 0 ? vSum / wSum : 0;
+    return wSum > 0 ? vSum / wSum : Number.NaN;
   };
 
   const zMeasured: Array<Array<number | null>> = [];
@@ -875,7 +1026,8 @@ export function buildEfficiencyGrid2D(
         continue;
       }
 
-      const valM = Math.max(0, Math.min(99.5, interpAt(nx, ny, 'etaM')));
+      const rawValM = interpAt(nx, ny, 'etaM');
+      const valM = Number.isFinite(rawValM) ? Math.max(0, Math.min(99.5, rawValM)) : null;
       const localVbus = interpAt(nx, ny, 'vBus');
       const omegaM = calcOmegaM(speeds[i]);
       const p0 = calcP0LossW(speeds[i], params.p0A, params.p0B);
@@ -903,8 +1055,10 @@ export function buildEfficiencyGrid2D(
 
       rowM.push(valM);
       rowP.push(valP);
-      minEta = Math.min(minEta, valM);
-      maxEta = Math.max(maxEta, valM);
+      if (valM !== null) {
+        minEta = Math.min(minEta, valM);
+        maxEta = Math.max(maxEta, valM);
+      }
       if (valP !== null) {
         minEta = Math.min(minEta, valP);
         maxEta = Math.max(maxEta, valP);

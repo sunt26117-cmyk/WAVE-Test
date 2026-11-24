@@ -12,6 +12,7 @@ import {
   HarmonicMarker,
   MotorConfig,
 } from '../types/models';
+import { ensureUniformForSpectral } from './timeSync';
 
 /**
  * Calculates radix-2 discrete Fourier transform in-place.
@@ -326,11 +327,34 @@ export function computeFFT(
   channelName: string,
   extra?: { sourceUnit?: string; isUniformSampling?: boolean }
 ): SpectrumResult {
-  const totalSamples = v.length;
-  if (totalSamples < 4 || sampleRate <= 0) {
+  if (v.length < 4 || sampleRate <= 0) {
     throw new Error('Insufficient points or invalid sample rate for FFT.');
   }
 
+  let workT = t;
+  let workV = v;
+  let effectiveFs = sampleRate;
+  const warnings: string[] = [];
+
+  if (t.length === v.length || t.length >= 4) {
+    const sync = ensureUniformForSpectral(t, v, sampleRate);
+    if (sync.wasResampled || extra?.isUniformSampling === false) {
+      workT = sync.t;
+      workV = sync.v;
+      effectiveFs = sync.sampleRate;
+      if (sync.gapCount > 0) {
+        warnings.push(
+          `Non-uniform sampling detected (${sync.gapCount} gap points); uniformly resampled to ${formatFreq(effectiveFs)} for FFT`
+        );
+      } else {
+        warnings.push(
+          `Non-uniform sampling detected; uniformly resampled to ${formatFreq(effectiveFs)} before FFT`
+        );
+      }
+    }
+  }
+
+  const totalSamples = workV.length;
   const MAX_FFT_SIZE = 262144; // Keeps UI interactive even on 1M+ sample captures
   const baseN = Math.min(totalSamples, MAX_FFT_SIZE);
   let paddingFactor = options.zeroPadding || 1;
@@ -338,17 +362,10 @@ export function computeFFT(
     paddingFactor >>= 1;
   }
   const fftN = baseN * paddingFactor;
-  const warnings: string[] = [];
   if (totalSamples > MAX_FFT_SIZE) {
     warnings.push(`Windowed to ${baseN.toLocaleString()} pts for interactive speed`);
   }
-  const nonUniformWarning =
-    extra?.isUniformSampling === false
-      ? 'Non-uniform sampling detected; spectrum amplitude/frequency accuracy may degrade'
-      : undefined;
-  if (nonUniformWarning) {
-    warnings.push(nonUniformWarning);
-  }
+  const nonUniformWarning = warnings.find((w) => w.startsWith('Non-uniform sampling'));
   const cappedWarning = warnings.length > 0 ? warnings.join(' · ') : undefined;
 
   // Sanitize NaN/Inf via linear interpolation between valid neighbors
@@ -358,7 +375,7 @@ export function computeFFT(
   let validCount = 0;
 
   for (let i = 0; i < baseN; i++) {
-    const val = v[i];
+    const val = workV[i];
     if (isFinite(val)) {
       cleanSlice[i] = val;
       if (firstValidIdx === -1) {
@@ -419,7 +436,7 @@ export function computeFFT(
   const magnitudes = new Float32Array(numBins);
   const dbValues = new Float32Array(numBins);
 
-  const binResolution = sampleRate / fftN;
+  const binResolution = effectiveFs / fftN;
   const normFactor = baseN * coherentGain;
 
   let maxMag = 0;
@@ -465,14 +482,14 @@ export function computeFFT(
     sourceChannelId: channelId,
     sourceChannelName: channelName,
     sourceUnit: extra?.sourceUnit || 'V',
-    sampleRate,
+    sampleRate: effectiveFs,
     fftSize: fftN,
     resolution: binResolution,
     coherentGain,
     window: options.window,
     peaks,
-    startTime: t[0],
-    endTime: t[Math.min(t.length - 1, baseN - 1)],
+    startTime: workT[0],
+    endTime: workT[Math.min(workT.length - 1, baseN - 1)],
     sampleCount: baseN,
     yMin,
     yMax,

@@ -694,7 +694,17 @@ def normalize_dyno_df(
     else:
         out["eta"] = fallback_eta
 
-    out["eta"] = out["eta"].clip(0.0, 1.0)
+    eta_vals = pd.to_numeric(out["eta"], errors="coerce")
+    quarantine_mask = eta_vals.isna() | (eta_vals < -0.02) | (eta_vals > 1.05)
+    drift_mask = (~quarantine_mask) & ((eta_vals < 0.0) | (eta_vals > 1.0))
+    n_quarantine = int(quarantine_mask.sum())
+    n_drift = int(drift_mask.sum())
+    out.loc[quarantine_mask, "eta"] = np.nan
+    out.loc[drift_mask, "eta"] = eta_vals.loc[drift_mask].clip(0.0, 1.0)
+    if n_quarantine > 0:
+        warnings.append(f"检测到 {n_quarantine} 条物理越界效率读数 (< -2% 或 > 105%)，已隔离标记为 NaN（未静默截断，不计入效率误差）。")
+    if n_drift > 0:
+        warnings.append(f"有 {n_drift} 条测点效率存在微小传感器零漂越界 (-2%~0% 或 100%~105%)，已微调至 [0, 1]。")
     out = out.dropna(subset=["n_rpm", "V_bus", "I_bus"]).reset_index(drop=True)
     out.attrs["warnings"] = warnings
     return out
@@ -709,6 +719,7 @@ def run_stepwise_calibration(
     manual_vtest: float = 13.5,
     manual_kv: float = 107.4,
     rs_fit_mode: str = "locked",
+    open_loop_mod_depth: float = 1.0,
 ) -> dict:
     calib_warnings: list[str] = []
     status = "ok"
@@ -720,6 +731,7 @@ def run_stepwise_calibration(
 
     # Step 1: Ke' & n0_rpm
     calibrated_n0 = base_params.n0_rpm
+    mod_scale = min(1.1547, max(0.1, float(open_loop_mod_depth))) if math.isfinite(open_loop_mod_depth) else 1.0
     if ke_source == "manual_n0_vtest":
         ke_prime = calc_ke_from_no_load(manual_vtest, manual_n0)
         calibrated_n0 = float(manual_n0)
@@ -729,8 +741,16 @@ def run_stepwise_calibration(
         valid_ol = df_open[(df_open["n_rpm"] > 50) & (df_open["V_bus"] > 0.5)]
         if len(valid_ol) > 0:
             top = valid_ol.sort_values("n_rpm", ascending=False).iloc[0]
-            ke_prime = calc_ke_from_no_load(float(top["V_bus"]), float(top["n_rpm"]))
+            ke_prime = calc_ke_from_no_load(float(top["V_bus"]) * mod_scale, float(top["n_rpm"]))
             calibrated_n0 = float(top["n_rpm"])
+            if len(valid_ol) >= 2:
+                ratios = (valid_ol["V_bus"] * mod_scale) / valid_ol["n_rpm"]
+                r_min, r_max, r_mean = float(ratios.min()), float(ratios.max()), float(ratios.mean())
+                if r_mean > 1e-9 and (r_max - r_min) / r_mean > 0.12:
+                    _elevate("warn")
+                    calib_warnings.append(
+                        f"开环多点 V_bus/n 线性离散度达 {((r_max - r_min) / r_mean) * 100:.1f}% (>12%)，说明部分测点非同油门/满调制，建议检查开环占空比或改用手动 KV。"
+                    )
         else:
             ke_prime = base_params.ke_prime
             _elevate("warn")
@@ -815,6 +835,9 @@ def run_stepwise_calibration(
                 "RMSE_eta_pct": 0.0,
                 "MAPE_eta_pct": 0.0,
             },
+            "validation_metrics": None,
+            "operating_envelope": None,
+            "param_sensitivity": None,
             "grid_n": None,
             "grid_t": None,
             "z_meas": None,
@@ -829,7 +852,8 @@ def run_stepwise_calibration(
         for _, row in df_closed.iterrows():
             r = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), p_cand)
             if math.isfinite(r["t_est"]):
-                eta_err = (r["eta_est"] - float(row["eta"])) if math.isfinite(r["eta_est"]) else 0.0
+                row_eta = float(row["eta"])
+                eta_err = (r["eta_est"] - row_eta) if (math.isfinite(r["eta_est"]) and math.isfinite(row_eta)) else 0.0
                 errs.append(r["t_est"] - float(row["T_Nm"]))
                 errs.append(0.1 * eta_err)
             else:
@@ -866,6 +890,8 @@ def run_stepwise_calibration(
         p_cu = r["p_cu"] if math.isfinite(r["p_cu"]) else 0.0
         t_est = r["t_est"] if math.isfinite(r["t_est"]) else 0.0
         eta_est = r["eta_est"] if math.isfinite(r["eta_est"]) else 0.0
+        eta_meas_val = float(row["eta"])
+        err_eta_val = (eta_est - eta_meas_val) if math.isfinite(eta_meas_val) else float("nan")
         eval_rows.append({
             **row.to_dict(),
             "iq_est": r["iq"],
@@ -875,7 +901,7 @@ def run_stepwise_calibration(
             "P_cu_loss": p_cu,
             "P_iron_wind_loss": r["p0"],
             "err_T": t_est - float(row["T_Nm"]),
-            "err_eta": eta_est - float(row["eta"]),
+            "err_eta": err_eta_val,
         })
     df_eval = pd.DataFrame(eval_rows, columns=EVAL_COLUMNS)
 
@@ -884,10 +910,67 @@ def run_stepwise_calibration(
     mask_t = df_eval["T_Nm"].abs() > 0.015
     mape_t = float(((df_eval.loc[mask_t, "err_T"].abs() / df_eval.loc[mask_t, "T_Nm"].abs()) * 100.0).mean()) if mask_t.any() else 0.0
 
-    mae_eta = float((df_eval["err_eta"].abs() * 100.0).mean())
-    rmse_eta = float(np.sqrt(((df_eval["err_eta"] * 100.0) ** 2).mean()))
-    mask_eta = df_eval["eta"] > 0.1
+    valid_err_eta = df_eval["err_eta"].dropna()
+    mae_eta = float((valid_err_eta.abs() * 100.0).mean()) if len(valid_err_eta) > 0 else 0.0
+    rmse_eta = float(np.sqrt(((valid_err_eta * 100.0) ** 2).mean())) if len(valid_err_eta) > 0 else 0.0
+    mask_eta = df_eval["eta"].notna() & (df_eval["eta"] > 0.1)
     mape_eta = float(((df_eval.loc[mask_eta, "err_eta"].abs() / df_eval.loc[mask_eta, "eta"]) * 100.0).mean()) if mask_eta.any() else 0.0
+
+    # 20% Holdout Cross-Validation, Operating Envelope & Parameter Sensitivity
+    validation_metrics = None
+    if len(df_closed) >= 10:
+        sorted_cl = df_closed.sort_values(["n_rpm", "T_Nm"]).reset_index(drop=True)
+        val_mask = (np.arange(len(sorted_cl)) % 5) == 2
+        val_df = sorted_cl.loc[val_mask]
+        train_df = sorted_cl.loc[~val_mask]
+        if len(val_df) >= 2 and len(train_df) >= 6:
+            def _train_res(x: np.ndarray) -> np.ndarray:
+                p_tr = MotorParams(**{**step3_base.__dict__, "beta_sat": float(x[0]), "rs_eff_override": best_rs})
+                out_e = []
+                for _, rw in train_df.iterrows():
+                    rr = solve_single_point(float(rw["V_bus"]), float(rw["I_bus"]), float(rw["n_rpm"]), p_tr)
+                    out_e.append((rr["t_est"] - float(rw["T_Nm"])) if math.isfinite(rr["t_est"]) else 1e3)
+                return np.array(out_e, dtype=float)
+            opt_val = least_squares(_train_res, x0=[0.005], bounds=([0.0], [0.5]))
+            val_params = MotorParams(**{**step3_base.__dict__, "beta_sat": float(opt_val.x[0]), "rs_eff_override": best_rs})
+            v_abs_t, v_pct_t, v_abs_eta = [], [], []
+            for _, rw in val_df.iterrows():
+                rr = solve_single_point(float(rw["V_bus"]), float(rw["I_bus"]), float(rw["n_rpm"]), val_params)
+                te = rr["t_est"] if math.isfinite(rr["t_est"]) else 0.0
+                ee = rr["eta_est"] if math.isfinite(rr["eta_est"]) else 0.0
+                tnm = float(rw["T_Nm"])
+                v_abs_t.append(abs(te - tnm))
+                if abs(tnm) > 0.015:
+                    v_pct_t.append((abs(te - tnm) / abs(tnm)) * 100.0)
+                if math.isfinite(float(rw["eta"])):
+                    v_abs_eta.append(abs((ee - float(rw["eta"])) * 100.0))
+            validation_metrics = {
+                "holdout_count": int(len(val_df)),
+                "val_mae_T": float(np.mean(v_abs_t)) if v_abs_t else 0.0,
+                "val_mape_T_pct": float(np.mean(v_pct_t)) if v_pct_t else 0.0,
+                "val_mae_eta_pct": float(np.mean(v_abs_eta)) if v_abs_eta else 0.0,
+            }
+
+    operating_envelope = {
+        "min_rpm": float(df_closed["n_rpm"].min()),
+        "max_rpm": float(df_closed["n_rpm"].max()),
+        "min_T_Nm": float(df_closed["T_Nm"].min()),
+        "max_T_Nm": float(df_closed["T_Nm"].max()),
+        "min_V_bus": float(df_closed["V_bus"].min()),
+        "max_V_bus": float(df_closed["V_bus"].max()),
+    }
+    def _eval_mae_with(**overrides) -> float:
+        p_test = MotorParams(**{**final_params.__dict__, **overrides})
+        errs_t = []
+        for _, rw in df_closed.iterrows():
+            rr = solve_single_point(float(rw["V_bus"]), float(rw["I_bus"]), float(rw["n_rpm"]), p_test)
+            te = rr["t_est"] if math.isfinite(rr["t_est"]) else 0.0
+            errs_t.append(abs(te - float(rw["T_Nm"])))
+        return float(np.mean(errs_t)) if errs_t else 0.0
+    param_sensitivity = {
+        "rs_plus_10pct_delta_mae": _eval_mae_with(rs_eff_override=best_rs * 1.1) - mae_t,
+        "ke_plus_5pct_delta_mae": _eval_mae_with(ke_prime=ke_prime * 1.05) - mae_t,
+    }
 
     if not math.isfinite(rs_anchor) or rs_anchor <= 0.0 or not math.isfinite(best_rs) or best_rs <= 0.0 or not math.isfinite(best_beta) or best_beta < 0.0:
         _elevate("failed")
@@ -959,6 +1042,9 @@ def run_stepwise_calibration(
             "RMSE_eta_pct": rmse_eta,
             "MAPE_eta_pct": mape_eta,
         },
+        "validation_metrics": validation_metrics,
+        "operating_envelope": operating_envelope,
+        "param_sensitivity": param_sensitivity,
         "grid_n": grid_n,
         "grid_t": grid_t,
         "z_meas": z_meas,
@@ -1112,6 +1198,8 @@ def synthesize_6mos_csv(
         "actual_duration_s": _safe_round(actual_duration_s, 4),
         "clamped_by_limit": clamped_by_limit,
         "mode": res["mode"],
+        "Synthetic Waveform Notice": "物理方程合成稳态相电流/占空比（非实测示波器瞬态谐波/死区畸变）",
+        "Rds(on) Note": f"Sidebar Rds={params.rds_on_mohm:.1f} mOhm (MOS Thermal 面板使用 Rds@25C + alpha*dTj)",
     }
     return df_wave, summary
 `;
@@ -1242,7 +1330,7 @@ def make_demo_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame(ol_rows), pd.DataFrame(cl_rows), pd.DataFrame(log_rows)
 
 
-def trigger_calibration(ol_map: dict[str, str], cl_map: dict[str, str], torque_unit: str, eta_fmt: str, ke_source: str, man_n0: float, man_vtest: float, man_kv: float, rs_mode: str) -> None:
+def trigger_calibration(ol_map: dict[str, str], cl_map: dict[str, str], torque_unit: str, eta_fmt: str, ke_source: str, man_n0: float, man_vtest: float, man_kv: float, rs_mode: str, ol_mod_depth: float = 1.0) -> None:
     norm_ol = normalize_dyno_df(st.session_state["df_ol"], ol_map, torque_unit=torque_unit, eta_format=eta_fmt, require_torque=False)
     norm_cl = normalize_dyno_df(st.session_state["df_cl"], cl_map, torque_unit=torque_unit, eta_format=eta_fmt, require_torque=True)
     report = run_stepwise_calibration(
@@ -1254,6 +1342,7 @@ def trigger_calibration(ol_map: dict[str, str], cl_map: dict[str, str], torque_u
         manual_vtest=man_vtest,
         manual_kv=man_kv,
         rs_fit_mode=rs_mode,
+        open_loop_mod_depth=ol_mod_depth,
     )
     report["warnings"] = list(norm_ol.attrs.get("warnings", [])) + list(norm_cl.attrs.get("warnings", [])) + list(report.get("warnings", []))
     st.session_state["calib_report"] = report
@@ -1340,8 +1429,10 @@ with tab1:
         }
 
         ke_source = st.selectbox("Ke' 初值来源", ["open_loop_auto", "manual_n0_vtest", "manual_kv"], key="ke_src")
-        man_n0, man_vtest, man_kv = 1450.0, 13.5, 107.4
-        if ke_source == "manual_n0_vtest":
+        man_n0, man_vtest, man_kv, ol_mod_depth = 1450.0, 13.5, 107.4, 1.0
+        if ke_source == "open_loop_auto":
+            ol_mod_depth = float(st.number_input("开环调制比 m_norm (若非满调制可修正)", 0.1, 1.1547, 1.0, format="%.3f", key="ol_mod"))
+        elif ke_source == "manual_n0_vtest":
             kc1, kc2 = st.columns(2)
             man_n0 = kc1.number_input("空载转速 n0 (RPM)", 10.0, 30000.0, 1450.0)
             man_vtest = kc2.number_input("测试母线 V_test (V)", 1.0, 200.0, 13.5)
@@ -1379,7 +1470,7 @@ with tab1:
 
     run_btn = st.button("执行分步标定", type="primary")
     if run_btn or st.session_state.pop("need_recalib", False):
-        trigger_calibration(ol_map, cl_map, torque_unit, eta_fmt, ke_source, man_n0, man_vtest, man_kv, rs_mode)
+        trigger_calibration(ol_map, cl_map, torque_unit, eta_fmt, ke_source, man_n0, man_vtest, man_kv, rs_mode, ol_mod_depth)
         st.rerun()
 
     report = st.session_state["calib_report"]
@@ -1400,6 +1491,25 @@ with tab1:
         k2.metric("Torque MAPE", f"{m['MAPE_T_pct']:.2f} %")
         k3.metric("Eta MAPE", f"{m['MAPE_eta_pct']:.2f} %")
         k4.metric("Rs_eff / β", f"{report['rs_eff']:.4f} Ω / {report['params'].beta_sat:.5f}")
+
+        val_m = report.get("validation_metrics")
+        env = report.get("operating_envelope")
+        sens = report.get("param_sensitivity")
+        audit_parts = []
+        if val_m:
+            audit_parts.append(
+                f"20% 留出交叉验证 ({val_m['holdout_count']}点): MAE_T={val_m['val_mae_T']:.4f} N·m, MAPE_T={val_m['val_mape_T_pct']:.1f}%, MAE_η={val_m['val_mae_eta_pct']:.2f}%"
+            )
+        if env:
+            audit_parts.append(
+                f"有效测功边界: {env['min_rpm']:.0f}~{env['max_rpm']:.0f} RPM, {env['min_T_Nm']:.3f}~{env['max_T_Nm']:.3f} N·m, {env['min_V_bus']:.1f}~{env['max_V_bus']:.1f} V"
+            )
+        if sens:
+            audit_parts.append(
+                f"参数敏感度: Rs+10%→ΔMAE {sens['rs_plus_10pct_delta_mae']:+.4f} N·m, Ke'+5%→ΔMAE {sens['ke_plus_5pct_delta_mae']:+.4f} N·m"
+            )
+        if audit_parts:
+            st.caption(" | ".join(audit_parts))
 
         df_eval = report["eval_df"].sort_values(["n_rpm", "T_Nm"]).reset_index(drop=True)
         fig_cmp = make_subplots(rows=1, cols=2, subplot_titles=("实测 vs 预测扭矩 (N·m)", "实测 vs 预测效率 (%)"))
@@ -1571,6 +1681,7 @@ with tab3:
         n_preview = min(len(df_wave), 400 if fe_val < 1.0 else max(60, int(round(min(dur_s, max(0.015, 3.0 / fe_val)) * fs_hz))))
         df_prev = df_wave.iloc[:n_preview]
 
+        st.caption("注：以下导出的波形为依据电机与逆变器物理方程合成的稳态相电流/占空比（不含实测示波器开关振铃与死区畸变）。")
         fig_w = go.Figure()
         fig_w.add_trace(go.Scatter(x=df_prev["Time"], y=df_prev["Ia"], name="Ia (A)", line=dict(color="#06B6D4")))
         fig_w.add_trace(go.Scatter(x=df_prev["Time"], y=df_prev["Ib"], name="Ib (A)", line=dict(color="#F59E0B")))

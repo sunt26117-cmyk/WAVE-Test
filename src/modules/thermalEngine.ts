@@ -15,6 +15,7 @@
 
 import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
+import { areTimebasesSynchronized, inspectChannelSamplingGaps, inspectTimebase } from './timeSync';
 
 export type ThermalInputMode = 'heating' | 'cooling';
 export type ThermalPathMode = 'junction_ambient' | 'pad_ambient';
@@ -148,8 +149,14 @@ export interface LossSimulationOptions {
   tempCoeffAlphaPerC: number; // e.g. 0.0045 (/°C)
   tAmbC: number;
   vOnThreshV?: number;
+  rdsFeedbackEnabled?: boolean;
   tStart?: number;
   tEnd?: number;
+  initialTjC?: number;
+  initialNodeT?: number[];
+  preheatPowerW?: number;
+  preheatDurationSec?: number;
+  pathMode?: ThermalPathMode;
 }
 
 export interface LossSimulationResult {
@@ -164,6 +171,13 @@ export interface LossSimulationResult {
   energyDeskewedMj: number;
   energyStrippedMj: number;
   switchingEvents: number;
+  zvsTurnOnCount: number;
+  incomplete: boolean;
+  incompleteReasons: string[];
+  nonFiniteMasked: number;
+  outOfCoverageCount: number;
+  thermalPathMode: ThermalPathMode;
+  warnings: string[];
 }
 
 export interface ViPowerOptions {
@@ -257,6 +271,67 @@ export function parseSiUnitScale(
   }
 
   return direct ?? 1;
+}
+
+export interface TemperatureValidationResult {
+  unitLabel: string;
+  scale: number;
+  offsetC: number;
+  warning: string | null;
+}
+
+/**
+ * Validates that a channel selected for thermal impedance deconvolution represents
+ * calibrated temperature (°C or Kelvin), rejecting raw NTC voltages (V/mV), currents (A),
+ * or uncalibrated ADC counts.
+ */
+export function validateTemperatureChannel(ch: WaveformChannel): TemperatureValidationResult {
+  const rawUnit = (ch.unit || '').trim();
+  const name = (ch.name || '').trim();
+  let token = rawUnit;
+
+  if (!token) {
+    const br = name.match(/[\(\[\{]\s*(°C|℃|degC|C|K|Kelvin|[µμunmk]?[VAW]|Ω|Ohm|Hz|rpm|%|ADC|count|counts|raw)\s*[\)\]\}]/i);
+    if (br) token = br[1];
+  }
+
+  const normalized = token.replace(/μ/g, 'u').replace(/µ/g, 'u').trim();
+  if (/^(?:[unmk]?[VAW]|volt|volts|amp|amps|watt|watts|ohm|Ω|hz|khz|mhz|rpm|%|pct|percent|adc|count|counts|raw)$/i.test(normalized)) {
+    throw new Error(
+      `温度通道 "${ch.name}" 单位为 "${token}"（非温度 °C/K），疑似未标定的 NTC 电压、电流或 ADC 原始码，已禁止直接代入热阻反演！`
+    );
+  }
+
+  if (/^(?:°C|℃|degC|celsius|c)$/i.test(normalized)) {
+    return { unitLabel: '°C', scale: 1, offsetC: 0, warning: null };
+  }
+  if (/^(?:K|kelvin)$/i.test(normalized)) {
+    return {
+      unitLabel: 'K -> °C',
+      scale: 1,
+      offsetC: -273.15,
+      warning: `温度通道 "${ch.name}" 单位为开尔文 (${token})，已自动换算为摄氏度 (°C = K - 273.15)。`,
+    };
+  }
+  if (normalized) {
+    throw new Error(
+      `温度通道 "${ch.name}" 单位 "${token}" 不是受支持的温度单位 (°C / K)，请先完成传感器标定与单位设置。`
+    );
+  }
+
+  // Empty unit: check channel name heuristics to catch obvious raw voltage/ADC channels
+  if (/(?:^|[^a-z0-9])(v_?ntc|ntc_?v|v_?temp|v_?th|adc|raw|counts?|vds|vgs|ids|ibus|vbus|rpm|pwm|duty)(?:$|[^a-z0-9])/i.test(name)) {
+    throw new Error(
+      `温度通道 "${ch.name}" 缺少单位且名称疑似电压/ADC原始量，已阻止直接作为 °C 代入热阻反演。`
+    );
+  }
+
+  return {
+    unitLabel: '°C (未标注)',
+    scale: 1,
+    offsetC: 0,
+    warning: `温度通道 "${ch.name}" 未显式标注 °C 单位，已假设数据已完成标定为 °C。`,
+  };
 }
 
 export function classifyThermalLayer(tauSec: number, pathMode: ThermalPathMode = 'junction_ambient'): string {
@@ -1291,14 +1366,21 @@ export function deconvolveThermalImpedance(
       ? Math.max(0, options.padSpreadRthCPerW)
       : 0;
 
-  // 1. Slice window & sanitize finite points
+  // 1. Slice window, enforce strict monotonic increasing timestamps & sanitize finite points
   const slicedT: number[] = [];
   const slicedY: number[] = [];
   const nRaw = Math.min(rawTime.length, rawTemp.length);
+  let prevFiniteT = -Infinity;
   for (let i = 0; i < nRaw; i++) {
     const ti = rawTime[i];
     const yi = rawTemp[i];
     if (!isFinite(ti) || !isFinite(yi)) continue;
+    if (slicedT.length > 0 && ti <= prevFiniteT) {
+      throw new Error(
+        `时间轴在样本索引 ${i} 处非严格递增 (${ti.toFixed(6)}s <= ${prevFiniteT.toFixed(6)}s)，请先清洗或重采样后再执行热阻反演。`
+      );
+    }
+    prevFiniteT = ti;
     if (options.tStart !== undefined && ti < options.tStart) continue;
     if (options.tEnd !== undefined && ti > options.tEnd) continue;
     slicedT.push(ti);
@@ -2136,17 +2218,68 @@ export function computeLossWithDeskewAndEoss(
     throw new Error('At least 4 samples are required inside gate for loss stripping simulation.');
   }
 
-  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name);
-  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name);
-  const sameTimebase =
-    nVFull === nIFull &&
-    (vdsCh.t === idsCh.t ||
-      (Math.abs(vdsCh.t[0] - idsCh.t[0]) <= 1e-15 &&
-        Math.abs(vdsCh.t[nVFull - 1] - idsCh.t[nIFull - 1]) <= 1e-15));
+  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name, { strict: true });
+  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name, { strict: true });
 
-  const time = new Float64Array(len);
-  const pLossW = new Float32Array(len);
-  const tjC = new Float32Array(len);
+  const tbV = inspectTimebase(vdsCh.t, 0, nVFull - 1);
+  const tbI = inspectTimebase(idsCh.t, 0, nIFull - 1);
+  if (!tbV.monotonic) {
+    throw new Error(`Vds 通道时间轴在索引 ${tbV.nonMonotonicIndex} 处非严格递增，无法保证损耗积分因果性。`);
+  }
+  if (!tbI.monotonic) {
+    throw new Error(`Ids 通道时间轴在索引 ${tbI.nonMonotonicIndex} 处非严格递增，无法进行时间对齐与 Deskew 插值。`);
+  }
+
+  const thermalPathMode: ThermalPathMode = opts.pathMode === 'pad_ambient' ? 'pad_ambient' : 'junction_ambient';
+  const deskewSec = (opts.deskewNs || 0) * 1e-9;
+  const sameTimebase = areTimebasesSynchronized(vdsCh.t, idsCh.t);
+  const warnings: string[] = [];
+  const incompleteReasons: string[] = [];
+
+  if (thermalPathMode === 'pad_ambient') {
+    warnings.push('注意：当前损耗温升仿真基于 PCB/焊盘侧网络 (pad_ambient)，输出曲线仅代表等效测点温度 Tpad，不得视为真实芯片结温 Tj。');
+  }
+  if (!sameTimebase) {
+    warnings.push('Vds 与 Ids 采样时刻未逐点同步，已按真实时间戳线性插值对齐（未按数组下标直接相乘）。');
+  }
+
+  const idsFirstT = idsCh.t[0];
+  const idsLastT = idsCh.t[nIFull - 1];
+  const gateSpanSec = Math.max(1e-12, vdsCh.t[i1] - vdsCh.t[i0]);
+  const covEps = Math.max(1e-12, gateSpanSec * 1e-6);
+
+  // If unshifted Vds gate exceeds Ids bounds, reject/mark incomplete rather than boundary-clamping Ids
+  const unshiftedOutOfCov = vdsCh.t[i0] < idsFirstT - covEps || vdsCh.t[i1] > idsLastT + covEps;
+  let deskewTrimmedCount = 0;
+
+  // For small probe deskew shifts (<= 5% of gate), trim edge indices outside [idsFirstT + deskewSec, idsLastT + deskewSec]
+  // instead of silently holding boundary samples.
+  if (!unshiftedOutOfCov && Math.abs(deskewSec) > 1e-15 && Math.abs(deskewSec) <= gateSpanSec * 0.05) {
+    const validTMin = idsFirstT + deskewSec - 1e-15;
+    const validTMax = idsLastT + deskewSec + 1e-15;
+    const origI0 = i0;
+    const origI1 = i1;
+    while (i0 < i1 && vdsCh.t[i0] < validTMin) i0++;
+    while (i1 > i0 && vdsCh.t[i1] > validTMax) i1--;
+    deskewTrimmedCount = (i0 - origI0) + (origI1 - i1);
+    if (deskewTrimmedCount > 0 && i1 - i0 + 1 >= 4) {
+      warnings.push(
+        `已自动裁剪探头 Deskew (${opts.deskewNs.toFixed(1)} ns) 边界越界样本 ${deskewTrimmedCount} 点，避免对 Ids 首尾样本做静态钳位保持。`
+      );
+    } else {
+      i0 = origI0;
+      i1 = origI1;
+    }
+  }
+
+  const evalLen = Math.max(0, i1 - i0 + 1);
+  if (evalLen < 4) {
+    throw new Error('有效重叠门控区间内样本数不足 4 点，无法执行损耗温升仿真。');
+  }
+
+  const time = new Float64Array(evalLen);
+  const pLossW = new Float32Array(evalLen);
+  const tjC = new Float32Array(evalLen);
 
   const mV = vdsCh.coupling === 'AC' ? computeChannelMean(vdsCh) : 0;
   const mI = idsCh.coupling === 'AC' ? computeChannelMean(idsCh) : 0;
@@ -2160,21 +2293,26 @@ export function computeLossWithDeskewAndEoss(
       if (vv > vMax) vMax = vv;
     }
   }
+  if (!isFinite(vMin) || !isFinite(vMax)) {
+    throw new Error('Vds 门控窗口内不存在有效有限数值样本。');
+  }
   const vSpan = Math.max(1e-6, vMax - vMin);
   const vLowThresh = vMin + vSpan * 0.2;
   const vHighThresh = vMin + vSpan * 0.8;
 
-  const deskewSec = (opts.deskewNs || 0) * 1e-9;
   const eossJ = Math.max(0, opts.eossUj || 0) * 1e-6;
   const r25Ohm = Math.max(0, opts.rdsOn25Mohm || 0) * 1e-3;
   const alpha = opts.tempCoeffAlphaPerC || 0;
   const vOnThresh = opts.vOnThreshV ?? Math.max(0.5, vMin + vSpan * 0.15);
+  const rdsFeedbackEnabled = opts.rdsFeedbackEnabled !== false;
 
-  const sampleIdsAt = (targetT: number): number => {
+  const sampleIdsStrict = (targetT: number): { val: number; covered: boolean } => {
     const tArr = idsCh.t;
-    if (nIFull === 0) return 0;
-    if (targetT <= tArr[0]) return getChannelDisplayValue(idsCh, 0, mI) * iScale;
-    if (targetT >= tArr[nIFull - 1]) return getChannelDisplayValue(idsCh, nIFull - 1, mI) * iScale;
+    if (nIFull === 0 || targetT < tArr[0] - covEps || targetT > tArr[nIFull - 1] + covEps) {
+      return { val: Number.NaN, covered: false };
+    }
+    if (targetT <= tArr[0]) return { val: getChannelDisplayValue(idsCh, 0, mI) * iScale, covered: true };
+    if (targetT >= tArr[nIFull - 1]) return { val: getChannelDisplayValue(idsCh, nIFull - 1, mI) * iScale, covered: true };
 
     let lo = 0;
     let hi = nIFull - 1;
@@ -2187,16 +2325,139 @@ export function computeLossWithDeskewAndEoss(
     const frac = dt > 1e-18 ? (targetT - tArr[lo]) / dt : 0;
     const v0 = getChannelDisplayValue(idsCh, lo, mI) * iScale;
     const v1 = getChannelDisplayValue(idsCh, hi, mI) * iScale;
-    return v0 + frac * (v1 - v0);
+    if (!Number.isFinite(v0) || !Number.isFinite(v1)) {
+      return { val: Number.NaN, covered: true };
+    }
+    return { val: v0 + frac * (v1 - v0), covered: true };
   };
+
+  // Detect interior sampling gaps in both Vds and Ids inside evaluation time span
+  let idsI0 = 0;
+  let idsI1 = nIFull - 1;
+  while (idsI0 < nIFull && idsCh.t[idsI0] < vdsCh.t[i0] - Math.abs(deskewSec)) idsI0++;
+  while (idsI1 > idsI0 && idsCh.t[idsI1] > vdsCh.t[i1] + Math.abs(deskewSec)) idsI1--;
+  const vdsGapReport = inspectChannelSamplingGaps(vdsCh.t, i0, i1, 3.5);
+  const idsGapReport = idsI1 - idsI0 >= 3 ? inspectChannelSamplingGaps(idsCh.t, idsI0, idsI1, 3.5) : { gapCount: 0, maxGapSec: 0, maxGapRatio: 1 };
+
+  const pRawArr = new Float64Array(evalLen);
+  const pDeskewArr = new Float64Array(evalLen);
+  const vScaledArr = new Float64Array(evalLen);
+  const iAlignedArr = new Float64Array(evalLen);
+  const pointValidMask = new Uint8Array(evalLen);
+  let nonFiniteMasked = 0;
+  let outOfCoverageCount = 0;
+
+  for (let k = 0; k < evalLen; k++) {
+    const idx = i0 + k;
+    const tCurr = vdsCh.t[idx];
+    time[k] = tCurr;
+    const vdsRaw = getChannelDisplayValue(vdsCh, idx, mV) * vScale;
+    const idsRawQuery = sameTimebase
+      ? { val: getChannelDisplayValue(idsCh, idx, mI) * iScale, covered: true }
+      : sampleIdsStrict(tCurr);
+    const idsAlignedQuery =
+      deskewSec !== 0 || !sameTimebase
+        ? sampleIdsStrict(tCurr - deskewSec)
+        : idsRawQuery;
+
+    if (!idsRawQuery.covered || !idsAlignedQuery.covered) {
+      outOfCoverageCount++;
+      pointValidMask[k] = 0;
+      vScaledArr[k] = Number.NaN;
+      iAlignedArr[k] = Number.NaN;
+      pRawArr[k] = Number.NaN;
+      pDeskewArr[k] = Number.NaN;
+      pLossW[k] = Number.NaN;
+    } else if (!Number.isFinite(vdsRaw) || !Number.isFinite(idsRawQuery.val) || !Number.isFinite(idsAlignedQuery.val)) {
+      nonFiniteMasked++;
+      pointValidMask[k] = 0;
+      vScaledArr[k] = Number.NaN;
+      iAlignedArr[k] = Number.NaN;
+      pRawArr[k] = Number.NaN;
+      pDeskewArr[k] = Number.NaN;
+      pLossW[k] = Number.NaN;
+    } else {
+      pointValidMask[k] = 1;
+      vScaledArr[k] = vdsRaw;
+      iAlignedArr[k] = idsAlignedQuery.val;
+      pRawArr[k] = vdsRaw * idsRawQuery.val;
+      pDeskewArr[k] = vdsRaw * idsAlignedQuery.val;
+      pLossW[k] = pDeskewArr[k];
+    }
+  }
+
+  if (unshiftedOutOfCov || outOfCoverageCount > 0) {
+    incompleteReasons.push(
+      `Ids 通道时间覆盖 [${idsFirstT.toExponential(3)}s, ${idsLastT.toExponential(3)}s] 未覆盖仿真门控区间，共有 ${Math.max(1, outOfCoverageCount)} 点超出覆盖范围（禁止边界钳位假定）。`
+    );
+  }
+  if (nonFiniteMasked > 0) {
+    incompleteReasons.push(`门控区间内检测到 ${nonFiniteMasked} 个 NaN/Inf 无效采样点（禁止清零掩盖损耗）。`);
+  }
+  if (vdsGapReport.gapCount > 0 || idsGapReport.gapCount > 0) {
+    incompleteReasons.push(
+      `检测到内部采样缺口/掉点（Vds gap=${vdsGapReport.gapCount}, Ids gap=${idsGapReport.gapCount}，最大空窗 ${Math.max(vdsGapReport.maxGapRatio, idsGapReport.maxGapRatio).toFixed(1)}× dt_med），关键边沿能量可能缺失。`
+    );
+  }
+
+  const incomplete = incompleteReasons.length > 0;
+  if (incomplete) {
+    warnings.push(...incompleteReasons);
+    tjC.fill(Number.NaN);
+    return {
+      time,
+      pLossW,
+      tjC,
+      pLossMeanW: Number.NaN,
+      tjMaxC: Number.NaN,
+      tjMinC: Number.NaN,
+      tjMeanC: Number.NaN,
+      energyRawMj: Number.NaN,
+      energyDeskewedMj: Number.NaN,
+      energyStrippedMj: Number.NaN,
+      switchingEvents: 0,
+      zvsTurnOnCount: 0,
+      incomplete: true,
+      incompleteReasons,
+      nonFiniteMasked,
+      outOfCoverageCount,
+      thermalPathMode,
+      warnings,
+    };
+  }
 
   let energyRawJ = 0;
   let energyDeskewedJ = 0;
   let energyStrippedJ = 0;
   let switchingEvents = 0;
+  let zvsTurnOnCount = 0;
 
   const mStages = cauerStages.length;
   const nodeT = new Float64Array(Math.max(1, mStages)).fill(opts.tAmbC);
+  if (
+    mStages > 0 &&
+    opts.initialNodeT &&
+    opts.initialNodeT.length === mStages &&
+    opts.initialNodeT.every((v) => Number.isFinite(v))
+  ) {
+    for (let s = 0; s < mStages; s++) nodeT[s] = opts.initialNodeT[s];
+    warnings.push(`已注入自定义 Cauer 初始节点温度历史（初始 Tj=${nodeT[0].toFixed(2)}°C）。`);
+  } else if (
+    mStages > 0 &&
+    opts.initialTjC !== undefined &&
+    Number.isFinite(opts.initialTjC) &&
+    Math.abs(opts.initialTjC - opts.tAmbC) > 1e-6
+  ) {
+    const rTotal = cauerStages.reduce((acc, st) => acc + Math.max(1e-9, st.r), 0);
+    let rRemaining = rTotal;
+    for (let s = 0; s < mStages; s++) {
+      const frac = rTotal > 1e-12 ? rRemaining / rTotal : 0;
+      nodeT[s] = opts.tAmbC + (opts.initialTjC - opts.tAmbC) * frac;
+      rRemaining -= Math.max(1e-9, cauerStages[s].r);
+    }
+    warnings.push(`已设定脉冲前热历史初温 Tj(0)=${nodeT[0].toFixed(2)}°C（沿 Cauer 热阻占比分布至内部节点）。`);
+  }
+
   const aSub = new Float64Array(Math.max(1, mStages));
   const bDiag = new Float64Array(Math.max(1, mStages));
   const cSup = new Float64Array(Math.max(1, mStages));
@@ -2211,31 +2472,61 @@ export function computeLossWithDeskewAndEoss(
   }
   if (!isFinite(minTau)) minTau = 1e-4;
 
-  let swState: 'on' | 'off' | 'trans_off' | 'trans_on' =
-    getChannelDisplayValue(vdsCh, i0, mV) * vScale <= vLowThresh ? 'on' : 'off';
-  let transStartIdx = -1;
+  const advanceCauerNodeT = (dtStep: number, pStepW: number) => {
+    if (mStages <= 0 || dtStep <= 0) return;
+    const subSteps = Math.min(32, Math.max(1, Math.ceil(dtStep / Math.max(1e-8, 0.05 * minTau))));
+    const subDt = dtStep / subSteps;
+    for (let s = 0; s < mStages; s++) {
+      const ckOverDt = cauerStages[s].c / subDt;
+      const gLeft = s > 0 ? 1 / cauerStages[s - 1].r : 0;
+      const gRight = 1 / cauerStages[s].r;
+      aSub[s] = s > 0 ? -gLeft : 0;
+      bDiag[s] = ckOverDt + gLeft + gRight;
+      cSup[s] = s < mStages - 1 ? -gRight : 0;
+    }
+    cPrime[0] = mStages > 1 ? cSup[0] / bDiag[0] : 0;
+    for (let s = 1; s < mStages; s++) {
+      const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
+      cPrime[s] = s < mStages - 1 ? cSup[s] / denom : 0;
+    }
+    const gLast = 1 / cauerStages[mStages - 1].r;
+    for (let sub = 0; sub < subSteps; sub++) {
+      for (let s = 0; s < mStages; s++) {
+        const ckOverDt = cauerStages[s].c / subDt;
+        rhs[s] = ckOverDt * nodeT[s] + (s === 0 ? pStepW : 0) + (s === mStages - 1 ? opts.tAmbC * gLast : 0);
+      }
+      dPrime[0] = rhs[0] / bDiag[0];
+      for (let s = 1; s < mStages; s++) {
+        const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
+        dPrime[s] = (rhs[s] - aSub[s] * dPrime[s - 1]) / denom;
+      }
+      nodeT[mStages - 1] = dPrime[mStages - 1];
+      for (let s = mStages - 2; s >= 0; s--) {
+        nodeT[s] = dPrime[s] - cPrime[s] * nodeT[s + 1];
+      }
+    }
+  };
 
-  const pRawArr = new Float64Array(len);
-  const pDeskewArr = new Float64Array(len);
-  const vScaledArr = new Float64Array(len);
-  const iAlignedArr = new Float64Array(len);
-
-  for (let k = 0; k < len; k++) {
-    const idx = i0 + k;
-    const tCurr = vdsCh.t[idx];
-    time[k] = tCurr;
-    const vds = getChannelDisplayValue(vdsCh, idx, mV) * vScale;
-    const idsRaw = sameTimebase
-      ? getChannelDisplayValue(idsCh, idx, mI) * iScale
-      : sampleIdsAt(tCurr);
-    const idsAligned = deskewSec !== 0 || !sameTimebase ? sampleIdsAt(tCurr - deskewSec) : idsRaw;
-
-    vScaledArr[k] = vds;
-    iAlignedArr[k] = idsAligned;
-    pRawArr[k] = vds * idsRaw;
-    pDeskewArr[k] = vds * idsAligned;
-    pLossW[k] = pDeskewArr[k];
+  if (
+    mStages > 0 &&
+    opts.preheatPowerW !== undefined &&
+    Number.isFinite(opts.preheatPowerW) &&
+    opts.preheatPowerW > 0 &&
+    opts.preheatDurationSec !== undefined &&
+    Number.isFinite(opts.preheatDurationSec) &&
+    opts.preheatDurationSec > 0
+  ) {
+    const preChunks = 24;
+    const dtChunk = opts.preheatDurationSec / preChunks;
+    for (let c = 0; c < preChunks; c++) advanceCauerNodeT(dtChunk, opts.preheatPowerW);
+    warnings.push(
+      `已运行脉冲前稳态预热 (${opts.preheatPowerW.toFixed(1)}W × ${opts.preheatDurationSec.toFixed(3)}s)：脉冲起始结温=${nodeT[0].toFixed(2)}°C。`
+    );
   }
+
+  let swState: 'on' | 'off' | 'trans_off' | 'trans_on' =
+    vScaledArr[0] <= vLowThresh ? 'on' : 'off';
+  let transStartIdx = -1;
 
   // Trapezoidal time-weight helper for exact 1.0x Eoss energy attribution
   const applyExactEdgeEnergy = (startK: number, endK: number, energyDeltaJ: number) => {
@@ -2243,7 +2534,7 @@ export function computeLossWithDeskewAndEoss(
     let totalTrapWeight = 0;
     for (let j = startK; j <= endK; j++) {
       const dtPrev = j > 0 ? Math.max(0, time[j] - time[j - 1]) : 0;
-      const dtNext = j < len - 1 ? Math.max(0, time[j + 1] - time[j]) : 0;
+      const dtNext = j < evalLen - 1 ? Math.max(0, time[j + 1] - time[j]) : 0;
       totalTrapWeight += 0.5 * (dtPrev + dtNext);
     }
     if (totalTrapWeight <= 1e-15) return;
@@ -2253,8 +2544,8 @@ export function computeLossWithDeskewAndEoss(
     }
   };
 
-  // Strip Eoss across identified turn-off (Vds rising) and turn-on (Vds falling) intervals
-  for (let k = 0; k < len; k++) {
+  // Strip Eoss across identified turn-off (Vds rising) and hard-switched turn-on (Vds falling w/ positive Ids)
+  for (let k = 0; k < evalLen; k++) {
     const vds = vScaledArr[k];
     if (swState === 'on' && vds > vLowThresh) {
       swState = 'trans_off';
@@ -2272,8 +2563,17 @@ export function computeLossWithDeskewAndEoss(
       transStartIdx = k;
     } else if (swState === 'trans_on') {
       if (vds <= vLowThresh) {
-        applyExactEdgeEnergy(transStartIdx, k, +eossJ);
-        switchingEvents++;
+        let maxForwardIds = -Infinity;
+        for (let j = Math.max(0, transStartIdx); j <= k; j++) {
+          if (iAlignedArr[j] > maxForwardIds) maxForwardIds = iAlignedArr[j];
+        }
+        if (maxForwardIds > 0.05) {
+          applyExactEdgeEnergy(transStartIdx, k, +eossJ);
+          switchingEvents++;
+        } else {
+          // Zero-voltage / reverse-conduction soft turn-on: Coss was already discharged cleanly before channel turn-on
+          zvsTurnOnCount++;
+        }
         swState = 'on';
       } else if (vds >= vHighThresh) {
         swState = 'off';
@@ -2281,78 +2581,54 @@ export function computeLossWithDeskewAndEoss(
     }
   }
 
-  // Advance closed-loop Tj(t) with temperature-dependent Rds(on)(Tj) feedback and Cauer sub-stepping
-  let sumLoss = 0;
-  let tjMaxC = opts.tAmbC;
-  let tjMinC = opts.tAmbC;
-  let sumTj = opts.tAmbC;
-  tjC[0] = opts.tAmbC;
+  if (zvsTurnOnCount > 0 && eossJ > 0) {
+    warnings.push(`检测到 ${zvsTurnOnCount} 次开通边沿处于零/反向电流 (ZVS/体二极管续流) 状态，已跳过 +Eoss 补偿以避免多加损耗。`);
+  }
+  if (rdsFeedbackEnabled && r25Ohm > 0 && alpha !== 0) {
+    warnings.push('已启用 Rds(on)(Tj) 温度修正 (按实测 Vds 处于 25°C 参考态叠加热增阻)；若实测 Vds 本身已在高温稳态下采集，请关闭此开关避免重复计温。');
+  }
 
-  for (let k = 0; k < len; k++) {
+  // Advance closed-loop Tj(t) with optional temperature-dependent Rds(on)(Tj) feedback and Cauer sub-stepping
+  const initialTj = mStages > 0 ? nodeT[0] : opts.tAmbC;
+  let sumLoss = 0;
+  let tjMaxC = initialTj;
+  let tjMinC = initialTj;
+  let sumTj = initialTj;
+  tjC[0] = initialTj;
+
+  for (let k = 0; k < evalLen; k++) {
     if (k > 0) {
       const dt = Math.max(1e-12, time[k] - time[k - 1]);
       energyRawJ += 0.5 * (pRawArr[k - 1] + pRawArr[k]) * dt;
       energyDeskewedJ += 0.5 * (pDeskewArr[k - 1] + pDeskewArr[k]) * dt;
 
       const vPrev = vScaledArr[k - 1];
-      if (r25Ohm > 0 && alpha !== 0 && Math.abs(vPrev) <= vOnThresh) {
+      if (rdsFeedbackEnabled && r25Ohm > 0 && alpha !== 0 && Math.abs(vPrev) <= vOnThresh) {
         const idsPrev = iAlignedArr[k - 1];
         const rTj = Math.max(1e-6, r25Ohm * (1 + alpha * (nodeT[0] - 25)));
         const deltaCond = idsPrev * idsPrev * (rTj - r25Ohm);
         pLossW[k - 1] += deltaCond;
       }
 
-      const pStepSigned = isFinite(pLossW[k - 1]) ? pLossW[k - 1] : 0;
+      const pStepSigned = pLossW[k - 1];
       const pThermalStep = Math.max(0, pStepSigned);
 
       if (mStages > 0) {
-        const subSteps = Math.min(32, Math.max(1, Math.ceil(dt / Math.max(1e-8, 0.05 * minTau))));
-        const subDt = dt / subSteps;
-        for (let s = 0; s < mStages; s++) {
-          const ckOverDt = cauerStages[s].c / subDt;
-          const gLeft = s > 0 ? 1 / cauerStages[s - 1].r : 0;
-          const gRight = 1 / cauerStages[s].r;
-          aSub[s] = s > 0 ? -gLeft : 0;
-          bDiag[s] = ckOverDt + gLeft + gRight;
-          cSup[s] = s < mStages - 1 ? -gRight : 0;
-        }
-        cPrime[0] = mStages > 1 ? cSup[0] / bDiag[0] : 0;
-        for (let s = 1; s < mStages; s++) {
-          const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
-          cPrime[s] = s < mStages - 1 ? cSup[s] / denom : 0;
-        }
-        const gLast = 1 / cauerStages[mStages - 1].r;
-        for (let sub = 0; sub < subSteps; sub++) {
-          for (let s = 0; s < mStages; s++) {
-            const ckOverDt = cauerStages[s].c / subDt;
-            rhs[s] = ckOverDt * nodeT[s] + (s === 0 ? pThermalStep : 0) + (s === mStages - 1 ? opts.tAmbC * gLast : 0);
-          }
-          dPrime[0] = rhs[0] / bDiag[0];
-          for (let s = 1; s < mStages; s++) {
-            const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
-            dPrime[s] = (rhs[s] - aSub[s] * dPrime[s - 1]) / denom;
-          }
-          nodeT[mStages - 1] = dPrime[mStages - 1];
-          for (let s = mStages - 2; s >= 0; s--) {
-            nodeT[s] = dPrime[s] - cPrime[s] * nodeT[s + 1];
-          }
-        }
+        advanceCauerNodeT(dt, pThermalStep);
         tjC[k] = nodeT[0];
       } else {
         tjC[k] = opts.tAmbC;
       }
 
-      // Apply Rds(Tj) feedback at sample k consistently before integrating interval [k-1..k]
-      if (r25Ohm > 0 && alpha !== 0 && Math.abs(vScaledArr[k]) <= vOnThresh) {
+      if (rdsFeedbackEnabled && r25Ohm > 0 && alpha !== 0 && Math.abs(vScaledArr[k]) <= vOnThresh) {
         const idsCurr = iAlignedArr[k];
         const rTjCurr = Math.max(1e-6, r25Ohm * (1 + alpha * (tjC[k] - 25)));
         const deltaCondCurr = idsCurr * idsCurr * (rTjCurr - r25Ohm);
-        // Store updated value on k only at final sample or track pCurr cleanly without double-adding on next iter
-        const pCurr = (isFinite(pLossW[k]) ? pLossW[k] : 0) + deltaCondCurr;
+        const pCurr = pLossW[k] + deltaCondCurr;
         energyStrippedJ += 0.5 * (pStepSigned + pCurr) * dt;
-        if (k === len - 1) pLossW[k] = pCurr;
+        if (k === evalLen - 1) pLossW[k] = pCurr;
       } else {
-        energyStrippedJ += 0.5 * (pStepSigned + (isFinite(pLossW[k]) ? pLossW[k] : 0)) * dt;
+        energyStrippedJ += 0.5 * (pStepSigned + pLossW[k]) * dt;
       }
 
       if (tjC[k] > tjMaxC) tjMaxC = tjC[k];
@@ -2362,18 +2638,29 @@ export function computeLossWithDeskewAndEoss(
     sumLoss += pLossW[k];
   }
 
+  const totalDurationSec = evalLen > 1 ? time[evalLen - 1] - time[0] : 0;
+  const pLossMeanW =
+    totalDurationSec > 1e-15 ? energyStrippedJ / totalDurationSec : evalLen > 0 ? sumLoss / evalLen : 0;
+
   return {
     time,
     pLossW,
     tjC,
-    pLossMeanW: len > 0 ? sumLoss / len : 0,
+    pLossMeanW,
     tjMaxC,
     tjMinC,
-    tjMeanC: len > 0 ? sumTj / len : opts.tAmbC,
+    tjMeanC: evalLen > 0 ? sumTj / evalLen : opts.tAmbC,
     energyRawMj: energyRawJ * 1e3,
     energyDeskewedMj: energyDeskewedJ * 1e3,
     energyStrippedMj: energyStrippedJ * 1e3,
     switchingEvents,
+    zvsTurnOnCount,
+    incomplete: false,
+    incompleteReasons: [],
+    nonFiniteMasked: 0,
+    outOfCoverageCount: 0,
+    thermalPathMode,
+    warnings,
   };
 }
 

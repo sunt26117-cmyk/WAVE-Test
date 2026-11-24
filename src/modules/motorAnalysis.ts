@@ -8,6 +8,7 @@
 
 import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
+import { inspectTimebase } from './timeSync';
 
 /**
  * Extracts electrical rotor angle theta(t) in radians from Clarke alpha/beta signals.
@@ -194,6 +195,18 @@ export function computeTwoChannelPhaseDiff(
       frequencyHz: null,
       matchedCycles: 0,
       status: 'Insufficient samples',
+    };
+  }
+  const tbRef = inspectTimebase(chRef.t, 0, Math.min(chRef.t.length, chRef.v.length) - 1);
+  const tbTgt = inspectTimebase(chTarget.t, 0, Math.min(chTarget.t.length, chTarget.v.length) - 1);
+  if (!tbRef.monotonic || !tbTgt.monotonic) {
+    return {
+      phaseDeg: null,
+      phaseDeg360: null,
+      deltaTimeSec: null,
+      frequencyHz: null,
+      matchedCycles: 0,
+      status: 'Non-monotonic or invalid timebase',
     };
   }
 

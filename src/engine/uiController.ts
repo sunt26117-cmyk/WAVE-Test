@@ -111,6 +111,8 @@ import { findTriggerPoint, alignViewToTrigger } from '../modules/trigger';
 import { evaluateMathExpression } from '../modules/mathParser';
 import { computeClarke, computePark, computeInstantaneousPower } from '../modules/transforms';
 import { estimateElectricalAngleFromAlphaBeta, computePowerSummary } from '../modules/motorAnalysis';
+import { alignChannelsToCommonTimebase, resolveCompatibleSiGroupScale } from '../modules/timeSync';
+import { parseSiUnitScale } from '../modules/thermalEngine';
 import {
   scanChannelAnomalies,
   evaluateGoldenTolerance,
@@ -3551,6 +3553,7 @@ export class OscilloscopeApp {
       name: string;
       unit?: string;
       baseChannelId: string;
+      time?: Float64Array;
       values: Float32Array;
       expr: string;
       color: string;
@@ -3566,6 +3569,7 @@ export class OscilloscopeApp {
       const baseCh = tab.channels[sp.baseChannelId] || tab.channels[tab.drawOrder[0]];
       if (!baseCh) return;
       const traceId = `bldc_${Date.now()}_${idx}`;
+      const chTime = sp.time && sp.time.length === sp.values.length ? sp.time : baseCh.t;
       const ch: WaveformChannel = {
         ...baseCh,
         id: traceId,
@@ -3573,7 +3577,7 @@ export class OscilloscopeApp {
         unit: sp.unit || baseCh.unit || 'V',
         color: sp.color || this.getNextComputedColor(idx),
         visible: true,
-        t: baseCh.t,
+        t: chTime,
         v: new Float32Array(sp.values),
         isMath: true,
         channelKind: 'computed',
@@ -3755,18 +3759,39 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     if (!tab) return;
 
-    const ua = tab.channels[uaId]?.v;
-    const ub = tab.channels[ubId]?.v;
-    const uc = tab.channels[ucId]?.v;
+    const chA = tab.channels[uaId];
+    const chB = tab.channels[ubId];
+    const chC = tab.channels[ucId];
 
-    if (!ua || !ub || !uc) {
+    if (!chA || !chB || !chC) {
       this.showToast('Selected phase channels are invalid.', 'error');
       return;
     }
 
     try {
+      const unitInfo = resolveCompatibleSiGroupScale([chA, chB, chC]);
+      if (!unitInfo.valid) {
+        this.showToast(unitInfo.reason || 'Three-phase channels have incompatible units.', 'error');
+        return;
+      }
+      const synced = alignChannelsToCommonTimebase([chA, chB, chC]);
+      if (!synced.valid || synced.time.length < 2) {
+        this.showToast(synced.invalidReason || synced.warnings[0] || 'Three-phase channels have no valid synchronized timebase.', 'error');
+        return;
+      }
+      const scaleArr = (arr: Float32Array, scale: number): Float32Array => {
+        if (Math.abs(scale - 1) <= 1e-12) return arr;
+        const out = new Float32Array(arr.length);
+        for (let i = 0; i < arr.length; i++) out[i] = arr[i] * scale;
+        return out;
+      };
+      const ua = scaleArr(synced.values[0], unitInfo.scales[0]);
+      const ub = scaleArr(synced.values[1], unitInfo.scales[1]);
+      const uc = scaleArr(synced.values[2], unitInfo.scales[2]);
       const { alpha, beta } = computeClarke(ua, ub, uc);
-      const baseCh = tab.channels[uaId];
+      const baseCh = chA;
+      const outUnit = unitInfo.baseUnit || baseCh.unit || 'V';
+      const syncDt = synced.time.length >= 2 ? (synced.time[synced.time.length - 1] - synced.time[0]) / (synced.time.length - 1) : (baseCh.dt ?? 1e-6);
 
       const alphaId = `clarke_alpha_${Date.now()}`;
       const betaId = `clarke_beta_${Date.now()}`;
@@ -3775,17 +3800,20 @@ export class OscilloscopeApp {
         ...baseCh,
         id: alphaId,
         name: 'Clarke α',
-        unit: baseCh.unit || 'V',
+        unit: outUnit,
         color: this.getNextComputedColor(0),
         visible: true,
+        t: synced.time,
         v: alpha,
+        dt: syncDt,
+        fs: syncDt > 0 ? 1 / syncDt : baseCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'transform',
         derivedBadge: 'fx',
         coupling: 'DC',
         inverted: false,
-        mathExpression: `Clarke α(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
+        mathExpression: `Clarke α(${chA.name}, ${chB.name}, ${chC.name})`,
         sourceChannelIds: [uaId, ubId, ucId],
         vMin: -1,
         vMax: 1,
@@ -3798,17 +3826,20 @@ export class OscilloscopeApp {
         ...baseCh,
         id: betaId,
         name: 'Clarke β',
-        unit: baseCh.unit || 'V',
+        unit: outUnit,
         color: this.getNextComputedColor(1),
         visible: true,
+        t: synced.time,
         v: beta,
+        dt: syncDt,
+        fs: syncDt > 0 ? 1 / syncDt : baseCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'transform',
         derivedBadge: 'fx',
         coupling: 'DC',
         inverted: false,
-        mathExpression: `Clarke β(${tab.channels[uaId].name}, ${tab.channels[ubId].name}, ${tab.channels[ucId].name})`,
+        mathExpression: `Clarke β(${chA.name}, ${chB.name}, ${chC.name})`,
         sourceChannelIds: [uaId, ubId, ucId],
         vMin: -1,
         vMax: 1,
@@ -3830,7 +3861,13 @@ export class OscilloscopeApp {
 
       this.renderSidebar();
       this.draw();
-      this.showToast('Generated Clarke α and β channels.', 'info');
+      const extraWarn = [unitInfo.normalizedNote, ...synced.warnings].filter(Boolean)[0];
+      this.showToast(
+        extraWarn
+          ? `Generated Clarke α/β (${extraWarn})`
+          : 'Generated Clarke α and β channels.',
+        synced.resampled || unitInfo.normalizedNote ? 'warn' : 'info'
+      );
     } catch (err: any) {
       this.showToast(`Clarke Transform Failed: ${err.message}`, 'error');
     }
@@ -3853,17 +3890,39 @@ export class OscilloscopeApp {
     }
 
     try {
+      const unitInfo = resolveCompatibleSiGroupScale([alphaCh, betaCh]);
+      if (!unitInfo.valid) {
+        this.showToast(unitInfo.reason || 'α and β channels have incompatible physical units.', 'error');
+        return;
+      }
       const offsetRad = ((isFinite(offsetDeg) ? offsetDeg : 0) * Math.PI) / 180;
+      const angleCh = angleMode === 'channel' ? tab.channels[angleChannelId] : undefined;
+      const chList = angleCh ? [alphaCh, betaCh, angleCh] : [alphaCh, betaCh];
+      const synced = alignChannelsToCommonTimebase(chList);
+      if (!synced.valid || synced.time.length < 2) {
+        this.showToast(synced.invalidReason || synced.warnings[0] || 'α/β/θ channels have no valid synchronized timebase.', 'error');
+        return;
+      }
+      const scaleArr = (arr: Float32Array, scale: number): Float32Array => {
+        if (Math.abs(scale - 1) <= 1e-12) return arr;
+        const out = new Float32Array(arr.length);
+        for (let i = 0; i < arr.length; i++) out[i] = arr[i] * scale;
+        return out;
+      };
+      const alphaArr = scaleArr(synced.values[0], unitInfo.scales[0]);
+      const betaArr = scaleArr(synced.values[1], unitInfo.scales[1]);
       let theta: Float32Array;
-      if (angleMode === 'channel' && tab.channels[angleChannelId]) {
-        const rawAng = tab.channels[angleChannelId].v;
+      if (angleCh) {
+        const rawAng = synced.values[2];
         theta = new Float32Array(rawAng.length);
         for (let i = 0; i < rawAng.length; i++) theta[i] = rawAng[i] + offsetRad;
       } else {
-        theta = estimateElectricalAngleFromAlphaBeta(alphaCh.v, betaCh.v, offsetRad);
+        theta = estimateElectricalAngleFromAlphaBeta(alphaArr, betaArr, offsetRad);
       }
 
-      const { d, q } = computePark(alphaCh.v, betaCh.v, theta);
+      const { d, q } = computePark(alphaArr, betaArr, theta);
+      const outUnit = unitInfo.baseUnit || alphaCh.unit || 'V';
+      const syncDt = synced.time.length >= 2 ? (synced.time[synced.time.length - 1] - synced.time[0]) / (synced.time.length - 1) : (alphaCh.dt ?? 1e-6);
       const dId = `park_d_${Date.now()}`;
       const qId = `park_q_${Date.now() + 1}`;
 
@@ -3871,10 +3930,13 @@ export class OscilloscopeApp {
         ...alphaCh,
         id: dId,
         name: 'Park Id/Ud',
-        unit: alphaCh.unit || 'V',
+        unit: outUnit,
         color: this.getNextComputedColor(0),
         visible: true,
+        t: synced.time,
         v: d,
+        dt: syncDt,
+        fs: syncDt > 0 ? 1 / syncDt : alphaCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'transform',
@@ -3892,10 +3954,13 @@ export class OscilloscopeApp {
         ...alphaCh,
         id: qId,
         name: 'Park Iq/Uq',
-        unit: alphaCh.unit || 'V',
+        unit: outUnit,
         color: this.getNextComputedColor(1),
         visible: true,
+        t: synced.time,
         v: q,
+        dt: syncDt,
+        fs: syncDt > 0 ? 1 / syncDt : alphaCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'transform',
@@ -3917,7 +3982,12 @@ export class OscilloscopeApp {
       this.cachedSpectrumKey = '';
       this.renderSidebar();
       this.draw();
-      this.showToast('Generated Park d and q channels.', 'info');
+      this.showToast(
+        synced.resampled || unitInfo.normalizedNote
+          ? `Generated Park d/q (${unitInfo.normalizedNote || synced.warnings[0] || 'resampled to common timebase'}).`
+          : 'Generated Park d and q channels.',
+        synced.resampled || unitInfo.normalizedNote ? 'warn' : 'info'
+      );
     } catch (err: any) {
       this.showToast(`Park Transform Failed: ${err.message}`, 'error');
     }
@@ -3943,13 +4013,26 @@ export class OscilloscopeApp {
 
     try {
       let power: Float32Array;
+      let syncTime: Float64Array;
+      let wasResampled = false;
+      let siScaled = false;
       let expr: string;
       let srcIds: string[];
 
       if (mode === '1ph') {
-        const n = Math.min(uaCh.v.length, iaCh.v.length);
-        power = new Float32Array(n);
-        for (let i = 0; i < n; i++) power[i] = uaCh.v[i] * iaCh.v[i];
+        const vScale = parseSiUnitScale(uaCh.unit, 'V', uaCh.name, { strict: true });
+        const iScale = parseSiUnitScale(iaCh.unit, 'A', iaCh.name, { strict: true });
+        siScaled = Math.abs(vScale - 1) > 1e-12 || Math.abs(iScale - 1) > 1e-12;
+        const synced = alignChannelsToCommonTimebase([uaCh, iaCh]);
+        if (!synced.valid || synced.time.length < 2) {
+          this.showToast(synced.invalidReason || synced.warnings[0] || 'Voltage and current channels have no valid synchronized timebase.', 'error');
+          return;
+        }
+        syncTime = synced.time;
+        wasResampled = synced.resampled;
+        const [vArr, iArr] = synced.values;
+        power = new Float32Array(syncTime.length);
+        for (let i = 0; i < syncTime.length; i++) power[i] = vArr[i] * vScale * (iArr[i] * iScale);
         expr = `${uaCh.name}*${iaCh.name}`;
         srcIds = [uaId, iaId];
       } else {
@@ -3961,11 +4044,38 @@ export class OscilloscopeApp {
           this.showToast('All 3 voltage and 3 current channels are required for 3-phase power.', 'error');
           return;
         }
-        power = computeInstantaneousPower(uaCh.v, ubCh.v, ucCh.v, iaCh.v, ibCh.v, icCh.v);
+        const vScaleA = parseSiUnitScale(uaCh.unit, 'V', uaCh.name, { strict: true });
+        const vScaleB = parseSiUnitScale(ubCh.unit, 'V', ubCh.name, { strict: true });
+        const vScaleC = parseSiUnitScale(ucCh.unit, 'V', ucCh.name, { strict: true });
+        const iScaleA = parseSiUnitScale(iaCh.unit, 'A', iaCh.name, { strict: true });
+        const iScaleB = parseSiUnitScale(ibCh.unit, 'A', ibCh.name, { strict: true });
+        const iScaleC = parseSiUnitScale(icCh.unit, 'A', icCh.name, { strict: true });
+        siScaled = [vScaleA, vScaleB, vScaleC, iScaleA, iScaleB, iScaleC].some((s) => Math.abs(s - 1) > 1e-12);
+        const synced = alignChannelsToCommonTimebase([uaCh, ubCh, ucCh, iaCh, ibCh, icCh]);
+        if (!synced.valid || synced.time.length < 2) {
+          this.showToast(synced.invalidReason || synced.warnings[0] || '6-channel 3-phase power has no valid synchronized timebase.', 'error');
+          return;
+        }
+        syncTime = synced.time;
+        wasResampled = synced.resampled;
+        const scaleArr = (arr: Float32Array, scale: number): Float32Array => {
+          if (Math.abs(scale - 1) <= 1e-12) return arr;
+          const out = new Float32Array(arr.length);
+          for (let i = 0; i < arr.length; i++) out[i] = arr[i] * scale;
+          return out;
+        };
+        const ua = scaleArr(synced.values[0], vScaleA);
+        const ub = scaleArr(synced.values[1], vScaleB);
+        const uc = scaleArr(synced.values[2], vScaleC);
+        const ia = scaleArr(synced.values[3], iScaleA);
+        const ib = scaleArr(synced.values[4], iScaleB);
+        const ic = scaleArr(synced.values[5], iScaleC);
+        power = computeInstantaneousPower(ua, ub, uc, ia, ib, ic);
         expr = `P3ph(${uaCh.name},${ubCh.name},${ucCh.name})`;
         srcIds = [uaId, ubId, ucId, iaId, ibId, icId];
       }
 
+      const syncDt = syncTime.length >= 2 ? (syncTime[syncTime.length - 1] - syncTime[0]) / (syncTime.length - 1) : (uaCh.dt ?? 1e-6);
       const pId = `power_${Date.now()}`;
       const pCh: WaveformChannel = {
         ...uaCh,
@@ -3974,7 +4084,10 @@ export class OscilloscopeApp {
         unit: 'W',
         color: this.getNextComputedColor(0),
         visible: true,
+        t: syncTime,
         v: power,
+        dt: syncDt,
+        fs: syncDt > 0 ? 1 / syncDt : uaCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'power',
@@ -3996,9 +4109,10 @@ export class OscilloscopeApp {
       this.draw();
 
       const summary = computePowerSummary(pCh.t, pCh.v);
+      const flags = [wasResampled ? 'Timebase Synced' : '', siScaled ? 'SI Scaled' : ''].filter(Boolean).join(' · ');
       this.showToast(
-        `P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_diss=${formatEng(summary.avgDissipationW, 'W', 3)}, E=${formatEng(summary.energyJ, 'J', 3)}`,
-        'info'
+        `${flags ? `[${flags}] ` : ''}P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_diss=${formatEng(summary.avgDissipationW, 'W', 3)}, E=${formatEng(summary.energyJ, 'J', 3)}`,
+        wasResampled || siScaled ? 'warn' : 'info'
       );
     } catch (err: any) {
       this.showToast(`Power Calculation Failed: ${err.message}`, 'error');

@@ -1,10 +1,10 @@
 /**
  * Waveform Viewer Pro - BLDC Motor & Power Electronics Diagnostics Suite
- * 1. Three-Phase Balance & Symmetry Audit (Vpp/RMS Unbalance %, 120 deg Phase Error, Zero-Seq V0)
- * 2. 6-Step Hall / Back-EMF Commutation Audit (60 deg Sector Error, CW/CCW, Illegal States, RPM Ripple)
- * 3. PWM Switching, Dead-Time, Shoot-Through & LC Ringing Frequency Analyzer
- * 4. Torque / Phase-Current Ripple & 6x Commutation Harmonic Fingerprint
- * 5. Derived BLDC Waveforms (Line-to-Line Uuv/Uvw/Uwu, Zero-Seq V0, Space Vector |Vs|)
+ * 1. Three-Phase Balance & Symmetry Audit (Time-Synchronized Vpp/RMS Unbalance %, 120 deg Phase Error, Zero-Seq V0)
+ * 2. 6-Step Hall / Back-EMF Commutation Audit (Time-Synchronized, Configurable Hall Sequence, 60 deg Sector Error, CW/CCW, RPM Ripple)
+ * 3. PWM Switching, Dead-Time, Shoot-Through & LC Ringing Frequency Analyzer (Gate vs SW-node role separation)
+ * 4. Torque / Phase-Current Ripple & 6x Commutation Harmonic Fingerprint (Physical quantity distinction)
+ * 5. Derived BLDC Waveforms (Time-Synchronized Line-to-Line Uuv/Uvw/Uwu, Zero-Seq V0, Space Vector |Vs|)
  */
 
 import { WaveformChannel } from '../types/models';
@@ -12,6 +12,8 @@ import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale'
 import { computeTwoChannelPhaseDiff } from './motorAnalysis';
 import { computeFFT } from './fft';
 import { computeClarke } from './transforms';
+import { alignChannelsToCommonTimebase, resolveCompatibleSiGroupScale } from './timeSync';
+import { parseSiUnitScale } from './thermalEngine';
 
 function sliceIndexRange(t: Float64Array, n: number, tStart?: number, tEnd?: number): { i0: number; i1: number } {
   let i0 = 0;
@@ -35,6 +37,8 @@ export interface PhaseChannelSummary {
 }
 
 export interface ThreePhaseBalanceResult {
+  valid: boolean;
+  unit: string;
   phases: [PhaseChannelSummary, PhaseChannelSummary, PhaseChannelSummary];
   vppUnbalancePct: number;
   rmsUnbalancePct: number;
@@ -45,6 +49,9 @@ export interface ThreePhaseBalanceResult {
   angleWUDeg: number | null;
   maxPhaseErrorDeg: number | null;
   zeroSeqTrace: Float32Array;
+  time: Float64Array;
+  resampled: boolean;
+  warnings: string[];
 }
 
 export function analyzeThreePhaseBalance(
@@ -54,18 +61,73 @@ export function analyzeThreePhaseBalance(
   tStart?: number,
   tEnd?: number
 ): ThreePhaseBalanceResult {
-  const n = Math.min(chU.t.length, chU.v.length, chV.v.length, chW.v.length);
-  const { i0, i1 } = sliceIndexRange(chU.t, n, tStart, tEnd);
+  const emptyPh = (name: string): PhaseChannelSummary => ({ name, rms: 0, vpp: 0, mean: 0, min: 0, max: 0 });
+  const unitInfo = resolveCompatibleSiGroupScale([chU, chV, chW]);
+  if (!unitInfo.valid) {
+    return {
+      valid: false,
+      unit: chU.unit || 'V',
+      phases: [emptyPh(chU.name), emptyPh(chV.name), emptyPh(chW.name)],
+      vppUnbalancePct: 0,
+      rmsUnbalancePct: 0,
+      zeroSeqRms: 0,
+      zeroSeqVpp: 0,
+      angleUVDeg: null,
+      angleVWDeg: null,
+      angleWUDeg: null,
+      maxPhaseErrorDeg: null,
+      zeroSeqTrace: new Float32Array(0),
+      time: new Float64Array(0),
+      resampled: false,
+      warnings: [unitInfo.reason || '三相通道单位不兼容。'],
+    };
+  }
 
-  const summarize = (ch: WaveformChannel): PhaseChannelSummary => {
-    const acMean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
+  const synced = alignChannelsToCommonTimebase([chU, chV, chW], tStart, tEnd);
+  const warnings = [...synced.warnings];
+  if (unitInfo.normalizedNote) warnings.push(unitInfo.normalizedNote);
+  const n = synced.time.length;
+
+  if (!synced.valid || n < 2) {
+    return {
+      valid: false,
+      unit: unitInfo.baseUnit,
+      phases: [emptyPh(chU.name), emptyPh(chV.name), emptyPh(chW.name)],
+      vppUnbalancePct: 0,
+      rmsUnbalancePct: 0,
+      zeroSeqRms: 0,
+      zeroSeqVpp: 0,
+      angleUVDeg: null,
+      angleVWDeg: null,
+      angleWUDeg: null,
+      maxPhaseErrorDeg: null,
+      zeroSeqTrace: new Float32Array(0),
+      time: new Float64Array(0),
+      resampled: synced.resampled,
+      warnings: warnings.length > 0 ? warnings : ['三相通道无有效重叠采样区间或时间轴非单调递增 (INVALID)。'],
+    };
+  }
+
+  const [rawU, rawV, rawW] = synced.values;
+  const [sU, sV, sW] = unitInfo.scales;
+  const scaleArr = (arr: Float32Array, scale: number) => {
+    if (Math.abs(scale - 1) <= 1e-12) return arr;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = arr[i] * scale;
+    return out;
+  };
+  const uArr = scaleArr(rawU, sU);
+  const vArr = scaleArr(rawV, sV);
+  const wArr = scaleArr(rawW, sW);
+
+  const summarize = (name: string, arr: Float32Array): PhaseChannelSummary => {
     let sum = 0;
     let sumSq = 0;
     let mn = Infinity;
     let mx = -Infinity;
     let cnt = 0;
-    for (let i = i0; i <= i1; i++) {
-      const val = getChannelDisplayValue(ch, i, acMean);
+    for (let i = 0; i < n; i++) {
+      const val = arr[i];
       if (!isFinite(val)) continue;
       sum += val;
       sumSq += val * val;
@@ -73,9 +135,9 @@ export function analyzeThreePhaseBalance(
       if (val > mx) mx = val;
       cnt++;
     }
-    if (cnt === 0) return { name: ch.name, rms: 0, vpp: 0, mean: 0, min: 0, max: 0 };
+    if (cnt === 0) return { name, rms: 0, vpp: 0, mean: 0, min: 0, max: 0 };
     return {
-      name: ch.name,
+      name,
       rms: Math.sqrt(sumSq / cnt),
       vpp: mx - mn,
       mean: sum / cnt,
@@ -84,9 +146,9 @@ export function analyzeThreePhaseBalance(
     };
   };
 
-  const pU = summarize(chU);
-  const pV = summarize(chV);
-  const pW = summarize(chW);
+  const pU = summarize(chU.name, uArr);
+  const pV = summarize(chV.name, vArr);
+  const pW = summarize(chW.name, wArr);
 
   const avgVpp = (pU.vpp + pV.vpp + pW.vpp) / 3;
   const maxVppDev = Math.max(Math.abs(pU.vpp - avgVpp), Math.abs(pV.vpp - avgVpp), Math.abs(pW.vpp - avgVpp));
@@ -96,23 +158,16 @@ export function analyzeThreePhaseBalance(
   const maxRmsDev = Math.max(Math.abs(pU.rms - avgRms), Math.abs(pV.rms - avgRms), Math.abs(pW.rms - avgRms));
   const rmsUnbalancePct = avgRms > 1e-12 ? (maxRmsDev / avgRms) * 100 : 0;
 
-  // Full zero-sequence trace (Ua + Ub + Uc)/3 + RMS/Vpp inside window
-  const mU = chU.coupling === 'AC' ? computeChannelMean(chU) : 0;
-  const mV = chV.coupling === 'AC' ? computeChannelMean(chV) : 0;
-  const mW = chW.coupling === 'AC' ? computeChannelMean(chW) : 0;
+  // Full zero-sequence trace (Ua + Ub + Uc)/3 on synchronized timebase
   const zeroSeqTrace = new Float32Array(n);
   let zSq = 0;
   let zMin = Infinity;
   let zMax = -Infinity;
   let zCnt = 0;
   for (let i = 0; i < n; i++) {
-    const z =
-      (getChannelDisplayValue(chU, i, mU) +
-        getChannelDisplayValue(chV, i, mV) +
-        getChannelDisplayValue(chW, i, mW)) /
-      3;
+    const z = (uArr[i] + vArr[i] + wArr[i]) / 3;
     zeroSeqTrace[i] = z;
-    if (i >= i0 && i <= i1 && isFinite(z)) {
+    if (isFinite(z)) {
       zSq += z * z;
       if (z < zMin) zMin = z;
       if (z > zMax) zMax = z;
@@ -120,9 +175,9 @@ export function analyzeThreePhaseBalance(
     }
   }
 
-  const dUV = computeTwoChannelPhaseDiff(chU, chV, tStart, tEnd);
-  const dVW = computeTwoChannelPhaseDiff(chV, chW, tStart, tEnd);
-  const dWU = computeTwoChannelPhaseDiff(chW, chU, tStart, tEnd);
+  const dUV = computeTwoChannelPhaseDiff(chU, chV, synced.overlapStart, synced.overlapEnd);
+  const dVW = computeTwoChannelPhaseDiff(chV, chW, synced.overlapStart, synced.overlapEnd);
+  const dWU = computeTwoChannelPhaseDiff(chW, chU, synced.overlapStart, synced.overlapEnd);
 
   const absAngErr = (deg: number | null): number | null => {
     if (deg === null || !isFinite(deg)) return null;
@@ -133,6 +188,8 @@ export function analyzeThreePhaseBalance(
   );
 
   return {
+    valid: true,
+    unit: unitInfo.baseUnit,
     phases: [pU, pV, pW],
     vppUnbalancePct,
     rmsUnbalancePct,
@@ -143,6 +200,9 @@ export function analyzeThreePhaseBalance(
     angleWUDeg: dWU.phaseDeg,
     maxPhaseErrorDeg: errs.length > 0 ? Math.max(...errs) : null,
     zeroSeqTrace,
+    time: synced.time,
+    resampled: synced.resampled,
+    warnings,
   };
 }
 
@@ -161,9 +221,31 @@ export interface HallCommutationEvent {
   detail: string;
 }
 
+export interface HallSequencePreset {
+  id: string;
+  label: string;
+  ring: [number, number, number, number, number, number];
+}
+
+export const HALL_SEQUENCE_PRESETS: HallSequencePreset[] = [
+  { id: 'std_120', label: '标准 120° Hall [5→1→3→2→6→4]', ring: [5, 1, 3, 2, 6, 4] },
+  { id: 'alt_120', label: '换相序 120° [5→4→6→2→3→1]', ring: [5, 4, 6, 2, 3, 1] },
+  { id: 'gray_60', label: '60° 排布 Hall [1→3→7→6→4→0]', ring: [1, 3, 7, 6, 4, 0] },
+];
+
+export interface HallCommutationOptions {
+  tStart?: number;
+  tEnd?: number;
+  customSequence?: number[];
+  hallOffsetDeg?: number;
+}
+
 export interface HallCommutationResult {
+  valid: boolean;
   direction: 'CW (Fwd)' | 'CCW (Rev)' | 'Mixed' | 'Unknown';
   sequence: number[];
+  activeRing: number[];
+  hallOffsetDeg: number;
   commutationCount: number;
   illegalStateCount: number;
   sequenceJumpCount: number;
@@ -175,24 +257,51 @@ export interface HallCommutationResult {
   maxSectorErrorDeg: number | null;
   sectorStats: HallSectorStat[];
   events: HallCommutationEvent[];
+  warnings: string[];
 }
 
 const HALL_CW_RING = [5, 1, 3, 2, 6, 4];
+
+export function parseHallSequenceText(raw: string | undefined): number[] | null {
+  if (!raw) return null;
+  const nums = raw
+    .split(/[\s,;\->→]+/)
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 7);
+  if (nums.length !== 6 || new Set(nums).size !== 6) return null;
+  return nums;
+}
 
 export function analyzeBldcHallCommutation(
   chA: WaveformChannel,
   chB: WaveformChannel,
   chC: WaveformChannel,
   polePairs: number,
-  tStart?: number,
-  tEnd?: number
+  tStartOrOpts?: number | HallCommutationOptions,
+  tEndArg?: number
 ): HallCommutationResult {
-  const n = Math.min(chA.t.length, chA.v.length, chB.v.length, chC.v.length);
-  const { i0, i1 } = sliceIndexRange(chA.t, n, tStart, tEnd);
+  const opts: HallCommutationOptions =
+    typeof tStartOrOpts === 'object' && tStartOrOpts !== null
+      ? tStartOrOpts
+      : { tStart: tStartOrOpts, tEnd: tEndArg };
+
+  const activeRing =
+    opts.customSequence && opts.customSequence.length === 6 && new Set(opts.customSequence).size === 6
+      ? opts.customSequence
+      : HALL_CW_RING;
+  const ringSet = new Set(activeRing);
+  const hallOffsetDeg = Number.isFinite(opts.hallOffsetDeg) ? Number(opts.hallOffsetDeg) : 0;
+
+  const synced = alignChannelsToCommonTimebase([chA, chB, chC], opts.tStart, opts.tEnd);
+  const warnings = [...synced.warnings];
+  const n = synced.time.length;
 
   const empty: HallCommutationResult = {
+    valid: false,
     direction: 'Unknown',
     sequence: [],
+    activeRing,
+    hallOffsetDeg,
     commutationCount: 0,
     illegalStateCount: 0,
     sequenceJumpCount: 0,
@@ -204,27 +313,30 @@ export function analyzeBldcHallCommutation(
     maxSectorErrorDeg: null,
     sectorStats: [],
     events: [],
+    warnings,
   };
-  if (i1 - i0 < 6) return empty;
+  if (!synced.valid || n < 6) return empty;
 
-  const statsForCh = (ch: WaveformChannel) => {
-    const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
+  const [aArr, bArr, cArr] = synced.values;
+  const timeArr = synced.time;
+
+  const statsForArr = (arr: Float32Array) => {
     let mn = Infinity;
     let mx = -Infinity;
-    for (let i = i0; i <= i1; i++) {
-      const val = getChannelDisplayValue(ch, i, mean);
+    for (let i = 0; i < n; i++) {
+      const val = arr[i];
       if (isFinite(val)) {
         if (val < mn) mn = val;
         if (val > mx) mx = val;
       }
     }
     const span = mx - mn;
-    return { mean, mid: (mx + mn) / 2, hyst: span * 0.08, valid: isFinite(span) && span > 1e-9 };
+    return { mid: (mx + mn) / 2, hyst: span * 0.08, valid: isFinite(span) && span > 1e-9 };
   };
 
-  const sA = statsForCh(chA);
-  const sB = statsForCh(chB);
-  const sC = statsForCh(chC);
+  const sA = statsForArr(aArr);
+  const sB = statsForArr(bArr);
+  const sC = statsForArr(cArr);
   if (!sA.valid || !sB.valid || !sC.valid) return empty;
 
   const getBit = (val: number, prevBit: number, mid: number, hyst: number) => {
@@ -233,12 +345,12 @@ export function analyzeBldcHallCommutation(
     return prevBit;
   };
 
-  let bA = getChannelDisplayValue(chA, i0, sA.mean) >= sA.mid ? 1 : 0;
-  let bB = getChannelDisplayValue(chB, i0, sB.mean) >= sB.mid ? 1 : 0;
-  let bC = getChannelDisplayValue(chC, i0, sC.mean) >= sC.mid ? 1 : 0;
+  let bA = aArr[0] >= sA.mid ? 1 : 0;
+  let bB = bArr[0] >= sB.mid ? 1 : 0;
+  let bC = cArr[0] >= sC.mid ? 1 : 0;
   let prevState = (bA << 2) | (bB << 1) | bC;
-  let stateStartTime = chA.t[i0];
-  let stateStartIdx = i0;
+  let stateStartTime = timeArr[0];
+  let stateStartIdx = 0;
 
   interface SectorSegment {
     state: number;
@@ -255,31 +367,31 @@ export function analyzeBldcHallCommutation(
   let cwSteps = 0;
   let ccwSteps = 0;
 
-  for (let i = i0 + 1; i <= i1; i++) {
-    bA = getBit(getChannelDisplayValue(chA, i, sA.mean), bA, sA.mid, sA.hyst);
-    bB = getBit(getChannelDisplayValue(chB, i, sB.mean), bB, sB.mid, sB.hyst);
-    bC = getBit(getChannelDisplayValue(chC, i, sC.mean), bC, sC.mid, sC.hyst);
+  for (let i = 1; i < n; i++) {
+    bA = getBit(aArr[i], bA, sA.mid, sA.hyst);
+    bB = getBit(bArr[i], bB, sB.mid, sB.hyst);
+    bC = getBit(cArr[i], bC, sC.mid, sC.hyst);
     const nextState = (bA << 2) | (bB << 1) | bC;
 
     if (nextState !== prevState) {
-      const tTrans = 0.5 * (chA.t[i - 1] + chA.t[i]);
+      const tTrans = 0.5 * (timeArr[i - 1] + timeArr[i]);
       const dur = tTrans - stateStartTime;
-      if (prevState >= 1 && prevState <= 6) {
+      if (ringSet.has(prevState)) {
         segments.push({ state: prevState, tStart: stateStartTime, tEnd: tTrans, dur, index: stateStartIdx });
       }
-      if (nextState === 0 || nextState === 7) {
+      if (!ringSet.has(nextState)) {
         illegalStateCount++;
         if (events.length < 40) {
           events.push({
             time: tTrans,
             index: i,
             kind: 'illegal-state',
-            detail: `Illegal Hall code ${nextState.toString(2).padStart(3, '0')} (${nextState})`,
+            detail: `Illegal Hall code ${nextState.toString(2).padStart(3, '0')} (${nextState}) not in [${activeRing.join(',')}]`,
           });
         }
-      } else if (prevState >= 1 && prevState <= 6) {
-        const idxPrev = HALL_CW_RING.indexOf(prevState);
-        const idxNext = HALL_CW_RING.indexOf(nextState);
+      } else if (ringSet.has(prevState)) {
+        const idxPrev = activeRing.indexOf(prevState);
+        const idxNext = activeRing.indexOf(nextState);
         const delta = (idxNext - idxPrev + 6) % 6;
         if (delta === 1) cwSteps++;
         else if (delta === 5) ccwSteps++;
@@ -301,7 +413,7 @@ export function analyzeBldcHallCommutation(
     }
   }
 
-  // Drop incomplete leading/trailing boundary segments so sector durations are true full 60-deg steps
+  // Drop incomplete leading segment so sector durations are true full 60-deg steps
   const completeSegs = segments.length > 2 ? segments.slice(1) : segments;
   if (completeSegs.length === 0) {
     return {
@@ -319,19 +431,18 @@ export function analyzeBldcHallCommutation(
   const safePoles = isFinite(polePairs) && polePairs > 0 ? polePairs : 4;
   const avgRpm = avgElecFreqHz !== null ? (60 * avgElecFreqHz) / safePoles : null;
 
-  // Instantaneous cycle RPM across sliding 6-sector windows
   const rpmSamples: number[] = [];
   if (completeSegs.length >= 6) {
     for (let k = 0; k <= completeSegs.length - 6; k++) {
       let cycDur = 0;
       for (let m = 0; m < 6; m++) cycDur += completeSegs[k + m].dur;
       if (cycDur > 1e-15) {
-        rpmSamples.push((60 / cycDur) / safePoles);
+        rpmSamples.push(60 / cycDur / safePoles);
       }
     }
   } else {
     completeSegs.forEach((s) => {
-      if (s.dur > 1e-15) rpmSamples.push((60 / (s.dur * 6)) / safePoles);
+      if (s.dur > 1e-15) rpmSamples.push(60 / (s.dur * 6) / safePoles);
     });
   }
 
@@ -342,7 +453,6 @@ export function analyzeBldcHallCommutation(
       ? ((rpmMax - rpmMin) / avgRpm) * 100
       : null;
 
-  // Group stats per Hall state 1..6
   const stateMap = new Map<number, { sumDur: number; cnt: number }>();
   let worstErr = 0;
   let worstSeg: SectorSegment | null = null;
@@ -369,18 +479,20 @@ export function analyzeBldcHallCommutation(
     });
   }
 
-  const sectorStats: HallSectorStat[] = HALL_CW_RING.filter((c) => stateMap.has(c)).map((code) => {
-    const entry = stateMap.get(code)!;
-    const avgD = entry.sumDur / entry.cnt;
-    const avgDeg = avgSectorDur > 1e-15 ? (avgD / avgSectorDur) * 60 : 60;
-    return {
-      stateCode: code,
-      avgDeg,
-      avgDurationSec: avgD,
-      count: entry.cnt,
-      errorDeg: avgDeg - 60,
-    };
-  });
+  const sectorStats: HallSectorStat[] = activeRing
+    .filter((c) => stateMap.has(c))
+    .map((code) => {
+      const entry = stateMap.get(code)!;
+      const avgD = entry.sumDur / entry.cnt;
+      const avgDeg = avgSectorDur > 1e-15 ? (avgD / avgSectorDur) * 60 : 60;
+      return {
+        stateCode: code,
+        avgDeg,
+        avgDurationSec: avgD,
+        count: entry.cnt,
+        errorDeg: avgDeg - 60,
+      };
+    });
 
   const maxSectorErrorDeg =
     sectorStats.length > 0 ? Math.max(...sectorStats.map((s) => Math.abs(s.errorDeg))) : null;
@@ -390,16 +502,22 @@ export function analyzeBldcHallCommutation(
   else if (ccwSteps > 0 && cwSteps === 0) direction = 'CCW (Rev)';
   else if (cwSteps > 0 && ccwSteps > 0) direction = cwSteps >= ccwSteps ? 'CW (Fwd)' : 'CCW (Rev)';
 
-  // Extract first cycle of unique sequence codes
   const seq: number[] = [];
   for (const s of completeSegs) {
     if (seq.length >= 6) break;
     if (seq.length === 0 || seq[seq.length - 1] !== s.state) seq.push(s.state);
   }
 
+  if (hallOffsetDeg !== 0) {
+    warnings.push(`已记录 Hall 安装电角度偏移 ${hallOffsetDeg.toFixed(1)}°（用于相对反电势过零点相位标定参考）。`);
+  }
+
   return {
+    valid: true,
     direction,
     sequence: seq,
+    activeRing,
+    hallOffsetDeg,
     commutationCount: completeSegs.length,
     illegalStateCount,
     sequenceJumpCount,
@@ -411,10 +529,20 @@ export function analyzeBldcHallCommutation(
     maxSectorErrorDeg,
     sectorStats,
     events,
+    warnings,
   };
 }
 
+export type PwmHighSignalRole = 'gate_h' | 'sw_node';
+
+export interface PwmAnalyzeOptions {
+  tStart?: number;
+  tEnd?: number;
+  highSignalRole?: PwmHighSignalRole;
+}
+
 export interface PwmDeadTimeResult {
+  valid: boolean;
   pwmFreqHz: number | null;
   pulseCount: number;
   dutyMinPct: number | null;
@@ -428,20 +556,36 @@ export interface PwmDeadTimeResult {
   deadTimeMaxSec: number | null;
   deadTimeCount: number;
   shootThroughCount: number;
+  deadTimeReliable: boolean;
+  highSignalRole: PwmHighSignalRole;
   worstEventIndex: number | null;
   worstEventTime: number | null;
+  warnings: string[];
 }
 
 export function analyzePwmSwitchingAndDeadTime(
   chHigh: WaveformChannel,
   chLow?: WaveformChannel | null,
-  tStart?: number,
-  tEnd?: number
+  tStartOrOpts?: number | PwmAnalyzeOptions,
+  tEndArg?: number
 ): PwmDeadTimeResult {
-  const n = chLow ? Math.min(chHigh.t.length, chHigh.v.length, chLow.v.length) : Math.min(chHigh.t.length, chHigh.v.length);
-  const { i0, i1 } = sliceIndexRange(chHigh.t, n, tStart, tEnd);
+  const opts: PwmAnalyzeOptions =
+    typeof tStartOrOpts === 'object' && tStartOrOpts !== null
+      ? tStartOrOpts
+      : { tStart: tStartOrOpts, tEnd: tEndArg };
+
+  const guessedSw =
+    /(?:^|[^a-z0-9])(sw|phase|node|vds|[uvw]_?(?:ph|phase)?)(?:$|[^a-z0-9])/i.test(chHigh.name) &&
+    !/(pwm|gate|vgs|drv|hin)/i.test(chHigh.name);
+  const highSignalRole: PwmHighSignalRole = opts.highSignalRole ?? (guessedSw ? 'sw_node' : 'gate_h');
+
+  const synced = alignChannelsToCommonTimebase(chLow ? [chHigh, chLow] : [chHigh], opts.tStart, opts.tEnd);
+  const warnings = [...synced.warnings];
+  const n = synced.time.length;
+  let deadTimeReliable = Boolean(chLow) && highSignalRole === 'gate_h';
 
   const empty: PwmDeadTimeResult = {
+    valid: false,
     pwmFreqHz: null,
     pulseCount: 0,
     dutyMinPct: null,
@@ -455,24 +599,60 @@ export function analyzePwmSwitchingAndDeadTime(
     deadTimeMaxSec: null,
     deadTimeCount: 0,
     shootThroughCount: 0,
+    deadTimeReliable: false,
+    highSignalRole,
     worstEventIndex: null,
     worstEventTime: null,
+    warnings,
   };
-  if (i1 - i0 < 6) return empty;
+  if (!synced.valid || n < 6) return empty;
 
-  const meanH = chHigh.coupling === 'AC' ? computeChannelMean(chHigh) : 0;
+  let vScaleH = 1;
+  try {
+    vScaleH = parseSiUnitScale(chHigh.unit, 'V', chHigh.name, { strict: true });
+  } catch (err: any) {
+    deadTimeReliable = false;
+    warnings.push(err?.message || `高侧信号 "${chHigh.name}" 单位非电压 (V/mV)，已禁用死区与 dV/dt 判定。`);
+  }
+
+  let vScaleL = 1;
+  if (chLow) {
+    try {
+      vScaleL = parseSiUnitScale(chLow.unit, 'V', chLow.name, { strict: true });
+    } catch (err: any) {
+      deadTimeReliable = false;
+      warnings.push(err?.message || `低侧信号 "${chLow.name}" 单位非电压 (V/mV)，已禁用死区/直通判定。`);
+    }
+    const lowLooksNonGate =
+      /(?:^|[^a-z0-9])(sw|phase|node|vds|ids|ibus|ia|ib|ic)(?:$|[^a-z0-9])/i.test(chLow.name) &&
+      !/(pwm|gate|vgs|drv|lin|low)/i.test(chLow.name);
+    if (lowLooksNonGate) {
+      deadTimeReliable = false;
+      warnings.push(`第二路 "${chLow.name}" 疑似相节点/功率电流信号而非低侧栅极驱动 (Vgs_L)，已禁用死区与直通判定。`);
+    }
+  }
+
+  const rawH = synced.values[0];
+  const hArr = Math.abs(vScaleH - 1) <= 1e-12 ? rawH : Float32Array.from(rawH, (v) => v * vScaleH);
+  const lArr = chLow
+    ? Math.abs(vScaleL - 1) <= 1e-12
+      ? synced.values[1]
+      : Float32Array.from(synced.values[1], (v) => v * vScaleL)
+    : null;
+  const tArr = synced.time;
+
   let mn = Infinity;
   let mx = -Infinity;
   let maxDvDt = 0;
 
-  for (let i = i0; i <= i1; i++) {
-    const v = getChannelDisplayValue(chHigh, i, meanH);
+  for (let i = 0; i < n; i++) {
+    const v = hArr[i];
     if (!isFinite(v)) continue;
     if (v < mn) mn = v;
     if (v > mx) mx = v;
-    if (i > i0) {
-      const vp = getChannelDisplayValue(chHigh, i - 1, meanH);
-      const dt = chHigh.t[i] - chHigh.t[i - 1];
+    if (i > 0) {
+      const vp = hArr[i - 1];
+      const dt = tArr[i] - tArr[i - 1];
       if (isFinite(vp) && dt > 1e-15) {
         const dvdt = Math.abs(v - vp) / (dt * 1e6); // V/us
         if (dvdt > maxDvDt) maxDvDt = dvdt;
@@ -482,15 +662,14 @@ export function analyzePwmSwitchingAndDeadTime(
   const span = mx - mn;
   if (!isFinite(span) || span <= 1e-9) return empty;
 
-  // Estimate steady high plateau using 75th-90th percentile high samples or upper quartile
   const mid = (mx + mn) / 2;
   const hyst = span * 0.08;
   let highSum = 0;
   let highCnt = 0;
   let lowSum = 0;
   let lowCnt = 0;
-  for (let i = i0; i <= i1; i++) {
-    const v = getChannelDisplayValue(chHigh, i, meanH);
+  for (let i = 0; i < n; i++) {
+    const v = hArr[i];
     if (!isFinite(v)) continue;
     if (v >= mn + span * 0.72 && v <= mn + span * 0.92) {
       highSum += v;
@@ -509,22 +688,22 @@ export function analyzePwmSwitchingAndDeadTime(
   const risingIndices: number[] = [];
   const fallingTimes: number[] = [];
   let armed = false;
-  let isHighState = getChannelDisplayValue(chHigh, i0, meanH) >= mid;
+  let isHighState = hArr[0] >= mid;
 
-  for (let i = i0 + 1; i <= i1; i++) {
-    const vp = getChannelDisplayValue(chHigh, i - 1, meanH);
-    const vc = getChannelDisplayValue(chHigh, i, meanH);
+  for (let i = 1; i < n; i++) {
+    const vp = hArr[i - 1];
+    const vc = hArr[i];
     if (!isFinite(vp) || !isFinite(vc)) continue;
     if (!isHighState && vp <= mid - hyst) armed = true;
     if (!isHighState && armed && vp < mid && vc >= mid) {
       const f = vc - vp > 1e-15 ? (mid - vp) / (vc - vp) : 0;
-      risingTimes.push(chHigh.t[i - 1] + f * (chHigh.t[i] - chHigh.t[i - 1]));
+      risingTimes.push(tArr[i - 1] + f * (tArr[i] - tArr[i - 1]));
       risingIndices.push(i);
       isHighState = true;
       armed = false;
     } else if (isHighState && vc <= mid - hyst) {
       const f = vp - vc > 1e-15 ? (vp - mid) / (vp - vc) : 0;
-      fallingTimes.push(chHigh.t[i - 1] + f * (chHigh.t[i] - chHigh.t[i - 1]));
+      fallingTimes.push(tArr[i - 1] + f * (tArr[i] - tArr[i - 1]));
       isHighState = false;
     }
   }
@@ -547,19 +726,18 @@ export function analyzePwmSwitchingAndDeadTime(
     }
   }
 
-  // Ringing frequency estimation immediately after first valid rising edge
   let ringingFreqHz: number | null = null;
   if (risingIndices.length > 0) {
     const rIdx = risingIndices[0];
-    const searchEnd = Math.min(i1, rIdx + 80);
+    const searchEnd = Math.min(n - 1, rIdx + 80);
     const localExtremaT: number[] = [];
     for (let i = rIdx + 1; i < searchEnd; i++) {
-      const vPrev = getChannelDisplayValue(chHigh, i - 1, meanH);
-      const vCurr = getChannelDisplayValue(chHigh, i, meanH);
-      const vNext = getChannelDisplayValue(chHigh, i + 1, meanH);
+      const vPrev = hArr[i - 1];
+      const vCurr = hArr[i];
+      const vNext = hArr[i + 1];
       if (vCurr >= mid && ((vCurr > vPrev && vCurr >= vNext) || (vCurr < vPrev && vCurr <= vNext))) {
         if (Math.abs(vCurr - vTop) > amp * 0.015) {
-          localExtremaT.push(chHigh.t[i]);
+          localExtremaT.push(tArr[i]);
           if (localExtremaT.length >= 3) break;
         }
       }
@@ -570,7 +748,6 @@ export function analyzePwmSwitchingAndDeadTime(
     }
   }
 
-  // Complementary Dead-Time & Shoot-Through inspection if chLow is provided
   let deadTimeMinSec: number | null = null;
   let deadTimeAvgSec: number | null = null;
   let deadTimeMaxSec: number | null = null;
@@ -579,76 +756,83 @@ export function analyzePwmSwitchingAndDeadTime(
   let worstEventIndex: number | null = null;
   let worstEventTime: number | null = null;
 
-  if (chLow) {
-    const meanL = chLow.coupling === 'AC' ? computeChannelMean(chLow) : 0;
+  if (lArr && highSignalRole === 'sw_node') {
+    warnings.push(
+      '第一路定义为 SW 相节点而非高侧栅极驱动 (Vgs_H)：死区期间体二极管续流与负载电流方向会改变 SW 电平，无法可靠判定真死区时间与直通 (Shoot-Through)，已禁用死区/直通判定。'
+    );
+  } else if (lArr && deadTimeReliable) {
     let mnL = Infinity;
     let mxL = -Infinity;
-    for (let i = i0; i <= i1; i++) {
-      const v = getChannelDisplayValue(chLow, i, meanL);
+    for (let i = 0; i < n; i++) {
+      const v = lArr[i];
       if (isFinite(v)) {
         if (v < mnL) mnL = v;
         if (v > mxL) mxL = v;
       }
     }
-    const midL = (mxL + mnL) / 2;
+    const spanL = mxL - mnL;
+    if (!isFinite(spanL) || span < 2.0 || spanL < 2.0 || Math.max(span, spanL) / Math.min(span, spanL) > 5.0) {
+      deadTimeReliable = false;
+      warnings.push(
+        `栅极驱动摆幅门限校验未通过 (Vpp_H=${span.toFixed(2)}V, Vpp_L=${isFinite(spanL) ? spanL.toFixed(2) : '--'}V，要求双路 ≥ 2.0V 且量纲比 ≤ 5×)，已禁用死区/直通判定。`
+      );
+    } else {
+      const midL = (mxL + mnL) / 2;
 
-    const getState = (vh: number, vl: number): 'H' | 'L' | 'DEAD' | 'BOTH' => {
-      const hOn = vh >= mid;
-      const lOn = vl >= midL;
-      if (hOn && lOn) return 'BOTH';
-      if (hOn) return 'H';
-      if (lOn) return 'L';
-      return 'DEAD';
-    };
+      const getState = (vh: number, vl: number): 'H' | 'L' | 'DEAD' | 'BOTH' => {
+        const hOn = vh >= mid;
+        const lOn = vl >= midL;
+        if (hOn && lOn) return 'BOTH';
+        if (hOn) return 'H';
+        if (lOn) return 'L';
+        return 'DEAD';
+      };
 
-    const deadGaps: number[] = [];
-    let prevState = getState(
-      getChannelDisplayValue(chHigh, i0, meanH),
-      getChannelDisplayValue(chLow, i0, meanL)
-    );
-    let segStartT = chHigh.t[i0];
-    let segStartIdx = i0;
-    let prevActiveSide: 'H' | 'L' | null = prevState === 'H' || prevState === 'L' ? prevState : null;
+      const deadGaps: number[] = [];
+      let prevState = getState(hArr[0], lArr[0]);
+      let segStartT = tArr[0];
+      let segStartIdx = 0;
+      let prevActiveSide: 'H' | 'L' | null = prevState === 'H' || prevState === 'L' ? prevState : null;
 
-    for (let i = i0 + 1; i <= i1; i++) {
-      const vh = getChannelDisplayValue(chHigh, i, meanH);
-      const vl = getChannelDisplayValue(chLow, i, meanL);
-      const st = getState(vh, vl);
-      if (st !== prevState) {
-        const tEdge = 0.5 * (chHigh.t[i - 1] + chHigh.t[i]);
-        if (prevState === 'BOTH') {
-          shootThroughCount++;
-          worstEventIndex = segStartIdx;
-          worstEventTime = segStartT;
-        } else if (prevState === 'DEAD' && prevActiveSide && (st === 'H' || st === 'L') && st !== prevActiveSide) {
-          const dtGap = tEdge - segStartT;
-          if (dtGap >= 0 && (!pwmFreqHz || dtGap < 0.25 / pwmFreqHz)) {
-            deadGaps.push(dtGap);
-            if (deadTimeMinSec === null || dtGap < deadTimeMinSec) {
-              deadTimeMinSec = dtGap;
-              if (shootThroughCount === 0) {
-                worstEventIndex = segStartIdx;
-                worstEventTime = segStartT;
+      for (let i = 1; i < n; i++) {
+        const st = getState(hArr[i], lArr[i]);
+        if (st !== prevState) {
+          const tEdge = 0.5 * (tArr[i - 1] + tArr[i]);
+          if (prevState === 'BOTH') {
+            shootThroughCount++;
+            worstEventIndex = segStartIdx;
+            worstEventTime = segStartT;
+          } else if (prevState === 'DEAD' && prevActiveSide && (st === 'H' || st === 'L') && st !== prevActiveSide) {
+            const dtGap = tEdge - segStartT;
+            if (dtGap >= 0 && (!pwmFreqHz || dtGap < 0.25 / pwmFreqHz)) {
+              deadGaps.push(dtGap);
+              if (deadTimeMinSec === null || dtGap < deadTimeMinSec) {
+                deadTimeMinSec = dtGap;
+                if (shootThroughCount === 0) {
+                  worstEventIndex = segStartIdx;
+                  worstEventTime = segStartT;
+                }
               }
             }
           }
+          if (st === 'H' || st === 'L') prevActiveSide = st;
+          prevState = st;
+          segStartT = tEdge;
+          segStartIdx = i;
         }
-        if (st === 'H' || st === 'L') prevActiveSide = st;
-        prevState = st;
-        segStartT = tEdge;
-        segStartIdx = i;
       }
-    }
 
-    if (deadGaps.length > 0) {
-      deadTimeCount = deadGaps.length;
-      deadTimeMinSec = Math.min(...deadGaps);
-      deadTimeMaxSec = Math.max(...deadGaps);
-      deadTimeAvgSec = deadGaps.reduce((a, b) => a + b, 0) / deadGaps.length;
+      if (deadGaps.length > 0) {
+        deadTimeCount = deadGaps.length;
+        deadTimeMinSec = Math.min(...deadGaps);
+        deadTimeMaxSec = Math.max(...deadGaps);
+        deadTimeAvgSec = deadGaps.reduce((a, b) => a + b, 0) / deadGaps.length;
+      }
     }
   }
 
   return {
+    valid: true,
     pwmFreqHz,
     pulseCount: risingTimes.length,
     dutyMinPct: duties.length > 0 ? Math.min(...duties) : null,
@@ -662,12 +846,20 @@ export function analyzePwmSwitchingAndDeadTime(
     deadTimeMaxSec,
     deadTimeCount,
     shootThroughCount,
+    deadTimeReliable,
+    highSignalRole,
     worstEventIndex,
     worstEventTime,
+    warnings,
   };
 }
 
+export type RippleSignalKind = 'torque' | 'current' | 'power' | 'other';
+
 export interface TorqueRippleResult {
+  signalKind: RippleSignalKind;
+  isTrueMechanicalTorque: boolean;
+  warning: string | null;
   mean: number;
   rms: number;
   peakToPeakRipple: number;
@@ -683,16 +875,44 @@ export interface TorqueRippleResult {
   dominantRippleAmp: number | null;
 }
 
+export function classifyRippleChannel(ch: WaveformChannel): RippleSignalKind {
+  const unit = (ch.unit || '').trim().toLowerCase();
+  const name = (ch.name || '').trim().toLowerCase();
+  if (/n[·\.\-\s]?m|kgf|oz[\.\-]?in/.test(unit) || /(torque|t_?shaft|t_?mech|扭矩|转矩)/.test(name)) {
+    return 'torque';
+  }
+  if (/^(u|µ|m|k)?a(mp)?$/.test(unit) || /(^i_|curr|ibus|iq|id|ia|ib|ic|电流)/.test(name)) {
+    return 'current';
+  }
+  if (/^(m|k)?w(att)?$/.test(unit) || /(power|p_?bus|p_?in|p_?out|功率)/.test(name)) {
+    return 'power';
+  }
+  return 'other';
+}
+
 export function analyzeTorqueAndCurrentRipple(
   ch: WaveformChannel,
   elecFreqOverrideHz?: number | null,
   tStart?: number,
   tEnd?: number
 ): TorqueRippleResult {
+  const signalKind = classifyRippleChannel(ch);
+  const isTrueMechanicalTorque = signalKind === 'torque';
+  const warning = isTrueMechanicalTorque
+    ? null
+    : signalKind === 'current'
+    ? '当前通道为电流信号，本结果仅反映电流脉动及 6× 换相谐波；由于存在磁饱和、齿槽转矩与铁损，电流纹波不能直接等同于机械轴转矩脉动。'
+    : signalKind === 'power'
+    ? '当前通道为电功率信号，反映瞬时功率脉动，不能直接等同于机械转矩脉动。'
+    : '未识别到机械扭矩单位 (N·m/mN·m)，结果仅代表所选通道自身的波形脉动与频谱分量。';
+
   const n = Math.min(ch.t.length, ch.v.length);
   const { i0, i1 } = sliceIndexRange(ch.t, n, tStart, tEnd);
   if (i1 - i0 < 8) {
     return {
+      signalKind,
+      isTrueMechanicalTorque,
+      warning,
       mean: 0,
       rms: 0,
       peakToPeakRipple: 0,
@@ -796,6 +1016,9 @@ export function analyzeTorqueAndCurrentRipple(
     h6 !== null && denomMean > 1e-9 ? (h6 / denomMean) * 100 : null;
 
   return {
+    signalKind,
+    isTrueMechanicalTorque,
+    warning,
     mean,
     rms,
     peakToPeakRipple,
@@ -817,32 +1040,62 @@ export function computeBldcDerivedTraces(
   chV: WaveformChannel,
   chW: WaveformChannel
 ): {
+  valid: boolean;
+  unit: string;
+  time: Float64Array;
   uuv: Float32Array;
   uvw: Float32Array;
   uwu: Float32Array;
   v0: Float32Array;
   svmMag: Float32Array;
+  warnings: string[];
 } {
-  const n = Math.min(chU.v.length, chV.v.length, chW.v.length);
-  const mU = chU.coupling === 'AC' ? computeChannelMean(chU) : 0;
-  const mV = chV.coupling === 'AC' ? computeChannelMean(chV) : 0;
-  const mW = chW.coupling === 'AC' ? computeChannelMean(chW) : 0;
+  const unitInfo = resolveCompatibleSiGroupScale([chU, chV, chW]);
+  if (!unitInfo.valid) {
+    return {
+      valid: false,
+      unit: chU.unit || 'V',
+      time: new Float64Array(0),
+      uuv: new Float32Array(0),
+      uvw: new Float32Array(0),
+      uwu: new Float32Array(0),
+      v0: new Float32Array(0),
+      svmMag: new Float32Array(0),
+      warnings: [unitInfo.reason || '三相通道单位不兼容。'],
+    };
+  }
+  const synced = alignChannelsToCommonTimebase([chU, chV, chW]);
+  const warnings = [...synced.warnings];
+  if (unitInfo.normalizedNote) warnings.push(unitInfo.normalizedNote);
+  const n = synced.time.length;
+  if (!synced.valid || n < 2) {
+    return {
+      valid: false,
+      unit: unitInfo.baseUnit,
+      time: new Float64Array(0),
+      uuv: new Float32Array(0),
+      uvw: new Float32Array(0),
+      uwu: new Float32Array(0),
+      v0: new Float32Array(0),
+      svmMag: new Float32Array(0),
+      warnings,
+    };
+  }
 
-  const uArr = new Float32Array(n);
-  const vArr = new Float32Array(n);
-  const wArr = new Float32Array(n);
+  const [rawU, rawV, rawW] = synced.values;
+  const [sU, sV, sW] = unitInfo.scales;
+  const uArr = Math.abs(sU - 1) <= 1e-12 ? rawU : Float32Array.from(rawU, (v) => v * sU);
+  const vArr = Math.abs(sV - 1) <= 1e-12 ? rawV : Float32Array.from(rawV, (v) => v * sV);
+  const wArr = Math.abs(sW - 1) <= 1e-12 ? rawW : Float32Array.from(rawW, (v) => v * sW);
   const uuv = new Float32Array(n);
   const uvw = new Float32Array(n);
   const uwu = new Float32Array(n);
   const v0 = new Float32Array(n);
 
   for (let i = 0; i < n; i++) {
-    const a = getChannelDisplayValue(chU, i, mU);
-    const b = getChannelDisplayValue(chV, i, mV);
-    const c = getChannelDisplayValue(chW, i, mW);
-    uArr[i] = a;
-    vArr[i] = b;
-    wArr[i] = c;
+    const a = uArr[i];
+    const b = vArr[i];
+    const c = wArr[i];
     uuv[i] = a - b;
     uvw[i] = b - c;
     uwu[i] = c - a;
@@ -855,5 +1108,5 @@ export function computeBldcDerivedTraces(
     svmMag[i] = Math.hypot(alpha[i], beta[i]);
   }
 
-  return { uuv, uvw, uwu, v0, svmMag };
+  return { valid: true, unit: unitInfo.baseUnit, time: synced.time, uuv, uvw, uwu, v0, svmMag, warnings };
 }

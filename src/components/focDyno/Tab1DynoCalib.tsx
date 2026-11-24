@@ -31,6 +31,7 @@ interface Tab1Props {
   manualVTestV: number;
   manualKv: number;
   rsFitMode: RsFitMode;
+  openLoopModDepth: number;
   report: CalibrationReport;
   warnings: string[];
   onUpdateOpenLoop: (ds: TabularDataset, map: DynoColumnMapping) => void;
@@ -47,6 +48,7 @@ interface Tab1Props {
   onChangeKeSource: (k: KeSourceMode) => void;
   onChangeManualKe: (n0: number, vTest: number, kv: number) => void;
   onChangeRsFitMode: (m: RsFitMode) => void;
+  onChangeOpenLoopModDepth: (m: number) => void;
   onRunCalibration: () => void;
   onNotify: (msg: string) => void;
 }
@@ -73,6 +75,7 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
   manualVTestV,
   manualKv,
   rsFitMode,
+  openLoopModDepth,
   report,
   warnings,
   onUpdateOpenLoop,
@@ -84,6 +87,7 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
   onChangeKeSource,
   onChangeManualKe,
   onChangeRsFitMode,
+  onChangeOpenLoopModDepth,
   onRunCalibration,
   onNotify,
 }) => {
@@ -313,6 +317,24 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
                   <option value="manual_kv">手动输入电机 KV</option>
                 </select>
 
+                {keSource === 'open_loop_auto' && (
+                  <div className="flex items-center gap-2 font-mono text-xs">
+                    <span className="dyno-text-muted" title="若开环空载并非满调制 (1.0)，请填入实际油门/调制系数">
+                      开环调制系数 m_norm:
+                    </span>
+                    <SmoothNumberInput
+                      value={openLoopModDepth}
+                      min={0.1}
+                      max={1.1547}
+                      step={0.05}
+                      precision={3}
+                      ariaLabel="开环调制系数 m_norm"
+                      onChange={(v) => onChangeOpenLoopModDepth(Math.max(0.1, Math.min(1.1547, v)))}
+                      className="dyno-input w-20 rounded-sm border px-2 py-1 text-right tabular-nums"
+                    />
+                  </div>
+                )}
+
                 {keSource === 'manual_n0_vtest' && (
                   <div className="flex items-center gap-2 font-mono text-xs">
                     <span className="dyno-text-muted">n0:</span>
@@ -469,13 +491,43 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
         <EfficiencyHeatmap2D grid={report.grid2D} points={report.evaluatedPoints} />
       </div>
 
-      {/* Stepwise Fit Audit Log */}
-      <div className="dyno-card rounded-sm border px-4 py-3 text-xs dyno-text-secondary space-y-1.5">
+      {/* Stepwise Fit Audit Log + Holdout CV + Operating Envelope */}
+      <div className="dyno-card rounded-sm border px-4 py-3 text-xs dyno-text-secondary space-y-2">
         <div className="flex flex-wrap items-center gap-x-6 gap-y-1 font-mono text-[11px]">
           {report.fitNotes.map((note, idx) => (
             <span key={idx}>{note}</span>
           ))}
         </div>
+        {(report.validationMetrics || report.operatingEnvelope || report.paramSensitivity) && (
+          <div className="grid grid-cols-1 gap-2 border-t dyno-border pt-2 font-mono text-[11px] md:grid-cols-3">
+            {report.validationMetrics && (
+              <div>
+                <span className="dyno-text-muted">20% Holdout 样本外验证 ({report.validationMetrics.holdoutCount}点): </span>
+                <span className="dyno-text-primary font-semibold">
+                  MAE={report.validationMetrics.valMaeTorqueNm.toFixed(4)} N·m ({report.validationMetrics.valMapeTorquePct.toFixed(2)}%), η MAE={report.validationMetrics.valMaeEtaPct.toFixed(2)}pp
+                </span>
+              </div>
+            )}
+            {report.operatingEnvelope && (
+              <div>
+                <span className="dyno-text-muted">标定有效包络: </span>
+                <span className="dyno-text-primary">
+                  {report.operatingEnvelope.minRpm.toFixed(0)}–{report.operatingEnvelope.maxRpm.toFixed(0)} RPM ·{' '}
+                  {report.operatingEnvelope.minTorqueNm.toFixed(3)}–{report.operatingEnvelope.maxTorqueNm.toFixed(3)} N·m ·{' '}
+                  {report.operatingEnvelope.minVbusV.toFixed(1)}–{report.operatingEnvelope.maxVbusV.toFixed(1)} V
+                </span>
+              </div>
+            )}
+            {report.paramSensitivity && (
+              <div>
+                <span className="dyno-text-muted">参数灵敏度 (ΔMAE): </span>
+                <span className="dyno-text-primary">
+                  Rs+10% → +{report.paramSensitivity.rsPlus10PctDeltaMaeNm.toFixed(4)} N·m · Ke&apos;+5% → +{report.paramSensitivity.kePlus5PctDeltaMaeNm.toFixed(4)} N·m
+                </span>
+              </div>
+            )}
+          </div>
+        )}
         <div className="text-[11px] dyno-text-muted">
           模型适用边界：稳态集总参数代数模型，假定 Y 型接法非凸极 SPMSM 且 Id = 0（不含高速弱磁 Id &lt; 0 与转子电感瞬态 dI/dt）。
         </div>

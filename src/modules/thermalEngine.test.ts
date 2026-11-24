@@ -25,6 +25,10 @@ import {
 import { analyzeSamplingQuality } from './qualityCheck';
 import { inferCsvChannelUnit, previewCsv } from '../parsers/csvParser';
 import { inferUnitFromHeader } from '../parsers/excelParser';
+import { computeFFT } from './fft';
+import { analyzeThreePhaseBalance, analyzePwmSwitchingAndDeadTime } from './bldcAnalysis';
+import { analyzeDoublePulseTest, generateDptDemoChannels } from './dptAnalyzer';
+import { validateTemperatureChannel } from './thermalEngine';
 
 function makeChannel(
   id: string,
@@ -906,6 +910,353 @@ test('Audit items #4, #5, #8, #9, #11, #13, #15, #16: strict units, single-shunt
   );
 });
 
+test('Audit P0/P1: FFT non-uniform resampling, BLDC async 3-phase & SW-node dead-time rejection', () => {
+  // 1. Non-uniform timebase FFT should resample & locate 50 Hz fundamental accurately
+  const n = 512;
+  const tNonUni = new Float64Array(n);
+  const vSine = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    // Smooth warped time axis (dt varies ~2x) over 0.2 s
+    const u = i / (n - 1);
+    const ti = 0.2 * (0.7 * u + 0.3 * u * u);
+    tNonUni[i] = ti;
+    vSine[i] = Math.sin(2 * Math.PI * 50 * ti);
+  }
+  const spec = computeFFT(
+    tNonUni,
+    vSine,
+    n / 0.2,
+    { window: 'hann', scale: 'magnitude', range: 'entire', removeDC: true, zeroPadding: 1 },
+    'ch_nonuni',
+    'Sine50'
+  );
+  assert.ok(spec.nonUniformWarning && spec.nonUniformWarning.includes('Non-uniform sampling'));
+  const fund = spec.peaks.find((p) => p.isFundamental) || spec.peaks[0];
+  assert.ok(fund && Math.abs(fund.frequency - 50) < 3.0, `Expected ~50 Hz peak, got ${fund?.frequency}`);
 
+  // 2. Unsynchronized 3-phase waveforms (different sample rate + start offset) must interpolate to ~120 deg
+  const makePhase = (id: string, name: string, count: number, phaseRad: number, tOff = 0) => {
+    const t = Float64Array.from({ length: count }, (_, i) => tOff + (i / (count - 1)) * 0.04);
+    const v = Float32Array.from({ length: count }, (_, i) => 10 * Math.sin(2 * Math.PI * 100 * t[i] + phaseRad));
+    return makeChannel(id, name, 'V', t, v);
+  };
+  const bal = analyzeThreePhaseBalance(
+    makePhase('pu', 'U', 401, 0, 0),
+    makePhase('pv', 'V', 333, -(2 * Math.PI) / 3, 0.0002),
+    makePhase('pw', 'W', 275, (2 * Math.PI) / 3, 0.0001)
+  );
+  assert.equal(bal.resampled, true);
+  assert.ok(bal.warnings.length > 0);
+  assert.ok(bal.zeroSeqRms < 0.2, `Expected near-zero V0 after time interpolation, got ${bal.zeroSeqRms}`);
+  assert.ok(bal.maxPhaseErrorDeg !== null && bal.maxPhaseErrorDeg < 2.5, `Phase err=${bal.maxPhaseErrorDeg}`);
 
+  // 3. SW node selected as high-side input should mark deadTimeReliable = false
+  const tPwm = Float64Array.from({ length: 400 }, (_, i) => i * 1e-7);
+  const swArr = Float32Array.from({ length: 400 }, (_, i) => ((i % 40) < 20 ? 48 : 0));
+  const glArr = Float32Array.from({ length: 400 }, (_, i) => ((i % 40) >= 22 && (i % 40) < 38 ? 12 : 0));
+  const pwmRes = analyzePwmSwitchingAndDeadTime(
+    makeChannel('sw', 'SW_PhaseA', 'V', tPwm, swArr),
+    makeChannel('gl', 'Gate_GL', 'V', tPwm, glArr)
+  );
+  assert.equal(pwmRes.highSignalRole, 'sw_node');
+  assert.equal(pwmRes.deadTimeReliable, false);
+  assert.ok(pwmRes.warnings.some((w) => w.includes('SW')));
+});
 
+test('Audit P0/P1: Dynamic SOA fail-closed INVALID, temp validation, ZVS Eoss skip, asymmetric FOC Rjc & DPT', () => {
+  // 1. Dynamic SOA returns INVALID (never pass: true) on all-NaN or disjoint timebases
+  const tA = new Float64Array([0, 1e-4, 2e-4, 3e-4, 4e-4]);
+  const nanArr = Float32Array.from({ length: 5 }, () => Number.NaN);
+  const resNan = evaluateDynamicSoa(
+    makeChannel('vn', 'Vds', 'V', tA, nanArr),
+    makeChannel('in', 'Ids', 'A', tA, nanArr),
+    SOA_PRESETS[0]
+  );
+  assert.equal(resNan.status, 'INVALID');
+  assert.equal(resNan.pass, false);
+  assert.equal(resNan.invalidData, true);
+
+  const tDisjoint = new Float64Array([10, 11, 12, 13, 14]);
+  const resDisjoint = evaluateDynamicSoa(
+    makeChannel('v1', 'Vds', 'V', tA, new Float32Array([20, 20, 20, 20, 20])),
+    makeChannel('i1', 'Ids', 'A', tDisjoint, new Float32Array([5, 5, 5, 5, 5])),
+    SOA_PRESETS[0]
+  );
+  assert.equal(resDisjoint.status, 'INVALID');
+  assert.equal(resDisjoint.pass, false);
+
+  // 2. Temperature validation rejects raw NTC voltage / ADC and converts Kelvin
+  const tTh = Float64Array.from({ length: 100 }, (_, i) => i * 0.05);
+  const vRawNtc = makeChannel('ntc', 'V_NTC', 'V', tTh, Float32Array.from({ length: 100 }, () => 2.5));
+  assert.throws(() => validateTemperatureChannel(vRawNtc));
+  const kRes = validateTemperatureChannel(
+    makeChannel('tk', 'Tj_K', 'K', tTh, Float32Array.from({ length: 100 }, () => 300.15))
+  );
+  assert.equal(kRes.offsetC, -273.15);
+
+  // Non-monotonic timebase rejected by deconvolveThermalImpedance
+  const tBad = Float64Array.from({ length: 50 }, (_, i) => (i === 25 ? 0.1 : i * 0.05));
+  const tempGood = makeChannel(
+    't_good',
+    'Tj',
+    '°C',
+    tBad,
+    Float32Array.from({ length: 50 }, (_, i) => 25 + 30 * (1 - Math.exp(-(i * 0.05) / 0.5)))
+  );
+  assert.throws(() =>
+    deconvolveThermalImpedance(tempGood.t, Float64Array.from(tempGood.v), { mode: 'cooling', powerW: 10, targetOrder: 2 })
+  );
+
+  // 3. Rds feedback toggle & ZVS Eoss skip check
+  const nL = 400;
+  const tL = Float64Array.from({ length: nL }, (_, i) => i * 1e-6);
+  const vL = Float32Array.from({ length: nL }, () => 40);
+  const iL = Float32Array.from({ length: nL }, () => 20);
+  const cauerTest = [{ r: 2.0, c: 0.002, tauEst: 0.004, layerLabel: 'Die' }];
+  const simFbOn = computeLossWithDeskewAndEoss(
+    makeChannel('vl1', 'Vds', 'V', tL, vL),
+    makeChannel('il1', 'Ids', 'A', tL, iL),
+    cauerTest,
+    { deskewNs: 0, eossUj: 0, tAmbC: 25, rdsOn25Mohm: 10, tempCoeffAlphaPerC: 0.0045, rdsFeedbackEnabled: true }
+  );
+  const simFbOff = computeLossWithDeskewAndEoss(
+    makeChannel('vl2', 'Vds', 'V', tL, vL),
+    makeChannel('il2', 'Ids', 'A', tL, iL),
+    cauerTest,
+    { deskewNs: 0, eossUj: 0, tAmbC: 25, rdsOn25Mohm: 10, tempCoeffAlphaPerC: 0.0045, rdsFeedbackEnabled: false }
+  );
+  assert.ok(simFbOn.warnings.some((w) => w.includes('Rds(on)(Tj)')));
+  assert.equal(simFbOff.warnings.some((w) => w.includes('Rds(on)(Tj)')), false);
+  assert.ok(simFbOn.tjMaxC > simFbOff.tjMaxC);
+  assert.ok(Math.abs(simFbOff.pLossMeanW - 800) < 1);
+
+  // 4. FOC 6-MOS asymmetric perSwitchRjcScale + SPICE nodal validation + datasheet Rjc constraint
+  const constrainedModel = splitCauerToFocModel(
+    [
+      { r: 0.4, c: 0.005, tauEst: 0.002, layerLabel: 'Die' },
+      { r: 1.6, c: 0.5, tauEst: 0.8, layerLabel: 'PCB' },
+    ],
+    0.05,
+    { pathMode: 'junction_ambient', rJcDatasheetOhm: 0.6 }
+  );
+  assert.equal(constrainedModel.modelKind, 'datasheet_constrained');
+  const asymModel = { ...constrainedModel, perSwitchRjcScale: [1.0, 1.3, 1.0, 1.0, 1.0, 1.0] };
+  const nF = 200;
+  const tF = Float64Array.from({ length: nF }, (_, i) => i * 5e-4);
+  const iaF = Float32Array.from({ length: nF }, (_, i) => 25 * Math.sin(2 * Math.PI * 50 * tF[i]));
+  const ibF = Float32Array.from({ length: nF }, (_, i) => 25 * Math.sin(2 * Math.PI * 50 * tF[i] - (2 * Math.PI) / 3));
+  const simAsym = simulateFoc6Mos(
+    makeChannel('fia', 'Ia', 'A', tF, iaF),
+    makeChannel('fib', 'Ib', 'A', tF, ibF),
+    asymModel,
+    { rdsOn25Mohm: 5, tempCoeffAlphaPerC: 0.0045, eonPlusEoffUj: 400, eossUj: 10, qrrNc: 30, vRefV: 48, iRefA: 25, vsdV: 0.8 },
+    { vBusConstV: 48, tAmbC: 25, modulation: 'SVPWM', modDepthM: 0.85, pfAngleDeg: 0, fswHz: 20000, tDeadNs: 200 }
+  );
+  const ah = simAsym.summaries.find((s) => s.key === 'AH')!;
+  const al = simAsym.summaries.find((s) => s.key === 'AL')!;
+  assert.ok(al.tjPeakC > ah.tjPeakC, `Expected AL with 1.3x Rjc (${al.tjPeakC}) > AH (${ah.tjPeakC})`);
+  const spiceText = focModelToSpice(asymModel);
+  const spiceCheck = validateFocSpiceNetlist(spiceText, asymModel);
+  assert.equal(spiceCheck.valid, true);
+
+  // 5. P1 Double Pulse Test (DPT) analyzer on synthetic realistic DPT capture
+  const demoDpt = generateDptDemoChannels();
+  const dptRes = analyzeDoublePulseTest(demoDpt.vgsCh, demoDpt.vdsCh, demoDpt.idsCh);
+  assert.equal(dptRes.valid, true);
+  assert.equal(dptRes.hasTurnOff, true);
+  assert.equal(dptRes.hasTurnOn, true);
+  assert.ok(dptRes.eOffUj > 10 && dptRes.eOffUj < 5000);
+  assert.ok(dptRes.eOnUj > 10 && dptRes.eOnUj < 5000);
+  assert.ok(dptRes.vdsPeakV > dptRes.vBusSteadyV + 5);
+  assert.ok(dptRes.vMillerPlateauV !== null && dptRes.vMillerPlateauV > 3.0 && dptRes.vMillerPlateauV < 7.0);
+  assert.ok(dptRes.iRrPeakA > 5 && dptRes.qRrNc > 10);
+});
+
+import { alignChannelsToCommonTimebase, inspectChannelSamplingGaps } from './timeSync';
+import { interpolateDptSwitchingLoss } from './dptAnalyzer';
+import { reconstructSingleShuntPhaseCurrents } from './singleShuntRecon';
+
+test('Round-2 P0/P1: timeSync fail-closed, SOA INDETERMINATE, Loss INCOMPLETE/preheat/Tpad, FOC splitFeasible/eonIncludesQrr, DPT LUT & Single-Shunt Recon', () => {
+  // 1. timeSync fail-closed on non-monotonic timestamps & gap detection
+  const tNonMono = new Float64Array([0, 0.001, 0.0005, 0.002, 0.003]);
+  const chGood = makeChannel('ts_g', 'V1', 'V', new Float64Array([0, 0.001, 0.002, 0.003, 0.004]), new Float32Array([1, 2, 3, 4, 5]));
+  const chBadT = makeChannel('ts_b', 'V2', 'V', tNonMono, new Float32Array([1, 2, 3, 4, 5]));
+  const syncedFail = alignChannelsToCommonTimebase([chGood, chBadT]);
+  assert.equal(syncedFail.valid, false);
+  assert.ok(syncedFail.invalidReason && syncedFail.invalidReason.length > 0);
+
+  const tGapped = new Float64Array([0, 0.001, 0.002, 0.003, 0.020, 0.021, 0.022]);
+  const gapRep = inspectChannelSamplingGaps(tGapped);
+  assert.equal(gapRep.gapCount, 1);
+  assert.ok(gapRep.maxGapRatio > 10);
+
+  // 2. Dynamic SOA partial NaN & sampling gap -> INDETERMINATE (never PASS)
+  const nSoa = 50;
+  const tSoa = Float64Array.from({ length: nSoa }, (_, i) => i * 1e-4);
+  const vSoa = Float32Array.from({ length: nSoa }, () => 24);
+  const iSoaPartialNan = Float32Array.from({ length: nSoa }, (_, i) => (i === 25 ? Number.NaN : 10));
+  const soaPartial = evaluateDynamicSoa(
+    makeChannel('vs_p', 'Vds', 'V', tSoa, vSoa),
+    makeChannel('is_p', 'Ids', 'A', tSoa, iSoaPartialNan),
+    SOA_PRESETS[0],
+    { forcedPulseKey: '1ms' }
+  );
+  assert.equal(soaPartial.status, 'INDETERMINATE');
+  assert.equal(soaPartial.pass, false);
+
+  const tSoaGap = Float64Array.from({ length: 20 }, (_, i) => (i < 10 ? i * 1e-4 : 0.005 + (i - 10) * 1e-4));
+  const soaGap = evaluateDynamicSoa(
+    makeChannel('vs_g', 'Vds', 'V', tSoaGap, new Float32Array(20).fill(24)),
+    makeChannel('is_g', 'Ids', 'A', tSoaGap, new Float32Array(20).fill(10)),
+    SOA_PRESETS[0],
+    { forcedPulseKey: '1ms' }
+  );
+  assert.equal(soaGap.status, 'INDETERMINATE');
+  assert.equal(soaGap.pass, false);
+  assert.ok(soaGap.gapCount >= 1);
+
+  // 3. computeLossWithDeskewAndEoss: incomplete on NaN, out-of-coverage & gap; preheat initialTjC; pad_ambient; <=5% deskew trim
+  const nLoss = 100;
+  const tLoss = Float64Array.from({ length: nLoss }, (_, i) => i * 1e-4);
+  const vLoss = Float32Array.from({ length: nLoss }, () => 20);
+  const iLoss = Float32Array.from({ length: nLoss }, () => 10);
+  const stages = [{ r: 1.0, c: 0.01, tauEst: 0.01, layerLabel: 'Die' }];
+
+  const iLossNan = Float32Array.from(iLoss);
+  iLossNan[40] = Number.NaN;
+  const lossNan = computeLossWithDeskewAndEoss(
+    makeChannel('vl_n', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('il_n', 'Ids', 'A', tLoss, iLossNan),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
+  );
+  assert.equal(lossNan.incomplete, true);
+  assert.ok(Number.isNaN(lossNan.energyRawMj));
+
+  const tIdsShort = Float64Array.from({ length: 40 }, (_, i) => i * 1e-4);
+  const lossCov = computeLossWithDeskewAndEoss(
+    makeChannel('vl_c', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('il_c', 'Ids', 'A', tIdsShort, new Float32Array(40).fill(10)),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
+  );
+  assert.equal(lossCov.incomplete, true);
+
+  const tLossGap = Float64Array.from({ length: 30 }, (_, i) => (i < 15 ? i * 1e-4 : 0.005 + (i - 15) * 1e-4));
+  const lossGap = computeLossWithDeskewAndEoss(
+    makeChannel('vl_g', 'Vds', 'V', tLossGap, new Float32Array(30).fill(20)),
+    makeChannel('il_g', 'Ids', 'A', tLossGap, new Float32Array(30).fill(10)),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
+  );
+  assert.equal(lossGap.incomplete, true);
+
+  // Small <=5% deskew shift (0.2ms on 10ms window = 2%) trims edges cleanly without marking incomplete
+  const lossDeskewTrim = computeLossWithDeskewAndEoss(
+    makeChannel('vl_d', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('il_d', 'Ids', 'A', tLoss, iLoss),
+    stages,
+    { deskewNs: 200_000, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25, initialTjC: 65, pathMode: 'pad_ambient' }
+  );
+  assert.equal(lossDeskewTrim.incomplete, false);
+  assert.equal(lossDeskewTrim.thermalPathMode, 'pad_ambient');
+  assert.ok(Math.abs(lossDeskewTrim.tjC[0] - 65) < 1e-4);
+  assert.ok(lossDeskewTrim.warnings.some((w) => w.includes('Tpad')));
+
+  // 4. FOC splitFeasible false guard, eonIncludesQrr flag & binary duty rejection
+  const infeasibleModel = splitCauerToFocModel(
+    [{ r: 0.4, c: 0.05, tauEst: 0.02, layerLabel: 'Single' }],
+    0.05,
+    { pathMode: 'junction_ambient', rJcDatasheetOhm: 0.5 }
+  );
+  assert.equal(infeasibleModel.splitFeasible, false);
+
+  const nF = 100;
+  const tF = Float64Array.from({ length: nF }, (_, i) => i * 5e-4);
+  const iaF = Float32Array.from({ length: nF }, (_, i) => 20 * Math.sin(2 * Math.PI * 50 * tF[i]));
+  const ibF = Float32Array.from({ length: nF }, (_, i) => 20 * Math.sin(2 * Math.PI * 50 * tF[i] - (2 * Math.PI) / 3));
+  const mosFoc = { rdsOn25Mohm: 5, tempCoeffAlphaPerC: 0.0045, vsdV: 0.9, eonPlusEoffUj: 80, vRefV: 48, iRefA: 20, qrrNc: 120, eossUj: 0 };
+  const ctrlFoc = { modulation: 'SVPWM' as const, fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 25, vBusConstV: 48 };
+  assert.throws(() =>
+    simulateFoc6Mos(makeChannel('f_ia', 'Ia', 'A', tF, iaF), makeChannel('f_ib', 'Ib', 'A', tF, ibF), infeasibleModel, mosFoc, ctrlFoc)
+  );
+
+  const lossNoQrrFlag = computePhaseMosLosses(20, 0.7, 48, 25, 25, 'SVPWM', 20000, 200, { ...mosFoc, eonIncludesQrr: false });
+  const lossWithQrrFlag = computePhaseMosLosses(20, 0.7, 48, 25, 25, 'SVPWM', 20000, 200, { ...mosFoc, eonIncludesQrr: true });
+  assert.ok(lossWithQrrFlag.pHighSw < lossNoQrrFlag.pHighSw && lossNoQrrFlag.pHighSw - lossWithQrrFlag.pHighSw > 0.05);
+
+  const binGate = Float32Array.from({ length: nF }, (_, i) => (i % 2 === 0 ? 1 : 0));
+  assert.throws(() =>
+    simulateFoc6Mos(makeChannel('fb_ia', 'Ia', 'A', tF, iaF), makeChannel('fb_ib', 'Ib', 'A', tF, ibF), DEFAULT_FOC_MODEL, mosFoc, ctrlFoc, {
+      dutyChs: {
+        da: makeChannel('bda', 'Duty_A', '', tF, binGate),
+        db: makeChannel('bdb', 'Duty_B', '', tF, binGate),
+        dc: makeChannel('bdc', 'Duty_C', '', tF, binGate),
+      },
+    })
+  );
+
+  // 5. DPT eonIncludesQrr & multi-point LUT interpolation
+  const demoDpt = generateDptDemoChannels();
+  const dptRes = analyzeDoublePulseTest(demoDpt.vgsCh, demoDpt.vdsCh, demoDpt.idsCh);
+  assert.equal(dptRes.eonIncludesQrr, true);
+  assert.ok(dptRes.eOnSansQrrUj <= dptRes.eOnUj + 1e-6);
+
+  const lutInterp = interpolateDptSwitchingLoss(
+    [
+      { id: 'p1', vBusV: 40, iLoadA: 20, tjC: 25, rgOhm: 5, eOnUj: 30, eOffUj: 20, qRrNc: 40, eOnSansQrrUj: 25 },
+      { id: 'p2', vBusV: 80, iLoadA: 40, tjC: 25, rgOhm: 5, eOnUj: 90, eOffUj: 60, qRrNc: 80, eOnSansQrrUj: 75 },
+    ],
+    60,
+    30
+  );
+  assert.ok(lutInterp !== null && Math.abs(lutInterp.eOnUj - 60) < 1e-6 && Math.abs(lutInterp.eOffUj - 40) < 1e-6);
+
+  // 6. Single-Shunt SVPWM phase current reconstruction & blind-zone flagging
+  const nSs = 200;
+  const tSs = Float64Array.from({ length: nSs }, (_, i) => i * 1e-4);
+  const daSs = new Float32Array(nSs);
+  const dbSs = new Float32Array(nSs);
+  const dcSs = new Float32Array(nSs);
+  const idcSs = new Float32Array(nSs);
+  const iAmp = 20;
+  for (let k = 0; k < nSs; k++) {
+    const th = 2 * Math.PI * 50 * tSs[k];
+    const iaTrue = iAmp * Math.sin(th);
+    const ibTrue = iAmp * Math.sin(th - (2 * Math.PI) / 3);
+    const icTrue = -(iaTrue + ibTrue);
+    const va = 0.4 * Math.sin(th);
+    const vb = 0.4 * Math.sin(th - (2 * Math.PI) / 3);
+    const vc = -(va + vb);
+    const vcm = -0.5 * (Math.max(va, vb, vc) + Math.min(va, vb, vc));
+    daSs[k] = 0.5 + va + vcm;
+    dbSs[k] = 0.5 + vb + vcm;
+    dcSs[k] = 0.5 + vc + vcm;
+    idcSs[k] = iaTrue * daSs[k] + ibTrue * dbSs[k] + icTrue * dcSs[k];
+  }
+  const ssRes = reconstructSingleShuntPhaseCurrents(
+    makeChannel('ss_idc', 'Idc', 'A', tSs, idcSs),
+    makeChannel('ss_da', 'Duty_A', '', tSs, daSs),
+    makeChannel('ss_db', 'Duty_B', '', tSs, dbSs),
+    makeChannel('ss_dc', 'Duty_C', '', tSs, dcSs),
+    { fswHz: 20000, tMinSec: 3.0e-6 }
+  );
+  assert.equal(ssRes.valid, true);
+  assert.equal(ssRes.mode, 'continuous_duty');
+  assert.ok(ssRes.blindCount > 0 && ssRes.blindZoneFractionPct > 0);
+  // Check KCL Ia+Ib+Ic ~= 0 & peak recovery near 20A away from blind zones
+  let maxIa = 0;
+  for (let k = 0; k < ssRes.ia.length; k++) {
+    assert.ok(Math.abs(ssRes.ia[k] + ssRes.ib[k] + ssRes.ic[k]) < 1e-4);
+    if (!ssRes.blindMask[k] && Math.abs(ssRes.ia[k]) > maxIa) maxIa = Math.abs(ssRes.ia[k]);
+  }
+  assert.ok(Math.abs(maxIa - iAmp) < 1.5, `Expected reconstructed peak ~${iAmp}A, got ${maxIa}`);
+
+  const ssBadT = reconstructSingleShuntPhaseCurrents(
+    makeChannel('ss_bad', 'Idc', 'A', new Float64Array([0, 0.002, 0.001, 0.003]), new Float32Array([1, 2, 3, 4])),
+    makeChannel('ss_da2', 'Duty_A', '', new Float64Array([0, 0.001, 0.002, 0.003]), new Float32Array([0.5, 0.6, 0.7, 0.8])),
+    makeChannel('ss_db2', 'Duty_B', '', new Float64Array([0, 0.001, 0.002, 0.003]), new Float32Array([0.5, 0.4, 0.3, 0.2])),
+    makeChannel('ss_dc2', 'Duty_C', '', new Float64Array([0, 0.001, 0.002, 0.003]), new Float32Array([0.5, 0.5, 0.5, 0.5]))
+  );
+  assert.equal(ssBadT.valid, false);
+});

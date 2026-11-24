@@ -7,6 +7,7 @@
 import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 import { parseSiUnitScale } from './thermalEngine';
+import { areTimebasesSynchronized, inspectChannelSamplingGaps, inspectTimebase, sampleSeriesAtTime } from './timeSync';
 
 export type SoaPulseKey = 'DC' | '10ms' | '1ms' | '100us' | '10us';
 
@@ -296,7 +297,13 @@ export interface SoaTrajectoryPoint {
 
 export interface DynamicSoaResult {
   pass: boolean;
+  status: 'PASS' | 'FAIL' | 'INVALID' | 'INDETERMINATE';
+  invalidData: boolean;
+  statusReason: string | null;
   totalSamples: number;
+  validSampleCount: number;
+  invalidSampleCount: number;
+  gapCount: number;
   violationCount: number;
   maxUtilizationPct: number;
   minMarginPct: number;
@@ -306,6 +313,30 @@ export interface DynamicSoaResult {
   worstId: number;
   worstPulseWidthSec: number;
   trajectoryPoints: SoaTrajectoryPoint[];
+  warnings: string[];
+}
+
+function buildInvalidSoaResult(reason: string, totalSamples = 0, invalidSampleCount = 0): DynamicSoaResult {
+  return {
+    pass: false,
+    status: 'INVALID',
+    invalidData: true,
+    statusReason: reason,
+    totalSamples,
+    validSampleCount: 0,
+    invalidSampleCount,
+    gapCount: 0,
+    violationCount: 0,
+    maxUtilizationPct: 0,
+    minMarginPct: 0,
+    worstIndex: null,
+    worstTime: null,
+    worstVds: 0,
+    worstId: 0,
+    worstPulseWidthSec: 1e-3,
+    trajectoryPoints: [],
+    warnings: [reason],
+  };
 }
 
 export function evaluateDynamicSoa(
@@ -317,89 +348,111 @@ export function evaluateDynamicSoa(
   const nV = Math.min(vdsCh.t.length, vdsCh.v.length);
   const nI = Math.min(idsCh.t.length, idsCh.v.length);
   if (nV === 0 || nI === 0) {
-    return {
-      pass: true,
-      totalSamples: 0,
-      violationCount: 0,
-      maxUtilizationPct: 0,
-      minMarginPct: 100,
-      worstIndex: null,
-      worstTime: null,
-      worstVds: 0,
-      worstId: 0,
-      worstPulseWidthSec: 1e-3,
-      trajectoryPoints: [],
-    };
+    return buildInvalidSoaResult('Vds 或 Ids 波形数据为空，无法判定 Dynamic SOA（已按 INVALID 拦截，禁止放行）。');
+  }
+
+  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name, { strict: true });
+  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name, { strict: true });
+
+  const tbV = inspectTimebase(vdsCh.t, 0, nV - 1);
+  const tbI = inspectTimebase(idsCh.t, 0, nI - 1);
+  if (!tbV.monotonic || !tbI.monotonic) {
+    return buildInvalidSoaResult(
+      `时间轴存在非单调递增或 NaN/Inf 时间戳 (${!tbV.monotonic ? vdsCh.name : idsCh.name} @ 索引 ${!tbV.monotonic ? tbV.nonMonotonicIndex : tbI.nonMonotonicIndex})，无法执行可靠 SOA 评估。`
+    );
+  }
+
+  const overlapStart = Math.max(
+    vdsCh.t[0],
+    idsCh.t[0],
+    opts?.tStart !== undefined && Number.isFinite(opts.tStart) ? opts.tStart : -Infinity
+  );
+  const overlapEnd = Math.min(
+    vdsCh.t[nV - 1],
+    idsCh.t[nI - 1],
+    opts?.tEnd !== undefined && Number.isFinite(opts.tEnd) ? opts.tEnd : Infinity
+  );
+  if (!Number.isFinite(overlapStart) || !Number.isFinite(overlapEnd) || overlapEnd < overlapStart) {
+    return buildInvalidSoaResult('Vds 与 Ids 在当前门控区间内没有时间重叠区域，无法同步评估 SOA。');
   }
 
   let i0 = 0;
   let i1 = nV - 1;
-  if (opts?.tStart !== undefined) while (i0 < nV && vdsCh.t[i0] < opts.tStart) i0++;
-  if (opts?.tEnd !== undefined) while (i1 > i0 && vdsCh.t[i1] > opts.tEnd) i1--;
-
-  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name);
-  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name);
-  const mV = vdsCh.coupling === 'AC' ? computeChannelMean(vdsCh) : 0;
-  const mI = idsCh.coupling === 'AC' ? computeChannelMean(idsCh) : 0;
-
-  const sameTimebase =
-    nV === nI &&
-    (vdsCh.t === idsCh.t ||
-      (Math.abs(vdsCh.t[0] - idsCh.t[0]) <= 1e-15 &&
-        Math.abs(vdsCh.t[nV >> 1] - idsCh.t[nI >> 1]) <= 1e-15 &&
-        Math.abs(vdsCh.t[nV - 1] - idsCh.t[nI - 1]) <= 1e-15));
-
-  const sampleIdsAt = (targetT: number, fallbackIdx: number): number => {
-    if (sameTimebase) return getChannelDisplayValue(idsCh, fallbackIdx, mI) * iScale;
-    const tArr = idsCh.t;
-    if (targetT <= tArr[0]) return getChannelDisplayValue(idsCh, 0, mI) * iScale;
-    if (targetT >= tArr[nI - 1]) return getChannelDisplayValue(idsCh, nI - 1, mI) * iScale;
-    let lo = 0;
-    let hi = nI - 1;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (tArr[mid] <= targetT) lo = mid;
-      else hi = mid;
-    }
-    const dt = tArr[hi] - tArr[lo];
-    const frac = dt > 1e-18 ? (targetT - tArr[lo]) / dt : 0;
-    const v0 = getChannelDisplayValue(idsCh, lo, mI) * iScale;
-    const v1 = getChannelDisplayValue(idsCh, hi, mI) * iScale;
-    return v0 + frac * (v1 - v0);
-  };
+  while (i0 < nV && vdsCh.t[i0] < overlapStart) i0++;
+  while (i1 > i0 && vdsCh.t[i1] > overlapEnd) i1--;
 
   const len = Math.max(0, i1 - i0 + 1);
   if (len === 0) {
-    return {
-      pass: true,
-      totalSamples: 0,
-      violationCount: 0,
-      maxUtilizationPct: 0,
-      minMarginPct: 100,
-      worstIndex: null,
-      worstTime: null,
-      worstVds: 0,
-      worstId: 0,
-      worstPulseWidthSec: 1e-3,
-      trajectoryPoints: [],
-    };
+    return buildInvalidSoaResult('门控区间内没有重叠的 Vds/Ids 有效样本点（INVALID）。');
   }
 
-  const vArr = new Float64Array(len);
-  const iArr = new Float64Array(len);
+  const mV = vdsCh.coupling === 'AC' ? computeChannelMean(vdsCh) : 0;
+  const mI = idsCh.coupling === 'AC' ? computeChannelMean(idsCh) : 0;
+  const sameTimebase = areTimebasesSynchronized(vdsCh.t, idsCh.t);
+  const warnings: string[] = [];
+  if (!sameTimebase) {
+    warnings.push('检测到 Vds 与 Ids 采样时刻未逐点同步，已按真实重叠时间窗逐点线性插值对齐（零外推）。');
+  }
+
+  const validIndices: number[] = [];
+  const validT: number[] = [];
+  const validV: number[] = [];
+  const validI: number[] = [];
+  let invalidSampleCount = 0;
   let maxAbsI = 0;
+
   for (let k = 0; k < len; k++) {
     const idx = i0 + k;
+    const tVal = vdsCh.t[idx];
     const vv = getChannelDisplayValue(vdsCh, idx, mV) * vScale;
-    const ii = sampleIdsAt(vdsCh.t[idx], idx);
-    vArr[k] = isFinite(vv) ? Math.abs(vv) : 0;
-    iArr[k] = isFinite(ii) ? Math.abs(ii) : 0;
-    if (iArr[k] > maxAbsI) maxAbsI = iArr[k];
+    const iiRaw = sameTimebase
+      ? getChannelDisplayValue(idsCh, idx, mI) * iScale
+      : sampleSeriesAtTime(idsCh.t, idsCh, tVal, mI) * iScale;
+
+    if (!Number.isFinite(vv) || !Number.isFinite(iiRaw)) {
+      invalidSampleCount++;
+      continue;
+    }
+
+    const vAbs = Math.abs(vv);
+    const iAbs = Math.abs(iiRaw);
+    validIndices.push(idx);
+    validT.push(tVal);
+    validV.push(vAbs);
+    validI.push(iAbs);
+    if (iAbs > maxAbsI) maxAbsI = iAbs;
   }
 
-  // Estimate contiguous pulse widths where |I| > max(1 mA, 10% peak)
+  let j0 = 0;
+  let j1 = nI - 1;
+  while (j0 < nI && idsCh.t[j0] < overlapStart) j0++;
+  while (j1 > j0 && idsCh.t[j1] > overlapEnd) j1--;
+  const vGapRep = inspectChannelSamplingGaps(vdsCh.t, i0, i1);
+  const iGapRep = inspectChannelSamplingGaps(idsCh.t, j0, j1);
+  const gapCount = vGapRep.gapCount + iGapRep.gapCount;
+  if (gapCount > 0) {
+    warnings.push(
+      `检测到评估门控内存在 ${gapCount} 处采样时间缺口 (最大空窗 ${formatGapSec(Math.max(vGapRep.maxGapSec, iGapRep.maxGapSec))}，约 ${Math.max(vGapRep.maxGapRatio, iGapRep.maxGapRatio).toFixed(1)}× 中位步长)，缺口内尖峰/脉宽无法被直接观测。`
+    );
+  }
+
+  if (validIndices.length === 0) {
+    return buildInvalidSoaResult(
+      `门控窗口内全部 ${len} 个样本均为 NaN/Inf 无效测量数据（禁止伪装成 0V/0A 通过 SOA）。`,
+      len,
+      invalidSampleCount
+    );
+  }
+
+  if (invalidSampleCount > 0) {
+    warnings.push(
+      `门控窗口内包含 ${invalidSampleCount}/${len} 个 NaN/Inf 无效样本点，已剔除（缺失区应力未知，不能直接判定安全 PASS）。`
+    );
+  }
+
+  const validCount = validIndices.length;
   const activeThreshI = Math.max(1e-3, maxAbsI * 0.1);
-  const pulseWidthForIdx = new Float64Array(len);
+  const pulseWidthForIdx = new Float64Array(validCount);
   const forcedDur =
     opts?.forcedPulseKey && opts.forcedPulseKey !== 'auto'
       ? PULSE_DURATIONS_SEC[opts.forcedPulseKey]
@@ -409,12 +462,12 @@ export function evaluateDynamicSoa(
     pulseWidthForIdx.fill(forcedDur);
   } else {
     let segStart = -1;
-    for (let k = 0; k < len; k++) {
-      const isAct = iArr[k] >= activeThreshI;
+    for (let k = 0; k < validCount; k++) {
+      const isAct = validI[k] >= activeThreshI;
       if (isAct && segStart === -1) segStart = k;
-      if ((!isAct || k === len - 1) && segStart !== -1) {
+      if ((!isAct || k === validCount - 1) && segStart !== -1) {
         const endK = isAct ? k : k - 1;
-        const dur = Math.max(1e-5, Math.min(1.0, vdsCh.t[i0 + endK] - vdsCh.t[i0 + segStart] || 1e-4));
+        const dur = Math.max(1e-5, Math.min(1.0, validT[endK] - validT[segStart] || 1e-4));
         for (let s = segStart; s <= endK; s++) pulseWidthForIdx[s] = dur;
         segStart = -1;
       }
@@ -430,23 +483,24 @@ export function evaluateDynamicSoa(
   let worstId = 0;
   let worstPulse = 1e-3;
 
-  const stride = Math.max(1, Math.floor(len / 900));
+  const stride = Math.max(1, Math.floor(validCount / 900));
   const trajectoryPoints: SoaTrajectoryPoint[] = [];
 
-  for (let k = 0; k < len; k++) {
-    const idx = i0 + k;
-    const vAbs = vArr[k];
-    const iAbs = iArr[k];
+  for (let k = 0; k < validCount; k++) {
+    const idx = validIndices[k];
+    const vAbs = validV[k];
+    const iAbs = validI[k];
     const pw = pulseWidthForIdx[k];
     const limitId = getSoaMaxId(curveSet, vAbs, pw);
 
-    const util = vAbs > curveSet.vdsMaxRated
-      ? 100 * (vAbs / Math.max(1e-3, curveSet.vdsMaxRated)) + 100
-      : limitId > 1e-9
-      ? (iAbs / limitId) * 100
-      : iAbs > 0
-      ? 999
-      : 0;
+    const util =
+      vAbs > curveSet.vdsMaxRated
+        ? 100 * (vAbs / Math.max(1e-3, curveSet.vdsMaxRated)) + 100
+        : limitId > 1e-9
+        ? (iAbs / limitId) * 100
+        : iAbs > 0
+        ? 999
+        : 0;
 
     const violated = vAbs > curveSet.vdsMaxRated || iAbs > limitId;
     if (violated) violationCount++;
@@ -454,7 +508,7 @@ export function evaluateDynamicSoa(
     if (util > maxUtil) {
       maxUtil = util;
       worstIndex = idx;
-      worstTime = vdsCh.t[idx];
+      worstTime = validT[k];
       worstVds = vAbs;
       worstId = iAbs;
       worstPulse = pw;
@@ -464,7 +518,7 @@ export function evaluateDynamicSoa(
       trajectoryPoints.push({
         vds: vAbs,
         id: iAbs,
-        time: vdsCh.t[idx],
+        time: validT[k],
         index: idx,
         pulseWidthSec: pw,
         limitId,
@@ -474,9 +528,24 @@ export function evaluateDynamicSoa(
     }
   }
 
+  const hasCoverageUncertainty = invalidSampleCount > 0 || gapCount > 0;
+  const status: DynamicSoaResult['status'] =
+    violationCount > 0 ? 'FAIL' : hasCoverageUncertainty ? 'INDETERMINATE' : 'PASS';
+  const pass = status === 'PASS';
+  const statusReason =
+    status === 'INDETERMINATE'
+      ? `评估区间存在 ${invalidSampleCount} 个无效点 (NaN/Inf) 与 ${gapCount} 处采样缺口，可能遗漏瞬态 Vds/Ids 峰值或畸变脉宽，判定为 INDETERMINATE（禁止放行 PASS）。`
+      : null;
+
   return {
-    pass: violationCount === 0,
+    pass,
+    status,
+    invalidData: hasCoverageUncertainty,
+    statusReason,
     totalSamples: len,
+    validSampleCount: validCount,
+    invalidSampleCount,
+    gapCount,
     violationCount,
     maxUtilizationPct: maxUtil,
     minMarginPct: 100 - maxUtil,
@@ -486,5 +555,14 @@ export function evaluateDynamicSoa(
     worstId,
     worstPulseWidthSec: worstPulse,
     trajectoryPoints: trajectoryPoints.slice(0, 1200),
+    warnings,
   };
+}
+
+function formatGapSec(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return '0s';
+  if (sec < 1e-6) return `${(sec * 1e9).toFixed(1)}ns`;
+  if (sec < 1e-3) return `${(sec * 1e6).toFixed(2)}µs`;
+  if (sec < 1) return `${(sec * 1e3).toFixed(2)}ms`;
+  return `${sec.toFixed(3)}s`;
 }

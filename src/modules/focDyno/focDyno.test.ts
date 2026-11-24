@@ -436,6 +436,86 @@ test('Audit items #2, #12, #20, #21: iqSignAmbiguous, trapezoidal filter, Dyno k
   assert.ok(badFitReport.warnings.some((w) => w.includes('误差过大')));
 });
 
+import { extractRuntimeLogWithAudit } from './scopeBridge';
 
+test('FOC DynoLab audit: out-of-range eta quarantine, holdout CV, openLoopModDepth, SI Vbus & hot Rds25 handoff', () => {
+  // 1. Out-of-range eta=73.2 in 0-1 mode is quarantined to NaN rather than clamped to 1.0
+  const badEtaDs = parseCsvText('n_rpm,T_Nm,V_bus,I_bus,eta\n1000,0.1,13.5,1.06,73.2\n');
+  const badEtaRes = normalizeDynoDataset(badEtaDs, autoMapColumns(badEtaDs.headers), 'Nm', '0-1', { requireTorque: true });
+  assert.equal(badEtaRes.points.length, 1);
+  assert.ok(Number.isNaN(badEtaRes.points[0].etaMeas));
+  assert.ok(badEtaRes.warnings.some((w) => w.includes('隔离标记为 NaN')));
 
+  // 2. Stepwise calibration produces 20% holdout validationMetrics, operatingEnvelope, and paramSensitivity + honors openLoopModDepth
+  const ol = buildDemoOpenLoopDataset();
+  const cl = buildDemoClosedLoopDataset();
+  const olPts = normalizeDynoDataset(ol, autoMapColumns(ol.headers), 'Nm', '0-1', { requireTorque: false }).points;
+  const clPts = normalizeDynoDataset(cl, autoMapColumns(cl.headers), 'Nm', '0-1', { requireTorque: true }).points;
+  const fullReport = runStepwiseCalibration(olPts, clPts, DEMO_MOTOR_PARAMS, {
+    keSource: 'open_loop_auto',
+    manualN0Rpm: 1450,
+    manualVTestV: 13.5,
+    manualKv: 107.4,
+    rsFitMode: 'locked',
+    openLoopModDepth: 1.0,
+  });
+  assert.ok(fullReport.validationMetrics && fullReport.validationMetrics.holdoutCount >= 2);
+  assert.ok(fullReport.operatingEnvelope && fullReport.operatingEnvelope.maxRpm >= 1000);
+  assert.ok(fullReport.paramSensitivity && Number.isFinite(fullReport.paramSensitivity.rsPlus10PctDeltaMaeNm));
 
+  const halfModReport = runStepwiseCalibration(olPts, clPts, DEMO_MOTOR_PARAMS, {
+    keSource: 'open_loop_auto',
+    manualN0Rpm: 1450,
+    manualVTestV: 13.5,
+    manualKv: 107.4,
+    rsFitMode: 'locked',
+    openLoopModDepth: 0.8,
+  });
+  assert.ok(Math.abs(halfModReport.kePrime - fullReport.kePrime * 0.8) < 1e-6);
+
+  // 3. extractRuntimeLogWithAudit converts mV Vbus to V and emits timebase warning when out-of-sync
+  const synth = synthesizeSixMosWaveform(
+    { vMeasV: 13.5, iBusA: 1.06, nRpm: 1000, tAmbC: 25, fsHz: 10000, durationS: 0.05 },
+    DEMO_MOTOR_PARAMS
+  );
+  const tab = buildOscilloscopeTabFromSixMos(synth, 1000)!;
+  const vbusMv = {
+    ...tab.channels['ch_vbus'],
+    unit: 'mV',
+    t: new Float64Array([0, 0.05]),
+    v: new Float32Array([13500, 13500]),
+  };
+  const audit = extractRuntimeLogWithAudit({
+    vbusCh: vbusMv,
+    vbusConstV: 13.5,
+    ibusCh: tab.channels['ch_ia'],
+    currentUnit: 'A',
+    speedCh: null,
+    speedConstRpm: 1000,
+    speedUnit: 'rpm',
+    polePairs: 7,
+  });
+  assert.equal(audit.vbusScaleV, 1e-3);
+  assert.ok(Math.abs(audit.rows[0].vMeasV - 13.5) < 1e-3);
+  assert.ok(audit.warnings.some((w) => w.includes('时间轴不完全一致')));
+
+  // 4. buildThermalHandoffFromSixMos converts hot Rds(100°C) back to Rds25 accurately
+  const handoffHot = buildThermalHandoffFromSixMos(synth, DEMO_MOTOR_PARAMS, 1000, 25, { rdsRefTempC: 100 })!;
+  const expectedRds25 = DEMO_MOTOR_PARAMS.rdsOnMOhm / (1 + 0.0045 * (100 - 25));
+  assert.ok(Math.abs(handoffHot.rdsOnMOhm - expectedRds25) < 0.02);
+  assert.ok(handoffHot.handoffNote?.includes('折算为 Rds25'));
+
+  // 5. Python bundle parity includes Round-2 dyno calibrator & exporter hardening
+  const dynoCalPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dyno_calibrator.py')?.content || '';
+  const exporterPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'thermal_exporter.py')?.content || '';
+  const appPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'app.py')?.content || '';
+  assert.ok(dynoCalPy.includes('quarantine_mask'));
+  assert.ok(dynoCalPy.includes('validation_metrics'));
+  assert.ok(dynoCalPy.includes('operating_envelope'));
+  assert.ok(dynoCalPy.includes('param_sensitivity'));
+  assert.ok(dynoCalPy.includes('open_loop_mod_depth'));
+  assert.ok(exporterPy.includes('Synthetic Waveform Notice'));
+  assert.ok(exporterPy.includes('Rds(on) Note'));
+  assert.ok(appPy.includes('ol_mod'));
+  assert.ok(appPy.includes('20% 留出交叉验证'));
+});

@@ -7,6 +7,8 @@
 import { TabState, WaveformChannel } from '../../types/models';
 import { analyzeSamplingQuality } from '../qualityCheck';
 import { getChannelDisplayValue, computeChannelMean } from '../oscilloscopeScale';
+import { parseSiUnitScale } from '../thermalEngine';
+import { inspectTimebase, areTimebasesSynchronized } from '../timeSync';
 import { MotorParams, RuntimeLogRow } from './motorPhysics';
 import { SynthesizedWaveform } from './thermalExporter';
 import { RawRuntimeLogEntry } from './demoData';
@@ -257,7 +259,8 @@ export function buildThermalHandoffFromSixMos(
   synth: SynthesizedWaveform,
   params: MotorParams,
   nRpm: number,
-  tAmbC: number
+  tAmbC: number,
+  options?: { rdsRefTempC?: number; alphaPerC?: number }
 ): FocThermalHandoffPayload | null {
   const tab = buildOscilloscopeTabFromSixMos(synth, nRpm);
   if (!tab) return null;
@@ -269,11 +272,21 @@ export function buildThermalHandoffFromSixMos(
   const pfAngleDeg = Number.isFinite(synth.summary.phiCmdDeg) ? synth.summary.phiCmdDeg : 0;
   const hasDutyChs = Boolean(tab.channels['ch_da'] && tab.channels['ch_db'] && tab.channels['ch_dc']);
 
+  // Convert DynoLab operating-Tj Rds(on) back to 25°C reference Rds25 when rdsRefTempC != 25
+  const rdsRefC = options?.rdsRefTempC !== undefined && Number.isFinite(options.rdsRefTempC) ? options.rdsRefTempC : 25;
+  const alphaPerC = options?.alphaPerC !== undefined && Number.isFinite(options.alphaPerC) ? options.alphaPerC : 0.0045;
+  const tempFactor = Math.max(0.4, 1 + alphaPerC * (rdsRefC - 25));
+  const rds25MOhm = rdsRefC !== 25 ? params.rdsOnMOhm / tempFactor : params.rdsOnMOhm;
+
   const clampMsg = synth.clampedByLimit
     ? `【时长已截断】请求导出 ${synth.requestedDurationS.toFixed(3)} s (${synth.requestedSamples.toLocaleString()} 点)，受 ${synth.exportedSamples.toLocaleString()} 点上限约束实际仅导出 ${synth.actualDurationS.toFixed(3)} s，将直接减少热仿真积温时长。`
     : '';
+  const rdsConvNote =
+    rdsRefC !== 25
+      ? `（已将 ${rdsRefC.toFixed(0)}°C 热态 Rds=${params.rdsOnMOhm.toFixed(2)}mΩ 折算为 Rds25=${rds25MOhm.toFixed(2)}mΩ 以避免闭环温升重复放大）`
+      : '';
   const baseNote =
-    'DynoLab 仅标定系统级参数 (I_idle/η_inv) 并同步 Vbus_cap, m_cmd, φ_cmd, f_sw, t_dead, Rds25, V_SD, R_s(堵转)；开关损耗/结温参数 (α, Esw, Qrr, Vref, Iref) 仍沿用 MOS Thermal 数据手册设定。';
+    `DynoLab 标定电机参数 (Ke', P0, β) 并结合人工设定 I_idle/η_inv 同步 Vbus_cap, m_cmd, φ_cmd, f_sw, t_dead, Rds25${rdsConvNote}, V_SD, R_s(堵转)；开关损耗/热系数 (α, Esw, Eoss, Qrr, Vref, Iref) 仍沿用 MOS Thermal 面板设定。`;
 
   return {
     tab,
@@ -291,7 +304,7 @@ export function buildThermalHandoffFromSixMos(
     pfAngleDeg: Number(pfAngleDeg.toFixed(2)),
     fswKhz: params.fSwKhz,
     tDeadNs: params.tDeadNs,
-    rdsOnMOhm: params.rdsOnMOhm,
+    rdsOnMOhm: Number(rds25MOhm.toFixed(3)),
     vsdV: params.vSdV,
     rsPhaseOhm: Number.isFinite(synth.pointResult.rsOhm) ? Number(synth.pointResult.rsOhm.toFixed(5)) : undefined,
     handoffNote: clampMsg ? `${clampMsg} ${baseNote}` : baseNote,
@@ -350,11 +363,15 @@ function sampleChannelAtTime(ch: WaveformChannel, tQuery: number, acOffset: numb
   return v0 + alpha * (v1 - v0);
 }
 
-/**
- * Extracts runtime log rows directly from active Oscilloscope channels with explicit unit conversions
- * and timestamp-aligned interpolation across channels + peak-preserving MinMax bucket downsampling.
- */
-export function extractRuntimeLogFromScopeChannels(options: {
+export interface ScopeRuntimeExtractionAudit {
+  rows: RawRuntimeLogEntry[];
+  warnings: string[];
+  vbusScaleV: number;
+  ibusScaleA: number;
+  isMonotonic: boolean;
+}
+
+export function extractRuntimeLogWithAudit(options: {
   vbusCh: WaveformChannel | null;
   vbusConstV: number;
   ibusCh: WaveformChannel;
@@ -364,7 +381,7 @@ export function extractRuntimeLogFromScopeChannels(options: {
   speedUnit: ScopeSpeedUnit;
   polePairs: number;
   maxPoints?: number;
-}): RawRuntimeLogEntry[] {
+}): ScopeRuntimeExtractionAudit {
   const {
     vbusCh,
     vbusConstV,
@@ -377,13 +394,29 @@ export function extractRuntimeLogFromScopeChannels(options: {
     maxPoints = 4000,
   } = options;
 
+  const warnings: string[] = [];
   const n = Math.min(ibusCh.t.length, ibusCh.v.length);
-  if (n < 2) return [];
+  if (n < 2) {
+    return { rows: [], warnings: ['Ibus 通道样本不足 2 点。'], vbusScaleV: 1, ibusScaleA: 1, isMonotonic: true };
+  }
+
+  const tbI = inspectTimebase(ibusCh.t);
+  if (!tbI.monotonic) {
+    warnings.push('Ibus 通道时间戳非严格递增，时间对齐与窗口滤波精度可能受影响。');
+  }
 
   const acI = ibusCh.coupling === 'AC' ? computeChannelMean(ibusCh) : 0;
   const acV = vbusCh && vbusCh.coupling === 'AC' ? computeChannelMean(vbusCh) : 0;
   const acSpd = speedCh && speedCh.coupling === 'AC' ? computeChannelMean(speedCh) : 0;
 
+  let vbusScaleV = 1;
+  if (vbusCh) {
+    try {
+      vbusScaleV = parseSiUnitScale(vbusCh.unit, 'V', vbusCh.name);
+    } catch (err: any) {
+      warnings.push(err?.message || `Vbus 通道单位 "${vbusCh.unit}" 非标准电压单位。`);
+    }
+  }
   const iScale = currentUnit === 'mA' ? 1e-3 : 1;
   const p = Math.max(1, Math.round(polePairs));
 
@@ -393,7 +426,6 @@ export function extractRuntimeLogFromScopeChannels(options: {
     return val;
   };
 
-  // Build chronologically ordered sample indices (peak-preserving MinMax buckets if n > maxPoints)
   const indices: number[] = [];
   if (n <= maxPoints) {
     for (let i = 0; i < n; i++) indices.push(i);
@@ -420,33 +452,32 @@ export function extractRuntimeLogFromScopeChannels(options: {
         }
       }
       if (minIdx >= 0 && maxIdx >= 0) {
-        if (minIdx === maxIdx) {
-          indices.push(minIdx);
-        } else if (minIdx < maxIdx) {
-          indices.push(minIdx, maxIdx);
-        } else {
-          indices.push(maxIdx, minIdx);
-        }
+        if (minIdx === maxIdx) indices.push(minIdx);
+        else if (minIdx < maxIdx) indices.push(minIdx, maxIdx);
+        else indices.push(maxIdx, minIdx);
       }
     }
   }
 
-  const sameVbusTimebase = Boolean(
-    vbusCh && vbusCh.t === ibusCh.t && vbusCh.v.length >= n
-  );
-  const sameSpeedTimebase = Boolean(
-    speedCh && speedCh.t === ibusCh.t && speedCh.v.length >= n
-  );
+  const sameVbusTimebase = Boolean(vbusCh && areTimebasesSynchronized(ibusCh.t, vbusCh.t));
+  const sameSpeedTimebase = Boolean(speedCh && areTimebasesSynchronized(ibusCh.t, speedCh.t));
+  if (vbusCh && !sameVbusTimebase) {
+    warnings.push(`Vbus (${vbusCh.name}) 与 Ibus 时间轴不完全一致，已按时间戳线性重采样对齐。`);
+  }
+  if (speedCh && !sameSpeedTimebase) {
+    warnings.push(`Speed (${speedCh.name}) 与 Ibus 时间轴不完全一致，已按时间戳线性重采样对齐。`);
+  }
 
   const rows: RawRuntimeLogEntry[] = [];
   for (const i of indices) {
     const t = ibusCh.t[i];
     const iVal = getChannelDisplayValue(ibusCh, i, acI) * iScale;
-    const vVal = !vbusCh
+    const vRaw = !vbusCh
       ? vbusConstV
       : sameVbusTimebase
       ? getChannelDisplayValue(vbusCh, i, acV)
       : sampleChannelAtTime(vbusCh, t, acV);
+    const vVal = !vbusCh ? vRaw : vRaw * vbusScaleV;
     const nVal = !speedCh
       ? speedConstRpm
       : convertSpeedToRpm(
@@ -465,5 +496,29 @@ export function extractRuntimeLogFromScopeChannels(options: {
     }
   }
 
-  return rows;
+  return {
+    rows,
+    warnings,
+    vbusScaleV,
+    ibusScaleA: iScale,
+    isMonotonic: tbI.monotonic,
+  };
+}
+
+/**
+ * Extracts runtime log rows directly from active Oscilloscope channels with explicit unit conversions
+ * and timestamp-aligned interpolation across channels + peak-preserving MinMax bucket downsampling.
+ */
+export function extractRuntimeLogFromScopeChannels(options: {
+  vbusCh: WaveformChannel | null;
+  vbusConstV: number;
+  ibusCh: WaveformChannel;
+  currentUnit: ScopeCurrentUnit;
+  speedCh: WaveformChannel | null;
+  speedConstRpm: number;
+  speedUnit: ScopeSpeedUnit;
+  polePairs: number;
+  maxPoints?: number;
+}): RawRuntimeLogEntry[] {
+  return extractRuntimeLogWithAudit(options).rows;
 }

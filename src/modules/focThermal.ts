@@ -12,11 +12,17 @@
  */
 
 import { WaveformChannel } from '../types/models';
-import { CauerStage, parseSiUnitScale } from './thermalEngine';
+import { CauerStage, ThermalPathMode, parseSiUnitScale, simulateCauerZoh } from './thermalEngine';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 
 export type FocModulationMode = 'SVPWM' | 'DPWM1' | 'SPWM';
 export type MosSwitchKey = 'AH' | 'AL' | 'BH' | 'BL' | 'CH' | 'CL';
+export type FocModelProvenanceKind =
+  | 'junction_ambient'
+  | 'pad_ambient'
+  | 'fallback_default'
+  | 'demo_builtin'
+  | 'datasheet_constrained';
 
 export const MOS_SWITCH_KEYS: MosSwitchKey[] = ['AH', 'AL', 'BH', 'BL', 'CH', 'CL'];
 
@@ -36,8 +42,21 @@ export interface FocCauerSplitMeta {
 export interface FocThermalModel {
   zthJC: CauerStage[];
   zthBoard: CauerStage[];
+  modelKind?: FocModelProvenanceKind;
+  provenanceNote?: string;
   isHeuristicSingleStageSplit?: boolean;
+  splitFeasible?: boolean;
+  zthValidation?: {
+    passed: boolean;
+    maxRelErrPct: number;
+    rthOrig: number;
+    rthSplit: number;
+  };
   splitMeta?: FocCauerSplitMeta;
+  /** Optional 6-element [AH, AL, BH, BL, CH, CL] multiplier on ZthJC (e.g. solder voiding / spatial tolerance) */
+  perSwitchRjcScale?: number[];
+  /** Optional 6-element [AH, AL, BH, BL, CH, CL] extra local PCB copper spreading Rth (°C/W) between case and shared TBRD */
+  perSwitchPadOffsetCPerW?: number[];
 }
 
 export interface FocMosParams {
@@ -49,6 +68,7 @@ export interface FocMosParams {
   iRefA: number;
   qrrNc: number; // reverse recovery charge (nC) at iRefA
   eossUj?: number; // optional zero-current Coss discharge energy (uJ) at vRefV (default 0 to avoid double-counting datasheet Eon)
+  eonIncludesQrr?: boolean; // true when Eon+Eoff comes from DPT waveform integral (Qrr already captured inside Eon)
 }
 
 export interface FocControlParams {
@@ -207,37 +227,177 @@ export const DEFAULT_FOC_MODEL: FocThermalModel = {
     { r: 0.45, c: 0.85, tauEst: 0.3825, layerLabel: 'PCB 铜箔共享节点' },
     { r: 0.65, c: 8.5, tauEst: 5.525, layerLabel: '散热器/环境 (>1s)' },
   ],
+  modelKind: 'fallback_default',
+  provenanceNote: '内置默认 6-MOS 参考热网络 (RθJC=0.50 °C/W, RθBoard=1.10 °C/W)，非实测器件数据。',
 };
 
-/**
- * Splits a single Cauer thermal ladder contiguously into per-MOS ZthJC (fast inner rungs)
- * and shared PCB/heatsink Zth_board (slow outer rungs), preserving physical ladder order
- * and quantifying capacitive shunting from the 5 unpowered JC arms on TBRD.
- */
-export function splitCauerToFocModel(fullCauer: CauerStage[], tauSplitSec = 0.05): FocThermalModel {
+export function buildPerSwitchJcChains(model: FocThermalModel): CauerStage[][] {
+  const baseJc = model.zthJC.length > 0 ? model.zthJC : DEFAULT_FOC_MODEL.zthJC;
+  const scales = model.perSwitchRjcScale;
+  const padOffsets = model.perSwitchPadOffsetCPerW;
+  return MOS_SWITCH_KEYS.map((_, m) => {
+    const sc = scales && scales.length === 6 && Number.isFinite(scales[m]) && scales[m] > 0.1 ? scales[m] : 1.0;
+    const padR = padOffsets && padOffsets.length === 6 && Number.isFinite(padOffsets[m]) && padOffsets[m] > 0 ? padOffsets[m] : 0;
+    const stages = baseJc.map((s) => ({
+      r: s.r * sc,
+      c: s.c,
+      tauEst: s.r * sc * s.c,
+      layerLabel: s.layerLabel,
+    }));
+    if (padR > 0 && stages.length > 0) {
+      const last = stages[stages.length - 1];
+      last.r += padR;
+      last.tauEst = last.r * last.c;
+    }
+    return stages;
+  });
+}
+
+function computeCauerSplitValidation(
+  origStages: CauerStage[],
+  splitChain: CauerStage[]
+): { passed: boolean; maxRelErrPct: number; rthOrig: number; rthSplit: number } {
+  const rthOrig = origStages.reduce((a, s) => a + Math.max(0, s.r), 0);
+  const rthSplit = splitChain.reduce((a, s) => a + Math.max(0, s.r), 0);
+  if (origStages.length === 0 || splitChain.length === 0 || rthOrig <= 1e-9) {
+    return { passed: true, maxRelErrPct: 0, rthOrig, rthSplit };
+  }
+  const taus = [...origStages, ...splitChain].map((s) => Math.max(1e-5, s.r * s.c));
+  const tMin = Math.max(1e-5, Math.min(...taus) * 0.25);
+  const tMax = Math.max(tMin * 20, Math.max(...taus) * 3.5);
+  const nPts = 80;
+  const tArr = new Float64Array(nPts);
+  const pArr = new Float32Array(nPts).fill(1);
+  for (let i = 0; i < nPts; i++) {
+    tArr[i] = i === 0 ? 0 : tMin * Math.pow(tMax / tMin, (i - 1) / Math.max(1, nPts - 2));
+  }
+  const zOrig = simulateCauerZoh(tArr, pArr, origStages, 0);
+  const zSplit = simulateCauerZoh(tArr, pArr, splitChain, 0);
+  let maxRelErr = 0;
+  const rRef = Math.max(1e-4, rthOrig);
+  for (let i = 1; i < nPts; i++) {
+    const err = Math.abs(zSplit[i] - zOrig[i]) / Math.max(0.05 * rRef, Math.abs(zOrig[i]));
+    if (err > maxRelErr) maxRelErr = err;
+  }
+  const maxRelErrPct = maxRelErr * 100;
+  const rthRelErr = Math.abs(rthSplit - rthOrig) / rRef;
+  return {
+    passed: rthRelErr <= 0.02 && maxRelErrPct <= 45,
+    maxRelErrPct,
+    rthOrig,
+    rthSplit,
+  };
+}
+
+export function splitCauerToFocModel(
+  fullCauer: CauerStage[],
+  tauSplitSec = 0.05,
+  options?: {
+    pathMode?: ThermalPathMode;
+    rJcDatasheetOhm?: number;
+  }
+): FocThermalModel {
+  const pathMode: ThermalPathMode = options?.pathMode === 'pad_ambient' ? 'pad_ambient' : 'junction_ambient';
+  const rJcConstraint =
+    options?.rJcDatasheetOhm !== undefined && Number.isFinite(options.rJcDatasheetOhm) && options.rJcDatasheetOhm > 0
+      ? options.rJcDatasheetOhm
+      : null;
+
   if (!fullCauer || fullCauer.length === 0) {
     return {
       zthJC: DEFAULT_FOC_MODEL.zthJC.map((s) => ({ ...s })),
       zthBoard: DEFAULT_FOC_MODEL.zthBoard.map((s) => ({ ...s })),
+      modelKind: 'fallback_default',
+      provenanceNote: DEFAULT_FOC_MODEL.provenanceNote,
       isHeuristicSingleStageSplit: false,
+      splitFeasible: true,
     };
   }
-  if (fullCauer.length === 1) {
-    const s = fullCauer[0];
-    const jcCap = s.c * 0.25;
-    const brdCap = s.c * 0.75;
-    const shuntCapRatioPct = brdCap > 1e-12 ? ((5 * jcCap) / brdCap) * 100 : 0;
+
+  // Case A: Pad-to-Ambient measured model + optional Datasheet RthJC series prepend
+  if (pathMode === 'pad_ambient' && rJcConstraint !== null) {
+    const tauJcSynth = 0.004;
+    const jcStage: CauerStage = {
+      r: rJcConstraint,
+      c: Math.max(1e-4, tauJcSynth / rJcConstraint),
+      tauEst: tauJcSynth,
+      layerLabel: '芯片 ZthJC (手册约束串联)',
+    };
+    const brdStages = fullCauer.map((s) => ({ ...s }));
+    const combinedOrig = [jcStage, ...brdStages];
+    const zthValidation = computeCauerSplitValidation(combinedOrig, [jcStage, ...brdStages]);
+    const sumBrdCap = brdStages.reduce((acc, c) => acc + c.c, 0);
+    const shuntCapRatioPct = sumBrdCap > 1e-12 ? ((5 * jcStage.c) / sumBrdCap) * 100 : 0;
     return {
-      zthJC: [{ r: s.r * 0.4, c: jcCap, tauEst: s.r * 0.4 * jcCap, layerLabel: '芯片/封装 (经验拆分)' }],
-      zthBoard: [{ r: s.r * 0.6, c: brdCap, tauEst: s.r * 0.6 * brdCap, layerLabel: 'PCB/散热器 (经验拆分)' }],
-      isHeuristicSingleStageSplit: true,
+      zthJC: [jcStage],
+      zthBoard: brdStages,
+      modelKind: 'datasheet_constrained',
+      provenanceNote: `来源：PCB/焊盘 Zth_board + 手册 RθJC=${rJcConstraint.toFixed(3)}°C/W 串联合成结-环境链路`,
+      isHeuristicSingleStageSplit: false,
+      splitFeasible: true,
+      zthValidation,
       splitMeta: {
         tauSplitSec,
         boundaryIndex: 1,
         boundaryAdjusted: true,
         nonMonotonicTau: false,
         shuntCapRatioPct,
-        warning: '单阶 Cauer 无法区分芯片与 PCB，已按经验比例拆分。',
+        warning: `已将手册 RθJC=${rJcConstraint.toFixed(3)} °C/W 串联前置到实测 PCB/焊盘 Zth_board 之前（总热阻=${zthValidation.rthSplit.toFixed(3)} °C/W）；因芯片瞬态电容按经验 τ_JC=4ms 估算，建议以高频瞬态复核。`,
+      },
+    };
+  }
+
+  if (fullCauer.length === 1) {
+    const s = fullCauer[0];
+    const jcCap = s.c * 0.25;
+    const brdCap = s.c * 0.75;
+    let jcR = s.r * 0.4;
+    let brdR = s.r * 0.6;
+    let splitFeasible = true;
+    const warnParts: string[] = [];
+
+    if (rJcConstraint !== null && pathMode !== 'pad_ambient') {
+      if (s.r <= rJcConstraint * 1.02 || s.r - rJcConstraint <= 1e-4) {
+        splitFeasible = false;
+        warnParts.push(
+          `约束不可行：手输手册 RθJC=${rJcConstraint.toFixed(3)} °C/W 与单阶实测总热阻 ${s.r.toFixed(3)} °C/W 过近或更大，无法保持正值板级热阻，已拒绝标注为 datasheet_constrained。`
+        );
+      } else {
+        jcR = rJcConstraint;
+        brdR = s.r - rJcConstraint;
+        warnParts.push(`已按器件手册约束 RθJC=${rJcConstraint.toFixed(3)} °C/W 拆分单阶模型。`);
+      }
+    } else if (pathMode === 'pad_ambient') {
+      warnParts.push('警告：当前反演来自 PCB/焊盘测温 (pad_ambient)，不包含芯片结-壳 ZthJC，请在 Tab 4 输入手册 RθJC 或重测 TSEP！');
+    } else {
+      warnParts.push('单阶 Cauer 无法从单一时间常数唯一区分芯片与 PCB，已按经验比例拆分 (仅供参考)。');
+    }
+    const shuntCapRatioPct = brdCap > 1e-12 ? ((5 * jcCap) / brdCap) * 100 : 0;
+    const jcOut = [{ r: jcR, c: jcCap, tauEst: jcR * jcCap, layerLabel: '芯片/封装 (经验拆分)' }];
+    const brdOut = [{ r: brdR, c: brdCap, tauEst: brdR * brdCap, layerLabel: 'PCB/散热器 (经验拆分)' }];
+    const zthValidation = computeCauerSplitValidation(fullCauer, [...jcOut, ...brdOut]);
+    const modelKind: FocModelProvenanceKind =
+      pathMode === 'pad_ambient'
+        ? 'pad_ambient'
+        : rJcConstraint !== null && splitFeasible
+        ? 'datasheet_constrained'
+        : 'junction_ambient';
+
+    return {
+      zthJC: jcOut,
+      zthBoard: brdOut,
+      modelKind,
+      provenanceNote: warnParts.join(' '),
+      isHeuristicSingleStageSplit: true,
+      splitFeasible,
+      zthValidation,
+      splitMeta: {
+        tauSplitSec,
+        boundaryIndex: 1,
+        boundaryAdjusted: true,
+        nonMonotonicTau: false,
+        shuntCapRatioPct,
+        warning: warnParts.join('；'),
       },
     };
   }
@@ -250,7 +410,6 @@ export function splitCauerToFocModel(fullCauer: CauerStage[], tauSplitSec = 0.05
     }
   }
 
-  // Find contiguous boundary split index so ladder node order TJ -> ... -> TBRD -> ... -> TAMB stays intact
   let splitIdx = fullCauer.findIndex((st) => st.tauEst > tauSplitSec);
   if (splitIdx === -1) splitIdx = fullCauer.length;
 
@@ -263,18 +422,70 @@ export function splitCauerToFocModel(fullCauer: CauerStage[], tauSplitSec = 0.05
     boundaryAdjusted = true;
   }
 
-  const jc = fullCauer.slice(0, splitIdx).map((s) => ({ ...s }));
-  const brd = fullCauer.slice(splitIdx).map((s) => ({ ...s }));
+  let jc = fullCauer.slice(0, splitIdx).map((s) => ({ ...s }));
+  let brd = fullCauer.slice(splitIdx).map((s) => ({ ...s }));
+  let splitFeasible = true;
+  let constraintApplied = false;
+  const noteParts: string[] = [];
+
+  if (rJcConstraint !== null && pathMode !== 'pad_ambient') {
+    const totalR = fullCauer.reduce((acc, s) => acc + s.r, 0);
+    if (totalR <= rJcConstraint * 1.02) {
+      splitFeasible = false;
+      noteParts.push(
+        `约束不可行：器件手册 RθJC=${rJcConstraint.toFixed(3)} °C/W 与实测总热阻 ${totalR.toFixed(3)} °C/W 过近或更大（需 R_total > 1.02×RθJC），已拒绝标注为 datasheet_constrained`
+      );
+    } else {
+      let bestIdx = 1;
+      let bestDiff = Infinity;
+      let cum = 0;
+      for (let i = 0; i < fullCauer.length - 1; i++) {
+        cum += fullCauer[i].r;
+        const diff = Math.abs(cum - rJcConstraint);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i + 1;
+        }
+      }
+      const candJc = fullCauer.slice(0, bestIdx).map((s) => ({ ...s }));
+      const candBrd = fullCauer.slice(bestIdx).map((s) => ({ ...s }));
+      const rawJcSum = candJc.reduce((acc, s) => acc + s.r, 0);
+      const deltaR = rawJcSum - rJcConstraint;
+      if (rawJcSum <= 1e-6 || candBrd.length === 0 || candBrd[0].r + deltaR <= 1e-4) {
+        splitFeasible = false;
+        noteParts.push(
+          `约束不可行：将 RθJC 调整至 ${rJcConstraint.toFixed(3)} °C/W 会导致首级 Board 热阻非正值 (${(candBrd[0]?.r + deltaR || 0).toFixed(4)} °C/W)，已拒绝强行拆分`
+        );
+      } else {
+        splitIdx = bestIdx;
+        const scaleJc = rJcConstraint / rawJcSum;
+        jc = candJc.map((s) => ({ ...s, r: s.r * scaleJc, tauEst: s.r * scaleJc * s.c }));
+        candBrd[0] = {
+          ...candBrd[0],
+          r: candBrd[0].r + deltaR,
+          tauEst: (candBrd[0].r + deltaR) * candBrd[0].c,
+        };
+        brd = candBrd;
+        boundaryAdjusted = true;
+        constraintApplied = true;
+        noteParts.push(`已按器件手册 RθJC=${rJcConstraint.toFixed(3)} °C/W 锚定结-壳与板级边界`);
+      }
+    }
+  }
 
   const sumJcCap = jc.reduce((s, c) => s + c.c, 0);
   const sumBrdCap = brd.reduce((s, c) => s + c.c, 0);
   const shuntCapRatioPct = sumBrdCap > 1e-12 ? ((5 * sumJcCap) / sumBrdCap) * 100 : 0;
 
-  const noteParts: string[] = [];
+  if (pathMode === 'pad_ambient') {
+    noteParts.push(
+      '警告：当前 Cauer 网络来自 PCB/焊盘测温 (pad_ambient)，不包含芯片结-壳 ZthJC；若用于 6-MOS 结温评估，请在 Tab 4 输入器件手册 RθJC 或重测 TSEP'
+    );
+  }
   if (nonMonotonicTau) {
     noteParts.push('Cauer 阶梯时间常数 τ 非严格递增，已按物理连接顺序保持连续截断未重排');
   }
-  if (boundaryAdjusted) {
+  if (boundaryAdjusted && rJcConstraint === null) {
     noteParts.push(`τ_split=${(tauSplitSec * 1e3).toFixed(1)}ms 越过全阶梯范围，已保留至少 1 阶 JC 与 1 阶 Board`);
   }
   if (shuntCapRatioPct > 35) {
@@ -283,10 +494,35 @@ export function splitCauerToFocModel(fullCauer: CauerStage[], tauSplitSec = 0.05
     );
   }
 
+  const zthValidation = computeCauerSplitValidation(fullCauer, [...jc, ...brd]);
+  if (!zthValidation.passed && splitFeasible) {
+    noteParts.push(
+      `拆分后阶跃响应校验偏差偏高 (maxRelErr=${zthValidation.maxRelErrPct.toFixed(1)}%)，建议调整 τ_split 或检验手册 RθJC`
+    );
+  }
+
+  const modelKind: FocModelProvenanceKind =
+    pathMode === 'pad_ambient'
+      ? 'pad_ambient'
+      : constraintApplied && splitFeasible
+      ? 'datasheet_constrained'
+      : 'junction_ambient';
+
   return {
     zthJC: jc,
     zthBoard: brd,
+    modelKind,
+    provenanceNote:
+      pathMode === 'pad_ambient'
+        ? '来源：PCB/焊盘测温反演 (缺真实 ZthJC)'
+        : constraintApplied && splitFeasible
+        ? `来源：实测反演 + 手册 RθJC=${rJcConstraint!.toFixed(3)}°C/W 锚定`
+        : !splitFeasible
+        ? '来源：实测反演 (手册 RθJC 约束不可行，已回退原始分割)'
+        : `来源：实测热响应反演 (τ_split=${(tauSplitSec * 1e3).toFixed(1)}ms 物理分割)`,
     isHeuristicSingleStageSplit: false,
+    splitFeasible,
+    zthValidation,
     splitMeta: {
       tauSplitSec,
       boundaryIndex: splitIdx,
@@ -308,10 +544,11 @@ export function focModelToSpice(
   tAmbC = 25,
   subcktName = 'INV_6MOS_THERM'
 ): string {
-  const jc = model.zthJC.length > 0 ? model.zthJC : DEFAULT_FOC_MODEL.zthJC;
+  const armJcs = buildPerSwitchJcChains(model);
   const brd = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
   const lines: string[] = [
     `* Waveform Viewer Pro - 6-MOS Star-Coupled BLDC Inverter Thermal Subcircuit`,
+    `* Provenance: ${model.provenanceNote || model.modelKind || 'Custom Model'}`,
     `* Ports: Q1(AH) Q2(AL) Q3(BH) Q4(BL) Q5(CH) Q6(CL) TAMB`,
     `* Shared Board Node: TBRD`,
     `.subckt ${subcktName} Q1 Q2 Q3 Q4 Q5 Q6 TAMB params: T_amb=${tAmbC.toFixed(2)}`,
@@ -322,6 +559,7 @@ export function focModelToSpice(
   for (let m = 0; m < 6; m++) {
     const port = `Q${m + 1}`;
     const label = MOS_SWITCH_KEYS[m];
+    const jc = armJcs[m];
     icNodes.push(`V(${port})={T_amb}`);
     lines.push(`* --- MOSFET ${port} (${label}) ZthJC ---`);
     for (let k = 0; k < jc.length; k++) {
@@ -534,36 +772,36 @@ export function validateFocSpiceNetlist(
         const rBrdCm = tBrdCm / 6;
         const rJcArms = [1, 2, 3, 4, 5, 6].map((m) => solCm[nodeIndex.get(`Q${m}`)!] - tBrdCm);
         const rJcMean = rJcArms.reduce((a, b) => a + b, 0) / 6;
-        const armSpread = Math.max(...rJcArms.map((v) => Math.abs(v - rJcMean)));
 
         const tQ1One = solOne[nodeIndex.get('Q1')!];
         const tBrdOne = solOne[nodeIndex.get('TBRD')!];
-        const oneArmErr = Math.abs(tQ1One - (rJcMean + rBrdCm)) + Math.abs(tBrdOne - rBrdCm);
+        const oneArmErr = Math.abs(tQ1One - (rJcArms[0] + rBrdCm)) + Math.abs(tBrdOne - rBrdCm);
 
         rJcParsed = rJcMean;
         rBrdParsed = rBrdCm;
-        dcCommonModeError = armSpread + oneArmErr;
-
         let expectedErr = 0;
+        let armMismatch = 0;
         if (expectedModel) {
-          const jcExp = (expectedModel.zthJC.length > 0 ? expectedModel.zthJC : DEFAULT_FOC_MODEL.zthJC).reduce(
-            (s, c) => s + c.r,
-            0
-          );
+          const armExps = buildPerSwitchJcChains(expectedModel).map((chain) => chain.reduce((s, c) => s + c.r, 0));
+          for (let m = 0; m < 6; m++) {
+            armMismatch = Math.max(armMismatch, Math.abs(rJcArms[m] - armExps[m]) / Math.max(1e-6, armExps[m]));
+          }
           const brdExp = (expectedModel.zthBoard.length > 0 ? expectedModel.zthBoard : DEFAULT_FOC_MODEL.zthBoard).reduce(
             (s, c) => s + c.r,
             0
           );
-          expectedErr =
-            Math.abs(rJcParsed - jcExp) / Math.max(1e-6, jcExp) +
-            Math.abs(rBrdParsed - brdExp) / Math.max(1e-6, brdExp);
+          expectedErr = armMismatch + Math.abs(rBrdParsed - brdExp) / Math.max(1e-6, brdExp);
+        } else {
+          armMismatch = Math.max(...rJcArms.map((v) => Math.abs(v - rJcMean)));
         }
 
-        if (armSpread <= 1e-4 && oneArmErr <= 1e-4 && expectedErr <= 1e-3) {
+        dcCommonModeError = armMismatch + oneArmErr;
+
+        if (armMismatch <= 1e-3 && oneArmErr <= 1e-4 && expectedErr <= 1e-3) {
           nodalMathVerified = true;
         } else {
           errors.push(
-            `Nodal DC matrix verification mismatch (spread=${armSpread.toExponential(2)}, oneArmErr=${oneArmErr.toExponential(2)}, modelRelErr=${expectedErr.toExponential(2)}).`
+            `Nodal DC matrix verification mismatch (armMismatch=${armMismatch.toExponential(2)}, oneArmErr=${oneArmErr.toExponential(2)}, modelRelErr=${expectedErr.toExponential(2)}).`
           );
         }
       } else {
@@ -712,7 +950,8 @@ export function computePhaseMosLosses(
     const vScale = Math.max(0, vBus) / Math.max(1e-3, mos.vRefV);
     const iScale = iAbs / Math.max(1e-3, mos.iRefA);
     const eSwJ = Math.max(0, mos.eonPlusEoffUj) * 1e-6 * vScale * iScale;
-    const eQrrJ = Math.max(0, mos.qrrNc) * 1e-9 * Math.max(0, vBus) * iScale;
+    // When Eon+Eoff is directly imported from a DPT integral (eonIncludesQrr=true), Qrr energy is already captured in Eon
+    const eQrrJ = mos.eonIncludesQrr ? 0 : Math.max(0, mos.qrrNc) * 1e-9 * Math.max(0, vBus) * iScale;
     // Half-bridge active hard-switching Coss capacitive discharge loss: once per PWM cycle on the active switch
     const eOssJ = Math.max(0, mos.eossUj ?? 0) * 1e-6 * vScale * vScale;
     pSw = fswHz * (eSwJ + eQrrJ + eOssJ);
@@ -751,7 +990,7 @@ export function computePhaseMosLosses(
  * across the 6 ZthJC arms into the shared Zth_board ladder.
  */
 class StarCoupled6MosThermalSolver {
-  private jc: CauerStage[];
+  private armJcs: CauerStage[][]; // 6 x kj
   private brd: CauerStage[];
   private kj: number;
   private kb: number;
@@ -761,14 +1000,15 @@ class StarCoupled6MosThermalSolver {
   private minTau: number;
   private maxSubDtOverTau: number = 0;
 
-  // Scratch buffers
-  private jcSub: Float64Array;
-  private jcDiag: Float64Array;
-  private jcSup: Float64Array;
-  private jcCPrime: Float64Array;
-  private jcDPrime: Float64Array;
-  private jcCkDt: Float64Array;
+  // Per-arm scratch buffers (supports per-switch spatial asymmetry)
+  private jcSubAll: Float64Array[];
+  private jcDiagAll: Float64Array[];
+  private jcSupAll: Float64Array[];
+  private jcCPrimeAll: Float64Array[];
+  private jcCkDtAll: Float64Array[];
   private jcDPrimesAll: Float64Array[];
+  private jcGammaBoard: Float64Array;
+  private jcGLast: Float64Array;
 
   private brdSub: Float64Array;
   private brdDiag: Float64Array;
@@ -784,9 +1024,9 @@ class StarCoupled6MosThermalSolver {
     initialBoardTempC?: number,
     initialState?: ThermalNetworkStateSnapshot
   ) {
-    this.jc = model.zthJC.length > 0 ? model.zthJC : DEFAULT_FOC_MODEL.zthJC;
+    this.armJcs = buildPerSwitchJcChains(model);
     this.brd = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
-    this.kj = this.jc.length;
+    this.kj = this.armJcs[0].length;
     this.kb = this.brd.length;
     this.tAmbC = tAmbC;
 
@@ -814,19 +1054,20 @@ class StarCoupled6MosThermalSolver {
     }
 
     let mt = Infinity;
-    for (const s of [...this.jc, ...this.brd]) {
+    for (const s of [...this.armJcs.flat(), ...this.brd]) {
       const t = s.r * s.c;
       if (isFinite(t) && t > 1e-12 && t < mt) mt = t;
     }
     this.minTau = isFinite(mt) ? mt : 1e-4;
 
-    this.jcSub = new Float64Array(this.kj);
-    this.jcDiag = new Float64Array(this.kj);
-    this.jcSup = new Float64Array(this.kj);
-    this.jcCPrime = new Float64Array(this.kj);
-    this.jcDPrime = new Float64Array(this.kj);
-    this.jcCkDt = new Float64Array(this.kj);
+    this.jcSubAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
+    this.jcDiagAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
+    this.jcSupAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
+    this.jcCPrimeAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
+    this.jcCkDtAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
     this.jcDPrimesAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
+    this.jcGammaBoard = new Float64Array(6);
+    this.jcGLast = new Float64Array(6);
 
     this.brdSub = new Float64Array(this.kb);
     this.brdDiag = new Float64Array(this.kb);
@@ -875,25 +1116,37 @@ class StarCoupled6MosThermalSolver {
     const kj = this.kj;
     const kb = this.kb;
 
-    // Factor identical JC arm matrix for this subDt
-    for (let k = 0; k < kj; k++) {
-      this.jcCkDt[k] = this.jc[k].c / subDt;
-      const gL = k > 0 ? 1 / this.jc[k - 1].r : 0;
-      const gR = 1 / this.jc[k].r;
-      this.jcSub[k] = k > 0 ? -gL : 0;
-      this.jcDiag[k] = this.jcCkDt[k] + gL + gR;
-      this.jcSup[k] = k < kj - 1 ? -gR : 0;
+    // Factor each MOSFET JC arm matrix (supports per-switch spatial asymmetry cleanly)
+    let gArms = 0;
+    for (let m = 0; m < 6; m++) {
+      const jc = this.armJcs[m];
+      const sub = this.jcSubAll[m];
+      const diag = this.jcDiagAll[m];
+      const sup = this.jcSupAll[m];
+      const cp = this.jcCPrimeAll[m];
+      const ckDt = this.jcCkDtAll[m];
+
+      for (let k = 0; k < kj; k++) {
+        ckDt[k] = jc[k].c / subDt;
+        const gL = k > 0 ? 1 / jc[k - 1].r : 0;
+        const gR = 1 / jc[k].r;
+        sub[k] = k > 0 ? -gL : 0;
+        diag[k] = ckDt[k] + gL + gR;
+        sup[k] = k < kj - 1 ? -gR : 0;
+      }
+      cp[0] = kj > 1 ? sup[0] / diag[0] : 0;
+      let lastDenomJc = diag[0];
+      for (let k = 1; k < kj; k++) {
+        const denom = diag[k] - sub[k] * cp[k - 1];
+        cp[k] = k < kj - 1 ? sup[k] / denom : 0;
+        if (k === kj - 1) lastDenomJc = denom;
+      }
+      const gJcLast = 1 / jc[kj - 1].r;
+      const gammaBoard = gJcLast / lastDenomJc;
+      this.jcGLast[m] = gJcLast;
+      this.jcGammaBoard[m] = gammaBoard;
+      gArms += gJcLast * (1 - gammaBoard);
     }
-    this.jcCPrime[0] = kj > 1 ? this.jcSup[0] / this.jcDiag[0] : 0;
-    let lastDenomJc = this.jcDiag[0];
-    for (let k = 1; k < kj; k++) {
-      const denom = this.jcDiag[k] - this.jcSub[k] * this.jcCPrime[k - 1];
-      this.jcCPrime[k] = k < kj - 1 ? this.jcSup[k] / denom : 0;
-      if (k === kj - 1) lastDenomJc = denom;
-    }
-    const gJcLast = 1 / this.jc[kj - 1].r;
-    const gammaBoard = gJcLast / lastDenomJc; // T_{m, kj-1} = d'_{m, kj-1} + gammaBoard * T_board
-    const gArms = 6 * gJcLast * (1 - gammaBoard);
 
     // Factor Zth_board matrix including Schur coupling gArms on node 0 (TBRD)
     for (let k = 0; k < kb; k++) {
@@ -914,21 +1167,25 @@ class StarCoupled6MosThermalSolver {
     const ambRhs = this.tAmbC * gBrdLast;
 
     for (let sub = 0; sub < subSteps; sub++) {
-      let sumLastDPrime = 0;
+      let pArms = 0;
       for (let m = 0; m < 6; m++) {
         const arm = this.armT[m];
         const dp = this.jcDPrimesAll[m];
-        const r0 = this.jcCkDt[0] * arm[0] + (powers[m] || 0);
-        dp[0] = r0 / this.jcDiag[0];
+        const subM = this.jcSubAll[m];
+        const diagM = this.jcDiagAll[m];
+        const cpM = this.jcCPrimeAll[m];
+        const ckDtM = this.jcCkDtAll[m];
+
+        const r0 = ckDtM[0] * arm[0] + (powers[m] || 0);
+        dp[0] = r0 / diagM[0];
         for (let k = 1; k < kj; k++) {
-          const rk = this.jcCkDt[k] * arm[k];
-          const denom = this.jcDiag[k] - this.jcSub[k] * this.jcCPrime[k - 1];
-          dp[k] = (rk - this.jcSub[k] * dp[k - 1]) / denom;
+          const rk = ckDtM[k] * arm[k];
+          const denom = diagM[k] - subM[k] * cpM[k - 1];
+          dp[k] = (rk - subM[k] * dp[k - 1]) / denom;
         }
-        sumLastDPrime += dp[kj - 1];
+        pArms += this.jcGLast[m] * dp[kj - 1];
       }
 
-      const pArms = gJcLast * sumLastDPrime;
       for (let k = 0; k < kb; k++) {
         this.brdRhs[k] =
           this.brdCkDt[k] * this.brdT[k] +
@@ -951,9 +1208,10 @@ class StarCoupled6MosThermalSolver {
       for (let m = 0; m < 6; m++) {
         const arm = this.armT[m];
         const dp = this.jcDPrimesAll[m];
-        arm[kj - 1] = dp[kj - 1] + gammaBoard * tBrd0;
+        const cpM = this.jcCPrimeAll[m];
+        arm[kj - 1] = dp[kj - 1] + this.jcGammaBoard[m] * tBrd0;
         for (let k = kj - 2; k >= 0; k--) {
-          arm[k] = dp[k] - this.jcCPrime[k] * arm[k + 1];
+          arm[k] = dp[k] - cpM[k] * arm[k + 1];
         }
       }
     }
@@ -1025,7 +1283,7 @@ function solveCoupledThermalSteadyState(params: {
   pCond25W: number[];
   pFixedW: number[];
   alphaPerC: number;
-  rJcTotal: number;
+  rJcTotalByArm: number[];
   rBrdTotal: number;
   tAmbC: number;
   tInitSeedC?: number[];
@@ -1035,11 +1293,11 @@ function solveCoupledThermalSteadyState(params: {
   converged: boolean;
   thermalRunaway: boolean;
 } {
-  const { pCond25W, pFixedW, alphaPerC, rJcTotal, rBrdTotal, tAmbC, tInitSeedC } = params;
+  const { pCond25W, pFixedW, alphaPerC, rJcTotalByArm, rBrdTotal, tAmbC, tInitSeedC } = params;
   const kArm = pCond25W.map((p25) => alphaPerC * p25);
   const p0Arm = pCond25W.map((p25, m) => pFixedW[m] + p25 * (1 - 25 * alphaPerC));
 
-  const armStable = kArm.every((km) => 1 - rJcTotal * km > 1e-6);
+  const armStable = kArm.every((km, m) => 1 - rJcTotalByArm[m] * km > 1e-6);
   let gLoop = Infinity;
   let analyticOk = false;
   let analyticBrd = tAmbC;
@@ -1049,7 +1307,7 @@ function solveCoupledThermalSteadyState(params: {
     let sumKOverDen = 0;
     let sumP0OverDen = 0;
     for (let m = 0; m < 6; m++) {
-      const den = 1 - rJcTotal * kArm[m];
+      const den = 1 - rJcTotalByArm[m] * kArm[m];
       sumKOverDen += kArm[m] / den;
       sumP0OverDen += p0Arm[m] / den;
     }
@@ -1058,8 +1316,8 @@ function solveCoupledThermalSteadyState(params: {
       analyticBrd = (tAmbC + rBrdTotal * sumP0OverDen) / (1 - gLoop);
       let allInsidePiecewiseLinear = Number.isFinite(analyticBrd) && analyticBrd <= 2000;
       for (let m = 0; m < 6; m++) {
-        const den = 1 - rJcTotal * kArm[m];
-        const tm = (analyticBrd + rJcTotal * p0Arm[m]) / den;
+        const den = 1 - rJcTotalByArm[m] * kArm[m];
+        const tm = (analyticBrd + rJcTotalByArm[m] * p0Arm[m]) / den;
         analyticTj[m] = tm;
         if (!Number.isFinite(tm) || tm > 2000 || 1 + alphaPerC * (tm - 25) < 0.1) {
           allInsidePiecewiseLinear = false;
@@ -1098,7 +1356,7 @@ function solveCoupledThermalSteadyState(params: {
     let maxDelta = Math.abs(nextBrd - tBrd);
     tBrd = nextBrd;
     for (let m = 0; m < 6; m++) {
-      const candT = tBrd + pArm[m] * rJcTotal;
+      const candT = tBrd + pArm[m] * rJcTotalByArm[m];
       const nextT = Number.isFinite(candT) ? Math.min(2000, Math.max(-50, candT)) : 2000;
       maxDelta = Math.max(maxDelta, Math.abs(nextT - tjVec[m]));
       tjVec[m] = nextT;
@@ -1132,6 +1390,9 @@ export function simulateFoc6Mos(
   ctrl: FocControlParams,
   opts?: FocSimulationOptions
 ): FocSimulationResult {
+  if (model.splitFeasible === false) {
+    throw new Error(model.splitMeta?.warning || '热模型 ZthJC / Zth_board 手册约束拆分不可行，已拒绝代入 6-MOS 仿真。');
+  }
   const nIa = Math.min(iaCh.t.length, iaCh.v.length);
   const nIb = Math.min(ibCh.t.length, ibCh.v.length);
   if (nIa < 4 || nIb < 2) {
@@ -1220,6 +1481,7 @@ export function simulateFoc6Mos(
     sample: (targetT: number, idxHint: number) => number;
     repairedNanCount: number;
     finiteCount: number;
+    completelyDisjoint: boolean;
   }
 
   const buildGapSafeSampler = (
@@ -1253,6 +1515,7 @@ export function simulateFoc6Mos(
       validIndices.push(i);
     }
 
+    let completelyDisjoint = false;
     if (!isSame) {
       if (badTCount > 0) {
         alignmentWarnings.push(`通道 ${label} 时间轴存在 ${badTCount} 个 NaN/Inf 无效时间戳，已自动剔除后按有效时刻插值。`);
@@ -1264,11 +1527,15 @@ export function simulateFoc6Mos(
       if (validIndices.length > 0) {
         const cStart = ch.t[validIndices[0]];
         const cEnd = ch.t[validIndices[validIndices.length - 1]];
-        if (cStart > simStart + covEps || cEnd < simEnd - covEps) {
+        if (cEnd < simStart - covEps || cStart > simEnd + covEps) {
+          completelyDisjoint = true;
+        } else if (cStart > simStart + covEps || cEnd < simEnd - covEps) {
           alignmentWarnings.push(
             `通道 ${label} 时间覆盖 [${cStart.toFixed(4)}s, ${cEnd.toFixed(4)}s] 未完整覆盖仿真区间 [${simStart.toFixed(4)}s, ${simEnd.toFixed(4)}s]，越界点将保持首/尾边界值。`
           );
         }
+      } else {
+        completelyDisjoint = true;
       }
     }
 
@@ -1292,7 +1559,6 @@ export function simulateFoc6Mos(
     }
 
     if (finiteCount > 0 && rawNanCount > 0) {
-      // Precompute O(M) gap-filled signal array via linear interpolation across NaN runs
       const prevValid = new Int32Array(m).fill(-1);
       const nextValid = new Int32Array(m).fill(-1);
       let lastV = -1;
@@ -1354,7 +1620,7 @@ export function simulateFoc6Mos(
       return vRepaired[lo] + frac * (vRepaired[hi] - vRepaired[lo]);
     };
 
-    return { sample, repairedNanCount: rawNanCount, finiteCount };
+    return { sample, repairedNanCount: rawNanCount, finiteCount, completelyDisjoint };
   };
 
   const simTStart = iaCh.t[i0];
@@ -1372,12 +1638,21 @@ export function simulateFoc6Mos(
   if (iaSampler.finiteCount === 0 || ibSampler.finiteCount === 0) {
     throw new Error('Ia 或 Ib 通道缺少有效数值样本 (全为 NaN/Inf)，无法执行 6-MOS 热仿真。');
   }
+  if (ibSampler.completelyDisjoint) {
+    throw new Error(`Ib(${ibCh.name}) 与主通道 Ia 门控区间完全无时间重叠，已拒绝执行错位 6-MOS 热仿真。`);
+  }
   const icSampler = icCh
     ? buildGapSafeSampler(icCh, icScale, mIc, `Ic(${icCh.name})`, sameIc, simTStart, simTEnd)
     : null;
+  if (icSampler && (icSampler.finiteCount === 0 || icSampler.completelyDisjoint)) {
+    throw new Error(`Ic(${icCh!.name}) 全为无效样本或与门控区间完全无时间重叠，请检查通道选择或改为 Auto (-Ia-Ib)。`);
+  }
   const vbusSampler = vbusCh
     ? buildGapSafeSampler(vbusCh, vbusScale, mVbus, `Vbus(${vbusCh.name})`, sameVbus, simTStart, simTEnd)
     : null;
+  if (vbusSampler && (vbusSampler.finiteCount === 0 || vbusSampler.completelyDisjoint)) {
+    throw new Error(`Vbus(${vbusCh!.name}) 全为无效样本或与门控区间完全无时间重叠，请检查母线电压通道或使用恒定 Vbus。`);
+  }
 
   // Determine channel-level external Duty format (explicit '%' unit vs scanned max > 1.05 across all 3 duty channels)
   const useExternalDuty = Boolean(daCh && dbCh && dcCh);
@@ -1434,6 +1709,11 @@ export function simulateFoc6Mos(
         dutyBinaryPulseSuspected = true;
       }
     }
+    if (dutyBinaryPulseSuspected) {
+      throw new Error(
+        '检测到外部 Duty_A/B/C 超过 95% 样本为精确 0 或 1（原始 PWM 二值开关脉宽波形而非周期平均占空比），若代入将导致开关损耗被按钳位误清零；请先在示波器对 PWM 滤波提取平均占空比，或切换为无传感器 SVPWM 重构。'
+      );
+    }
   }
 
   const daSampler = daCh
@@ -1445,6 +1725,15 @@ export function simulateFoc6Mos(
   const dcSampler = dcCh
     ? buildGapSafeSampler(dcCh, dutyScale, 0, `Duty_C(${dcCh.name})`, sameDc, simTStart, simTEnd)
     : null;
+  for (const [lbl, smp] of [
+    ['Duty_A', daSampler],
+    ['Duty_B', dbSampler],
+    ['Duty_C', dcSampler],
+  ] as const) {
+    if (smp && (smp.finiteCount === 0 || smp.completelyDisjoint)) {
+      throw new Error(`外部占空比通道 ${lbl} 全为无效样本或与门控区间无时间重叠，已拒绝执行 6-MOS 仿真。`);
+    }
+  }
 
   const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
   let overmodulatedCount = 0;
@@ -1681,9 +1970,10 @@ export function simulateFoc6Mos(
   const tBoardFinalC = tBoard[len - 1];
 
   // Coupled steady-state extrapolation (exact coupled thermal/Rds(on)(Tj) solve + runaway check)
-  const jcStages = model.zthJC.length > 0 ? model.zthJC : DEFAULT_FOC_MODEL.zthJC;
+  const armJcs = buildPerSwitchJcChains(model);
+  const jcStages = armJcs[0];
   const brdStages = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
-  const rJcTotal = jcStages.reduce((s, c) => s + c.r, 0);
+  const rJcTotalByArm = armJcs.map((chain) => chain.reduce((s, c) => s + c.r, 0));
   const rBrdTotal = brdStages.reduce((s, c) => s + c.r, 0);
   const tauMaxBoardSec = computeDominantCauerTauSec(jcStages, brdStages);
 
@@ -1692,7 +1982,7 @@ export function simulateFoc6Mos(
     pCond25W: summaries.map((s) => s.pCondAvgW / Math.max(0.1, 1 + alpha * (s.tjAvgC - 25))),
     pFixedW: summaries.map((s) => s.pSwAvgW + s.pDeadAvgW),
     alphaPerC: alpha,
-    rJcTotal,
+    rJcTotalByArm,
     rBrdTotal,
     tAmbC: ctrl.tAmbC,
     tInitSeedC: summaries.map((s) => s.tjAvgC),
@@ -1718,6 +2008,13 @@ export function simulateFoc6Mos(
   const finalThermalState = solver.getStateSnapshot();
 
   const warnings: string[] = [...alignmentWarnings];
+  if (model.modelKind === 'fallback_default') {
+    warnings.push('当前 6-MOS 使用内置默认参考热网络 (Fallback)，非当前具体器件实测曲线，结果仅供趋势对比。');
+  } else if (model.modelKind === 'pad_ambient') {
+    warnings.push('警告：当前热网络源自 PCB/焊盘测温 (pad_ambient)，缺失真实芯片结-壳 ZthJC，算出的 Tj 仅代表传感器等效点温升！');
+  } else if (model.modelKind === 'demo_builtin') {
+    warnings.push('当前使用内置 FOC Demo 参考热模型，切换至实测波形时请在 Tab 1 反演或手动设定器件 Zth 参数。');
+  }
   if (partialDutySelected) {
     warnings.push('仅选择了部分外部 Duty 通道，需同时指定 Duty_A / Duty_B / Duty_C 三路才会启用外部占空比，当前已回退为无传感器重构。');
   }
@@ -1807,9 +2104,9 @@ export function simulateFoc6Mos(
  * solves exact safe stall time t_safe (s) and dual I^2*t thresholds (phase RMS and worst phase leg).
  */
 export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResult {
-  const jc = opts.model.zthJC.length > 0 ? opts.model.zthJC : DEFAULT_FOC_MODEL.zthJC;
+  const armJcs = buildPerSwitchJcChains(opts.model);
   const brd = opts.model.zthBoard.length > 0 ? opts.model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
-  const rJc = jc.reduce((s, c) => s + c.r, 0);
+  const rJcByArm = armJcs.map((chain) => chain.reduce((s, c) => s + c.r, 0));
   const rBrd = brd.reduce((s, c) => s + c.r, 0);
 
   const stallMode = opts.stallDutyMode === 'user_m' ? 'user_m' : 'resistive';
@@ -1872,7 +2169,7 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
         lBaseC.pLowSw + lBaseC.pLowDead,
       ],
       alphaPerC: opts.mos.tempCoeffAlphaPerC || 0,
-      rJcTotal: rJc,
+      rJcTotalByArm: rJcByArm,
       rBrdTotal: rBrd,
       tAmbC: opts.tAmbC,
     });
