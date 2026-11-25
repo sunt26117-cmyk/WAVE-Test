@@ -79,6 +79,8 @@ interface CompareQueueEntry {
     metrics: WaveformCompareMetrics;
     pass: boolean;
     violationCount: number;
+    valid: boolean;
+    reason?: string;
   };
 }
 
@@ -791,9 +793,17 @@ function bindModals() {
     if (!tab) return;
     const chId = (document.getElementById('motorEstChannelSelect') as HTMLSelectElement)?.value;
     const ch = tab.channels[chId];
-    const poles = parseInt((document.getElementById('motorPolesInput') as HTMLInputElement)?.value || '4', 10) || 4;
+    const polesRaw = (document.getElementById('motorPolesInput') as HTMLInputElement)?.value.trim() || '';
+    const poles = Number(polesRaw);
     const outEl = document.getElementById('motorEstOutput');
     if (!ch) return;
+    if (!polesRaw || !Number.isInteger(poles) || poles <= 0) {
+      if (outEl) {
+        outEl.innerText = 'Enter rotor pole pairs (integer p >= 1) first — no default assumed.';
+        outEl.className = 'font-mono text-[11px] text-amber-300 tabular-nums';
+      }
+      return;
+    }
     const b = getTimeBoundsForView(tab, ch);
     const est = estimateSpeedFromSignal(ch.t, ch.v, poles, b.tStart, b.tEnd);
     if (est.rpm !== null && est.freqHz !== null) {
@@ -816,11 +826,18 @@ function bindModals() {
     const enableChk = document.getElementById('motorEnableChk') as HTMLInputElement;
 
     const rpm = parseFloat(rpmInput.value);
-    const poles = parseInt(poleInput.value, 10);
+    const polesRaw = poleInput.value.trim();
+    const poles = Number(polesRaw);
+    const validPoles = Boolean(polesRaw) && Number.isInteger(poles) && poles > 0;
+    const validRpm = Number.isFinite(rpm) && rpm > 0;
+
+    if (enableChk.checked && (!validRpm || !validPoles)) {
+      app.showToast('Harmonic markers require valid RPM (> 0) and integer rotor pole pairs (p >= 1).', 'warn');
+    }
 
     tab.motorConfig.enabled = enableChk.checked;
-    tab.motorConfig.rpm = !isNaN(rpm) && rpm > 0 ? rpm : null;
-    tab.motorConfig.polePairs = !isNaN(poles) && poles > 0 ? poles : null;
+    tab.motorConfig.rpm = validRpm ? rpm : null;
+    tab.motorConfig.polePairs = validPoles ? poles : null;
 
     app.draw();
     document.getElementById('motorModal')!.style.display = 'none';
@@ -1546,19 +1563,30 @@ function bindModals() {
     const groupId = editingCompareGroupId || `grp_${groupNameRaw.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now().toString(36)}`;
     const colorOffset = tagTarget ? 1 : 0;
 
-    const payloadItems = compareQueue
-      .filter((e) => e.computed)
-      .map((entry, idx) => ({
-        id: entry.id,
-        refLabel: entry.label,
-        color: entry.customColor || getCompareGroupTraceColor(theme.id, idx + colorOffset, paletteMode),
-        alignedRefV: entry.computed!.alignedRefV,
-        diffV: entry.computed!.diffV,
-        fullRefT: entry.computed!.fullRefT,
-        fullRefV: entry.computed!.fullRefV,
-      }));
+    const validEntries = compareQueue.filter((e) => e.computed?.valid);
+    const skippedCount = compareQueue.length - validEntries.length;
+    if (validEntries.length === 0) {
+      const firstReason = compareQueue.find((e) => e.computed?.reason)?.computed?.reason;
+      app.showToast(
+        firstReason || 'Cannot apply compare group: all reference traces failed unit/overlap validation.',
+        'error'
+      );
+      return;
+    }
 
-    if (payloadItems.length === 0) return;
+    const payloadItems = validEntries.map((entry, idx) => ({
+      id: entry.id,
+      refLabel: entry.label,
+      color: entry.customColor || getCompareGroupTraceColor(theme.id, idx + colorOffset, paletteMode),
+      alignedRefV: entry.computed!.alignedRefV,
+      diffV: entry.computed!.diffV,
+      fullRefT: entry.computed!.fullRefT,
+      fullRefV: entry.computed!.fullRefV,
+    }));
+
+    if (skippedCount > 0) {
+      app.showToast(`Skipped ${skippedCount} invalid/non-overlapping reference trace(s) before applying.`, 'warn');
+    }
 
     app.applyMultiCompareGroup(
       tgtId,
@@ -2118,7 +2146,7 @@ function openMotorModal(tab: TabState) {
   const estSel = document.getElementById('motorEstChannelSelect') as HTMLSelectElement;
 
   rpmInput.value = tab.motorConfig.rpm ? tab.motorConfig.rpm.toString() : '';
-  polesInput.value = tab.motorConfig.polePairs ? tab.motorConfig.polePairs.toString() : '4';
+  polesInput.value = tab.motorConfig.polePairs ? tab.motorConfig.polePairs.toString() : '';
   enableChk.checked = tab.motorConfig.enabled;
 
   if (estSel) {
@@ -3137,6 +3165,8 @@ function recomputeComparePanel(tab: TabState) {
       metrics,
       pass: golden.pass,
       violationCount: golden.violationCount,
+      valid: cmpValid,
+      reason: cmpReason || undefined,
     };
 
     const refDur =

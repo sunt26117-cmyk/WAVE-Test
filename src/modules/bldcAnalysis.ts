@@ -372,18 +372,14 @@ export function analyzeBldcHallCommutation(
   const sC = statsForArr(cArr);
   if (!sA.valid || !sB.valid || !sC.valid) return empty;
 
+  const hallTb = inspectTimebase(timeArr, 0, timeArr.length - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const gapThresholdSec = hallTb.gapThresholdSec;
+
   const getBit = (val: number, prevBit: number, mid: number, hyst: number) => {
     if (val >= mid + hyst) return 1;
     if (val <= mid - hyst) return 0;
     return prevBit;
   };
-
-  let bA = aArr[0] >= sA.mid ? 1 : 0;
-  let bB = bArr[0] >= sB.mid ? 1 : 0;
-  let bC = cArr[0] >= sC.mid ? 1 : 0;
-  let prevState = (bA << 2) | (bB << 1) | bC;
-  let stateStartTime = timeArr[0];
-  let stateStartIdx = 0;
 
   interface SectorSegment {
     state: number;
@@ -393,24 +389,72 @@ export function analyzeBldcHallCommutation(
     index: number;
   }
 
-  const segments: SectorSegment[] = [];
+  const completeSegs: SectorSegment[] = [];
   const events: HallCommutationEvent[] = [];
   let illegalStateCount = 0;
   let sequenceJumpCount = 0;
   let cwSteps = 0;
   let ccwSteps = 0;
+  let gapBreakCount = 0;
 
-  for (let i = 1; i < n; i++) {
-    bA = getBit(aArr[i], bA, sA.mid, sA.hyst);
-    bB = getBit(bArr[i], bB, sB.mid, sB.hyst);
-    bC = getBit(cArr[i], bC, sC.mid, sC.hyst);
+  let bA = 0;
+  let bB = 0;
+  let bC = 0;
+  let prevState = 0;
+  let stateStartTime = timeArr[0];
+  let stateStartIdx = 0;
+  let hasActiveState = false;
+  let segHasLeadingEdge = false;
+
+  for (let i = 0; i < n; i++) {
+    const va = aArr[i];
+    const vb = bArr[i];
+    const vc = cArr[i];
+    const sampleFinite = Number.isFinite(va) && Number.isFinite(vb) && Number.isFinite(vc) && Number.isFinite(timeArr[i]);
+    if (!sampleFinite) {
+      if (hasActiveState) {
+        gapBreakCount++;
+      }
+      hasActiveState = false;
+      segHasLeadingEdge = false;
+      continue;
+    }
+
+    if (!hasActiveState) {
+      bA = va >= sA.mid ? 1 : 0;
+      bB = vb >= sB.mid ? 1 : 0;
+      bC = vc >= sC.mid ? 1 : 0;
+      prevState = (bA << 2) | (bB << 1) | bC;
+      stateStartTime = timeArr[i];
+      stateStartIdx = i;
+      hasActiveState = true;
+      segHasLeadingEdge = false;
+      continue;
+    }
+
+    const dt = timeArr[i] - timeArr[i - 1];
+    if (!(dt > 0) || (Number.isFinite(gapThresholdSec) && dt > gapThresholdSec)) {
+      gapBreakCount++;
+      bA = va >= sA.mid ? 1 : 0;
+      bB = vb >= sB.mid ? 1 : 0;
+      bC = vc >= sC.mid ? 1 : 0;
+      prevState = (bA << 2) | (bB << 1) | bC;
+      stateStartTime = timeArr[i];
+      stateStartIdx = i;
+      segHasLeadingEdge = false;
+      continue;
+    }
+
+    bA = getBit(va, bA, sA.mid, sA.hyst);
+    bB = getBit(vb, bB, sB.mid, sB.hyst);
+    bC = getBit(vc, bC, sC.mid, sC.hyst);
     const nextState = (bA << 2) | (bB << 1) | bC;
 
     if (nextState !== prevState) {
       const tTrans = 0.5 * (timeArr[i - 1] + timeArr[i]);
       const dur = tTrans - stateStartTime;
-      if (ringSet.has(prevState)) {
-        segments.push({ state: prevState, tStart: stateStartTime, tEnd: tTrans, dur, index: stateStartIdx });
+      if (segHasLeadingEdge && ringSet.has(prevState) && dur > 0) {
+        completeSegs.push({ state: prevState, tStart: stateStartTime, tEnd: tTrans, dur, index: stateStartIdx });
       }
       if (!ringSet.has(nextState)) {
         illegalStateCount++;
@@ -443,11 +487,16 @@ export function analyzeBldcHallCommutation(
       prevState = nextState;
       stateStartTime = tTrans;
       stateStartIdx = i;
+      segHasLeadingEdge = true;
     }
   }
 
-  // Drop incomplete leading segment (which begins at tArr[0] with no leading edge)
-  const completeSegs = segments.length > 0 ? segments.slice(1) : [];
+  if (gapBreakCount > 0) {
+    warnings.push(
+      `检测到 ${gapBreakCount} 处 Hall 信号采样缺口或无效点，已在缺口处分段重置换相状态机，不跨缺口统计扇区宽度或跳步。`
+    );
+  }
+
   if (completeSegs.length === 0) {
     return {
       ...empty,
@@ -456,6 +505,7 @@ export function analyzeBldcHallCommutation(
       illegalStateCount,
       sequenceJumpCount,
       events,
+      warnings,
     };
   }
 
@@ -464,7 +514,6 @@ export function analyzeBldcHallCommutation(
   const avgElecPeriod = avgSectorDur * 6;
   const avgElecFreqHz = avgElecPeriod > 1e-15 ? 1 / avgElecPeriod : null;
 
-  const hallTb = inspectTimebase(timeArr, 0, timeArr.length - 1, DEFAULT_SAMPLING_GAP_FACTOR);
   const dtStep = hallTb.dtMedian > 0 ? hallTb.dtMedian : (timeArr[timeArr.length - 1] - timeArr[0]) / Math.max(1, timeArr.length - 1);
   const sectorQuantErrDeg = avgSectorDur > 1e-15 && dtStep > 0 ? (dtStep / avgSectorDur) * 60 : 0;
   if (sectorQuantErrDeg > 1.5) {

@@ -543,7 +543,7 @@ test('Measure ME-01..ME-06: boundary linear interpolation and structured custom 
   assert.ok(meas.average !== null && Math.abs(meas.average - 15) < 1e-4);
 
   // evaluateCustomMeasurementDetailed exposes NO_OVERLAP, INSUFFICIENT_DATA, INVALID, EVAL_ERROR
-  const defOk = { id: 'c1', name: 'MeanSq', expression: 'mean(x^2)', unit: 'V^2' };
+  const defOk = { id: 'c1', label: 'MeanSq', shortLabel: 'MeanSq', expression: 'mean(x^2)', unitType: 'custom' as const, customUnit: 'V^2' };
   const noOv = evaluateCustomMeasurementDetailed(
     defOk,
     ch,
@@ -556,7 +556,7 @@ test('Measure ME-01..ME-06: boundary linear interpolation and structured custom 
   assert.equal(noOv.status, 'NO_OVERLAP');
 
   const badExpr = evaluateCustomMeasurementDetailed(
-    { id: 'c2', name: 'Bad', expression: 'unknownFunc(x)', unit: '' },
+    { id: 'c2', label: 'Bad', shortLabel: 'Bad', expression: 'unknownFunc(x)', unitType: 'ratio' as const },
     ch,
     meas,
     'entire',
@@ -653,5 +653,46 @@ test('Analyze AN-01..AN-12: Park angle guards, Hall pole validation, PWM gap res
   // AN-08: torque ripple helper still valid
   const tq = analyzeTorqueAndCurrentRipple(makeChannel('tq_ok', t, Float32Array.from(t, () => 1), 'A'), 50);
   assert.equal(tq.valid, true);
+});
+
+// 20. Hall Commutation AN-08: sampling gaps reset state machine without bridging sectors; NaN fails closed
+test('Hall AN-08: sampling gap resets state machine cleanly and NaN fails closed', () => {
+  const dt = 1e-4; // 10 kHz
+  const seg1Len = 300; // 0 .. 0.03s (3 electrical cycles @ 100 Hz)
+  const seg2Len = 300; // shifted across a 0.05s gap
+  const tGap = new Float64Array(seg1Len + seg2Len);
+  for (let i = 0; i < seg1Len; i++) tGap[i] = i * dt;
+  for (let i = 0; i < seg2Len; i++) tGap[seg1Len + i] = 0.08 + i * dt;
+
+  const mkSq = (phase: number) =>
+    Float32Array.from(tGap, (x) => (Math.sin(2 * Math.PI * 100 * x + phase) >= 0 ? 5 : 0));
+
+  const ha = mkSq(0);
+  const hb = mkSq(-(2 * Math.PI) / 3);
+  const hc = mkSq((2 * Math.PI) / 3);
+
+  const hallGap = analyzeBldcHallCommutation(
+    makeChannel('hg_a', tGap, ha, 'V'),
+    makeChannel('hg_b', tGap, hb, 'V'),
+    makeChannel('hg_c', tGap, hc, 'V'),
+    2
+  );
+  assert.equal(hallGap.valid, true);
+  assert.equal(hallGap.sequenceJumpCount, 0);
+  assert.ok(hallGap.avgElecFreqHz !== null && Math.abs(hallGap.avgElecFreqHz - 100) < 5, `Expected ~100 Hz, got ${hallGap.avgElecFreqHz}`);
+  assert.ok(hallGap.avgRpm !== null && Math.abs(hallGap.avgRpm - 3000) < 150, `Expected ~3000 RPM, got ${hallGap.avgRpm}`);
+  assert.ok(hallGap.maxSectorErrorDeg !== null && hallGap.maxSectorErrorDeg < 5, `Expected clean sectors, got ${hallGap.maxSectorErrorDeg}`);
+  assert.ok(hallGap.warnings.some((w) => w.includes('分段重置换相状态机')));
+
+  // NaN injected inside Hall channel fails closed
+  const haNan = Float32Array.from(ha);
+  haNan[420] = Number.NaN;
+  const hallNan = analyzeBldcHallCommutation(
+    makeChannel('hg_an', tGap, haNan, 'V'),
+    makeChannel('hg_b', tGap, hb, 'V'),
+    makeChannel('hg_c', tGap, hc, 'V'),
+    2
+  );
+  assert.equal(hallNan.valid, false);
 });
 

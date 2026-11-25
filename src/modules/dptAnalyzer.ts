@@ -8,7 +8,12 @@
 
 import { WaveformChannel } from '../types/models';
 import { parseSiUnitScale } from './thermalEngine';
-import { alignChannelsToCommonTimebase, inspectTimebase, sampleSeriesAtTime } from './timeSync';
+import {
+  alignChannelsToCommonTimebase,
+  DEFAULT_SAMPLING_GAP_FACTOR,
+  inspectTimebase,
+  sampleSeriesAtTime,
+} from './timeSync';
 import { computeChannelMean } from './oscilloscopeScale';
 import { analyzeSamplingQuality } from './qualityCheck';
 
@@ -277,15 +282,15 @@ export function analyzeDoublePulseTest(
     throw new Error(aligned.invalidReason || aligned.warnings[0] || 'DPT 通道时间轴无效或无重叠区间，已拒绝分析。');
   }
   const warnings: string[] = [...aligned.warnings];
-  const time = aligned.time;
-  const len = time.length;
+  let time = aligned.time;
+  let len = time.length;
   if (len < 20) {
     throw new Error('DPT 分析需要重叠时间窗内至少 20 个有效同步采样点。');
   }
 
-  const vgs = new Float32Array(len);
-  const vds = new Float32Array(len);
-  const ids = new Float32Array(len);
+  let vgs = new Float32Array(len);
+  let vds = new Float32Array(len);
+  let ids = new Float32Array(len);
 
   const deskewSec = (opts.idsDeskewNs || 0) * 1e-9;
   const mIds = idsCh.coupling === 'AC' ? computeChannelMean(idsCh) : 0;
@@ -294,17 +299,62 @@ export function analyzeDoublePulseTest(
     throw new Error(`Ids 通道时间轴非严格递增，无法应用 Deskew 插值。`);
   }
 
-  for (let k = 0; k < len; k++) {
-    vgs[k] = aligned.values[0][k] * vgsScale;
-    vds[k] = aligned.values[1][k] * vdsScale;
-    if (Math.abs(deskewSec) > 1e-15) {
-      const tQ = Math.max(idsCh.t[0], Math.min(idsCh.t[idsCh.t.length - 1], time[k] - deskewSec));
+  if (Math.abs(deskewSec) > 1e-15) {
+    const idsMinT = idsCh.t[0];
+    const idsMaxT = idsCh.t[idsCh.t.length - 1];
+    let kFirst = 0;
+    while (kFirst < len && time[kFirst] - deskewSec < idsMinT - 1e-15) kFirst++;
+    let kLast = len - 1;
+    while (kLast >= kFirst && time[kLast] - deskewSec > idsMaxT + 1e-15) kLast--;
+
+    const validCount = kLast >= kFirst ? kLast - kFirst + 1 : 0;
+    const trimmedPts = len - validCount;
+    const maxTrimPts = Math.max(4, Math.ceil(len * 0.05));
+    if (validCount < 20 || trimmedPts > maxTrimPts) {
+      throw new Error(
+        `Ids Deskew 偏移 (${(deskewSec * 1e9).toFixed(1)} ns) 超出 Ids 通道有效时间覆盖范围 (${trimmedPts}/${len} 点越界)，已拒绝首尾钳位或伪外推。`
+      );
+    }
+
+    if (trimmedPts > 0) {
+      warnings.push(
+        `Ids Deskew (${(deskewSec * 1e9).toFixed(1)} ns) 已裁去越界边缘 ${trimmedPts} 个采样点，拒绝首尾端点重复钳位。`
+      );
+      time = time.slice(kFirst, kLast + 1);
+      vgs = new Float32Array(validCount);
+      vds = new Float32Array(validCount);
+      ids = new Float32Array(validCount);
+    }
+
+    for (let k = 0; k < validCount; k++) {
+      const srcIdx = kFirst + k;
+      vgs[k] = aligned.values[0][srcIdx] * vgsScale;
+      vds[k] = aligned.values[1][srcIdx] * vdsScale;
+      const tQ = time[k] - deskewSec;
       const iv = sampleSeriesAtTime(idsCh.t, idsCh, tQ, mIds) * idsScale;
-      ids[k] = Number.isFinite(iv) ? iv : aligned.values[2][k] * idsScale;
-    } else {
+      ids[k] = Number.isFinite(iv) ? iv : Number.NaN;
+    }
+    len = validCount;
+  } else {
+    for (let k = 0; k < len; k++) {
+      vgs[k] = aligned.values[0][k] * vgsScale;
+      vds[k] = aligned.values[1][k] * vdsScale;
       ids[k] = aligned.values[2][k] * idsScale;
     }
   }
+
+  const syncTb = inspectTimebase(time, 0, len - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const gapThresholdSec = syncTb.gapThresholdSec;
+  const assertCleanWindow = (i0: number, i1: number, label: string) => {
+    for (let j = i0; j <= i1; j++) {
+      if (!Number.isFinite(vgs[j]) || !Number.isFinite(vds[j]) || !Number.isFinite(ids[j])) {
+        throw new Error(`${label}窗口内存在缺失值 (NaN/Inf)，已拒绝输出失真 DPT 开关能量与峰谷指标。`);
+      }
+      if (j > i0 && Number.isFinite(gapThresholdSec) && time[j] - time[j - 1] > gapThresholdSec) {
+        throw new Error(`${label}窗口内存在采样缺口 (Δt > ${gapThresholdSec.toExponential(2)} s)，已拒绝跨缺口积分开关能量。`);
+      }
+    }
+  };
 
   // Estimate Vgs low/high & Vds steady high using percentiles/histograms
   const sortedVgs = Array.from(vgs).filter(Number.isFinite).sort((a, b) => a - b);
@@ -333,6 +383,8 @@ export function analyzeDoublePulseTest(
   const risingEdges: number[] = [];
   const minEdgeSpacingPts = Math.max(4, Math.floor(len * 0.01));
   for (let i = 1; i < len; i++) {
+    if (!Number.isFinite(vgs[i - 1]) || !Number.isFinite(vgs[i])) continue;
+    if (Number.isFinite(gapThresholdSec) && time[i] - time[i - 1] > gapThresholdSec) continue;
     if (vgs[i - 1] >= vgsMid && vgs[i] < vgsMid) {
       if (fallingEdges.length === 0 || i - fallingEdges[fallingEdges.length - 1] > minEdgeSpacingPts) {
         fallingEdges.push(i);
@@ -349,9 +401,16 @@ export function analyzeDoublePulseTest(
   let bestTurnOffCurrent = -Infinity;
   for (const idx of fallingEdges) {
     const pre0 = Math.max(0, idx - Math.max(3, Math.floor(len * 0.02)));
-    let meanPreI = 0;
-    for (let j = pre0; j < idx; j++) meanPreI += ids[j];
-    meanPreI /= Math.max(1, idx - pre0);
+    let sumPre = 0;
+    let cntPre = 0;
+    for (let j = pre0; j < idx; j++) {
+      if (Number.isFinite(ids[j])) {
+        sumPre += ids[j];
+        cntPre++;
+      }
+    }
+    if (cntPre === 0) continue;
+    const meanPreI = sumPre / cntPre;
     if (meanPreI > bestTurnOffCurrent) {
       bestTurnOffCurrent = meanPreI;
       turnOffGateIdx = idx;
@@ -367,13 +426,18 @@ export function analyzeDoublePulseTest(
     }
   }
   if (turnOnGateIdx < 0 && risingEdges.length > 0) {
-    // Fallback: pick rising edge that actually has post-edge drain current > 10% max Ids
-    const maxI = Math.max(...Array.from(ids));
+    // Fallback: pick rising edge that actually has post-edge drain current > 15% max finite Ids
+    let maxI = -Infinity;
+    for (let j = 0; j < len; j++) {
+      if (Number.isFinite(ids[j]) && ids[j] > maxI) maxI = ids[j];
+    }
     for (const idx of risingEdges) {
       const post1 = Math.min(len - 1, idx + Math.max(6, Math.floor(len * 0.04)));
-      let peakPost = 0;
-      for (let j = idx; j <= post1; j++) if (ids[j] > peakPost) peakPost = ids[j];
-      if (peakPost > maxI * 0.15) {
+      let peakPost = -Infinity;
+      for (let j = idx; j <= post1; j++) {
+        if (Number.isFinite(ids[j]) && ids[j] > peakPost) peakPost = ids[j];
+      }
+      if (Number.isFinite(maxI) && peakPost > maxI * 0.15) {
         turnOnGateIdx = idx;
         break;
       }
@@ -434,6 +498,7 @@ export function analyzeDoublePulseTest(
     let eEnd = v90Idx;
     while (eEnd < w1 && ids[eEnd] > 0.02 * iRefOff) eEnd++;
     eEnd = Math.min(w1, Math.max(eStart + 2, eEnd + 1));
+    assertCleanWindow(eStart, eEnd, '关断瞬态 (Turn-Off)');
 
     let eJ = 0;
     for (let j = eStart + 1; j <= eEnd; j++) {
@@ -443,6 +508,9 @@ export function analyzeDoublePulseTest(
       eJ += 0.5 * (p0 + p1) * dt;
     }
     eOffUj = Math.max(0, eJ * 1e6);
+    if (!Number.isFinite(eOffUj)) {
+      throw new Error('关断瞬态积分结果非有限值，已拒绝输出 E_off。');
+    }
 
     let pkIdx = eStart;
     vdsPeakV = vds[eStart];
@@ -520,6 +588,7 @@ export function analyzeDoublePulseTest(
     let eEnd = eStart;
     while (eEnd < w1 && vds[eEnd] > 0.02 * vBusSteadyV) eEnd++;
     eEnd = Math.min(w1, Math.max(eStart + 2, eEnd + 1));
+    assertCleanWindow(eStart, eEnd, '开通瞬态 (Turn-On)');
 
     let eJ = 0;
     for (let j = eStart + 1; j <= eEnd; j++) {
@@ -529,12 +598,15 @@ export function analyzeDoublePulseTest(
       eJ += 0.5 * (p0 + p1) * dt;
     }
     eOnUj = Math.max(0, eJ * 1e6);
+    if (!Number.isFinite(eOnUj)) {
+      throw new Error('开通瞬态积分结果非有限值，已拒绝输出 E_on。');
+    }
 
     // Reverse recovery detection: region where Ids > iRefOn around turn-on peak
     let peakIdx = eStart;
     let iPeakOn = ids[eStart];
     for (let j = eStart; j <= w1; j++) {
-      if (ids[j] > iPeakOn) {
+      if (Number.isFinite(ids[j]) && ids[j] > iPeakOn) {
         iPeakOn = ids[j];
         peakIdx = j;
       }
@@ -545,6 +617,7 @@ export function analyzeDoublePulseTest(
       while (rrStart > eStart && ids[rrStart] > iRefOn) rrStart--;
       let rrEnd = peakIdx;
       while (rrEnd < w1 && ids[rrEnd] > iRefOn) rrEnd++;
+      assertCleanWindow(rrStart, rrEnd, '反向恢复 (Reverse Recovery)');
 
       let qC = 0;
       let eRecJ = 0;

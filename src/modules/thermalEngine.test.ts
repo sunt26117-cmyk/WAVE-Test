@@ -1768,4 +1768,44 @@ test('MOS Thermal MT-03..MT-05: DPT LUT extrapolation/0A-rolloff and FOC 6-MOS L
   assert.ok(simLut.warnings.some((w) => w.includes('DPT 查找表')));
 });
 
+test('MT-06: DPT analyzer trims bounded deskew without clamping, rejects excessive deskew, and fails closed on edge NaNs/gaps', () => {
+  const demo = generateDptDemoChannels();
 
+  // 1. Bounded small deskew (10 ns = 5 pts <= 5% of 2000 pts) trims edges with disclosure rather than clamping endpoints
+  const smallDeskew = analyzeDoublePulseTest(demo.vgsCh, demo.vdsCh, demo.idsCh, { idsDeskewNs: 10 });
+  assert.equal(smallDeskew.valid, true);
+  assert.ok(smallDeskew.warnings.some((w) => w.includes('拒绝首尾端点重复钳位')));
+  assert.ok(Number.isFinite(smallDeskew.eOffUj) && Number.isFinite(smallDeskew.eOnUj));
+
+  // 2. Excessive deskew (500 ns = 250/2000 pts > 5%) rejects endpoint extrapolation
+  assert.throws(
+    () => analyzeDoublePulseTest(demo.vgsCh, demo.vdsCh, demo.idsCh, { idsDeskewNs: 500 }),
+    /拒绝首尾钳位或伪外推/
+  );
+
+  // 3. NaN inside Turn-Off window must fail closed even with non-zero deskew (no fallback to undeskewed samples)
+  const baseRes = analyzeDoublePulseTest(demo.vgsCh, demo.vdsCh, demo.idsCh);
+  assert.ok(baseRes.offWindow !== null);
+  const midOffIdx = Math.floor(0.5 * (baseRes.offWindow!.tStartIdx + baseRes.offWindow!.tEndIdx));
+  const idsNanArr = Float32Array.from(demo.idsCh.v);
+  idsNanArr[midOffIdx] = Number.NaN;
+  const idsNanCh = { ...demo.idsCh, v: idsNanArr };
+  assert.throws(
+    () => analyzeDoublePulseTest(demo.vgsCh, demo.vdsCh, idsNanCh, { idsDeskewNs: 2 }),
+    /NaN\/Inf|缺失值/
+  );
+
+  // 4. Sampling gap inside Turn-Off switching window must fail closed instead of integrating across gap
+  const nGap = demo.vgsCh.t.length;
+  const gappedT = Float64Array.from(demo.vgsCh.t, (tv, idx) => (idx >= midOffIdx ? tv + 2e-6 : tv));
+  assert.throws(
+    () =>
+      analyzeDoublePulseTest(
+        { ...demo.vgsCh, t: gappedT },
+        { ...demo.vdsCh, t: gappedT },
+        { ...demo.idsCh, t: gappedT }
+      ),
+    /采样缺口/
+  );
+  assert.equal(nGap, 2000);
+});

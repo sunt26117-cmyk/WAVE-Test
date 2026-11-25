@@ -3884,12 +3884,12 @@ export class OscilloscopeApp {
 
       this.renderSidebar();
       this.draw();
-      const extraWarn = [unitInfo.normalizedNote, ...synced.warnings].filter(Boolean)[0];
+      const extraWarn = Array.from(new Set([unitInfo.normalizedNote, ...synced.warnings].filter(Boolean))).join(' | ');
       this.showToast(
         extraWarn
           ? `Generated Clarke α/β (${extraWarn})`
           : 'Generated Clarke α and β channels.',
-        synced.resampled || unitInfo.normalizedNote ? 'warn' : 'info'
+        synced.resampled || unitInfo.normalizedNote || synced.warnings.length > 0 ? 'warn' : 'info'
       );
     } catch (err: any) {
       this.showToast(`Clarke Transform Failed: ${err.message}`, 'error');
@@ -3990,7 +3990,7 @@ export class OscilloscopeApp {
       this.cachedSpectrumKey = '';
       this.renderSidebar();
       this.draw();
-      const topWarn = parkRes.warnings[0];
+      const topWarn = Array.from(new Set(parkRes.warnings.filter(Boolean))).join(' | ');
       this.showToast(
         topWarn ? `Generated Park (${topWarn})` : 'Generated Park d and q channels.',
         parkRes.warnings.length > 0 || parkRes.resampled ? 'warn' : 'info'
