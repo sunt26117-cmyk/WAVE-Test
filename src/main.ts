@@ -2427,12 +2427,15 @@ function syncWaveformEditModalState(tab: TabState) {
     if (!gEval || tab.goldenBand?.channelId !== ch.id) {
       gReadout.innerText = 'Disabled';
       gReadout.className = 'font-mono text-[11px] text-slate-400 tabular-nums';
-    } else if (gEval.pass) {
-      gReadout.innerText = `PASS (Max dev ${formatEng(gEval.maxDeviation, ch.unit, 2)})`;
+    } else if (gEval.status === 'PASS') {
+      gReadout.innerText = `PASS (Max dev ${formatEng(gEval.maxDeviation, ch.unit, 2)} · Cov ${gEval.coveragePct.toFixed(0)}%)`;
       gReadout.className = 'font-mono text-[11px] text-emerald-400 font-semibold tabular-nums';
-    } else {
-      gReadout.innerText = `FAIL · ${gEval.violationCount} pts out (Max ${formatEng(gEval.maxDeviation, ch.unit, 2)})`;
+    } else if (gEval.status === 'FAIL') {
+      gReadout.innerText = `FAIL · ${gEval.violationCount} pts out (Max ${formatEng(gEval.maxDeviation, ch.unit, 2)} · Cov ${gEval.coveragePct.toFixed(0)}%)`;
       gReadout.className = 'font-mono text-[11px] text-red-400 font-semibold tabular-nums';
+    } else {
+      gReadout.innerText = `${gEval.status} · Cov ${gEval.coveragePct.toFixed(0)}%${gEval.invalidReason ? ` (${gEval.invalidReason})` : ''}`;
+      gReadout.className = 'font-mono text-[11px] text-amber-300 font-semibold tabular-nums';
     }
   }
 
@@ -3107,15 +3110,24 @@ function recomputeComparePanel(tab: TabState) {
       aligned.targetMeanApplied,
       aligned.refMeanApplied
     );
-    const metrics = computeWaveformCompareMetrics(targetCh, aligned.alignedRefV, removeDc);
+    const metrics = computeWaveformCompareMetrics(targetCh, aligned.alignedRefV, removeDc, aligned);
     const golden = evaluateGoldenTolerance(targetCh, {
       enabled: true,
       channelId: targetCh.id,
       mode: tolMode,
       tolerance: tolLimit,
+      refT: targetCh.t,
       refV: aligned.alignedRefV,
+      refUnit: targetCh.unit,
       refLabel: entry.label,
     });
+    const cmpValid = aligned.valid && metrics.valid;
+    const cmpStatus = !aligned.valid
+      ? aligned.status
+      : !metrics.valid
+      ? metrics.status
+      : golden.status;
+    const cmpReason = aligned.invalidReason || metrics.invalidReason || golden.invalidReason;
 
     entry.computed = {
       alignedRefV: aligned.alignedRefV,
@@ -3177,19 +3189,31 @@ function recomputeComparePanel(tab: TabState) {
         </div>
       </td>
       <td class="p-1.5 text-right">
-        <div class="text-cyan-300 font-semibold">${metrics.similarityPct !== null ? metrics.similarityPct.toFixed(1) + '%' : '--'}</div>
-        <div class="text-[10px] text-slate-400">r=${metrics.correlation !== null ? metrics.correlation.toFixed(3) : '--'}</div>
+        <div class="text-cyan-300 font-semibold">${cmpValid && metrics.similarityPct !== null ? metrics.similarityPct.toFixed(1) + '%' : '--'}</div>
+        <div class="text-[10px] text-slate-400">${cmpValid && metrics.correlation !== null ? `r=${metrics.correlation.toFixed(3)}` : `Cov ${metrics.coveragePct.toFixed(0)}%`}</div>
       </td>
       <td class="p-1.5 text-right">
-        <div>${fmt(metrics.rmse, u)}</div>
-        <div class="text-[10px] text-slate-400">${fmt(metrics.mae, u)}</div>
+        <div>${cmpValid ? fmt(metrics.rmse, u) : '--'}</div>
+        <div class="text-[10px] text-slate-400">${cmpValid ? fmt(metrics.mae, u) : '--'}</div>
       </td>
       <td class="p-1.5 text-right">
-        <div class="text-amber-300">${fmt(metrics.maxAbsDiff, u)}</div>
-        <div class="text-[10px] text-slate-400">@${fmt(metrics.maxAbsDiffTime, 's')}</div>
+        <div class="text-amber-300">${cmpValid ? fmt(metrics.maxAbsDiff, u) : '--'}</div>
+        <div class="text-[10px] text-slate-400">${cmpValid ? `@${fmt(metrics.maxAbsDiffTime, 's')}` : '--'}</div>
       </td>
-      <td class="p-1.5 text-center">
-        <span class="font-semibold ${golden.pass ? 'text-emerald-400' : 'text-red-400'}">${golden.pass ? 'PASS' : `FAIL(${golden.violationCount})`}</span>
+      <td class="p-1.5 text-center" title="${escapeHtml(cmpReason || '')}">
+        <span class="font-semibold ${
+          cmpValid && golden.status === 'PASS'
+            ? 'text-emerald-400'
+            : !cmpValid || cmpStatus === 'INVALID' || cmpStatus === 'INSUFFICIENT_DATA'
+            ? 'text-amber-300'
+            : 'text-red-400'
+        }">${
+          cmpValid && golden.status === 'PASS'
+            ? 'PASS'
+            : cmpValid && golden.status === 'FAIL'
+            ? `FAIL(${golden.violationCount})`
+            : cmpStatus
+        }</span>
       </td>
       <td class="p-1.5 text-right whitespace-nowrap">
         <button type="button" class="cmp-row-jump px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-amber-600/50 text-amber-300 rounded-xs cursor-pointer mr-1" title="Jump to Max |Δ|">Jump</button>
@@ -3512,7 +3536,8 @@ function renderBldcHall(tab: TabState) {
   const aId = (document.getElementById('bldcHallASelect') as HTMLSelectElement)?.value;
   const bId = (document.getElementById('bldcHallBSelect') as HTMLSelectElement)?.value;
   const cId = (document.getElementById('bldcHallCSelect') as HTMLSelectElement)?.value;
-  const poles = parseInt((document.getElementById('bldcHallPolesInput') as HTMLInputElement)?.value || '4', 10) || 4;
+  const rawPolesStr = ((document.getElementById('bldcHallPolesInput') as HTMLInputElement)?.value ?? '').trim();
+  const poles = rawPolesStr === '' ? Number.NaN : Number(rawPolesStr);
   const presetVal = (document.getElementById('bldcHallSeqPresetSelect') as HTMLSelectElement)?.value || 'std_120';
   const customSeqRaw = (document.getElementById('bldcHallCustomSeqInput') as HTMLInputElement)?.value || '';
   const offsetDeg = parseFloat((document.getElementById('bldcHallOffsetInput') as HTMLInputElement)?.value || '0') || 0;

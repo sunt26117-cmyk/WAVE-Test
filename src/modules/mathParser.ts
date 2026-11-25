@@ -5,6 +5,15 @@
  */
 
 import { WaveformChannel } from '../types/models';
+import {
+  areTimebasesSynchronized,
+  inspectTimebase,
+  parsePhysicalUnit,
+  sampleSeriesAtTimeStrict,
+  validateChannelIntegrity,
+  DEFAULT_SAMPLING_GAP_FACTOR,
+} from './timeSync';
+import { analyzeSamplingQuality } from './qualityCheck';
 
 export interface Token {
   type: 'number' | 'identifier' | 'operator' | 'function' | 'lparen' | 'rparen' | 'comma';
@@ -17,9 +26,9 @@ const OPERATOR_PRECEDENCE: Record<string, number> = {
   '-': 1,
   '*': 2,
   '/': 2,
+  'unary-': 2.5,
+  'unary+': 2.5,
   '^': 3,
-  'unary-': 4,
-  'unary+': 4,
 };
 
 const RIGHT_ASSOCIATIVE: Record<string, boolean> = {
@@ -220,18 +229,22 @@ export function toRPN(tokens: Token[]): Token[] {
       const o1 = token.value;
       const p1 = OPERATOR_PRECEDENCE[o1] || 0;
       const isRightAssoc = !!RIGHT_ASSOCIATIVE[o1];
+      const isPrefixUnary = o1 === 'unary-' || o1 === 'unary+';
 
-      while (operatorStack.length > 0) {
-        const top = operatorStack[operatorStack.length - 1];
-        if (top.type === 'operator') {
-          const o2 = top.value;
-          const p2 = OPERATOR_PRECEDENCE[o2] || 0;
-          if ((!isRightAssoc && p1 <= p2) || (isRightAssoc && p1 < p2)) {
-            output.push(operatorStack.pop()!);
-            continue;
+      // Prefix unary operators bind to the right operand and never pop preceding operators (e.g. 2^-2).
+      if (!isPrefixUnary) {
+        while (operatorStack.length > 0) {
+          const top = operatorStack[operatorStack.length - 1];
+          if (top.type === 'operator') {
+            const o2 = top.value;
+            const p2 = OPERATOR_PRECEDENCE[o2] || 0;
+            if ((!isRightAssoc && p1 <= p2) || (isRightAssoc && p1 < p2)) {
+              output.push(operatorStack.pop()!);
+              continue;
+            }
           }
+          break;
         }
-        break;
       }
       operatorStack.push(token);
     } else if (token.type === 'lparen') {
@@ -268,7 +281,50 @@ export function toRPN(tokens: Token[]): Token[] {
   return output;
 }
 
-type OperandValue = { isScalar: true; val: number } | { isScalar: false; val: Float32Array };
+type OperandValue =
+  | { isScalar: true; val: number; unit: string }
+  | { isScalar: false; val: Float32Array; unit: string };
+
+/**
+ * Resamples a channel onto masterT via strict binary-search linear interpolation whenever timebases differ.
+ * Rejects mismatched t/v arrays and non-monotonic timestamps; never bridges NaNs or sampling gaps.
+ */
+function sampleChannelOntoTimebase(
+  ch: WaveformChannel,
+  masterT: Float64Array | undefined,
+  sampleCount: number
+): Float32Array {
+  const integrity = validateChannelIntegrity(ch, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!integrity.valid) {
+    throw new Error(integrity.invalidReason || `Channel "${ch.name}" failed time-series integrity check.`);
+  }
+
+  const srcT = ch.t;
+  const srcV = ch.v;
+  if (!masterT || masterT.length === 0) return srcV;
+
+  // Fast path ONLY when identical reference OR full element-wise synchronized timebase
+  if (srcT === masterT && srcV.length === sampleCount) {
+    return srcV;
+  }
+  if (srcT.length === sampleCount && masterT.length === sampleCount && areTimebasesSynchronized(srcT, masterT)) {
+    return srcV;
+  }
+
+  // Evaluate raw channel values without coupling/inversion side-effects unless already baked in
+  const rawViewCh: WaveformChannel =
+    ch.coupling === 'AC' || ch.inverted
+      ? { ...ch, coupling: 'DC', inverted: false }
+      : ch;
+
+  const gapLimit = integrity.timebase.gapThresholdSec;
+  const out = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    const qt = masterT[i];
+    out[i] = sampleSeriesAtTimeStrict(srcT, rawViewCh, qt, 0, gapLimit).value;
+  }
+  return out;
+}
 
 function resolveChannelByIdentifier(
   rawName: string,
@@ -335,76 +391,6 @@ function resolveChannelByIdentifier(
   return targetChannel;
 }
 
-/**
- * Resamples a channel onto masterT via binary-search linear interpolation whenever timebases differ.
- */
-function sampleChannelOntoTimebase(
-  ch: WaveformChannel,
-  masterT: Float64Array | undefined,
-  sampleCount: number
-): Float32Array {
-  if (!masterT || masterT.length === 0) return ch.v;
-  const srcT = ch.t;
-  const srcV = ch.v;
-  const srcN = Math.min(srcT ? srcT.length : 0, srcV ? srcV.length : 0);
-  if (srcN === 0) {
-    const empty = new Float32Array(sampleCount);
-    empty.fill(NaN);
-    return empty;
-  }
-
-  // Fast path: identical timebase reference or identical grid bounds and uniform sampling
-  if (srcT === masterT && srcV.length >= sampleCount) {
-    return srcV;
-  }
-  if (
-    srcN === sampleCount &&
-    masterT.length === sampleCount &&
-    Math.abs(srcT[0] - masterT[0]) <= 1e-15 &&
-    Math.abs(srcT[srcN - 1] - masterT[sampleCount - 1]) <= 1e-15 &&
-    ch.metadata?.isUniformSampling !== false
-  ) {
-    return srcV;
-  }
-
-  const out = new Float32Array(sampleCount);
-  const tMin = srcT[0];
-  const tMax = srcT[srcN - 1];
-
-  for (let i = 0; i < sampleCount; i++) {
-    const qt = masterT[i];
-    if (!isFinite(qt) || qt < tMin || qt > tMax) {
-      out[i] = NaN;
-      continue;
-    }
-    if (srcN === 1) {
-      out[i] = srcV[0];
-      continue;
-    }
-    let lo = 0;
-    let hi = srcN - 1;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (srcT[mid] <= qt) lo = mid;
-      else hi = mid;
-    }
-    const v0 = srcV[lo];
-    const v1 = srcV[hi];
-    if (!isFinite(v0) && !isFinite(v1)) {
-      out[i] = NaN;
-    } else if (!isFinite(v0)) {
-      out[i] = v1;
-    } else if (!isFinite(v1)) {
-      out[i] = v0;
-    } else {
-      const span = srcT[hi] - srcT[lo];
-      const frac = span > 1e-18 ? (qt - srcT[lo]) / span : 0;
-      out[i] = v0 + frac * (v1 - v0);
-    }
-  }
-  return out;
-}
-
 function safeDiv(a: number, b: number): number {
   if (!isFinite(a) || !isFinite(b) || b === 0) return NaN;
   const r = a / b;
@@ -421,6 +407,157 @@ function safeSqrt(v: number): number {
   return Math.sqrt(v);
 }
 
+function formatExponentUnit(baseUnit: string, exp: number): string {
+  if (!baseUnit) return '';
+  if (Math.abs(exp) <= 1e-12) return '';
+  if (Math.abs(exp - 1) <= 1e-12) return baseUnit;
+  if (Math.abs(exp - 2) <= 1e-12) return `${baseUnit}²`;
+  const rounded = Number(exp.toPrecision(4));
+  return `${baseUnit}^${rounded}`;
+}
+
+function parseUnitExponent(u: string): { base: string; power: number } {
+  const clean = (u || '').trim();
+  if (!clean) return { base: '', power: 1 };
+  if (clean.endsWith('²')) {
+    return { base: clean.slice(0, -1), power: 2 };
+  }
+  const match = clean.match(/^(.+?)\^(-?\d+(?:\.\d+)?)$/);
+  if (match) {
+    const p = Number(match[2]);
+    if (Number.isFinite(p)) {
+      return { base: match[1], power: p };
+    }
+  }
+  return { base: clean, power: 1 };
+}
+
+function resolveSqrtUnit(u: string): string {
+  const clean = (u || '').trim();
+  if (!clean) return '';
+  const parsed = parseUnitExponent(clean);
+  if (parsed.base) {
+    return formatExponentUnit(parsed.base, parsed.power * 0.5);
+  }
+  return '';
+}
+
+function resolveTrigArgument(u: string, fnName: string): { scale: number; outUnit: string } {
+  const clean = (u || '').trim();
+  if (!clean || clean === '1' || clean.toLowerCase() === 'pu') {
+    return { scale: 1, outUnit: '' };
+  }
+  const lower = clean.toLowerCase();
+  const parsed = parsePhysicalUnit(clean);
+  if (lower === 'rad' || parsed?.domain === 'angle_rad') {
+    return { scale: 1, outUnit: '' };
+  }
+  if (lower === 'deg' || clean === '°' || parsed?.domain === 'angle_deg') {
+    return { scale: Math.PI / 180, outUnit: '' };
+  }
+  throw new Error(
+    `三角函数 ${fnName}(...) 仅支持无量纲或角度单位 (rad/deg)，禁止对 "${clean}" 执行计算。`
+  );
+}
+
+function resolveBinaryUnitOperation(
+  uA: string,
+  uB: string,
+  op: '+' | '-' | '*' | '/' | '^',
+  scalarExpHint?: number
+): { scaleA: number; scaleB: number; outUnit: string } {
+  const cleanA = (uA || '').trim();
+  const cleanB = (uB || '').trim();
+  const pA = parsePhysicalUnit(cleanA);
+  const pB = parsePhysicalUnit(cleanB);
+
+  if (op === '+' || op === '-') {
+    if (cleanA && cleanB) {
+      if (pA && pB) {
+        if (pA.domain !== pB.domain) {
+          throw new Error(
+            `跨量纲运算禁止执行："${cleanA}" (${pA.domain}) ${op} "${cleanB}" (${pB.domain}) 物理量纲不兼容。`
+          );
+        }
+        if (cleanA === cleanB || Math.abs(pA.scale - pB.scale) <= 1e-12) {
+          return { scaleA: 1, scaleB: 1, outUnit: cleanA };
+        }
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: pA.baseUnit };
+      }
+      if (cleanA.toLowerCase() !== cleanB.toLowerCase()) {
+        throw new Error(`跨量纲运算禁止执行："${cleanA}" ${op} "${cleanB}" 单位不兼容。`);
+      }
+      return { scaleA: 1, scaleB: 1, outUnit: cleanA };
+    }
+    return { scaleA: 1, scaleB: 1, outUnit: cleanA || cleanB };
+  }
+
+  if (op === '*') {
+    if (!cleanA) return { scaleA: 1, scaleB: 1, outUnit: cleanB };
+    if (!cleanB) return { scaleA: 1, scaleB: 1, outUnit: cleanA };
+    if (pA && pB) {
+      if (
+        (pA.domain === 'voltage' && pB.domain === 'current') ||
+        (pA.domain === 'current' && pB.domain === 'voltage')
+      ) {
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: 'W' };
+      }
+      if (
+        (pA.domain === 'power' && pB.domain === 'time') ||
+        (pA.domain === 'time' && pB.domain === 'power')
+      ) {
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: 'J' };
+      }
+      if (pA.domain === pB.domain) {
+        if (cleanA === cleanB) return { scaleA: 1, scaleB: 1, outUnit: `${cleanA}²` };
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: `${pA.baseUnit}²` };
+      }
+    }
+    return { scaleA: 1, scaleB: 1, outUnit: `${cleanA}·${cleanB}` };
+  }
+
+  if (op === '/') {
+    if (!cleanB) return { scaleA: 1, scaleB: 1, outUnit: cleanA };
+    if (!cleanA) return { scaleA: 1, scaleB: 1, outUnit: `1/${cleanB}` };
+    if (pA && pB) {
+      if (pA.domain === pB.domain) {
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: '' };
+      }
+      if (pA.domain === 'voltage' && pB.domain === 'current') {
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: 'Ω' };
+      }
+      if (pA.domain === 'power' && pB.domain === 'voltage') {
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: 'A' };
+      }
+      if (pA.domain === 'power' && pB.domain === 'current') {
+        return { scaleA: pA.scale, scaleB: pB.scale, outUnit: 'V' };
+      }
+    }
+    if (cleanA === cleanB) return { scaleA: 1, scaleB: 1, outUnit: '' };
+    return { scaleA: 1, scaleB: 1, outUnit: `${cleanA}/${cleanB}` };
+  }
+
+  if (op === '^') {
+    if (cleanB && cleanB !== '1' && cleanB.toLowerCase() !== 'pu') {
+      throw new Error(`幂运算指数必须无量纲，禁止使用物理单位 "${cleanB}" 作为指数。`);
+    }
+    if (!cleanA) {
+      return { scaleA: 1, scaleB: 1, outUnit: '' };
+    }
+    if (scalarExpHint !== undefined && Number.isFinite(scalarExpHint)) {
+      const parsed = parseUnitExponent(cleanA);
+      return {
+        scaleA: 1,
+        scaleB: 1,
+        outUnit: formatExponentUnit(parsed.base, parsed.power * scalarExpHint),
+      };
+    }
+    return { scaleA: 1, scaleB: 1, outUnit: `${cleanA}^n` };
+  }
+
+  return { scaleA: 1, scaleB: 1, outUnit: '' };
+}
+
 /**
  * Evaluates RPN tokens with channel data (and optional scalar variable overrides).
  */
@@ -433,18 +570,29 @@ export function evaluateRPN(
   baseTimeArray?: Float64Array,
   scalarVariables?: Record<string, number>
 ): Float32Array {
+  const baseTb =
+    baseTimeArray && baseTimeArray.length > 0
+      ? inspectTimebase(baseTimeArray, 0, baseTimeArray.length - 1, DEFAULT_SAMPLING_GAP_FACTOR)
+      : null;
+  if (baseTb && !baseTb.monotonic) {
+    throw new Error(
+      `基准时间轴在索引 ${baseTb.nonMonotonicIndex ?? '?'} 处存在非单调、重复或 NaN/Inf 时间戳，已阻止 Math 运算。`
+    );
+  }
+  const baseGapLimit = baseTb ? baseTb.gapThresholdSec : Infinity;
+
   const stack: OperandValue[] = [];
 
   for (const token of rpn) {
     if (token.type === 'number') {
-      stack.push({ isScalar: true, val: token.numValue! });
+      stack.push({ isScalar: true, val: token.numValue!, unit: '' });
       continue;
     }
 
     if (token.type === 'identifier') {
       const rawName = token.value;
       if (scalarVariables && Object.prototype.hasOwnProperty.call(scalarVariables, rawName.toLowerCase())) {
-        stack.push({ isScalar: true, val: scalarVariables[rawName.toLowerCase()] });
+        stack.push({ isScalar: true, val: scalarVariables[rawName.toLowerCase()], unit: '' });
         continue;
       }
 
@@ -459,7 +607,7 @@ export function evaluateRPN(
       }
 
       const alignedV = sampleChannelOntoTimebase(targetChannel, baseTimeArray, sampleCount);
-      stack.push({ isScalar: false, val: alignedV });
+      stack.push({ isScalar: false, val: alignedV, unit: (targetChannel.unit || '').trim() });
       continue;
     }
 
@@ -469,13 +617,13 @@ export function evaluateRPN(
         if (!a) throw new Error(`Invalid syntax: missing operand for "${token.value}"`);
         const sign = token.value === 'unary-' ? -1 : 1;
         if (a.isScalar) {
-          stack.push({ isScalar: true, val: sign * a.val });
+          stack.push({ isScalar: true, val: sign * a.val, unit: a.unit });
         } else if (sign === 1) {
           stack.push(a);
         } else {
           const res = new Float32Array(sampleCount);
           for (let i = 0; i < sampleCount; i++) res[i] = -a.val[i];
-          stack.push({ isScalar: false, val: res });
+          stack.push({ isScalar: false, val: res, unit: a.unit });
         }
         continue;
       }
@@ -486,55 +634,60 @@ export function evaluateRPN(
         throw new Error(`Invalid syntax: missing operand for operator "${token.value}"`);
       }
 
-      const op = token.value;
+      const op = token.value as '+' | '-' | '*' | '/' | '^';
+      const scalarExpHint = op === '^' && b.isScalar ? b.val : undefined;
+      const { scaleA, scaleB, outUnit } = resolveBinaryUnitOperation(a.unit, b.unit, op, scalarExpHint);
+
       if (a.isScalar && b.isScalar) {
+        const sA = a.val * scaleA;
+        const sB = b.val * scaleB;
         let r = NaN;
-        if (op === '+') r = a.val + b.val;
-        else if (op === '-') r = a.val - b.val;
-        else if (op === '*') r = a.val * b.val;
-        else if (op === '/') r = safeDiv(a.val, b.val);
-        else if (op === '^') r = safePow(a.val, b.val);
-        stack.push({ isScalar: true, val: r });
+        if (op === '+') r = sA + sB;
+        else if (op === '-') r = sA - sB;
+        else if (op === '*') r = sA * sB;
+        else if (op === '/') r = safeDiv(sA, sB);
+        else if (op === '^') r = safePow(sA, sB);
+        stack.push({ isScalar: true, val: r, unit: outUnit });
       } else if (a.isScalar && !b.isScalar) {
-        const s = a.val;
+        const s = a.val * scaleA;
         const arr = b.val;
         const res = new Float32Array(sampleCount);
         for (let i = 0; i < sampleCount; i++) {
-          const v = arr[i];
+          const v = arr[i] * scaleB;
           if (op === '+') res[i] = s + v;
           else if (op === '-') res[i] = s - v;
           else if (op === '*') res[i] = s * v;
           else if (op === '/') res[i] = safeDiv(s, v);
           else if (op === '^') res[i] = safePow(s, v);
         }
-        stack.push({ isScalar: false, val: res });
+        stack.push({ isScalar: false, val: res, unit: outUnit });
       } else if (!a.isScalar && b.isScalar) {
         const arr = a.val;
-        const s = b.val;
+        const s = b.val * scaleB;
         const res = new Float32Array(sampleCount);
         for (let i = 0; i < sampleCount; i++) {
-          const v = arr[i];
+          const v = arr[i] * scaleA;
           if (op === '+') res[i] = v + s;
           else if (op === '-') res[i] = v - s;
           else if (op === '*') res[i] = v * s;
           else if (op === '/') res[i] = safeDiv(v, s);
           else if (op === '^') res[i] = safePow(v, s);
         }
-        stack.push({ isScalar: false, val: res });
+        stack.push({ isScalar: false, val: res, unit: outUnit });
       } else if (!a.isScalar && !b.isScalar) {
         const arrA = a.val as Float32Array;
         const arrB = b.val as Float32Array;
         const res = new Float32Array(sampleCount);
         for (let i = 0; i < sampleCount; i++) {
-          const vA = arrA[i];
-          const vB = arrB[i];
+          const vA = arrA[i] * scaleA;
+          const vB = arrB[i] * scaleB;
           if (op === '+') res[i] = vA + vB;
           else if (op === '-') res[i] = vA - vB;
           else if (op === '*') res[i] = vA * vB;
           else if (op === '/') res[i] = safeDiv(vA, vB);
           else if (op === '^') res[i] = safePow(vA, vB);
         }
-        stack.push({ isScalar: false, val: res });
+        stack.push({ isScalar: false, val: res, unit: outUnit });
       }
       continue;
     }
@@ -545,26 +698,36 @@ export function evaluateRPN(
       if (!arg) throw new Error(`Missing argument for function "${fn}"`);
 
       if (fn === 'abs' || fn === 'sqrt' || fn === 'sin' || fn === 'cos' || fn === 'tan') {
+        let argScale = 1;
+        let outUnit = arg.unit;
+        if (fn === 'sin' || fn === 'cos' || fn === 'tan') {
+          const trig = resolveTrigArgument(arg.unit, fn);
+          argScale = trig.scale;
+          outUnit = trig.outUnit;
+        } else if (fn === 'sqrt') {
+          outUnit = resolveSqrtUnit(arg.unit);
+        }
         if (arg.isScalar) {
           let r = NaN;
-          if (fn === 'abs') r = Math.abs(arg.val);
-          else if (fn === 'sqrt') r = safeSqrt(arg.val);
-          else if (fn === 'sin') r = Math.sin(arg.val);
-          else if (fn === 'cos') r = Math.cos(arg.val);
-          else if (fn === 'tan') r = Math.tan(arg.val);
-          stack.push({ isScalar: true, val: r });
+          const v = arg.val * argScale;
+          if (fn === 'abs') r = Math.abs(v);
+          else if (fn === 'sqrt') r = safeSqrt(v);
+          else if (fn === 'sin') r = Math.sin(v);
+          else if (fn === 'cos') r = Math.cos(v);
+          else if (fn === 'tan') r = Math.tan(v);
+          stack.push({ isScalar: true, val: r, unit: outUnit });
         } else {
           const res = new Float32Array(sampleCount);
           const src = arg.val;
           for (let i = 0; i < sampleCount; i++) {
-            const v = src[i];
+            const v = src[i] * argScale;
             if (fn === 'abs') res[i] = Math.abs(v);
             else if (fn === 'sqrt') res[i] = safeSqrt(v);
             else if (fn === 'sin') res[i] = Math.sin(v);
             else if (fn === 'cos') res[i] = Math.cos(v);
             else if (fn === 'tan') res[i] = Math.tan(v);
           }
-          stack.push({ isScalar: false, val: res });
+          stack.push({ isScalar: false, val: res, unit: outUnit });
         }
       } else if (fn === 'mean' || fn === 'rms' || fn === 'min' || fn === 'max') {
         let scalar = NaN;
@@ -572,26 +735,71 @@ export function evaluateRPN(
           scalar = arg.val;
         } else {
           const src = arg.val;
-          if (fn === 'mean') {
+          if (fn === 'mean' || fn === 'rms') {
             let sum = 0;
-            let count = 0;
-            for (let i = 0; i < sampleCount; i++) {
-              if (isFinite(src[i])) {
-                sum += src[i];
-                count++;
-              }
-            }
-            scalar = count > 0 ? sum / count : NaN;
-          } else if (fn === 'rms') {
             let sumSq = 0;
             let count = 0;
+            let invalidCount = 0;
+            let gapCount = 0;
+            let trapSum = 0;
+            let trapSqSum = 0;
+            let totalDtWeight = 0;
+            let minDtObserved = Infinity;
+            let maxDtObserved = 0;
+            let prevVal: number | null = null;
+            let prevTime: number | null = null;
+            const hasTime = !!baseTimeArray && baseTimeArray.length === sampleCount;
+
             for (let i = 0; i < sampleCount; i++) {
-              if (isFinite(src[i])) {
-                sumSq += src[i] * src[i];
+              const val = src[i];
+              const ti = hasTime ? baseTimeArray[i] : NaN;
+              if (isFinite(val) && (!hasTime || isFinite(ti))) {
+                sum += val;
+                sumSq += val * val;
                 count++;
+                if (hasTime && prevVal !== null && prevTime !== null) {
+                  const stepDt = ti - prevTime;
+                  if (stepDt > 0) {
+                    if (Number.isFinite(baseGapLimit) && stepDt > baseGapLimit) {
+                      gapCount++;
+                    } else {
+                      if (stepDt < minDtObserved) minDtObserved = stepDt;
+                      if (stepDt > maxDtObserved) maxDtObserved = stepDt;
+                      trapSum += 0.5 * (prevVal + val) * stepDt;
+                      trapSqSum += ((prevVal * prevVal + prevVal * val + val * val) / 3) * stepDt;
+                      totalDtWeight += stepDt;
+                    }
+                  }
+                }
+                prevVal = val;
+                prevTime = ti;
+              } else {
+                invalidCount++;
+                prevVal = null;
+                prevTime = null;
               }
             }
-            scalar = count > 0 ? Math.sqrt(sumSq / count) : NaN;
+
+            const hasVaryingDt =
+              isFinite(minDtObserved) && maxDtObserved > 0 && minDtObserved < maxDtObserved * 0.98;
+            const useTimeWeighted =
+              hasTime &&
+              totalDtWeight > 0 &&
+              (baseTb?.isUniform === false || hasVaryingDt || gapCount > 0 || invalidCount > 0);
+
+            if (fn === 'mean') {
+              scalar = useTimeWeighted
+                ? trapSum / totalDtWeight
+                : count > 0
+                ? sum / count
+                : NaN;
+            } else {
+              scalar = useTimeWeighted
+                ? Math.sqrt(Math.max(0, trapSqSum / totalDtWeight))
+                : count > 0
+                ? Math.sqrt(sumSq / count)
+                : NaN;
+            }
           } else if (fn === 'min') {
             let m = Infinity;
             for (let i = 0; i < sampleCount; i++) {
@@ -606,26 +814,41 @@ export function evaluateRPN(
             scalar = isFinite(m) ? m : NaN;
           }
         }
-        stack.push({ isScalar: true, val: scalar });
+        stack.push({ isScalar: true, val: scalar, unit: arg.unit });
       } else if (fn === 'diff' || fn === 'deriv') {
+        const outUnit = fn === 'deriv' ? (arg.unit ? `${arg.unit}/s` : '1/s') : arg.unit;
         const res = new Float32Array(sampleCount);
-        if (arg.isScalar) {
-          stack.push({ isScalar: false, val: res });
-        } else {
+        res.fill(NaN);
+        if (!arg.isScalar) {
           const src = arg.val;
-          const fallbackDt = dt > 0 ? dt : 1;
-          res[0] = 0;
+          res[0] = NaN;
           for (let i = 1; i < sampleCount; i++) {
-            const localDt =
-              fn === 'deriv'
-                ? baseTimeArray && baseTimeArray[i] - baseTimeArray[i - 1] > 1e-18
-                  ? baseTimeArray[i] - baseTimeArray[i - 1]
-                  : fallbackDt
-                : 1;
-            res[i] = isFinite(src[i]) && isFinite(src[i - 1]) ? (src[i] - src[i - 1]) / localDt : NaN;
+            const hasTime = !!baseTimeArray && i < baseTimeArray.length;
+            if (fn === 'deriv') {
+              if (!hasTime) {
+                res[i] = NaN;
+                continue;
+              }
+              const rawStepDt = baseTimeArray![i] - baseTimeArray![i - 1];
+              if (!isFinite(rawStepDt) || rawStepDt <= 1e-18) {
+                res[i] = NaN;
+                continue;
+              }
+              if (Number.isFinite(baseGapLimit) && rawStepDt > baseGapLimit) {
+                res[i] = NaN;
+                continue;
+              }
+              res[i] = isFinite(src[i]) && isFinite(src[i - 1]) ? (src[i] - src[i - 1]) / rawStepDt : NaN;
+            } else {
+              if (hasTime && Number.isFinite(baseGapLimit) && baseTimeArray![i] - baseTimeArray![i - 1] > baseGapLimit) {
+                res[i] = NaN;
+                continue;
+              }
+              res[i] = isFinite(src[i]) && isFinite(src[i - 1]) ? src[i] - src[i - 1] : NaN;
+            }
           }
-          stack.push({ isScalar: false, val: res });
         }
+        stack.push({ isScalar: false, val: res, unit: outUnit });
       }
       continue;
     }
@@ -641,8 +864,6 @@ export function evaluateRPN(
     arr.fill(finalResult.val);
     return arr;
   }
-  // The scalar branch returns above; retain an explicit array assertion so
-  // TypeScript configurations without strictNullChecks also narrow this union.
   return finalResult.val as Float32Array;
 }
 
@@ -654,68 +875,60 @@ export function inferUnitFromRpn(
   channels: Record<string, WaveformChannel>,
   channelAliases: Record<string, string>
 ): string {
-  const unitStack: string[] = [];
+  const unitStack: Array<{ unit: string; scalarVal?: number }> = [];
 
   for (const token of rpn) {
     if (token.type === 'number') {
-      unitStack.push('');
+      unitStack.push({ unit: '', scalarVal: token.numValue });
       continue;
     }
     if (token.type === 'identifier') {
       const ch = resolveChannelByIdentifier(token.value, channels, channelAliases);
-      unitStack.push((ch?.unit || '').trim());
+      unitStack.push({ unit: (ch?.unit || '').trim() });
       continue;
     }
     if (token.type === 'operator') {
       if (token.value === 'unary-' || token.value === 'unary+') {
-        const u = unitStack.pop() ?? '';
-        unitStack.push(u);
+        const a = unitStack.pop() ?? { unit: '' };
+        const sign = token.value === 'unary-' ? -1 : 1;
+        unitStack.push({
+          unit: a.unit,
+          scalarVal: a.scalarVal !== undefined ? sign * a.scalarVal : undefined,
+        });
         continue;
       }
-      const uB = unitStack.pop() ?? '';
-      const uA = unitStack.pop() ?? '';
-      const op = token.value;
-      if (op === '+' || op === '-') {
-        if (uA === uB) unitStack.push(uA);
-        else if (!uA) unitStack.push(uB);
-        else if (!uB) unitStack.push(uA);
-        else unitStack.push('');
-      } else if (op === '*') {
-        if (!uA) unitStack.push(uB);
-        else if (!uB) unitStack.push(uA);
-        else if ((uA === 'V' && uB === 'A') || (uA === 'A' && uB === 'V')) unitStack.push('W');
-        else if (uA === uB) unitStack.push(`${uA}²`);
-        else unitStack.push(`${uA}·${uB}`);
-      } else if (op === '/') {
-        if (!uB) unitStack.push(uA);
-        else if (!uA) unitStack.push(`1/${uB}`);
-        else if (uA === uB) unitStack.push('');
-        else if (uA === 'V' && uB === 'A') unitStack.push('Ω');
-        else if (uA === 'W' && uB === 'V') unitStack.push('A');
-        else if (uA === 'W' && uB === 'A') unitStack.push('V');
-        else unitStack.push(`${uA}/${uB}`);
-      } else if (op === '^') {
-        unitStack.push('');
+      const b = unitStack.pop() ?? { unit: '' };
+      const a = unitStack.pop() ?? { unit: '' };
+      const op = token.value as '+' | '-' | '*' | '/' | '^';
+      const { outUnit } = resolveBinaryUnitOperation(a.unit, b.unit, op, b.scalarVal);
+      let scalarVal: number | undefined;
+      if (a.scalarVal !== undefined && b.scalarVal !== undefined) {
+        if (op === '+') scalarVal = a.scalarVal + b.scalarVal;
+        else if (op === '-') scalarVal = a.scalarVal - b.scalarVal;
+        else if (op === '*') scalarVal = a.scalarVal * b.scalarVal;
+        else if (op === '/') scalarVal = b.scalarVal !== 0 ? a.scalarVal / b.scalarVal : undefined;
+        else if (op === '^') scalarVal = Math.pow(a.scalarVal, b.scalarVal);
       }
+      unitStack.push({ unit: outUnit, scalarVal });
       continue;
     }
     if (token.type === 'function') {
-      const u = unitStack.pop() ?? '';
+      const a = unitStack.pop() ?? { unit: '' };
       const fn = token.value;
       if (fn === 'sin' || fn === 'cos' || fn === 'tan') {
-        unitStack.push('');
+        const trig = resolveTrigArgument(a.unit, fn);
+        unitStack.push({ unit: trig.outUnit });
       } else if (fn === 'sqrt') {
-        if (u.endsWith('²')) unitStack.push(u.slice(0, -1));
-        else unitStack.push(u);
+        unitStack.push({ unit: resolveSqrtUnit(a.unit) });
       } else if (fn === 'deriv') {
-        unitStack.push(u ? `${u}/s` : '1/s');
+        unitStack.push({ unit: a.unit ? `${a.unit}/s` : '1/s' });
       } else {
-        unitStack.push(u);
+        unitStack.push({ unit: a.unit });
       }
     }
   }
 
-  return unitStack.length === 1 ? unitStack[0] : '';
+  return unitStack.length === 1 ? unitStack[0].unit : '';
 }
 
 /**
@@ -758,6 +971,11 @@ export function evaluateMathExpression(
 
   // Use the first referenced source channel as master timebase (falls back to first channel)
   const baseCh = (referencedIds[0] && channels[referencedIds[0]]) || visibleChList[0];
+  const baseIntegrity = validateChannelIntegrity(baseCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!baseIntegrity.valid) {
+    throw new Error(baseIntegrity.invalidReason || `Channel "${baseCh.name}" has invalid time/value arrays.`);
+  }
+
   const sampleCount = baseCh.v.length;
   const dt = baseCh.dt || (baseCh.t.length > 1 ? baseCh.t[1] - baseCh.t[0] : 1e-4);
 
@@ -781,6 +999,8 @@ export function evaluateMathExpression(
   if (!isFinite(max)) max = 1;
   const margin = (max - min) * 0.1 || 0.1;
 
+  const freshTbMeta = analyzeSamplingQuality(baseCh.t);
+
   return {
     id: channelId,
     name: channelName,
@@ -789,8 +1009,8 @@ export function evaluateMathExpression(
     visible: true,
     t: baseCh.t,
     v,
-    fs: baseCh.fs,
-    dt: baseCh.dt,
+    fs: freshTbMeta.sampleRate,
+    dt: freshTbMeta.nominalDt ?? freshTbMeta.medianDt,
     isMath: true,
     channelKind: 'computed',
     derivedKind: 'math',
@@ -798,11 +1018,11 @@ export function evaluateMathExpression(
     mathExpression: expression,
     sourceChannelIds: referencedIds,
     metadata: {
-      ...baseCh.metadata,
+      ...freshTbMeta,
+      dataProvenance: 'derived_estimate',
+      sourceModel: 'math_expression',
       invalidSamples: nanCount,
       signalNanCount: nanCount,
-      gapCount: baseCh.metadata?.gapCount || 0,
-      gapIndices: [...(baseCh.metadata?.gapIndices || [])],
     },
     vMin: min - margin,
     vMax: max + margin,

@@ -157,6 +157,8 @@ export interface GoldenBandConfig {
   mode: 'percent' | 'absolute';
   tolerance: number;
   refLabel?: string;
+  refUnit?: string;
+  minCoveragePct?: number;
   refT?: Float64Array;
   refV?: Float32Array;
 }
@@ -289,6 +291,11 @@ export interface ChannelMeasurements {
   posWidth: number | null; // s (+Width at 50%)
   negWidth: number | null; // s (-Width at 50%)
 
+  valid?: boolean;
+  status?: 'OK' | 'INVALID' | 'INSUFFICIENT_DATA' | 'NO_OVERLAP';
+  coveragePct?: number;
+  gapCount?: number;
+  invalidSampleCount?: number;
   statusMessage?: string;
 }
 

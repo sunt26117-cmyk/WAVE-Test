@@ -3,10 +3,17 @@
  */
 
 import { WaveformChannel } from '../types/models';
-import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
+import { alignChannelsToCommonTimebase, validateChannelIntegrity } from './timeSync';
+
+export type XYStatus = 'OK' | 'INVALID' | 'INSUFFICIENT_DATA';
 
 export interface XYMetrics {
+  valid: boolean;
+  status: XYStatus;
+  invalidReason: string | null;
   sampleCount: number;
+  invalidCount: number;
+  coveragePct: number;
   xMin: number;
   xMax: number;
   yMin: number;
@@ -15,107 +22,199 @@ export interface XYMetrics {
   lissajousPhaseDeg: number | null;
 }
 
+export interface XYAlignedResult {
+  metrics: XYMetrics;
+  time: Float64Array;
+  xValues: Float32Array;
+  yValues: Float32Array;
+}
+
+function makeInvalidXY(
+  status: 'INVALID' | 'INSUFFICIENT_DATA',
+  invalidReason: string
+): XYAlignedResult {
+  return {
+    metrics: {
+      valid: false,
+      status,
+      invalidReason,
+      sampleCount: 0,
+      invalidCount: 0,
+      coveragePct: 0,
+      xMin: -1,
+      xMax: 1,
+      yMin: -1,
+      yMax: 1,
+      circularityPct: null,
+      lissajousPhaseDeg: null,
+    },
+    time: new Float64Array(0),
+    xValues: new Float32Array(0),
+    yValues: new Float32Array(0),
+  };
+}
+
+export function computeXYAlignedTrajectory(
+  xCh: WaveformChannel,
+  yCh: WaveformChannel,
+  tStart?: number,
+  tEnd?: number
+): XYAlignedResult {
+  const xCheck = validateChannelIntegrity(xCh, 2);
+  if (!xCheck.valid) {
+    return makeInvalidXY('INVALID', xCheck.invalidReason || 'X 通道时间轴或数组无效。');
+  }
+  const yCheck = validateChannelIntegrity(yCh, 2);
+  if (!yCheck.valid) {
+    return makeInvalidXY('INVALID', yCheck.invalidReason || 'Y 通道时间轴或数组无效。');
+  }
+
+  const synced = alignChannelsToCommonTimebase([xCh, yCh], tStart, tEnd, {
+    allowPartialNaNs: true,
+  });
+  if (!synced.valid || synced.time.length < 2) {
+    return makeInvalidXY(
+      'INSUFFICIENT_DATA',
+      synced.invalidReason || 'XY 通道在所选窗口内无有效公共时间重叠。'
+    );
+  }
+
+  const xValues = synced.values[0];
+  const yValues = synced.values[1];
+  const totalPts = synced.time.length;
+
+  let xMin = Infinity;
+  let xMax = -Infinity;
+  let yMin = Infinity;
+  let yMax = -Infinity;
+  let validCount = 0;
+  let invalidCount = 0;
+  let sumX = 0;
+  let sumY = 0;
+
+  for (let i = 0; i < totalPts; i++) {
+    const xv = xValues[i];
+    const yv = yValues[i];
+    if (!Number.isFinite(xv) || !Number.isFinite(yv)) {
+      invalidCount++;
+      continue;
+    }
+    if (xv < xMin) xMin = xv;
+    if (xv > xMax) xMax = xv;
+    if (yv < yMin) yMin = yv;
+    if (yv > yMax) yMax = yv;
+    sumX += xv;
+    sumY += yv;
+    validCount++;
+  }
+
+  const coveragePct = totalPts > 0 ? (validCount / totalPts) * 100 : 0;
+  if (validCount < 2 || !Number.isFinite(xMin) || !Number.isFinite(yMin)) {
+    return makeInvalidXY('INSUFFICIENT_DATA', '公共时间轴对齐后有效配对样本数不足 (< 2)。');
+  }
+
+  const xSpan = xMax - xMin;
+  const ySpan = yMax - yMin;
+  const circularityPct =
+    xSpan > 1e-12 && ySpan > 1e-12
+      ? (Math.min(xSpan, ySpan) / Math.max(xSpan, ySpan)) * 100
+      : null;
+
+  // Signed Lissajous phase in [-180, +180] deg:
+  // |phase| from Pearson correlation r = cos(phi); sign from oriented Shoelace area (CCW positive)
+  let lissajousPhaseDeg: number | null = null;
+  if (xSpan > 1e-12 && ySpan > 1e-12 && validCount >= 4) {
+    const mx = sumX / validCount;
+    const my = sumY / validCount;
+    let sxx = 0;
+    let syy = 0;
+    let sxy = 0;
+    let signedArea2 = 0;
+    let prevValid = false;
+    let prevCx = 0;
+    let prevCy = 0;
+
+    for (let i = 0; i < totalPts; i++) {
+      const xv = xValues[i];
+      const yv = yValues[i];
+      if (!Number.isFinite(xv) || !Number.isFinite(yv)) {
+        prevValid = false;
+        continue;
+      }
+      const cx = xv - mx;
+      const cy = yv - my;
+      sxx += cx * cx;
+      syy += cy * cy;
+      sxy += cx * cy;
+      if (prevValid) {
+        signedArea2 += prevCx * cy - cx * prevCy;
+      }
+      prevCx = cx;
+      prevCy = cy;
+      prevValid = true;
+    }
+
+    const denom = Math.sqrt(sxx * syy);
+    if (denom > 1e-18) {
+      const r = Math.max(-1, Math.min(1, sxy / denom));
+      const magDeg = (Math.acos(r) * 180) / Math.PI;
+      if (magDeg < 0.5 || magDeg > 179.5) {
+        lissajousPhaseDeg = magDeg;
+      } else {
+        lissajousPhaseDeg = signedArea2 >= 0 ? magDeg : -magDeg;
+      }
+    }
+  }
+
+  return {
+    metrics: {
+      valid: true,
+      status: 'OK',
+      invalidReason: null,
+      sampleCount: validCount,
+      invalidCount,
+      coveragePct,
+      xMin,
+      xMax,
+      yMin,
+      yMax,
+      circularityPct,
+      lissajousPhaseDeg,
+    },
+    time: synced.time,
+    xValues,
+    yValues,
+  };
+}
+
 export function computeXYMetrics(
   xCh: WaveformChannel,
   yCh: WaveformChannel,
   iStart: number,
   iEnd: number
 ): XYMetrics {
-  const n = Math.min(xCh.v.length, yCh.v.length);
-  const s = Math.max(0, Math.min(n - 1, iStart));
-  const e = Math.max(s + 1, Math.min(n, iEnd));
-
-  if (n < 2 || e <= s) {
-    return {
-      sampleCount: 0,
-      xMin: -1,
-      xMax: 1,
-      yMin: -1,
-      yMax: 1,
-      circularityPct: null,
-      lissajousPhaseDeg: null,
-    };
+  const xCheck = validateChannelIntegrity(xCh, 2);
+  if (!xCheck.valid) {
+    return makeInvalidXY('INVALID', xCheck.invalidReason || 'X 通道时间轴或数组无效。').metrics;
+  }
+  const yCheck = validateChannelIntegrity(yCh, 2);
+  if (!yCheck.valid) {
+    return makeInvalidXY('INVALID', yCheck.invalidReason || 'Y 通道时间轴或数组无效。').metrics;
   }
 
-  const xMean = xCh.coupling === 'AC' ? computeChannelMean(xCh) : 0;
-  const yMean = yCh.coupling === 'AC' ? computeChannelMean(yCh) : 0;
-
-  let xMin = Infinity;
-  let xMax = -Infinity;
-  let yMin = Infinity;
-  let yMax = -Infinity;
-  let cnt = 0;
-
-  const stride = e - s > 60000 ? Math.ceil((e - s) / 60000) : 1;
-  for (let i = s; i < e; i += stride) {
-    const xv = getChannelDisplayValue(xCh, i, xMean);
-    const yv = getChannelDisplayValue(yCh, i, yMean);
-    if (!isFinite(xv) || !isFinite(yv)) continue;
-    if (xv < xMin) xMin = xv;
-    if (xv > xMax) xMax = xv;
-    if (yv < yMin) yMin = yv;
-    if (yv > yMax) yMax = yv;
-    cnt++;
-  }
-
-  if (cnt < 2 || !isFinite(xMin) || !isFinite(yMin)) {
-    return {
-      sampleCount: 0,
-      xMin: -1,
-      xMax: 1,
-      yMin: -1,
-      yMax: 1,
-      circularityPct: null,
-      lissajousPhaseDeg: null,
-    };
-  }
-
-  const xSpan = xMax - xMin;
-  const ySpan = yMax - yMin;
-  const xCenter = (xMax + xMin) / 2;
-  const yCenter = (yMax + yMin) / 2;
-
-  const circularityPct =
-    xSpan > 1e-12 && ySpan > 1e-12
-      ? (Math.min(xSpan, ySpan) / Math.max(xSpan, ySpan)) * 100
-      : null;
-
-  // Classic Lissajous intercept phase estimate: sin(phi) = y_intercept / (ySpan / 2) when x crosses xCenter
-  let lissajousPhaseDeg: number | null = null;
-  if (xSpan > 1e-12 && ySpan > 1e-12) {
-    let interceptSum = 0;
-    let interceptCnt = 0;
-    let prevX = getChannelDisplayValue(xCh, s, xMean) - xCenter;
-    let prevY = getChannelDisplayValue(yCh, s, yMean) - yCenter;
-    for (let i = s + stride; i < e; i += stride) {
-      const cx = getChannelDisplayValue(xCh, i, xMean) - xCenter;
-      const cy = getChannelDisplayValue(yCh, i, yMean) - yCenter;
-      if (isFinite(prevX) && isFinite(prevY) && isFinite(cx) && isFinite(cy)) {
-        if ((prevX < 0 && cx >= 0) || (prevX > 0 && cx <= 0)) {
-          const denom = cx - prevX;
-          const frac = Math.abs(denom) > 1e-15 ? -prevX / denom : 0;
-          const yCross = prevY + frac * (cy - prevY);
-          interceptSum += Math.abs(yCross);
-          interceptCnt++;
-        }
-      }
-      prevX = cx;
-      prevY = cy;
-    }
-    if (interceptCnt > 0) {
-      const yIntercept = interceptSum / interceptCnt;
-      const ratio = Math.max(0, Math.min(1, yIntercept / (ySpan / 2)));
-      lissajousPhaseDeg = (Math.asin(ratio) * 180) / Math.PI;
+  const nx = xCh.t.length;
+  const fullRange = iStart <= 0 && iEnd >= Math.min(xCh.t.length, yCh.t.length);
+  let tStart: number | undefined;
+  let tEnd: number | undefined;
+  if (!fullRange) {
+    const s = Math.max(0, Math.min(nx - 1, iStart));
+    const e = Math.max(s + 1, Math.min(nx, iEnd));
+    tStart = xCh.t[s];
+    tEnd = xCh.t[e - 1];
+    if (!(tEnd > tStart)) {
+      return makeInvalidXY('INSUFFICIENT_DATA', '所选 XY 索引范围没有有效时间跨度。').metrics;
     }
   }
 
-  return {
-    sampleCount: e - s,
-    xMin,
-    xMax,
-    yMin,
-    yMax,
-    circularityPct,
-    lissajousPhaseDeg,
-  };
+  return computeXYAlignedTrajectory(xCh, yCh, tStart, tEnd).metrics;
 }

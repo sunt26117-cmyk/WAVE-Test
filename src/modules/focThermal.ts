@@ -15,6 +15,7 @@ import { WaveformChannel } from '../types/models';
 import { CauerStage, ThermalPathMode, parseSiUnitScale, simulateCauerZoh } from './thermalEngine';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 import { inspectChannelSamplingGaps } from './timeSync';
+import { DptOperatingPoint, interpolateDptSwitchingLoss } from './dptAnalyzer';
 
 export type FocModulationMode = 'SVPWM' | 'DPWM1' | 'SPWM';
 export type MosSwitchKey = 'AH' | 'AL' | 'BH' | 'BL' | 'CH' | 'CL';
@@ -70,6 +71,8 @@ export interface FocMosParams {
   qrrNc: number; // reverse recovery charge (nC) at iRefA
   eossUj?: number; // optional zero-current Coss discharge energy (uJ) at vRefV (default 0 to avoid double-counting datasheet Eon)
   eonIncludesQrr?: boolean; // true when Eon+Eoff comes from DPT waveform integral (Qrr already captured inside Eon)
+  /** Optional multi-point DPT lookup table; when provided, computePhaseMosLosses interpolates switching loss per (Vbus, |I_phase|) */
+  dptLut?: DptOperatingPoint[];
 }
 
 export interface FocControlParams {
@@ -888,11 +891,25 @@ export function computePhaseMosLosses(
 
   if (!clamped && fswHz > 0) {
     const iAbs = Math.abs(iPhase);
-    const vScale = Math.max(0, vBus) / Math.max(1e-3, mos.vRefV);
-    const iScale = iAbs / Math.max(1e-3, mos.iRefA);
-    const eSwJ = Math.max(0, mos.eonPlusEoffUj) * 1e-6 * vScale * iScale;
-    // When Eon+Eoff is directly imported from a DPT integral (eonIncludesQrr=true), Qrr energy is already captured in Eon
-    const eQrrJ = mos.eonIncludesQrr ? 0 : Math.max(0, mos.qrrNc) * 1e-9 * Math.max(0, vBus) * iScale;
+    const vPos = Math.max(0, vBus);
+    const vScale = vPos / Math.max(1e-3, mos.vRefV);
+    const lutInterp = mos.dptLut && mos.dptLut.length > 0 ? interpolateDptSwitchingLoss(mos.dptLut, vPos, iAbs) : null;
+    let eSwJ: number;
+    let eQrrJ: number;
+    if (lutInterp) {
+      if (mos.eonIncludesQrr) {
+        eSwJ = Math.max(0, lutInterp.eSwTotalUj) * 1e-6;
+        eQrrJ = 0;
+      } else {
+        eSwJ = Math.max(0, lutInterp.eOnSansQrrUj + lutInterp.eOffUj) * 1e-6;
+        eQrrJ = Math.max(0, lutInterp.qRrNc) * 1e-9 * vPos;
+      }
+    } else {
+      const iScale = iAbs / Math.max(1e-3, mos.iRefA);
+      eSwJ = Math.max(0, mos.eonPlusEoffUj) * 1e-6 * vScale * iScale;
+      // When Eon+Eoff is directly imported from a DPT integral (eonIncludesQrr=true), Qrr energy is already captured in Eon
+      eQrrJ = mos.eonIncludesQrr ? 0 : Math.max(0, mos.qrrNc) * 1e-9 * vPos * iScale;
+    }
     // Half-bridge active hard-switching Coss capacitive discharge loss: once per PWM cycle on the active switch
     const eOssJ = Math.max(0, mos.eossUj ?? 0) * 1e-6 * vScale * vScale;
     pSw = fswHz * (eSwJ + eQrrJ + eOssJ);
@@ -1755,6 +1772,25 @@ export function simulateFoc6Mos(
   let overmodulatedCount = 0;
   let zeroCurrentFallbackCount = 0;
 
+  const hasDptLut = Boolean(mos.dptLut && mos.dptLut.length > 0);
+  let lutVMin = Infinity;
+  let lutVMax = -Infinity;
+  let lutIMin = Infinity;
+  let lutIMax = -Infinity;
+  if (hasDptLut && mos.dptLut) {
+    for (const pt of mos.dptLut) {
+      if (pt.vBusV < lutVMin) lutVMin = pt.vBusV;
+      if (pt.vBusV > lutVMax) lutVMax = pt.vBusV;
+      if (pt.iLoadA < lutIMin) lutIMin = pt.iLoadA;
+      if (pt.iLoadA > lutIMax) lutIMax = pt.iLoadA;
+    }
+  }
+  let lutExtrapolatedSamples = 0;
+  let scalarWideScaleSamples = 0;
+  let opVMin = Infinity;
+  let opVMax = -Infinity;
+  let opIMax = 0;
+
   // Estimate electrical fundamental samples-per-cycle from raw Ia zero-crossings (DC stall keeps zeroCrossings < 3 -> null)
   let zeroCrossings = 0;
   let prevSign = 0;
@@ -1825,6 +1861,28 @@ export function simulateFoc6Mos(
       }
       if (countOvermod && rec.zeroCurrentFallback) {
         zeroCurrentFallbackCount++;
+      }
+    }
+
+    if (countOvermod) {
+      if (vbus < opVMin) opVMin = vbus;
+      if (vbus > opVMax) opVMax = vbus;
+      const stepMaxI = Math.max(Math.abs(ia), Math.abs(ib), Math.abs(ic));
+      if (stepMaxI > opIMax) opIMax = stepMaxI;
+      if (hasDptLut) {
+        if (
+          vbus < lutVMin - 1e-6 ||
+          vbus > lutVMax + 1e-6 ||
+          stepMaxI > lutIMax + 1e-6
+        ) {
+          lutExtrapolatedSamples++;
+        }
+      } else {
+        const vRatio = vbus / Math.max(1e-3, mos.vRefV);
+        const iRatio = stepMaxI / Math.max(1e-3, mos.iRefA);
+        if (vRatio < 0.25 || vRatio > 2.0 || iRatio > 2.0) {
+          scalarWideScaleSamples++;
+        }
       }
     }
 
@@ -2104,7 +2162,23 @@ export function simulateFoc6Mos(
   } else if (model.modelKind === 'demo_builtin') {
     warnings.push('当前使用内置 FOC Demo 参考热模型，切换至实测波形时请在 Tab 1 反演或手动设定器件 Zth 参数。');
   }
-  warnings.push('MOS 开关损耗当前采用参考 Eon+Eoff 标量按 V/I 缩放；其口径按“单颗硬开关 MOS、每 PWM 周期的 Eon+Eoff”解释，并按电流方向分配至对应硬开关器件，不代表整桥/半桥六管损耗合计值。若数据手册/DPT 的能量口径是双管或整桥合计，必须先换算。未提供覆盖 Vbus、Id、Tj、Rg 的器件 DPT/LUT 时，不应把该结果作为最坏开关损耗签核值。');
+  if (hasDptLut && mos.dptLut) {
+    warnings.push(
+      `MOS 开关损耗已启用 ${mos.dptLut.length} 点 DPT 查找表按瞬时 (Vbus, |I_phase|) 逐点插值（表范围 Vbus=[${lutVMin.toFixed(1)}~${lutVMax.toFixed(1)}]V, I=[${lutIMin.toFixed(1)}~${lutIMax.toFixed(1)}]A，按单颗硬开关 MOSFET 口径分配）。`
+    );
+    if (lutExtrapolatedSamples > 0) {
+      warnings.push(
+        `注意：共有 ${lutExtrapolatedSamples} 步仿真运行点超出 DPT 矩阵实测边界（仿真 Vbus=[${opVMin.toFixed(1)}~${opVMax.toFixed(1)}]V, I_max=${opIMax.toFixed(1)}A vs LUT [${lutVMin.toFixed(1)}~${lutVMax.toFixed(1)}]V × [${lutIMin.toFixed(1)}~${lutIMax.toFixed(1)}]A），超界点仅作邻近外推。`
+      );
+    }
+  } else {
+    warnings.push('MOS 开关损耗当前采用参考 Eon+Eoff 标量按 V/I 缩放；其口径按“单颗硬开关 MOS、每 PWM 周期的 Eon+Eoff”解释，并按电流方向分配至对应硬开关器件，不代表整桥/半桥六管损耗合计值。若数据手册/DPT 的能量口径是双管或整桥合计，必须先换算。未提供覆盖 Vbus、Id、Tj、Rg 的器件 DPT/LUT 时，不应把该结果作为最坏开关损耗签核值。');
+    if (scalarWideScaleSamples > 0) {
+      warnings.push(
+        `注意：共有 ${scalarWideScaleSamples} 步仿真工况相对单点参考 (Vref=${mos.vRefV.toFixed(1)}V, Iref=${mos.iRefA.toFixed(1)}A) 缩放倍率超过 2× 或低于 0.25×（仿真峰值 I_max=${opIMax.toFixed(1)}A, Vbus=[${opVMin.toFixed(1)}~${opVMax.toFixed(1)}]V），非线性开关损耗偏差可能较大。`
+      );
+    }
+  }
   if ((mos.eossUj ?? 0) > 0) {
     warnings.push('当前 Eoss 仅输入 Vref 处的单点能量，并按 Eoss∝Vbus² 缩放（等效假设 Coss 不随电压变化）；真实 MOS Coss 通常强非线性，需用器件 Eoss(V)/Qoss(V) 曲线或 DPT/LUT 替代，当前结果只作近似估算。');
   }

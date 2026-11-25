@@ -12,7 +12,7 @@ import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale'
 import { computeTwoChannelPhaseDiff } from './motorAnalysis';
 import { computeFFT } from './fft';
 import { computeClarke } from './transforms';
-import { alignChannelsToCommonTimebase, resolveCompatibleSiGroupScale } from './timeSync';
+import { alignChannelsToCommonTimebase, DEFAULT_SAMPLING_GAP_FACTOR, inspectTimebase, resolveCompatibleSiGroupScale } from './timeSync';
 import { parseSiUnitScale } from './thermalEngine';
 
 function sliceIndexRange(t: Float64Array, n: number, tStart?: number, tEnd?: number): { i0: number; i1: number } {
@@ -25,6 +25,62 @@ function sliceIndexRange(t: Float64Array, n: number, tStart?: number, tEnd?: num
     while (i1 > i0 && t[i1] > tEnd) i1--;
   }
   return { i0, i1 };
+}
+
+function computeSegmentedTrapezoidalStats(
+  t: Float64Array,
+  v: Float32Array,
+  i0 = 0,
+  i1 = t.length - 1,
+  gapThresholdSec = Infinity
+): { mean: number; rms: number; acRms: number; vpp: number; min: number; max: number; validCount: number } {
+  let area = 0;
+  let sqArea = 0;
+  let dur = 0;
+  let mn = Infinity;
+  let mx = -Infinity;
+  let validCount = 0;
+
+  for (let i = i0; i <= i1; i++) {
+    const val = v[i];
+    if (!Number.isFinite(val)) continue;
+    if (val < mn) mn = val;
+    if (val > mx) mx = val;
+    validCount++;
+  }
+
+  for (let i = i0 + 1; i <= i1; i++) {
+    const a = v[i - 1];
+    const b = v[i];
+    const dt = t[i] - t[i - 1];
+    if (!Number.isFinite(a) || !Number.isFinite(b) || !(dt > 0)) continue;
+    if (Number.isFinite(gapThresholdSec) && dt > gapThresholdSec) continue;
+    area += 0.5 * (a + b) * dt;
+    sqArea += ((a * a + a * b + b * b) / 3) * dt;
+    dur += dt;
+  }
+
+  if (validCount === 0 || dur <= 0) {
+    return { mean: 0, rms: 0, acRms: 0, vpp: 0, min: 0, max: 0, validCount: 0 };
+  }
+
+  const mean = area / dur;
+  const rms = Math.sqrt(Math.max(0, sqArea / dur));
+
+  let acSqArea = 0;
+  for (let i = i0 + 1; i <= i1; i++) {
+    const a = v[i - 1];
+    const b = v[i];
+    const dt = t[i] - t[i - 1];
+    if (!Number.isFinite(a) || !Number.isFinite(b) || !(dt > 0)) continue;
+    if (Number.isFinite(gapThresholdSec) && dt > gapThresholdSec) continue;
+    const da = a - mean;
+    const db = b - mean;
+    acSqArea += ((da * da + da * db + db * db) / 3) * dt;
+  }
+  const acRms = Math.sqrt(Math.max(0, acSqArea / dur));
+
+  return { mean, rms, acRms, vpp: mx - mn, min: mn, max: mx, validCount };
 }
 
 export interface PhaseChannelSummary {
@@ -120,29 +176,16 @@ export function analyzeThreePhaseBalance(
   const vArr = scaleArr(rawV, sV);
   const wArr = scaleArr(rawW, sW);
 
+  const syncTb = inspectTimebase(synced.time, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
   const summarize = (name: string, arr: Float32Array): PhaseChannelSummary => {
-    let sum = 0;
-    let sumSq = 0;
-    let mn = Infinity;
-    let mx = -Infinity;
-    let cnt = 0;
-    for (let i = 0; i < n; i++) {
-      const val = arr[i];
-      if (!isFinite(val)) continue;
-      sum += val;
-      sumSq += val * val;
-      if (val < mn) mn = val;
-      if (val > mx) mx = val;
-      cnt++;
-    }
-    if (cnt === 0) return { name, rms: 0, vpp: 0, mean: 0, min: 0, max: 0 };
+    const st = computeSegmentedTrapezoidalStats(synced.time, arr, 0, n - 1, syncTb.gapThresholdSec);
     return {
       name,
-      rms: Math.sqrt(sumSq / cnt),
-      vpp: mx - mn,
-      mean: sum / cnt,
-      min: mn,
-      max: mx,
+      rms: st.rms,
+      vpp: st.vpp,
+      mean: st.mean,
+      min: st.min,
+      max: st.max,
     };
   };
 
@@ -160,20 +203,10 @@ export function analyzeThreePhaseBalance(
 
   // Full zero-sequence trace (Ua + Ub + Uc)/3 on synchronized timebase
   const zeroSeqTrace = new Float32Array(n);
-  let zSq = 0;
-  let zMin = Infinity;
-  let zMax = -Infinity;
-  let zCnt = 0;
   for (let i = 0; i < n; i++) {
-    const z = (uArr[i] + vArr[i] + wArr[i]) / 3;
-    zeroSeqTrace[i] = z;
-    if (isFinite(z)) {
-      zSq += z * z;
-      if (z < zMin) zMin = z;
-      if (z > zMax) zMax = z;
-      zCnt++;
-    }
+    zeroSeqTrace[i] = (uArr[i] + vArr[i] + wArr[i]) / 3;
   }
+  const zeroStats = computeSegmentedTrapezoidalStats(synced.time, zeroSeqTrace, 0, n - 1, syncTb.gapThresholdSec);
 
   const dUV = computeTwoChannelPhaseDiff(chU, chV, synced.overlapStart, synced.overlapEnd);
   const dVW = computeTwoChannelPhaseDiff(chV, chW, synced.overlapStart, synced.overlapEnd);
@@ -193,8 +226,8 @@ export function analyzeThreePhaseBalance(
     phases: [pU, pV, pW],
     vppUnbalancePct,
     rmsUnbalancePct,
-    zeroSeqRms: zCnt > 0 ? Math.sqrt(zSq / zCnt) : 0,
-    zeroSeqVpp: zCnt > 0 ? zMax - zMin : 0,
+    zeroSeqRms: zeroStats.rms,
+    zeroSeqVpp: zeroStats.vpp,
     angleUVDeg: dUV.phaseDeg,
     angleVWDeg: dVW.phaseDeg,
     angleWUDeg: dWU.phaseDeg,
@@ -413,11 +446,13 @@ export function analyzeBldcHallCommutation(
     }
   }
 
-  // Drop incomplete leading segment so sector durations are true full 60-deg steps
-  const completeSegs = segments.length > 2 ? segments.slice(1) : segments;
+  // Drop incomplete leading segment (which begins at tArr[0] with no leading edge)
+  const completeSegs = segments.length > 0 ? segments.slice(1) : [];
   if (completeSegs.length === 0) {
     return {
       ...empty,
+      valid: true,
+      commutationCount: 0,
       illegalStateCount,
       sequenceJumpCount,
       events,
@@ -428,28 +463,45 @@ export function analyzeBldcHallCommutation(
   const avgSectorDur = totalDur / completeSegs.length;
   const avgElecPeriod = avgSectorDur * 6;
   const avgElecFreqHz = avgElecPeriod > 1e-15 ? 1 / avgElecPeriod : null;
-  const safePoles = isFinite(polePairs) && polePairs > 0 ? polePairs : 4;
-  const avgRpm = avgElecFreqHz !== null ? (60 * avgElecFreqHz) / safePoles : null;
 
-  const rpmSamples: number[] = [];
-  if (completeSegs.length >= 6) {
-    for (let k = 0; k <= completeSegs.length - 6; k++) {
-      let cycDur = 0;
-      for (let m = 0; m < 6; m++) cycDur += completeSegs[k + m].dur;
-      if (cycDur > 1e-15) {
-        rpmSamples.push(60 / cycDur / safePoles);
-      }
-    }
-  } else {
-    completeSegs.forEach((s) => {
-      if (s.dur > 1e-15) rpmSamples.push(60 / (s.dur * 6) / safePoles);
-    });
+  const hallTb = inspectTimebase(timeArr, 0, timeArr.length - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const dtStep = hallTb.dtMedian > 0 ? hallTb.dtMedian : (timeArr[timeArr.length - 1] - timeArr[0]) / Math.max(1, timeArr.length - 1);
+  const sectorQuantErrDeg = avgSectorDur > 1e-15 && dtStep > 0 ? (dtStep / avgSectorDur) * 60 : 0;
+  if (sectorQuantErrDeg > 1.5) {
+    warnings.push(
+      `采样步长 Δt≈${dtStep.toExponential(2)}s 对 60° 扇区引入约 ±${sectorQuantErrDeg.toFixed(2)}° 边沿量化误差，扇区误差判断受采样分辨率限制。`
+    );
   }
 
-  const rpmMin = rpmSamples.length > 0 ? Math.min(...rpmSamples) : avgRpm;
-  const rpmMax = rpmSamples.length > 0 ? Math.max(...rpmSamples) : avgRpm;
+  const validPoles = Number.isFinite(polePairs) && polePairs > 0 && Number.isInteger(polePairs);
+  if (!validPoles) {
+    warnings.push(
+      `极对数设置无效 (${String(polePairs)}，要求正整数 ≥ 1)；已拒绝假定默认极对数，仅保留电频率 f_e 并禁用机械转速 (RPM) 计算。`
+    );
+  }
+  const avgRpm = validPoles && avgElecFreqHz !== null ? (60 * avgElecFreqHz) / polePairs : null;
+
+  const rpmSamples: number[] = [];
+  if (validPoles) {
+    if (completeSegs.length >= 6) {
+      for (let k = 0; k <= completeSegs.length - 6; k++) {
+        let cycDur = 0;
+        for (let m = 0; m < 6; m++) cycDur += completeSegs[k + m].dur;
+        if (cycDur > 1e-15) {
+          rpmSamples.push(60 / cycDur / polePairs);
+        }
+      }
+    } else {
+      completeSegs.forEach((s) => {
+        if (s.dur > 1e-15) rpmSamples.push(60 / (s.dur * 6) / polePairs);
+      });
+    }
+  }
+
+  const rpmMin = validPoles ? (rpmSamples.length > 0 ? Math.min(...rpmSamples) : avgRpm) : null;
+  const rpmMax = validPoles ? (rpmSamples.length > 0 ? Math.max(...rpmSamples) : avgRpm) : null;
   const rpmRipplePct =
-    avgRpm && rpmMin !== null && rpmMax !== null && avgRpm > 1e-9
+    validPoles && avgRpm && rpmMin !== null && rpmMax !== null && avgRpm > 1e-9
       ? ((rpmMax - rpmMin) / avgRpm) * 100
       : null;
 
@@ -684,40 +736,57 @@ export function analyzePwmSwitchingAndDeadTime(
   const amp = vTop - vBase;
   const overshootPct = amp > 1e-9 && mx > vTop ? ((mx - vTop) / amp) * 100 : 0;
 
-  const risingTimes: number[] = [];
-  const risingIndices: number[] = [];
-  const fallingTimes: number[] = [];
+  const pwmTb = inspectTimebase(tArr, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const gapThreshold = pwmTb.gapThresholdSec;
+  const risingEvents: Array<{ t: number; idx: number; seg: number }> = [];
+  const fallingEvents: Array<{ t: number; seg: number }> = [];
+  let segId = 0;
   let armed = false;
-  let isHighState = hArr[0] >= mid;
+  let isHighState = isFinite(hArr[0]) ? hArr[0] >= mid : false;
 
   for (let i = 1; i < n; i++) {
     const vp = hArr[i - 1];
     const vc = hArr[i];
-    if (!isFinite(vp) || !isFinite(vc)) continue;
+    const dt = tArr[i] - tArr[i - 1];
+    const isBreak =
+      !isFinite(vp) ||
+      !isFinite(vc) ||
+      !(dt > 0) ||
+      (Number.isFinite(gapThreshold) && dt > gapThreshold);
+    if (isBreak) {
+      segId++;
+      armed = false;
+      if (isFinite(vc)) {
+        isHighState = vc >= mid;
+      }
+      continue;
+    }
     if (!isHighState && vp <= mid - hyst) armed = true;
     if (!isHighState && armed && vp < mid && vc >= mid) {
       const f = vc - vp > 1e-15 ? (mid - vp) / (vc - vp) : 0;
-      risingTimes.push(tArr[i - 1] + f * (tArr[i] - tArr[i - 1]));
-      risingIndices.push(i);
+      risingEvents.push({ t: tArr[i - 1] + f * dt, idx: i, seg: segId });
       isHighState = true;
       armed = false;
     } else if (isHighState && vc <= mid - hyst) {
       const f = vp - vc > 1e-15 ? (vp - mid) / (vp - vc) : 0;
-      fallingTimes.push(tArr[i - 1] + f * (tArr[i] - tArr[i - 1]));
+      fallingEvents.push({ t: tArr[i - 1] + f * dt, seg: segId });
       isHighState = false;
     }
   }
 
   let pwmFreqHz: number | null = null;
   const duties: number[] = [];
-  if (risingTimes.length >= 2) {
+  if (risingEvents.length >= 2) {
     const periods: number[] = [];
-    for (let k = 0; k < risingTimes.length - 1; k++) {
-      const per = risingTimes[k + 1] - risingTimes[k];
+    for (let k = 0; k < risingEvents.length - 1; k++) {
+      const r0 = risingEvents[k];
+      const r1 = risingEvents[k + 1];
+      if (r0.seg !== r1.seg) continue; // Do not measure period/duty across NaN or sampling gap breaks
+      const per = r1.t - r0.t;
       if (per > 0) periods.push(per);
-      const fallAfter = fallingTimes.find((ft) => ft > risingTimes[k] && ft < risingTimes[k + 1]);
+      const fallAfter = fallingEvents.find((fe) => fe.seg === r0.seg && fe.t > r0.t && fe.t < r1.t);
       if (fallAfter !== undefined && per > 0) {
-        duties.push(((fallAfter - risingTimes[k]) / per) * 100);
+        duties.push(((fallAfter.t - r0.t) / per) * 100);
       }
     }
     if (periods.length > 0) {
@@ -727,8 +796,8 @@ export function analyzePwmSwitchingAndDeadTime(
   }
 
   let ringingFreqHz: number | null = null;
-  if (risingIndices.length > 0) {
-    const rIdx = risingIndices[0];
+  if (risingEvents.length > 0) {
+    const rIdx = risingEvents[0].idx;
     const searchEnd = Math.min(n - 1, rIdx + 80);
     const localExtremaT: number[] = [];
     for (let i = rIdx + 1; i < searchEnd; i++) {
@@ -789,12 +858,34 @@ export function analyzePwmSwitchingAndDeadTime(
       };
 
       const deadGaps: number[] = [];
-      let prevState = getState(hArr[0], lArr[0]);
+      let prevState: 'H' | 'L' | 'DEAD' | 'BOTH' | 'INVALID' =
+        isFinite(hArr[0]) && isFinite(lArr[0]) ? getState(hArr[0], lArr[0]) : 'INVALID';
       let segStartT = tArr[0];
       let segStartIdx = 0;
       let prevActiveSide: 'H' | 'L' | null = prevState === 'H' || prevState === 'L' ? prevState : null;
 
       for (let i = 1; i < n; i++) {
+        const dt = tArr[i] - tArr[i - 1];
+        const isBreak =
+          !isFinite(hArr[i - 1]) ||
+          !isFinite(hArr[i]) ||
+          !isFinite(lArr[i - 1]) ||
+          !isFinite(lArr[i]) ||
+          !(dt > 0) ||
+          (Number.isFinite(gapThreshold) && dt > gapThreshold);
+
+        if (isBreak) {
+          prevActiveSide = null;
+          if (isFinite(hArr[i]) && isFinite(lArr[i])) {
+            prevState = getState(hArr[i], lArr[i]);
+            segStartT = tArr[i];
+            segStartIdx = i;
+          } else {
+            prevState = 'INVALID';
+          }
+          continue;
+        }
+
         const st = getState(hArr[i], lArr[i]);
         if (st !== prevState) {
           const tEdge = 0.5 * (tArr[i - 1] + tArr[i]);
@@ -834,7 +925,7 @@ export function analyzePwmSwitchingAndDeadTime(
   return {
     valid: true,
     pwmFreqHz,
-    pulseCount: risingTimes.length,
+    pulseCount: risingEvents.length,
     dutyMinPct: duties.length > 0 ? Math.min(...duties) : null,
     dutyAvgPct: duties.length > 0 ? duties.reduce((a, b) => a + b, 0) / duties.length : null,
     dutyMaxPct: duties.length > 0 ? Math.max(...duties) : null,
@@ -948,42 +1039,22 @@ export function analyzeTorqueAndCurrentRipple(
     };
   }
 
+  const segT = ch.t.subarray(i0, i1 + 1);
+  const segV = new Float32Array(i1 - i0 + 1);
   const acMeanOffset = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
-  let sum = 0;
-  let sumSq = 0;
-  let mn = Infinity;
-  let mx = -Infinity;
-  let cnt = 0;
   for (let i = i0; i <= i1; i++) {
-    const val = getChannelDisplayValue(ch, i, acMeanOffset);
-    if (!isFinite(val)) continue;
-    sum += val;
-    sumSq += val * val;
-    if (val < mn) mn = val;
-    if (val > mx) mx = val;
-    cnt++;
+    segV[i - i0] = getChannelDisplayValue(ch, i, acMeanOffset);
   }
-  const mean = cnt > 0 ? sum / cnt : 0;
-  const rms = cnt > 0 ? Math.sqrt(sumSq / cnt) : 0;
-  const peakToPeakRipple = cnt > 0 ? mx - mn : 0;
-
-  let acSq = 0;
-  for (let i = i0; i <= i1; i++) {
-    const val = getChannelDisplayValue(ch, i, acMeanOffset);
-    if (!isFinite(val)) continue;
-    const d = val - mean;
-    acSq += d * d;
-  }
-  const acRms = cnt > 0 ? Math.sqrt(acSq / cnt) : 0;
+  const segTb = inspectTimebase(segT, 0, segT.length - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const stats = computeSegmentedTrapezoidalStats(segT, segV, 0, segT.length - 1, segTb.gapThresholdSec);
+  const mean = stats.mean;
+  const rms = stats.rms;
+  const peakToPeakRipple = stats.vpp;
+  const acRms = stats.acRms;
   const denomMean = Math.abs(mean) > 1e-9 ? Math.abs(mean) : rms > 1e-9 ? rms : 1e-9;
   const rippleFactorPct = (peakToPeakRipple / (2 * denomMean)) * 100;
   const rmsRipplePct = (acRms / denomMean) * 100;
 
-  const segT = ch.t.subarray(i0, i1 + 1);
-  const segV = new Float32Array(i1 - i0 + 1);
-  for (let i = i0; i <= i1; i++) {
-    segV[i - i0] = getChannelDisplayValue(ch, i, acMeanOffset);
-  }
   const dt = segT.length >= 2 ? (segT[segT.length - 1] - segT[0]) / (segT.length - 1) : ch.dt || 1e-4;
   const fs = dt > 0 ? 1 / dt : ch.fs || 1e4;
 

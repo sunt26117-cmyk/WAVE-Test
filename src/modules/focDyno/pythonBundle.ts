@@ -1703,8 +1703,11 @@ with tab1:
         sens = report.get("param_sensitivity")
         audit_parts = []
         if val_m:
+            _fmt_t = f"{val_m['val_mae_T']:.4f} N·m" if np.isfinite(val_m['val_mae_T']) else "N/A"
+            _fmt_mp = f"{val_m['val_mape_T_pct']:.1f}%" if np.isfinite(val_m['val_mape_T_pct']) else "N/A"
+            _fmt_e = f"{val_m['val_mae_eta_pct']:.2f}%" if np.isfinite(val_m['val_mae_eta_pct']) else "N/A"
             audit_parts.append(
-                f"20% 留出交叉验证 ({val_m['holdout_count']}点): MAE_T={val_m['val_mae_T']:.4f} N·m, MAPE_T={val_m['val_mape_T_pct']:.1f}%, MAE_η={val_m['val_mae_eta_pct']:.2f}%"
+                f"20% 留出交叉验证 ({val_m['holdout_count']}点): MAE_T={_fmt_t}, MAPE_T={_fmt_mp}, MAE_η={_fmt_e}"
             )
         if env:
             audit_parts.append(

@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   SVPWM_LINEAR_LIMIT,
   calcKeFromKv,
   calcKeFromNoLoad,
   calcKvFromKe,
   calcLqH,
+  calcPhiDeg,
   calcRsAnchorOhm,
+  calcVqCmd,
   forwardVerifyPoint,
   isMonotonicTimestamps,
   movingAverageFilter,
@@ -912,3 +915,106 @@ test('FOC DynoLab audit: out-of-range eta quarantine, holdout CV, openLoopModDep
   assert.ok(appPy.includes('线性 SVPWM 上限 1.0'));
   assert.ok(appPy.includes('20% 留出交叉验证'));
 });
+
+test('FOC DynoLab live python3 parity: motor_physics.py numerically matches TS solver across operating modes', () => {
+  const motorPhysicsPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'motor_physics.py')?.content || '';
+  assert.ok(motorPhysicsPy.length > 1000);
+
+  const cases = [
+    { vMeas: 13.5, iBus: 2.5, nRpm: 1000 },
+    { vMeas: 13.5, iBus: -0.8, nRpm: 1200 },
+    { vMeas: 13.5, iBus: 1.5, nRpm: 0 },
+    { vMeas: 13.5, iBus: 0.065, nRpm: 800 },
+    { vMeas: 13.5, iBus: -50.0, nRpm: 1000 },
+    { vMeas: 0.05, iBus: 1.0, nRpm: 500 },
+  ];
+
+  const pyScript = `
+import json, math, sys, types
+# Minimal stubs so stdlib python3 executes pure motor_physics core without requiring numpy/pandas install
+np_stub = types.ModuleType("numpy")
+np_stub.ndarray = list
+pd_stub = types.ModuleType("pandas")
+pd_stub.DataFrame = dict
+sys.modules["numpy"] = np_stub
+sys.modules["pandas"] = pd_stub
+
+ns = {}
+exec(sys.stdin.read(), ns)
+MP = ns["MotorParams"]
+p = MP(
+    pole_pairs=${DEMO_MOTOR_PARAMS.polePairs},
+    ke_prime=${DEMO_MOTOR_PARAMS.kePrime},
+    r_ll_25=${DEMO_MOTOR_PARAMS.rLL25Ohm},
+    t_coil=${DEMO_MOTOR_PARAMS.tCoilC},
+    l_ll_mh=${DEMO_MOTOR_PARAMS.lLLmH},
+    n0_rpm=${DEMO_MOTOR_PARAMS.n0Rpm},
+    beta_sat=${DEMO_MOTOR_PARAMS.betaSat},
+    p0_a=${DEMO_MOTOR_PARAMS.p0A},
+    p0_b=${DEMO_MOTOR_PARAMS.p0B},
+    rs_eff_override=None,
+    i_idle=${DEMO_MOTOR_PARAMS.iIdleA},
+    eta_inv=${DEMO_MOTOR_PARAMS.etaInv},
+    i_deadband=${DEMO_MOTOR_PARAMS.iDeadbandA},
+    r_line=${DEMO_MOTOR_PARAMS.rLineOhm},
+    rds_on_mohm=${DEMO_MOTOR_PARAMS.rdsOnMOhm},
+    t_dead_ns=${DEMO_MOTOR_PARAMS.tDeadNs},
+    f_sw_khz=${DEMO_MOTOR_PARAMS.fSwKhz},
+    v_sd=${DEMO_MOTOR_PARAMS.vSdV},
+)
+cases = ${JSON.stringify(cases)}
+out = []
+for c in cases:
+    r = ns["solve_single_point"](c["vMeas"], c["iBus"], c["nRpm"], p)
+    fwd = ns["forward_verify_point"](r["iq"], c["nRpm"], c["vMeas"], p) if (r["iq"] == r["iq"]) else None
+    out.append({"point": r, "fwd": fwd})
+def sanitize(obj):
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize(v) for v in obj]
+    return obj
+print(json.dumps(sanitize({
+    "ke_kv": ns["calc_ke_from_kv"](107.4),
+    "ke_n0": ns["calc_ke_from_no_load"](13.5, 1450.0),
+    "vq_cmd": ns["calc_vq_cmd"](5.0, 10.0, 13.4, p),
+    "phi_deg": ns["calc_phi_deg"](5.0, -0.5, 10.0),
+    "results": out,
+}), allow_nan=False))
+`;
+
+  const proc = spawnSync('python3', ['-c', pyScript], {
+    input: motorPhysicsPy,
+    encoding: 'utf8',
+  });
+  assert.equal(proc.status, 0, `python3 execution failed: ${proc.stderr}`);
+  const pyData = JSON.parse(proc.stdout);
+
+  assert.ok(Math.abs(pyData.ke_kv - calcKeFromKv(107.4)) < 1e-12);
+  assert.ok(Math.abs(pyData.ke_n0 - calcKeFromNoLoad(13.5, 1450)) < 1e-12);
+  assert.ok(Math.abs(pyData.vq_cmd - calcVqCmd(5.0, 10.0, 13.4, DEMO_MOTOR_PARAMS)) < 1e-12);
+  assert.ok(Math.abs(pyData.phi_deg - calcPhiDeg(5.0, -0.5, 10.0)) < 1e-12);
+
+  for (let idx = 0; idx < cases.length; idx++) {
+    const c = cases[idx];
+    const ts = solveSinglePoint(c.vMeas, c.iBus, c.nRpm, DEMO_MOTOR_PARAMS);
+    const py = pyData.results[idx].point;
+    assert.equal(py.mode, ts.mode, `Mode mismatch on case ${idx}`);
+    assert.equal(py.alert_iq_sign_ambiguous, ts.alerts.iqSignAmbiguous);
+    assert.equal(py.alert_invalid_bus, ts.alerts.invalidBus);
+    assert.equal(py.alert_regen_limit, ts.alerts.regenLimit);
+    if (Number.isFinite(ts.iqA)) {
+      assert.ok(Math.abs(py.iq - ts.iqA) < 1e-9, `iq mismatch on case ${idx}: ${py.iq} vs ${ts.iqA}`);
+      assert.ok(Math.abs(py.t_est - ts.tEstNm) < 1e-9);
+      assert.ok(Math.abs(py.m_norm_cmd - ts.mNormCmd) < 1e-9);
+      assert.ok(Math.abs(py.phi_deg - ts.phiDeg) < 1e-9);
+      const tsFwd = forwardVerifyPoint(ts.iqA, c.nRpm, c.vMeas, DEMO_MOTOR_PARAMS);
+      const pyFwd = pyData.results[idx].fwd;
+      assert.ok(Math.abs(pyFwd.i_bus_est - tsFwd.iBusEstA) < 1e-9);
+      assert.ok(Math.abs(pyFwd.t_est - tsFwd.tEstNm) < 1e-9);
+    }
+  }
+});
+

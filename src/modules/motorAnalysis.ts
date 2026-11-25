@@ -8,25 +8,33 @@
 
 import { WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
-import { inspectTimebase } from './timeSync';
+import { DEFAULT_SAMPLING_GAP_FACTOR, inspectTimebase, validateChannelIntegrity } from './timeSync';
 
 /**
  * Extracts electrical rotor angle theta(t) in radians from Clarke alpha/beta signals.
+ * Rejects mismatched lengths and outputs NaN on invalid samples instead of holding stale angles.
  */
 export function estimateElectricalAngleFromAlphaBeta(
   alpha: Float32Array,
   beta: Float32Array,
   offsetRad: number = 0
 ): Float32Array {
-  const n = Math.min(alpha.length, beta.length);
+  if (alpha.length !== beta.length) {
+    throw new Error(
+      `Clarke α (${alpha.length}) 与 β (${beta.length}) 数组长度不一致，已拒绝静默截断。`
+    );
+  }
+  const n = alpha.length;
   const theta = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const a = alpha[i];
     const b = beta[i];
-    if (isFinite(a) && isFinite(b)) {
+    if (Number.isFinite(a) && Number.isFinite(b) && (a !== 0 || b !== 0)) {
       theta[i] = Math.atan2(b, a) + offsetRad;
+    } else if (Number.isFinite(a) && Number.isFinite(b)) {
+      theta[i] = 0 + offsetRad;
     } else {
-      theta[i] = i > 0 ? theta[i - 1] : 0;
+      theta[i] = Number.NaN;
     }
   }
   return theta;
@@ -50,17 +58,21 @@ export function estimateSpeedFromSignal(
   tStart?: number,
   tEnd?: number
 ): SpeedEstimateResult {
-  const n = Math.min(t.length, v.length);
-  if (n < 4 || !isFinite(polePairs) || polePairs <= 0) {
+  if (t.length !== v.length || t.length < 4 || !Number.isFinite(polePairs) || polePairs <= 0) {
+    return { freqHz: null, rpm: null, zeroCrossings: 0, avgPeriodSec: null };
+  }
+  const n = t.length;
+  const tb = inspectTimebase(t, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tb.monotonic) {
     return { freqHz: null, rpm: null, zeroCrossings: 0, avgPeriodSec: null };
   }
 
   let i0 = 0;
   let i1 = n - 1;
-  if (tStart !== undefined) {
+  if (tStart !== undefined && Number.isFinite(tStart)) {
     while (i0 < n && t[i0] < tStart) i0++;
   }
-  if (tEnd !== undefined) {
+  if (tEnd !== undefined && Number.isFinite(tEnd)) {
     while (i1 > i0 && t[i1] > tEnd) i1--;
   }
   if (i1 - i0 < 4) {
@@ -71,13 +83,13 @@ export function estimateSpeedFromSignal(
   let max = -Infinity;
   for (let i = i0; i <= i1; i++) {
     const val = v[i];
-    if (isFinite(val)) {
+    if (Number.isFinite(val)) {
       if (val < min) min = val;
       if (val > max) max = val;
     }
   }
   const span = max - min;
-  if (!isFinite(span) || span <= 1e-12) {
+  if (!Number.isFinite(span) || span <= 1e-12) {
     return { freqHz: null, rpm: null, zeroCrossings: 0, avgPeriodSec: null };
   }
 
@@ -89,12 +101,16 @@ export function estimateSpeedFromSignal(
   for (let i = i0 + 1; i <= i1; i++) {
     const prev = v[i - 1];
     const curr = v[i];
-    if (!isFinite(prev) || !isFinite(curr)) continue;
+    const dt = t[i] - t[i - 1];
+    if (!Number.isFinite(prev) || !Number.isFinite(curr) || dt <= 0 || dt > tb.gapThresholdSec) {
+      armed = false;
+      continue;
+    }
     if (prev <= mid - hyst) armed = true;
     if (armed && prev < mid && curr >= mid) {
       const denom = curr - prev;
       const frac = denom > 1e-15 ? (mid - prev) / denom : 0;
-      const tc = t[i - 1] + frac * (t[i] - t[i - 1]);
+      const tc = t[i - 1] + frac * dt;
       crossings.push(tc);
       armed = false;
     }
@@ -111,7 +127,7 @@ export function estimateSpeedFromSignal(
 
   const totalSpan = crossings[crossings.length - 1] - crossings[0];
   const avgPeriodSec = totalSpan / (crossings.length - 1);
-  if (!isFinite(avgPeriodSec) || avgPeriodSec <= 0) {
+  if (!Number.isFinite(avgPeriodSec) || avgPeriodSec <= 0) {
     return { freqHz: null, rpm: null, zeroCrossings: crossings.length, avgPeriodSec: null };
   }
 
@@ -132,10 +148,11 @@ export interface PhaseDiffResult {
 function findRisingMidCrossings(
   ch: WaveformChannel,
   tStart: number,
-  tEnd: number
+  tEnd: number,
+  gapThresholdSec: number
 ): { crossings: number[]; span: number } {
-  const n = Math.min(ch.t.length, ch.v.length);
-  if (n < 4) return { crossings: [], span: 0 };
+  const n = ch.t.length;
+  if (n < 4 || ch.v.length !== n) return { crossings: [], span: 0 };
 
   let i0 = 0;
   while (i0 < n && ch.t[i0] < tStart) i0++;
@@ -148,13 +165,13 @@ function findRisingMidCrossings(
   let max = -Infinity;
   for (let i = i0; i <= i1; i++) {
     const val = getChannelDisplayValue(ch, i, mean);
-    if (isFinite(val)) {
+    if (Number.isFinite(val)) {
       if (val < min) min = val;
       if (val > max) max = val;
     }
   }
   const span = max - min;
-  if (!isFinite(span) || span <= 1e-12) return { crossings: [], span: 0 };
+  if (!Number.isFinite(span) || span <= 1e-12) return { crossings: [], span: 0 };
 
   const mid = (max + min) / 2;
   const hyst = span * 0.06;
@@ -164,12 +181,16 @@ function findRisingMidCrossings(
   for (let i = i0 + 1; i <= i1; i++) {
     const prev = getChannelDisplayValue(ch, i - 1, mean);
     const curr = getChannelDisplayValue(ch, i, mean);
-    if (!isFinite(prev) || !isFinite(curr)) continue;
+    const dt = ch.t[i] - ch.t[i - 1];
+    if (!Number.isFinite(prev) || !Number.isFinite(curr) || dt <= 0 || dt > gapThresholdSec) {
+      armed = false;
+      continue;
+    }
     if (prev <= mid - hyst) armed = true;
     if (armed && prev < mid && curr >= mid) {
       const denom = curr - prev;
       const frac = denom > 1e-15 ? (mid - prev) / denom : 0;
-      crossings.push(ch.t[i - 1] + frac * (ch.t[i] - ch.t[i - 1]));
+      crossings.push(ch.t[i - 1] + frac * dt);
       armed = false;
     }
   }
@@ -178,7 +199,7 @@ function findRisingMidCrossings(
 }
 
 /**
- * Computes fundamental phase difference (Target relative to Reference: positive means Target lags or leads cleanly wrapped).
+ * Computes fundamental phase difference (Target relative to Reference: positive means Target leads Ref).
  * Convention: Δt = t_target_crossing - t_ref_crossing wrapped into [-T/2, +T/2], ΔΦ = -360 * Δt / T (positive = target leads ref).
  */
 export function computeTwoChannelPhaseDiff(
@@ -187,36 +208,36 @@ export function computeTwoChannelPhaseDiff(
   tStart?: number,
   tEnd?: number
 ): PhaseDiffResult {
-  if (!chRef || !chTarget || chRef.t.length < 4 || chTarget.t.length < 4) {
+  const refCheck = validateChannelIntegrity(chRef, 4, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!refCheck.valid) {
     return {
       phaseDeg: null,
       phaseDeg360: null,
       deltaTimeSec: null,
       frequencyHz: null,
       matchedCycles: 0,
-      status: 'Insufficient samples',
+      status: refCheck.invalidReason || 'Invalid reference channel',
     };
   }
-  const tbRef = inspectTimebase(chRef.t, 0, Math.min(chRef.t.length, chRef.v.length) - 1);
-  const tbTgt = inspectTimebase(chTarget.t, 0, Math.min(chTarget.t.length, chTarget.v.length) - 1);
-  if (!tbRef.monotonic || !tbTgt.monotonic) {
+  const tgtCheck = validateChannelIntegrity(chTarget, 4, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tgtCheck.valid) {
     return {
       phaseDeg: null,
       phaseDeg360: null,
       deltaTimeSec: null,
       frequencyHz: null,
       matchedCycles: 0,
-      status: 'Non-monotonic or invalid timebase',
+      status: tgtCheck.invalidReason || 'Invalid target channel',
     };
   }
 
   const start =
-    tStart !== undefined
-      ? tStart
+    tStart !== undefined && Number.isFinite(tStart)
+      ? Math.max(tStart, chRef.t[0], chTarget.t[0])
       : Math.max(chRef.t[0], chTarget.t[0]);
   const end =
-    tEnd !== undefined
-      ? tEnd
+    tEnd !== undefined && Number.isFinite(tEnd)
+      ? Math.min(tEnd, chRef.t[chRef.t.length - 1], chTarget.t[chTarget.t.length - 1])
       : Math.min(chRef.t[chRef.t.length - 1], chTarget.t[chTarget.t.length - 1]);
 
   if (end <= start) {
@@ -230,8 +251,8 @@ export function computeTwoChannelPhaseDiff(
     };
   }
 
-  const refRes = findRisingMidCrossings(chRef, start, end);
-  const tgtRes = findRisingMidCrossings(chTarget, start, end);
+  const refRes = findRisingMidCrossings(chRef, start, end, refCheck.timebase.gapThresholdSec);
+  const tgtRes = findRisingMidCrossings(chTarget, start, end, tgtCheck.timebase.gapThresholdSec);
 
   if (refRes.crossings.length < 2 || tgtRes.crossings.length < 1) {
     return {
@@ -247,7 +268,7 @@ export function computeTwoChannelPhaseDiff(
   const period =
     (refRes.crossings[refRes.crossings.length - 1] - refRes.crossings[0]) /
     (refRes.crossings.length - 1);
-  if (!isFinite(period) || period <= 0) {
+  if (!Number.isFinite(period) || period <= 0) {
     return {
       phaseDeg: null,
       phaseDeg360: null,
@@ -275,7 +296,7 @@ export function computeTwoChannelPhaseDiff(
         bestDt = rawDt;
       }
     }
-    if (isFinite(bestDt) && Math.abs(bestDt) <= period) {
+    if (Number.isFinite(bestDt) && Math.abs(bestDt) <= period) {
       // Phase of target relative to ref: if target crosses BEFORE ref (bestDt < 0), target LEADS (+)
       const angleRad = (-2 * Math.PI * bestDt) / period;
       sumSin += Math.sin(angleRad);
@@ -311,15 +332,57 @@ export function computeTwoChannelPhaseDiff(
 }
 
 export interface PowerSummary {
+  valid: boolean;
+  status: 'OK' | 'INVALID' | 'INSUFFICIENT_DATA';
+  invalidReason: string | null;
   avgPowerW: number;
+  /** Time-averaged magnitude ∫|P(t)|dt / T (non-directional power amplitude, NOT semiconductor heat dissipation). */
+  avgAbsPowerW: number;
+  /** @deprecated Alias for avgAbsPowerW kept for backward compatibility; does NOT represent device heat dissipation. */
   avgDissipationW: number;
   peakPowerW: number;
+  peakPosPowerW: number;
+  peakNegPowerW: number;
+  peakAbsPowerW: number;
   energyJ: number;
+  inputEnergyJ: number;
+  regenEnergyJ: number;
   durationSec: number;
+  validSegmentCount: number;
+  skippedGapCount: number;
+  coveragePct: number;
+}
+
+function makeInvalidPowerSummary(
+  status: 'INVALID' | 'INSUFFICIENT_DATA',
+  invalidReason: string,
+  skippedGapCount = 0
+): PowerSummary {
+  return {
+    valid: false,
+    status,
+    invalidReason,
+    avgPowerW: Number.NaN,
+    avgAbsPowerW: Number.NaN,
+    avgDissipationW: Number.NaN,
+    peakPowerW: Number.NaN,
+    peakPosPowerW: Number.NaN,
+    peakNegPowerW: Number.NaN,
+    peakAbsPowerW: Number.NaN,
+    energyJ: Number.NaN,
+    inputEnergyJ: Number.NaN,
+    regenEnergyJ: Number.NaN,
+    durationSec: 0,
+    validSegmentCount: 0,
+    skippedGapCount,
+    coveragePct: 0,
+  };
 }
 
 /**
- * Computes signed active average power, non-negative dissipation mean ∫|P(t)|dt/T, peak power, and trapezoidal energy integral ∫ P(t) dt.
+ * Computes signed active average power, time-averaged magnitude ∫|P(t)|dt/T, signed peak power,
+ * and trapezoidal positive/regenerative/net energy integrals ∫ P(t) dt.
+ * Enforces t/p length equality, strict monotonicity, and gap/NaN segmentation without fabricating 0 W / 0 J on invalid input.
  */
 export function computePowerSummary(
   t: Float64Array,
@@ -327,46 +390,128 @@ export function computePowerSummary(
   tStart?: number,
   tEnd?: number
 ): PowerSummary {
-  const n = Math.min(t.length, p.length);
-  if (n < 2) return { avgPowerW: 0, avgDissipationW: 0, peakPowerW: 0, energyJ: 0, durationSec: 0 };
+  if (!t || !p || t.length !== p.length) {
+    return makeInvalidPowerSummary(
+      'INVALID',
+      `功率时间轴 (${t?.length ?? 0}) 与功率数组 (${p?.length ?? 0}) 长度不一致，已拒绝计算。`
+    );
+  }
+  const n = t.length;
+  if (n < 2) {
+    return makeInvalidPowerSummary('INSUFFICIENT_DATA', '功率积分至少需要 2 个有效采样点。');
+  }
+
+  const tb = inspectTimebase(t, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tb.monotonic) {
+    return makeInvalidPowerSummary(
+      'INVALID',
+      `功率时间轴在索引 ${tb.nonMonotonicIndex ?? '?'} 处存在非单调、重复或 NaN/Inf 时间戳。`
+    );
+  }
+
+  const startBound = tStart !== undefined && Number.isFinite(tStart) ? tStart : t[0];
+  const endBound = tEnd !== undefined && Number.isFinite(tEnd) ? tEnd : t[n - 1];
+  if (endBound <= startBound || endBound < t[0] || startBound > t[n - 1]) {
+    return makeInvalidPowerSummary('INSUFFICIENT_DATA', '所选功率积分窗口与原始波形无有效时间重叠。');
+  }
 
   let i0 = 0;
   let i1 = n - 1;
-  if (tStart !== undefined) while (i0 < n && t[i0] < tStart) i0++;
-  if (tEnd !== undefined) while (i1 > i0 && t[i1] > tEnd) i1--;
-  if (i1 <= i0) return { avgPowerW: 0, avgDissipationW: 0, peakPowerW: 0, energyJ: 0, durationSec: 0 };
+  while (i0 < n && t[i0] < startBound) i0++;
+  while (i1 > i0 && t[i1] > endBound) i1--;
+  if (i1 <= i0) {
+    return makeInvalidPowerSummary('INSUFFICIENT_DATA', '所选功率积分窗口内连续样本数不足 (< 2)。');
+  }
 
-  let energy = 0;
-  let dissipationEnergy = 0;
+  let inputEnergyJ = 0;
+  let regenEnergyJ = 0;
   let peak = 0;
+  let peakPos = -Infinity;
+  let peakNeg = Infinity;
+  let peakAbs = 0;
+  let hasPeak = false;
   let dur = 0;
+  let validSegmentCount = 0;
+  let skippedGapCount = 0;
 
   for (let i = i0 + 1; i <= i1; i++) {
     const p0 = p[i - 1];
     const p1 = p[i];
     const dt = t[i] - t[i - 1];
-    if (isFinite(p0) && isFinite(p1) && isFinite(dt) && dt > 0) {
-      energy += 0.5 * (p0 + p1) * dt;
-      if ((p0 >= 0 && p1 >= 0) || (p0 <= 0 && p1 <= 0)) {
-        dissipationEnergy += 0.5 * (Math.abs(p0) + Math.abs(p1)) * dt;
+    if (!(dt > 0) || !Number.isFinite(dt)) continue;
+    if (Number.isFinite(tb.gapThresholdSec) && dt > tb.gapThresholdSec) {
+      skippedGapCount++;
+      continue;
+    }
+    if (Number.isFinite(p0) && Number.isFinite(p1)) {
+      if (p0 >= 0 && p1 >= 0) {
+        inputEnergyJ += 0.5 * (p0 + p1) * dt;
+      } else if (p0 <= 0 && p1 <= 0) {
+        regenEnergyJ += 0.5 * (-p0 - p1) * dt;
       } else {
         const a0 = Math.abs(p0);
         const a1 = Math.abs(p1);
         const denom = a0 + a1;
         const frac = denom > 1e-18 ? a0 / denom : 0.5;
-        dissipationEnergy += 0.5 * a0 * (dt * frac) + 0.5 * a1 * (dt * (1 - frac));
+        const dt0 = dt * frac;
+        const dt1 = dt * (1 - frac);
+        if (p0 > 0) {
+          inputEnergyJ += 0.5 * a0 * dt0;
+          regenEnergyJ += 0.5 * a1 * dt1;
+        } else {
+          regenEnergyJ += 0.5 * a0 * dt0;
+          inputEnergyJ += 0.5 * a1 * dt1;
+        }
       }
       dur += dt;
-      if (Math.abs(p0) > Math.abs(peak)) peak = p0;
-      if (Math.abs(p1) > Math.abs(peak)) peak = p1;
+      validSegmentCount++;
+      if (!hasPeak || Math.abs(p0) > Math.abs(peak)) {
+        peak = p0;
+        hasPeak = true;
+      }
+      if (Math.abs(p1) > Math.abs(peak)) {
+        peak = p1;
+      }
+      if (p0 > peakPos) peakPos = p0;
+      if (p1 > peakPos) peakPos = p1;
+      if (p0 < peakNeg) peakNeg = p0;
+      if (p1 < peakNeg) peakNeg = p1;
+      if (Math.abs(p0) > peakAbs) peakAbs = Math.abs(p0);
+      if (Math.abs(p1) > peakAbs) peakAbs = Math.abs(p1);
     }
   }
 
+  if (validSegmentCount === 0 || dur <= 0) {
+    return makeInvalidPowerSummary(
+      'INSUFFICIENT_DATA',
+      '指定积分窗内缺少有效的连续有限功率段（全为 NaN 或采样缺口）。',
+      skippedGapCount
+    );
+  }
+
+  const netEnergyJ = inputEnergyJ - regenEnergyJ;
+  const absEnergyJ = inputEnergyJ + regenEnergyJ;
+  const avgAbsPowerW = absEnergyJ / dur;
+  const windowSpan = t[i1] - t[i0];
+  const coveragePct = windowSpan > 0 ? Math.min(100, (dur / windowSpan) * 100) : 0;
+
   return {
-    avgPowerW: dur > 0 ? energy / dur : 0,
-    avgDissipationW: dur > 0 ? dissipationEnergy / dur : 0,
+    valid: true,
+    status: 'OK',
+    invalidReason: null,
+    avgPowerW: netEnergyJ / dur,
+    avgAbsPowerW,
+    avgDissipationW: avgAbsPowerW,
     peakPowerW: peak,
-    energyJ: energy,
+    peakPosPowerW: Number.isFinite(peakPos) ? peakPos : 0,
+    peakNegPowerW: Number.isFinite(peakNeg) ? peakNeg : 0,
+    peakAbsPowerW: peakAbs,
+    energyJ: netEnergyJ,
+    inputEnergyJ,
+    regenEnergyJ,
     durationSec: dur,
+    validSegmentCount,
+    skippedGapCount,
+    coveragePct,
   };
 }

@@ -32,7 +32,7 @@ import {
   SampleReader,
 } from '../modules/decimator';
 import { MEASUREMENT_DEFINITIONS, MeasurementDefinition } from '../modules/measurements';
-import { computeXYMetrics } from '../modules/xyAnalysis';
+import { computeXYAlignedTrajectory, computeXYMetrics } from '../modules/xyAnalysis';
 import { GoldenEvaluationResult } from '../modules/anomalyScanner';
 
 export type { PlotArea, SubplotRect };
@@ -2342,16 +2342,16 @@ export function drawMeasurementStripOnCanvas(
   return curY + cardH + 8 - yStart;
 }
 
-function resolveXYSliceIndices(
+function resolveXYTimeWindow(
   tab: TabState,
   xCh: WaveformChannel,
   yCh: WaveformChannel
-): { iStart: number; iEnd: number } {
+): { tStart?: number; tEnd?: number; iStart: number; iEnd: number } {
+  const baseCh = tab.channels[tab.drawOrder[0]] || xCh;
   const n = Math.min(xCh.v.length, yCh.v.length);
-  if (n <= 0) return { iStart: 0, iEnd: 0 };
   const rangeMode = tab.xyConfig?.range || 'view';
   if (rangeMode === 'entire') {
-    return { iStart: 0, iEnd: n };
+    return { tStart: undefined, tEnd: undefined, iStart: 0, iEnd: n };
   }
   if (
     rangeMode === 'cursors' &&
@@ -2365,11 +2365,18 @@ function resolveXYSliceIndices(
     while (s < xCh.t.length && xCh.t[s] < tMin) s++;
     let e = s;
     while (e < xCh.t.length && xCh.t[e] <= tMax) e++;
-    return { iStart: Math.min(s, n - 1), iEnd: Math.min(Math.max(s + 1, e), n) };
+    return { tStart: tMin, tEnd: tMax, iStart: Math.min(s, Math.max(0, n - 1)), iEnd: Math.min(Math.max(s + 1, e), n) };
   }
-  const s = Math.max(0, Math.min(n - 1, tab.view.startIndex));
-  const e = Math.max(s + 1, Math.min(n, tab.view.endIndex));
-  return { iStart: s, iEnd: e };
+  const bn = baseCh.t.length;
+  if (bn < 2) return { tStart: undefined, tEnd: undefined, iStart: 0, iEnd: 0 };
+  const s = Math.max(0, Math.min(bn - 1, tab.view.startIndex));
+  const e = Math.max(s + 1, Math.min(bn, tab.view.endIndex));
+  return {
+    tStart: baseCh.t[s],
+    tEnd: baseCh.t[e - 1],
+    iStart: Math.min(s, Math.max(0, n - 1)),
+    iEnd: Math.min(e, n),
+  };
 }
 
 export function getXYPlotBounds(
@@ -2377,8 +2384,9 @@ export function getXYPlotBounds(
   xCh: WaveformChannel,
   yCh: WaveformChannel
 ): { xMin: number; xMax: number; yMin: number; yMax: number; iStart: number; iEnd: number } {
-  const { iStart, iEnd } = resolveXYSliceIndices(tab, xCh, yCh);
-  const metrics = computeXYMetrics(xCh, yCh, iStart, iEnd);
+  const { tStart, tEnd, iStart, iEnd } = resolveXYTimeWindow(tab, xCh, yCh);
+  const aligned = computeXYAlignedTrajectory(xCh, yCh, tStart, tEnd);
+  const metrics = aligned.metrics;
   const xSpan = Math.max(1e-6, metrics.xMax - metrics.xMin);
   const ySpan = Math.max(1e-6, metrics.yMax - metrics.yMin);
   const xPad = xSpan * 0.12;
@@ -2408,8 +2416,15 @@ export function drawXYPlot(
   const yCh = tab.channels[yId];
   if (!xCh || !yCh) return;
 
-  const bounds = getXYPlotBounds(tab, xCh, yCh);
-  const { xMin, xMax, yMin, yMax, iStart, iEnd } = bounds;
+  const { tStart, tEnd } = resolveXYTimeWindow(tab, xCh, yCh);
+  const aligned = computeXYAlignedTrajectory(xCh, yCh, tStart, tEnd);
+  const metrics = aligned.metrics;
+  const xRawSpan = Math.max(1e-6, metrics.xMax - metrics.xMin);
+  const yRawSpan = Math.max(1e-6, metrics.yMax - metrics.yMin);
+  const xMin = metrics.xMin - xRawSpan * 0.12;
+  const xMax = metrics.xMax + xRawSpan * 0.12;
+  const yMin = metrics.yMin - yRawSpan * 0.12;
+  const yMax = metrics.yMax + yRawSpan * 0.12;
   const xSpan = Math.max(1e-9, xMax - xMin);
   const ySpan = Math.max(1e-9, yMax - yMin);
 
@@ -2440,38 +2455,39 @@ export function drawXYPlot(
     ctx.setLineDash([]);
   }
 
-  const xMean = xCh.coupling === 'AC' ? computeChannelMean(xCh) : 0;
-  const yMean = yCh.coupling === 'AC' ? computeChannelMean(yCh) : 0;
-  const totalCount = Math.max(0, iEnd - iStart);
-  const stride = totalCount > 24000 ? Math.ceil(totalCount / 24000) : 1;
-
-  ctx.strokeStyle = theme.cursor;
-  ctx.lineWidth = 1.6;
-  ctx.lineJoin = 'round';
-  ctx.beginPath();
-  let penDown = false;
   let firstPx: { x: number; y: number } | null = null;
   let lastPx: { x: number; y: number } | null = null;
 
-  for (let i = iStart; i < iEnd; i += stride) {
-    const xv = getChannelDisplayValue(xCh, i, xMean);
-    const yv = getChannelDisplayValue(yCh, i, yMean);
-    if (!isFinite(xv) || !isFinite(yv)) {
-      penDown = false;
-      continue;
+  if (metrics.valid && aligned.time.length >= 2) {
+    const totalCount = aligned.time.length;
+    const stride = totalCount > 24000 ? Math.ceil(totalCount / 24000) : 1;
+
+    ctx.strokeStyle = theme.cursor;
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    let penDown = false;
+
+    for (let i = 0; i < totalCount; i += stride) {
+      const xv = aligned.xValues[i];
+      const yv = aligned.yValues[i];
+      if (!Number.isFinite(xv) || !Number.isFinite(yv)) {
+        penDown = false;
+        continue;
+      }
+      const px = p.x + ((xv - xMin) / xSpan) * p.width;
+      const py = p.y + p.height - ((yv - yMin) / ySpan) * p.height;
+      if (!penDown) {
+        ctx.moveTo(px, py);
+        penDown = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+      if (!firstPx) firstPx = { x: px, y: py };
+      lastPx = { x: px, y: py };
     }
-    const px = p.x + ((xv - xMin) / xSpan) * p.width;
-    const py = p.y + p.height - ((yv - yMin) / ySpan) * p.height;
-    if (!penDown) {
-      ctx.moveTo(px, py);
-      penDown = true;
-    } else {
-      ctx.lineTo(px, py);
-    }
-    if (!firstPx) firstPx = { x: px, y: py };
-    lastPx = { x: px, y: py };
+    ctx.stroke();
   }
-  ctx.stroke();
 
   if (firstPx) {
     ctx.fillStyle = theme.peak;
@@ -2486,12 +2502,17 @@ export function drawXYPlot(
     ctx.fill();
   }
 
-  const metrics = computeXYMetrics(xCh, yCh, iStart, iEnd);
+  const phaseStr =
+    metrics.lissajousPhaseDeg !== null
+      ? `${metrics.lissajousPhaseDeg > 0 ? '+' : ''}${metrics.lissajousPhaseDeg.toFixed(1)}°`
+      : '--';
   const lines = [
     `XY: ${xCh.name} (X) vs ${yCh.name} (Y)`,
-    `Pts: ${metrics.sampleCount.toLocaleString()}`,
+    metrics.valid
+      ? `Status: OK (${metrics.coveragePct.toFixed(0)}%) · Pts: ${metrics.sampleCount.toLocaleString()}`
+      : `Status: ${metrics.status}`,
     `Circularity: ${metrics.circularityPct !== null ? metrics.circularityPct.toFixed(1) + '%' : '--'}`,
-    `Lissajous ΔΦ: ${metrics.lissajousPhaseDeg !== null ? metrics.lissajousPhaseDeg.toFixed(1) + '°' : '--'}`,
+    `Lissajous ΔΦ: ${phaseStr}`,
   ];
 
   ctx.font = '11px "JetBrains Mono", monospace';
@@ -2504,11 +2525,11 @@ export function drawXYPlot(
   const by = p.y + 8;
   ctx.fillStyle = theme.hudBg;
   ctx.fillRect(bx, by, maxW + 16, lines.length * 15 + 10);
-  ctx.strokeStyle = theme.hudBorder;
+  ctx.strokeStyle = metrics.valid ? theme.hudBorder : '#f59e0b';
   ctx.strokeRect(bx, by, maxW + 16, lines.length * 15 + 10);
   ctx.textAlign = 'left';
   lines.forEach((ln, idx) => {
-    ctx.fillStyle = idx === 0 ? theme.cursor : theme.text;
+    ctx.fillStyle = idx === 0 ? theme.cursor : !metrics.valid && idx === 1 ? '#fbbf24' : theme.text;
     ctx.fillText(ln, bx + 8, by + 15 + idx * 15);
   });
 
@@ -2528,7 +2549,7 @@ export function drawGoldenToleranceBand(
 ): void {
   const cfg = tab.goldenBand;
   if (!cfg || !cfg.enabled || cfg.channelId !== ch.id) return;
-  const refV = cfg.refV || ch.refV;
+  const refV = goldenEval.alignedRefV || cfg.refV || ch.refV;
   if (!refV || refV.length === 0) return;
 
   const area = subPlotArea || p;
@@ -2544,7 +2565,7 @@ export function drawGoldenToleranceBand(
   const startIdx = Math.max(0, Math.min(n - 1, tab.view.startIndex));
   const endIdx = Math.max(startIdx + 1, Math.min(n, tab.view.endIndex));
   const step = Math.max(1, Math.floor((endIdx - startIdx) / Math.max(200, Math.round(area.width))));
-  const half = goldenEval.bandHalfWidth;
+  const half = Number.isFinite(goldenEval.bandHalfWidth) ? goldenEval.bandHalfWidth : 0;
 
   ctx.save();
   ctx.beginPath();
@@ -2555,14 +2576,16 @@ export function drawGoldenToleranceBand(
   const upperPts: Array<{ x: number; y: number }> = [];
   const lowerPts: Array<{ x: number; y: number }> = [];
 
-  for (let i = startIdx; i < endIdx; i += step) {
-    const rv = refV[i];
-    if (!isFinite(rv)) continue;
-    const x = area.x + ((ch.t[i] - tStart) / tSpan) * area.width;
-    const yUp = area.y + area.height - ((rv + half - vMin) / vRange) * area.height;
-    const yLo = area.y + area.height - ((rv - half - vMin) / vRange) * area.height;
-    upperPts.push({ x, y: yUp });
-    lowerPts.push({ x, y: yLo });
+  if (half > 0 && goldenEval.status !== 'INVALID') {
+    for (let i = startIdx; i < endIdx; i += step) {
+      const rv = refV[i];
+      if (!isFinite(rv)) continue;
+      const x = area.x + ((ch.t[i] - tStart) / tSpan) * area.width;
+      const yUp = area.y + area.height - ((rv + half - vMin) / vRange) * area.height;
+      const yLo = area.y + area.height - ((rv - half - vMin) / vRange) * area.height;
+      upperPts.push({ x, y: yUp });
+      lowerPts.push({ x, y: yLo });
+    }
   }
 
   if (upperPts.length > 1) {
@@ -2603,19 +2626,27 @@ export function drawGoldenToleranceBand(
     }
   }
 
-  // Pass/Fail badge inside graticule top-left
-  const statusText = goldenEval.pass
-    ? `GOLDEN PASS (±${formatEng(half, ch.unit, 2)})`
-    : `GOLDEN FAIL · ${goldenEval.violationCount} pts out`;
+  // Pass/Fail/Invalid/Insufficient badge inside graticule top-left
+  const isPass = goldenEval.status === 'PASS';
+  const isWarn = goldenEval.status === 'INVALID' || goldenEval.status === 'INSUFFICIENT_DATA';
+  const statusText = isPass
+    ? `GOLDEN PASS (±${formatEng(half, ch.unit, 2)} · ${goldenEval.coveragePct.toFixed(0)}%)`
+    : goldenEval.status === 'FAIL'
+    ? `GOLDEN FAIL · ${goldenEval.violationCount} pts out (${goldenEval.coveragePct.toFixed(0)}%)`
+    : `GOLDEN ${goldenEval.status === 'INSUFFICIENT_DATA' ? 'INSUFFICIENT DATA' : 'INVALID'} (${goldenEval.coveragePct.toFixed(0)}%)`;
   ctx.font = '600 10.5px "JetBrains Mono", monospace';
   const tw = ctx.measureText(statusText).width;
   const bx = area.x + 8;
   const by = area.y + (tab.separateView ? 24 : 8);
-  ctx.fillStyle = goldenEval.pass ? 'rgba(6, 78, 59, 0.88)' : 'rgba(127, 29, 29, 0.9)';
+  ctx.fillStyle = isPass
+    ? 'rgba(6, 78, 59, 0.88)'
+    : isWarn
+    ? 'rgba(120, 53, 15, 0.9)'
+    : 'rgba(127, 29, 29, 0.9)';
   ctx.fillRect(bx, by, tw + 12, 17);
-  ctx.strokeStyle = goldenEval.pass ? '#10b981' : '#ef4444';
+  ctx.strokeStyle = isPass ? '#10b981' : isWarn ? '#f59e0b' : '#ef4444';
   ctx.strokeRect(bx, by, tw + 12, 17);
-  ctx.fillStyle = goldenEval.pass ? '#6ee7b7' : '#fecaca';
+  ctx.fillStyle = isPass ? '#6ee7b7' : isWarn ? '#fde68a' : '#fecaca';
   ctx.textAlign = 'left';
   ctx.fillText(statusText, bx + 6, by + 12);
 

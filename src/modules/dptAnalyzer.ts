@@ -82,50 +82,98 @@ export interface DptOperatingPoint {
   eOnSansQrrUj?: number;
 }
 
+export interface DptLutInterpolationResult {
+  eOnUj: number;
+  eOffUj: number;
+  eSwTotalUj: number;
+  qRrNc: number;
+  eOnSansQrrUj: number;
+  extrapolated: boolean;
+  vRange: [number, number];
+  iRange: [number, number];
+}
+
 /**
  * Bilinear / inverse-distance-weighted multi-point DPT operating matrix interpolation
- * across (Vbus, Iload) with nearest fallback when only 1 point is recorded.
+ * across (Vbus, Iload) with bounds/extrapolation reporting.
  */
 export function interpolateDptSwitchingLoss(
   lut: DptOperatingPoint[],
   vBusTargetV: number,
   iLoadTargetA: number
-): { eOnUj: number; eOffUj: number; eSwTotalUj: number; qRrNc: number; eOnSansQrrUj: number } | null {
+): DptLutInterpolationResult | null {
   if (!lut || lut.length === 0) return null;
+  const vSafe = Math.max(0, Number.isFinite(vBusTargetV) ? vBusTargetV : 0);
+  const iSafe = Math.max(0, Number.isFinite(iLoadTargetA) ? iLoadTargetA : 0);
+
   if (lut.length === 1) {
     const p = lut[0];
-    const vRatio = Math.max(0, vBusTargetV) / Math.max(1e-3, p.vBusV);
-    const iRatio = Math.max(0, iLoadTargetA) / Math.max(1e-3, p.iLoadA);
+    const vRatio = vSafe / Math.max(1e-3, p.vBusV);
+    const iRatio = iSafe / Math.max(1e-3, p.iLoadA);
     const eOnUj = p.eOnUj * vRatio * iRatio;
     const eOffUj = p.eOffUj * vRatio * iRatio;
     const eOnSansQrrUj = (p.eOnSansQrrUj ?? p.eOnUj) * vRatio * iRatio;
+    const extrapolated =
+      Math.abs(vSafe - p.vBusV) > 0.05 * Math.max(1, p.vBusV) ||
+      Math.abs(iSafe - p.iLoadA) > 0.05 * Math.max(1, p.iLoadA);
     return {
       eOnUj,
       eOffUj,
       eSwTotalUj: eOnUj + eOffUj,
       qRrNc: p.qRrNc * iRatio,
       eOnSansQrrUj,
+      extrapolated,
+      vRange: [p.vBusV, p.vBusV],
+      iRange: [p.iLoadA, p.iLoadA],
     };
   }
-  const vNorm = Math.max(1, vBusTargetV);
-  const iNorm = Math.max(1, iLoadTargetA);
+
+  let vMin = Infinity;
+  let vMax = -Infinity;
+  let iMin = Infinity;
+  let iMax = -Infinity;
+  for (const pt of lut) {
+    if (pt.vBusV < vMin) vMin = pt.vBusV;
+    if (pt.vBusV > vMax) vMax = pt.vBusV;
+    if (pt.iLoadA < iMin) iMin = pt.iLoadA;
+    if (pt.iLoadA > iMax) iMax = pt.iLoadA;
+  }
+
+  const extrapolated =
+    vSafe < vMin - 1e-6 ||
+    vSafe > vMax + 1e-6 ||
+    iSafe < iMin - 1e-6 ||
+    iSafe > iMax + 1e-6;
+
+  // When target current is below minimum recorded LUT point, interpolate at iMin and scale linearly toward 0 A
+  // (preventing IDW from holding high-current switching energy near 0 A)
+  const iEval = iSafe < iMin && iMin > 1e-6 ? iMin : iSafe;
+  const lowCurrentScale = iSafe < iMin && iMin > 1e-6 ? iSafe / iMin : 1;
+
+  const vNorm = Math.max(1, vSafe);
+  const iNorm = Math.max(1, iEval);
   let wSum = 0;
   let eOnAcc = 0;
   let eOffAcc = 0;
   let qRrAcc = 0;
   let eOnSansAcc = 0;
   for (const pt of lut) {
-    const dv = (pt.vBusV - vBusTargetV) / vNorm;
-    const di = (pt.iLoadA - iLoadTargetA) / iNorm;
+    const dv = (pt.vBusV - vSafe) / vNorm;
+    const di = (pt.iLoadA - iEval) / iNorm;
     const d2 = dv * dv + di * di;
     if (d2 < 1e-10) {
-      const eOnSans = pt.eOnSansQrrUj ?? pt.eOnUj;
+      const eOnSans = (pt.eOnSansQrrUj ?? pt.eOnUj) * lowCurrentScale;
+      const eOnUj = pt.eOnUj * lowCurrentScale;
+      const eOffUj = pt.eOffUj * lowCurrentScale;
       return {
-        eOnUj: pt.eOnUj,
-        eOffUj: pt.eOffUj,
-        eSwTotalUj: pt.eOnUj + pt.eOffUj,
-        qRrNc: pt.qRrNc,
+        eOnUj,
+        eOffUj,
+        eSwTotalUj: eOnUj + eOffUj,
+        qRrNc: pt.qRrNc * lowCurrentScale,
         eOnSansQrrUj: eOnSans,
+        extrapolated,
+        vRange: [vMin, vMax],
+        iRange: [iMin, iMax],
       };
     }
     const w = 1 / (d2 + 1e-6);
@@ -135,14 +183,17 @@ export function interpolateDptSwitchingLoss(
     qRrAcc += w * pt.qRrNc;
     eOnSansAcc += w * (pt.eOnSansQrrUj ?? pt.eOnUj);
   }
-  const eOnUj = eOnAcc / wSum;
-  const eOffUj = eOffAcc / wSum;
+  const eOnUj = (eOnAcc / wSum) * lowCurrentScale;
+  const eOffUj = (eOffAcc / wSum) * lowCurrentScale;
   return {
     eOnUj,
     eOffUj,
     eSwTotalUj: eOnUj + eOffUj,
-    qRrNc: qRrAcc / wSum,
-    eOnSansQrrUj: eOnSansAcc / wSum,
+    qRrNc: (qRrAcc / wSum) * lowCurrentScale,
+    eOnSansQrrUj: (eOnSansAcc / wSum) * lowCurrentScale,
+    extrapolated,
+    vRange: [vMin, vMax],
+    iRange: [iMin, iMax],
   };
 }
 

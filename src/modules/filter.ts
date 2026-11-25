@@ -24,6 +24,7 @@
 
 import { ChannelFilterSpec } from '../types/models';
 import { resampleUniform } from './resampler';
+import { DEFAULT_SAMPLING_GAP_FACTOR, inspectTimebase } from './timeSync';
 
 export const FILTER_ORDERS: Array<1 | 2 | 4> = [1, 2, 4];
 
@@ -108,6 +109,8 @@ export interface FilterExecutionResult {
   t: Float64Array;
   metrics: FilterMetrics;
   warning?: string;
+  partialRegionSkipped?: boolean;
+  unfilteredShortSegmentCount?: number;
 }
 
 export interface BodePoint {
@@ -239,65 +242,121 @@ function sectionCutoff(spec: ChannelFilterSpec): number {
 }
 
 /**
+ * Distinguishes isolated missing-data sampling gaps (1-2 outlier large steps) from
+ * sustained adaptive-solver coarse-step regimes (3+ consecutive intervals of comparable dt).
+ */
+function isIsolatedSamplingGap(
+  t: Float64Array,
+  idx: number,
+  gapThreshold: number,
+  maxEndIdx: number
+): boolean {
+  if (!Number.isFinite(gapThreshold) || idx < 0 || idx + 1 > maxEndIdx) return false;
+  const dt = t[idx + 1] - t[idx];
+  if (!(dt > gapThreshold)) return false;
+
+  let runLen = 1;
+  // Walk backward through contiguous coarse intervals of comparable magnitude (within 2.5x)
+  let j = idx - 1;
+  while (j >= 0 && runLen < 3) {
+    const prevDt = t[j + 1] - t[j];
+    if (!(prevDt > gapThreshold)) break;
+    const ratio = prevDt > dt ? prevDt / dt : dt / prevDt;
+    if (ratio > 2.5) break;
+    runLen++;
+    j--;
+  }
+  // Walk forward through contiguous coarse intervals of comparable magnitude
+  j = idx + 1;
+  while (j + 1 <= maxEndIdx && runLen < 3) {
+    const nextDt = t[j + 1] - t[j];
+    if (!(nextDt > gapThreshold)) break;
+    const ratio = nextDt > dt ? nextDt / dt : dt / nextDt;
+    if (ratio > 2.5) break;
+    runLen++;
+    j++;
+  }
+
+  return runLen < 3;
+}
+
+/**
  * Legacy helper preserved for backward compatibility with existing callers/tests.
+ * Filters each contiguous finite, non-gap segment independently without bridging across NaNs or sampling gaps.
  */
 export function lowPassFilter(
   t: Float64Array,
   v: Float32Array,
   spec: ChannelFilterSpec
 ): Float32Array {
-  const n = v.length;
-  const out = new Float32Array(n);
-  if (n === 0) return out;
+  const n = Math.min(t.length, v.length);
+  const out = new Float32Array(v.length);
+  if (n === 0 || t.length !== v.length) {
+    for (let i = 0; i < v.length; i++) out[i] = v[i];
+    return out;
+  }
+
+  const tb = inspectTimebase(t, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tb.monotonic) {
+    for (let i = 0; i < n; i++) out[i] = v[i];
+    return out;
+  }
 
   const tau = 1 / (2 * Math.PI * sectionCutoff(spec));
-  const work = new Float64Array(n);
-  const nanMask = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    const x = v[i];
-    if (Number.isFinite(x)) work[i] = x;
-    else nanMask[i] = 1;
+  const gapThreshold = tb.gapThresholdSec;
+
+  let i = 0;
+  while (i < n) {
+    if (!Number.isFinite(v[i]) || !Number.isFinite(t[i])) {
+      out[i] = Number.NaN;
+      i++;
+      continue;
+    }
+
+    const s0 = i;
+    let s1 = i;
+    while (s1 + 1 < n) {
+      const nextT = t[s1 + 1];
+      const nextV = v[s1 + 1];
+      const dt = nextT - t[s1];
+      if (!Number.isFinite(nextV) || !Number.isFinite(nextT) || !(dt > 0)) break;
+      if (isIsolatedSamplingGap(t, s1, gapThreshold, n - 1)) break;
+      s1++;
+    }
+
+    const segLen = s1 - s0 + 1;
+    if (segLen === 1) {
+      out[s0] = v[s0];
+    } else {
+      const work = new Float64Array(segLen);
+      for (let k = 0; k < segLen; k++) work[k] = v[s0 + k];
+
+      for (let s = 0; s < spec.order; s++) {
+        let y = work[0];
+        for (let k = 1; k < segLen; k++) {
+          const dt = t[s0 + k] - t[s0 + k - 1];
+          const a = dt > 0 ? 1 - Math.exp(-dt / tau) : 0;
+          y += a * (work[k] - y);
+          work[k] = y;
+        }
+      }
+      if (spec.zeroPhase) {
+        for (let s = 0; s < spec.order; s++) {
+          let y = work[segLen - 1];
+          for (let k = segLen - 2; k >= 0; k--) {
+            const dt = t[s0 + k + 1] - t[s0 + k];
+            const a = dt > 0 ? 1 - Math.exp(-dt / tau) : 0;
+            y += a * (work[k] - y);
+            work[k] = y;
+          }
+        }
+      }
+      for (let k = 0; k < segLen; k++) out[s0 + k] = work[k];
+    }
+
+    i = s1 + 1;
   }
 
-  let last = 0;
-  let seen = false;
-  for (let i = 0; i < n; i++) {
-    if (nanMask[i]) work[i] = seen ? last : 0;
-    else {
-      last = work[i];
-      seen = true;
-    }
-  }
-  if (!seen) return new Float32Array(v);
-  for (let i = 0; i < n && nanMask[i]; i++) work[i] = last;
-
-  const forward = (): void => {
-    for (let s = 0; s < spec.order; s++) {
-      let y = work[0];
-      for (let i = 1; i < n; i++) {
-        const dt = t[i] - t[i - 1];
-        const a = dt > 0 ? 1 - Math.exp(-dt / tau) : 0;
-        y += a * (work[i] - y);
-        work[i] = y;
-      }
-    }
-  };
-  const backward = (): void => {
-    for (let s = 0; s < spec.order; s++) {
-      let y = work[n - 1];
-      for (let i = n - 2; i >= 0; i--) {
-        const dt = t[i + 1] - t[i];
-        const a = dt > 0 ? 1 - Math.exp(-dt / tau) : 0;
-        y += a * (work[i] - y);
-        work[i] = y;
-      }
-    }
-  };
-
-  forward();
-  if (spec.zeroPhase) backward();
-
-  for (let i = 0; i < n; i++) out[i] = nanMask[i] ? NaN : work[i];
   return out;
 }
 
@@ -1292,123 +1351,219 @@ export function applyWaveformFilter(
   const fsHz = dtMed > 0 ? 1 / dtMed : 1;
   const nyq = fsHz / 2;
 
-  if (n < 3) {
-    return {
-      v: new Float32Array(v),
-      t,
-      metrics: {
-        sampleCountTotal: n,
-        sampleCountFiltered: 0,
-        effectiveFsHz: fsHz,
-        nyquistHz: nyq,
-        resampledAdaptive: false,
-        tStartApplied: t[0] || 0,
-        tEndApplied: t[n - 1] || 0,
-        rmsBefore: 0,
-        rmsAfter: 0,
-        rmsRemovedDiff: 0,
-        vppBefore: 0,
-        vppAfter: 0,
-        effectiveCutoffHz: cfg.algorithm === 'rc_passive' ? resolveRcCutoffHz(cfg) : cfg.cutoffHz,
-        badgeText: getFilterBadgeText(cfg),
-        summaryText: formatFilterSummary(cfg),
-      },
-      warning: 'Insufficient samples',
-    };
+  const makeSkippedResult = (warning: string, partialRegionSkipped = false): FilterExecutionResult => ({
+    v: new Float32Array(v),
+    t,
+    metrics: {
+      sampleCountTotal: n,
+      sampleCountFiltered: 0,
+      effectiveFsHz: fsHz,
+      nyquistHz: nyq,
+      resampledAdaptive: false,
+      tStartApplied: t[0] || 0,
+      tEndApplied: t[Math.max(0, n - 1)] || 0,
+      rmsBefore: 0,
+      rmsAfter: 0,
+      rmsRemovedDiff: 0,
+      vppBefore: 0,
+      vppAfter: 0,
+      effectiveCutoffHz: cfg.algorithm === 'rc_passive' ? resolveRcCutoffHz(cfg) : cfg.cutoffHz,
+      badgeText: getFilterBadgeText(cfg),
+      summaryText: formatFilterSummary(cfg),
+    },
+    warning,
+    partialRegionSkipped,
+    unfilteredShortSegmentCount: 0,
+  });
+
+  if (t.length !== v.length) {
+    return makeSkippedResult(
+      `Time (${t.length}) and sample (${v.length}) lengths differ; filtering aborted.`,
+      true
+    );
   }
 
-  // Determine active time window [tWinStart, tWinEnd]
+  if (n < 3) {
+    return makeSkippedResult('Insufficient samples (< 3) to filter.');
+  }
+
+  const tb = inspectTimebase(t, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tb.monotonic) {
+    return makeSkippedResult(
+      `Non-monotonic or NaN/Inf timestamp at index ${tb.nonMonotonicIndex ?? '?'}; filtering aborted.`,
+      true
+    );
+  }
+
+  // Determine active time window [tWinStart, tWinEnd] without silent full-trace fallback
   let tWinStart = t[0];
   let tWinEnd = t[n - 1];
-  if (cfg.regionMode === 'view' && bounds?.viewStart !== undefined && bounds?.viewEnd !== undefined) {
-    tWinStart = Math.max(t[0], Math.min(bounds.viewStart, bounds.viewEnd));
-    tWinEnd = Math.min(t[n - 1], Math.max(bounds.viewStart, bounds.viewEnd));
-  } else if (
-    cfg.regionMode === 'cursors' &&
-    bounds?.cursorX1 !== undefined &&
-    bounds?.cursorX1 !== null &&
-    bounds?.cursorX2 !== undefined &&
-    bounds?.cursorX2 !== null
-  ) {
-    tWinStart = Math.max(t[0], Math.min(bounds.cursorX1, bounds.cursorX2));
-    tWinEnd = Math.min(t[n - 1], Math.max(bounds.cursorX1, bounds.cursorX2));
-  } else if (cfg.regionMode === 'custom' && cfg.tStart !== undefined && cfg.tEnd !== undefined) {
-    tWinStart = Math.max(t[0], Math.min(cfg.tStart, cfg.tEnd));
-    tWinEnd = Math.min(t[n - 1], Math.max(cfg.tStart, cfg.tEnd));
+  if (cfg.regionMode === 'view') {
+    if (
+      bounds?.viewStart === undefined ||
+      bounds?.viewEnd === undefined ||
+      !Number.isFinite(bounds.viewStart) ||
+      !Number.isFinite(bounds.viewEnd)
+    ) {
+      return makeSkippedResult('Viewport bounds unavailable; partial viewport filtering aborted.', true);
+    }
+    const reqStart = Math.min(bounds.viewStart, bounds.viewEnd);
+    const reqEnd = Math.max(bounds.viewStart, bounds.viewEnd);
+    if (reqEnd <= reqStart || reqEnd < t[0] || reqStart > t[n - 1]) {
+      return makeSkippedResult('Viewport window has no overlap with waveform; partial filtering aborted.', true);
+    }
+    tWinStart = Math.max(t[0], reqStart);
+    tWinEnd = Math.min(t[n - 1], reqEnd);
+  } else if (cfg.regionMode === 'cursors') {
+    if (
+      bounds?.cursorX1 === undefined ||
+      bounds?.cursorX1 === null ||
+      bounds?.cursorX2 === undefined ||
+      bounds?.cursorX2 === null ||
+      !Number.isFinite(bounds.cursorX1) ||
+      !Number.isFinite(bounds.cursorX2) ||
+      bounds.cursorX1 === bounds.cursorX2
+    ) {
+      return makeSkippedResult(
+        'Cursor region selected, but X1/X2 cursors are not active or have zero span; partial filtering aborted.',
+        true
+      );
+    }
+    const reqStart = Math.min(bounds.cursorX1, bounds.cursorX2);
+    const reqEnd = Math.max(bounds.cursorX1, bounds.cursorX2);
+    if (reqEnd < t[0] || reqStart > t[n - 1]) {
+      return makeSkippedResult('Cursor window [X1, X2] is outside waveform time range; partial filtering aborted.', true);
+    }
+    tWinStart = Math.max(t[0], reqStart);
+    tWinEnd = Math.min(t[n - 1], reqEnd);
+  } else if (cfg.regionMode === 'custom') {
+    if (
+      cfg.tStart === undefined ||
+      cfg.tEnd === undefined ||
+      !Number.isFinite(cfg.tStart) ||
+      !Number.isFinite(cfg.tEnd)
+    ) {
+      return makeSkippedResult('Custom slice bounds are incomplete; partial filtering aborted.', true);
+    }
+    const reqStart = Math.min(cfg.tStart, cfg.tEnd);
+    const reqEnd = Math.max(cfg.tStart, cfg.tEnd);
+    if (reqEnd <= reqStart || reqEnd < t[0] || reqStart > t[n - 1]) {
+      return makeSkippedResult('Custom slice has no overlap with waveform time range; partial filtering aborted.', true);
+    }
+    tWinStart = Math.max(t[0], reqStart);
+    tWinEnd = Math.min(t[n - 1], reqEnd);
   }
 
   let iStart = 0;
-  while (iStart < n - 1 && t[iStart] < tWinStart - 1e-15) iStart++;
+  while (iStart < n && t[iStart] < tWinStart - 1e-15) iStart++;
   let iEnd = n - 1;
-  while (iEnd > iStart && t[iEnd] > tWinEnd + 1e-15) iEnd--;
+  while (iEnd >= 0 && t[iEnd] > tWinEnd + 1e-15) iEnd--;
 
   if (iEnd - iStart < 2) {
-    iStart = 0;
-    iEnd = n - 1;
-    tWinStart = t[0];
-    tWinEnd = t[n - 1];
+    return makeSkippedResult(
+      'Selected slice contains fewer than 3 samples; partial filtering aborted (no full-trace fallback).',
+      cfg.regionMode !== 'entire'
+    );
   }
 
-  const { filled, nanMask, hasValid } = fillGapsLinear(v);
-  if (!hasValid) {
-    return {
-      v: new Float32Array(v),
-      t,
-      metrics: {
-        sampleCountTotal: n,
-        sampleCountFiltered: 0,
-        effectiveFsHz: fsHz,
-        nyquistHz: nyq,
-        resampledAdaptive: false,
-        tStartApplied: tWinStart,
-        tEndApplied: tWinEnd,
-        rmsBefore: 0,
-        rmsAfter: 0,
-        rmsRemovedDiff: 0,
-        vppBefore: 0,
-        vppAfter: 0,
-        effectiveCutoffHz: cfg.algorithm === 'rc_passive' ? resolveRcCutoffHz(cfg) : cfg.cutoffHz,
-        badgeText: getFilterBadgeText(cfg),
-        summaryText: formatFilterSummary(cfg),
-      },
-      warning: 'No valid samples',
-    };
+  let anyFiniteInWindow = false;
+  let hasNanInWindow = false;
+  for (let i = iStart; i <= iEnd; i++) {
+    if (Number.isFinite(v[i])) anyFiniteInWindow = true;
+    else hasNanInWindow = true;
+  }
+  if (!anyFiniteInWindow) {
+    return makeSkippedResult('No valid finite samples inside target filter window.');
   }
 
-  // Context margin around [iStart, iEnd] so partial filtering enters steady state smoothly
+  // Context margin around [iStart, iEnd]; segmented per contiguous finite non-gap run
   const isPartial = iStart > 0 || iEnd < n - 1;
   const ctxPad = isPartial ? Math.min(256, Math.max(32, Math.round((iEnd - iStart + 1) * 0.15))) : 0;
   const ctxStart = Math.max(0, iStart - ctxPad);
   const ctxEnd = Math.min(n - 1, iEnd + ctxPad);
   const ctxLen = ctxEnd - ctxStart + 1;
 
-  const tCtx = t.subarray(ctxStart, ctxEnd + 1);
-  const vCtxF32 = new Float32Array(ctxLen);
-  for (let i = 0; i < ctxLen; i++) vCtxF32[i] = filled[ctxStart + i];
+  const filteredCtx = new Float64Array(ctxLen);
+  for (let i = 0; i < ctxLen; i++) filteredCtx[i] = v[ctxStart + i];
 
   const needsUniformGrid = cfg.algorithm !== 'rc_passive';
-  const nonUniform = isNonUniformTimestep(tCtx);
+  const gapThreshold = tb.gapThresholdSec;
   let resampledAdaptive = false;
-  let filteredCtx: Float64Array;
+  let segmentCountInWindow = 0;
+  let unfilteredShortSegmentCount = 0;
+  let gapBreaksInWindow = 0;
 
-  if (needsUniformGrid && nonUniform) {
-    resampledAdaptive = true;
-    const uniform = resampleUniform(tCtx, vCtxF32, { allowGapInterpolation: true });
-    const work = new Float64Array(uniform.v.length);
-    for (let i = 0; i < uniform.v.length; i++) {
-      work[i] = Number.isFinite(uniform.v[i]) ? uniform.v[i] : 0;
+  let cursor = ctxStart;
+  while (cursor <= ctxEnd) {
+    if (!Number.isFinite(v[cursor])) {
+      filteredCtx[cursor - ctxStart] = Number.NaN;
+      cursor++;
+      continue;
     }
-    runCoreFilterOnSlice(uniform.t, work, cfg, uniform.fs);
-    filteredCtx = interpolateOnGrid(uniform.t, work, tCtx);
-  } else {
-    filteredCtx = new Float64Array(ctxLen);
-    for (let i = 0; i < ctxLen; i++) filteredCtx[i] = vCtxF32[i];
-    const localDt = dtMed > 0 ? dtMed : (tCtx[ctxLen - 1] - tCtx[0]) / Math.max(1, ctxLen - 1);
-    const localFs = localDt > 0 ? 1 / localDt : fsHz;
-    runCoreFilterOnSlice(tCtx, filteredCtx, cfg, localFs);
+
+    const segStart = cursor;
+    let segEnd = cursor;
+    while (segEnd + 1 <= ctxEnd) {
+      const nextV = v[segEnd + 1];
+      if (!Number.isFinite(nextV)) break;
+      if (isIsolatedSamplingGap(t, segEnd, gapThreshold, ctxEnd)) {
+        if (segEnd >= iStart && segEnd + 1 <= iEnd) gapBreaksInWindow++;
+        break;
+      }
+      segEnd++;
+    }
+
+    const overlapsTarget = !(segEnd < iStart || segStart > iEnd);
+    const segLen = segEnd - segStart + 1;
+    if (overlapsTarget) {
+      segmentCountInWindow++;
+      if (segLen < 3) {
+        unfilteredShortSegmentCount++;
+      } else {
+        const segT = t.subarray(segStart, segEnd + 1);
+        const segV = new Float32Array(segLen);
+        for (let k = 0; k < segLen; k++) segV[k] = v[segStart + k];
+
+        let segOut: Float64Array;
+        if (needsUniformGrid && isNonUniformTimestep(segT)) {
+          resampledAdaptive = true;
+          // Contiguous non-gap adaptive segment: true missing-data gaps were already isolated above.
+          const uniform = resampleUniform(segT, segV, { allowGapInterpolation: true });
+          const work = new Float64Array(uniform.v.length);
+          let allFiniteUniform = true;
+          for (let k = 0; k < uniform.v.length; k++) {
+            if (!Number.isFinite(uniform.v[k])) {
+              allFiniteUniform = false;
+              break;
+            }
+            work[k] = uniform.v[k];
+          }
+          if (allFiniteUniform && work.length >= 3) {
+            runCoreFilterOnSlice(uniform.t, work, cfg, uniform.fs);
+            segOut = interpolateOnGrid(uniform.t, work, segT);
+          } else {
+            unfilteredShortSegmentCount++;
+            segOut = new Float64Array(segLen);
+            for (let k = 0; k < segLen; k++) segOut[k] = segV[k];
+          }
+        } else {
+          segOut = new Float64Array(segLen);
+          for (let k = 0; k < segLen; k++) segOut[k] = segV[k];
+          const localDt = medianDt(segT) || dtMed || (segT[segLen - 1] - segT[0]) / Math.max(1, segLen - 1);
+          const localFs = localDt > 0 ? 1 / localDt : fsHz;
+          runCoreFilterOnSlice(segT, segOut, cfg, localFs);
+        }
+
+        for (let k = 0; k < segLen; k++) {
+          filteredCtx[segStart + k - ctxStart] = segOut[k];
+        }
+      }
+    }
+
+    cursor = segEnd + 1;
   }
 
-  // Reassemble full trace, preserving untouched samples outside [iStart, iEnd]
+  // Reassemble full trace, preserving untouched samples outside [iStart, iEnd] and NaNs inside
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) out[i] = v[i];
 
@@ -1426,12 +1581,16 @@ export function applyWaveformFilter(
   let validCount = 0;
 
   for (let i = iStart; i <= iEnd; i++) {
-    if (nanMask[i]) {
-      out[i] = NaN;
+    if (!Number.isFinite(v[i])) {
+      out[i] = Number.NaN;
       continue;
     }
     const rawVal = v[i];
     const filtVal = filteredCtx[i - ctxStart];
+    if (!Number.isFinite(filtVal)) {
+      out[i] = rawVal;
+      continue;
+    }
     let w = 1;
     if (blendSamples > 0) {
       const dLeft = i - iStart;
@@ -1457,12 +1616,22 @@ export function applyWaveformFilter(
   }
 
   const invN = validCount > 0 ? 1 / validCount : 0;
+  const warnParts: string[] = [];
+  if (hasNanInWindow || gapBreaksInWindow > 0) {
+    warnParts.push(
+      `Isolated across ${segmentCountInWindow} contiguous finite segment(s) without bridging NaNs or sampling gaps.`
+    );
+  }
+  if (unfilteredShortSegmentCount > 0) {
+    warnParts.push(`${unfilteredShortSegmentCount} short segment(s) (< 3 samples) were left unfiltered.`);
+  }
+
   return {
     v: out,
     t,
     metrics: {
       sampleCountTotal: n,
-      sampleCountFiltered: activeLen,
+      sampleCountFiltered: validCount,
       effectiveFsHz: fsHz,
       nyquistHz: nyq,
       resampledAdaptive,
@@ -1477,6 +1646,9 @@ export function applyWaveformFilter(
       badgeText: getFilterBadgeText(cfg),
       summaryText: formatFilterSummary(cfg),
     },
+    warning: warnParts.length > 0 ? warnParts.join(' ') : undefined,
+    partialRegionSkipped: false,
+    unfilteredShortSegmentCount,
   };
 }
 

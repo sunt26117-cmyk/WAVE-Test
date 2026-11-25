@@ -450,7 +450,8 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
         <div className="p-3.5">
           <div className="text-[11px] dyno-text-muted">扭矩回代 MAE / RMSE</div>
           <div className="mt-1 font-mono text-base font-semibold tabular-nums dyno-text-primary">
-            {metrics.maeTorqueNm.toFixed(4)} / {metrics.rmseTorqueNm.toFixed(4)}
+            {Number.isFinite(metrics.maeTorqueNm) ? metrics.maeTorqueNm.toFixed(4) : 'N/A'} /{' '}
+            {Number.isFinite(metrics.rmseTorqueNm) ? metrics.rmseTorqueNm.toFixed(4) : 'N/A'}
             <span className="ml-1 text-[10px] font-normal dyno-text-muted">N·m</span>
           </div>
         </div>
@@ -459,10 +460,12 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
           <div className="text-[11px] dyno-text-muted">扭矩回代 MAPE</div>
           <div
             className={`mt-1 font-mono text-lg font-semibold tabular-nums ${
-              metrics.mapeTorquePct <= 3.5 ? 'dyno-alert-ok' : 'text-amber-400'
+              Number.isFinite(metrics.mapeTorquePct) && metrics.mapeTorquePct <= 3.5
+                ? 'dyno-alert-ok'
+                : 'text-amber-400'
             }`}
           >
-            {metrics.mapeTorquePct.toFixed(2)}
+            {Number.isFinite(metrics.mapeTorquePct) ? metrics.mapeTorquePct.toFixed(2) : 'N/A'}
             <span className="ml-1 text-xs font-normal dyno-text-muted">%</span>
           </div>
         </div>
@@ -471,10 +474,13 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
           <div className="text-[11px] dyno-text-muted">效率回代 MAE / MAPE</div>
           <div
             className={`mt-1 font-mono text-base font-semibold tabular-nums ${
-              metrics.mapeEtaPct <= 3.5 ? 'dyno-alert-ok' : 'text-amber-400'
+              Number.isFinite(metrics.mapeEtaPct) && metrics.mapeEtaPct <= 3.5
+                ? 'dyno-alert-ok'
+                : 'text-amber-400'
             }`}
           >
-            {metrics.maeEtaPct.toFixed(2)}pp / {metrics.mapeEtaPct.toFixed(2)}%
+            {Number.isFinite(metrics.maeEtaPct) ? `${metrics.maeEtaPct.toFixed(2)}pp` : 'N/A'} /{' '}
+            {Number.isFinite(metrics.mapeEtaPct) ? `${metrics.mapeEtaPct.toFixed(2)}%` : 'N/A'}
           </div>
         </div>
       </div>
@@ -524,7 +530,15 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
               <div>
                 <span className="dyno-text-muted">参数灵敏度 (ΔMAE): </span>
                 <span className="dyno-text-primary">
-                  Rs+10% → +{report.paramSensitivity.rsPlus10PctDeltaMaeNm.toFixed(4)} N·m · Ke&apos;+5% → +{report.paramSensitivity.kePlus5PctDeltaMaeNm.toFixed(4)} N·m
+                  Rs+10% →{' '}
+                  {Number.isFinite(report.paramSensitivity.rsPlus10PctDeltaMaeNm)
+                    ? `${report.paramSensitivity.rsPlus10PctDeltaMaeNm >= 0 ? '+' : ''}${report.paramSensitivity.rsPlus10PctDeltaMaeNm.toFixed(4)}`
+                    : 'N/A'}{' '}
+                  N·m · Ke&apos;+5% →{' '}
+                  {Number.isFinite(report.paramSensitivity.kePlus5PctDeltaMaeNm)
+                    ? `${report.paramSensitivity.kePlus5PctDeltaMaeNm >= 0 ? '+' : ''}${report.paramSensitivity.kePlus5PctDeltaMaeNm.toFixed(4)}`
+                    : 'N/A'}{' '}
+                  N·m
                 </span>
               </div>
             )}

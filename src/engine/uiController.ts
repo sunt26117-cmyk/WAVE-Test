@@ -81,6 +81,8 @@ import { computeFFT, computeBLDCHarmonics } from '../modules/fft';
 import {
   computeMeasurements,
   evaluateCustomMeasurement,
+  evaluateCustomMeasurementDetailed,
+  CustomMeasurementDetailedResult,
   MEASUREMENT_DEFINITIONS,
 } from '../modules/measurements';
 import { clampCursorsToViewport, centerCursorsInViewport } from '../modules/cursorEngine';
@@ -109,7 +111,7 @@ import { buildEngineeringReportHTML, downloadEngineeringReportHTML } from '../mo
 import { performAutoSet } from '../modules/autoSet';
 import { findTriggerPoint, alignViewToTrigger } from '../modules/trigger';
 import { evaluateMathExpression } from '../modules/mathParser';
-import { computeClarke, computePark, computeInstantaneousPower } from '../modules/transforms';
+import { computeClarke, computePark, computeParkFromChannels, computeInstantaneousPower } from '../modules/transforms';
 import { estimateElectricalAngleFromAlphaBeta, computePowerSummary } from '../modules/motorAnalysis';
 import { alignChannelsToCommonTimebase, resolveCompatibleSiGroupScale } from '../modules/timeSync';
 import { parseSiUnitScale } from '../modules/thermalEngine';
@@ -119,7 +121,7 @@ import {
   AnomalyScanOptions,
   GoldenEvaluationResult,
 } from '../modules/anomalyScanner';
-import { computeXYMetrics } from '../modules/xyAnalysis';
+import { computeXYAlignedTrajectory, computeXYMetrics } from '../modules/xyAnalysis';
 import { serializeSession, deserializeSession } from './session';
 import { previewCsv, parseFullCsv, computeCsvPreviewQuality } from '../parsers/csvParser';
 import { parseWfmBuffer } from '../parsers/wfmParser';
@@ -188,7 +190,7 @@ export class OscilloscopeApp {
 
   // Cached measurements by channel key for fast 60fps strip updates
   private measCache: Record<string, { key: string; value: ChannelMeasurements }> = {};
-  private customMeasCache: Record<string, { key: string; values: Record<string, number | null> }> = {};
+  private customMeasCache: Record<string, { key: string; values: Record<string, CustomMeasurementDetailedResult> }> = {};
   private pendingDrawRaf: number | null = null;
   private editVersion: number = 0;
 
@@ -1043,6 +1045,12 @@ export class OscilloscopeApp {
       cursorX2: tab.cursors.enabled ? tab.cursors.x2 : null,
     });
 
+    if (res.partialRegionSkipped) {
+      const msg = res.warning || 'Selected filter slice has insufficient overlap with the waveform.';
+      this.showToast(msg, 'error');
+      return { ok: false, error: msg, result: res };
+    }
+
     if (config.outputMode === 'in_place') {
       this.pushUndoSnapshot(`Filter ${srcCh.name} (${res.metrics.badgeText})`, true);
       ensureReferenceLocked(srcCh);
@@ -1054,8 +1062,8 @@ export class OscilloscopeApp {
       this.renderSidebar();
       this.draw();
       this.showToast(
-        `Filtered ${srcCh.name} in-place (${res.metrics.summaryText}, recomputed from original Ref).`,
-        check.warning ? 'warn' : 'info'
+        `Filtered ${srcCh.name} in-place (${res.metrics.summaryText}, recomputed from original Ref).${res.warning ? ` Note: ${res.warning}` : ''}`,
+        check.warning || res.warning ? 'warn' : 'info'
       );
       return { ok: true, targetChannelId: srcCh.id, result: res };
     }
@@ -1103,8 +1111,8 @@ export class OscilloscopeApp {
     this.renderSidebar();
     this.draw();
     this.showToast(
-      `Created [${res.metrics.badgeText}] ${newCh.name} (${res.metrics.sampleCountFiltered.toLocaleString()} pts).`,
-      check.warning ? 'warn' : 'info'
+      `Created [${res.metrics.badgeText}] ${newCh.name} (${res.metrics.sampleCountFiltered.toLocaleString()} pts).${res.warning ? ` Note: ${res.warning}` : ''}`,
+      check.warning || res.warning ? 'warn' : 'info'
     );
     return { ok: true, targetChannelId: newId, result: res };
   }
@@ -1358,7 +1366,9 @@ export class OscilloscopeApp {
         channelId: targetChannelId,
         mode: options.goldenMode,
         tolerance: Math.max(0.01, options.goldenTolerance || 5),
+        refT: new Float64Array(targetCh.t),
         refV: new Float32Array(alignedRefV),
+        refUnit: targetCh.unit,
         refLabel,
       };
     }
@@ -1542,7 +1552,9 @@ export class OscilloscopeApp {
         channelId: targetChannelId,
         mode: groupConfig.goldenMode,
         tolerance: Math.max(0.01, groupConfig.goldenTolerance || 5),
+        refT: new Float64Array(targetCh.t),
         refV: new Float32Array(items[0].alignedRefV),
+        refUnit: targetCh.unit,
         refLabel: `[${groupConfig.groupName}] ${items[0].refLabel}`,
       };
     }
@@ -3901,61 +3913,46 @@ export class OscilloscopeApp {
     }
 
     try {
-      const unitInfo = resolveCompatibleSiGroupScale([alphaCh, betaCh]);
-      if (!unitInfo.valid) {
-        this.showToast(unitInfo.reason || 'α and β channels have incompatible physical units.', 'error');
-        return;
-      }
       const offsetRad = ((isFinite(offsetDeg) ? offsetDeg : 0) * Math.PI) / 180;
       const angleCh = angleMode === 'channel' ? tab.channels[angleChannelId] : undefined;
-      const chList = angleCh ? [alphaCh, betaCh, angleCh] : [alphaCh, betaCh];
-      const synced = alignChannelsToCommonTimebase(chList);
-      if (!synced.valid || synced.time.length < 2) {
-        this.showToast(synced.invalidReason || synced.warnings[0] || 'α/β/θ channels have no valid synchronized timebase.', 'error');
+      if (angleMode === 'channel' && !angleCh) {
+        this.showToast('Select a valid electrical angle θ(t) channel or switch to Auto mode.', 'error');
         return;
       }
-      const scaleArr = (arr: Float32Array, scale: number): Float32Array => {
-        if (Math.abs(scale - 1) <= 1e-12) return arr;
-        const out = new Float32Array(arr.length);
-        for (let i = 0; i < arr.length; i++) out[i] = arr[i] * scale;
-        return out;
-      };
-      const alphaArr = scaleArr(synced.values[0], unitInfo.scales[0]);
-      const betaArr = scaleArr(synced.values[1], unitInfo.scales[1]);
-      let theta: Float32Array;
-      if (angleCh) {
-        const rawAng = synced.values[2];
-        theta = new Float32Array(rawAng.length);
-        for (let i = 0; i < rawAng.length; i++) theta[i] = rawAng[i] + offsetRad;
-      } else {
-        theta = estimateElectricalAngleFromAlphaBeta(alphaArr, betaArr, offsetRad);
+      const parkRes = computeParkFromChannels(alphaCh, betaCh, angleCh, offsetRad);
+      if (!parkRes.valid || parkRes.time.length < 2) {
+        this.showToast(parkRes.invalidReason || parkRes.warnings[0] || 'Park transform failed.', 'error');
+        return;
       }
 
-      const { d, q } = computePark(alphaArr, betaArr, theta);
-      const outUnit = unitInfo.baseUnit || alphaCh.unit || 'V';
-      const syncDt = synced.time.length >= 2 ? (synced.time[synced.time.length - 1] - synced.time[0]) / (synced.time.length - 1) : (alphaCh.dt ?? 1e-6);
+      const isSelfAligned = parkRes.frameType === 'self_aligned_vector';
+      const syncDt =
+        parkRes.time.length >= 2
+          ? (parkRes.time[parkRes.time.length - 1] - parkRes.time[0]) / (parkRes.time.length - 1)
+          : (alphaCh.dt ?? 1e-6);
       const dId = `park_d_${Date.now()}`;
       const qId = `park_q_${Date.now() + 1}`;
+      const srcIds = angleCh ? [alphaId, betaId, angleCh.id] : [alphaId, betaId];
 
       const dCh: WaveformChannel = {
         ...alphaCh,
         id: dId,
-        name: 'Park Id/Ud',
-        unit: outUnit,
+        name: isSelfAligned ? 'Park d_vec (自对齐)' : 'Park Id/Ud',
+        unit: parkRes.unit,
         color: this.getNextComputedColor(0),
         visible: true,
-        t: synced.time,
-        v: d,
+        t: parkRes.time,
+        v: parkRes.d,
         dt: syncDt,
         fs: syncDt > 0 ? 1 / syncDt : alphaCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'transform',
-        derivedBadge: 'fx',
+        derivedBadge: isSelfAligned ? 'vec' : 'fx',
         coupling: 'DC',
         inverted: false,
-        mathExpression: `Park_d(${alphaCh.name}, ${betaCh.name})`,
-        sourceChannelIds: [alphaId, betaId],
+        mathExpression: `Park_d(${alphaCh.name}, ${betaCh.name}${angleCh ? `, ${angleCh.name}` : ', auto'})`,
+        sourceChannelIds: srcIds,
         voltsPerDiv: undefined,
         vOffset: undefined,
       };
@@ -3964,22 +3961,22 @@ export class OscilloscopeApp {
       const qCh: WaveformChannel = {
         ...alphaCh,
         id: qId,
-        name: 'Park Iq/Uq',
-        unit: outUnit,
+        name: isSelfAligned ? 'Park q_vec (自对齐)' : 'Park Iq/Uq',
+        unit: parkRes.unit,
         color: this.getNextComputedColor(1),
         visible: true,
-        t: synced.time,
-        v: q,
+        t: parkRes.time,
+        v: parkRes.q,
         dt: syncDt,
         fs: syncDt > 0 ? 1 / syncDt : alphaCh.fs,
         isMath: true,
         channelKind: 'computed',
         derivedKind: 'transform',
-        derivedBadge: 'fx',
+        derivedBadge: isSelfAligned ? 'vec' : 'fx',
         coupling: 'DC',
         inverted: false,
-        mathExpression: `Park_q(${alphaCh.name}, ${betaCh.name})`,
-        sourceChannelIds: [alphaId, betaId],
+        mathExpression: `Park_q(${alphaCh.name}, ${betaCh.name}${angleCh ? `, ${angleCh.name}` : ', auto'})`,
+        sourceChannelIds: srcIds,
         voltsPerDiv: undefined,
         vOffset: undefined,
       };
@@ -3993,11 +3990,10 @@ export class OscilloscopeApp {
       this.cachedSpectrumKey = '';
       this.renderSidebar();
       this.draw();
+      const topWarn = parkRes.warnings[0];
       this.showToast(
-        synced.resampled || unitInfo.normalizedNote
-          ? `Generated Park d/q (${unitInfo.normalizedNote || synced.warnings[0] || 'resampled to common timebase'}).`
-          : 'Generated Park d and q channels.',
-        synced.resampled || unitInfo.normalizedNote ? 'warn' : 'info'
+        topWarn ? `Generated Park (${topWarn})` : 'Generated Park d and q channels.',
+        parkRes.warnings.length > 0 || parkRes.resampled ? 'warn' : 'info'
       );
     } catch (err: any) {
       this.showToast(`Park Transform Failed: ${err.message}`, 'error');
@@ -4121,10 +4117,17 @@ export class OscilloscopeApp {
 
       const summary = computePowerSummary(pCh.t, pCh.v);
       const flags = [wasResampled ? 'Timebase Synced' : '', siScaled ? 'SI Scaled' : ''].filter(Boolean).join(' · ');
-      this.showToast(
-        `${flags ? `[${flags}] ` : ''}P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_diss=${formatEng(summary.avgDissipationW, 'W', 3)}, E=${formatEng(summary.energyJ, 'J', 3)}`,
-        wasResampled || siScaled ? 'warn' : 'info'
-      );
+      if (!summary.valid) {
+        this.showToast(
+          `${flags ? `[${flags}] ` : ''}P(t) created, 积分无效 (${summary.status}): ${summary.invalidReason || '数据不足'}`,
+          'warn'
+        );
+      } else {
+        this.showToast(
+          `${flags ? `[${flags}] ` : ''}P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_avg=${formatEng(summary.avgAbsPowerW, 'W', 3)} (非热损耗), E_net=${formatEng(summary.energyJ, 'J', 3)} (E+=${formatEng(summary.inputEnergyJ, 'J', 3)}, E-=${formatEng(summary.regenEnergyJ, 'J', 3)})`,
+          wasResampled || siScaled || summary.skippedGapCount > 0 ? 'warn' : 'info'
+        );
+      }
     } catch (err: any) {
       this.showToast(`Power Calculation Failed: ${err.message}`, 'error');
     }
@@ -4517,13 +4520,45 @@ export class OscilloscopeApp {
         const xCh = tab.channels[tab.xyConfig?.xChannelId || tab.drawOrder[0]];
         const yCh = tab.channels[tab.xyConfig?.yChannelId || tab.drawOrder[1] || tab.drawOrder[0]];
         if (xyReadout && xCh && yCh) {
-          const m = computeXYMetrics(xCh, yCh, tab.view.startIndex, tab.view.endIndex);
-          xyReadout.innerHTML = `
-            <div class="flex justify-between"><span>X Span:</span><span>${escapeHtml(formatEng(m.xMax - m.xMin, xCh.unit, 2))}</span></div>
-            <div class="flex justify-between"><span>Y Span:</span><span>${escapeHtml(formatEng(m.yMax - m.yMin, yCh.unit, 2))}</span></div>
-            <div class="flex justify-between"><span>Circularity:</span><span class="text-cyan-300">${m.circularityPct !== null ? m.circularityPct.toFixed(1) + '%' : '--'}</span></div>
-            <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-amber-300">${m.lissajousPhaseDeg !== null ? m.lissajousPhaseDeg.toFixed(1) + '°' : '--'}</span></div>
-          `;
+          const rangeMode = tab.xyConfig?.range || 'view';
+          if (rangeMode === 'cursors' && (!tab.cursors.enabled || tab.cursors.x1 === null || tab.cursors.x2 === null)) {
+            xyReadout.innerHTML = `
+              <div class="flex justify-between"><span>Status / Cov:</span><span class="text-amber-300">NO CURSOR</span></div>
+              <div class="flex justify-between"><span>X Span:</span><span>--</span></div>
+              <div class="flex justify-between"><span>Y Span:</span><span>--</span></div>
+              <div class="flex justify-between"><span>Circularity:</span><span class="text-slate-400">--</span></div>
+              <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-slate-400">--</span></div>
+              <div class="text-[10px] text-amber-300 leading-snug pt-0.5">当前 XY 范围设为 Cursors，但 X1/X2 光标未启用；已阻断回退到整段轨迹。</div>
+            `;
+          } else {
+            let xyT0: number | undefined;
+            let xyT1: number | undefined;
+            if (rangeMode === 'cursors' && tab.cursors.enabled && tab.cursors.x1 !== null && tab.cursors.x2 !== null) {
+              xyT0 = Math.min(tab.cursors.x1, tab.cursors.x2);
+              xyT1 = Math.max(tab.cursors.x1, tab.cursors.x2);
+            } else if (rangeMode === 'view') {
+              const baseCh = tab.channels[tab.drawOrder[0]] || xCh;
+              if (baseCh.t.length >= 2) {
+                const s = Math.max(0, Math.min(baseCh.t.length - 1, tab.view.startIndex));
+                const e = Math.max(s + 1, Math.min(baseCh.t.length, tab.view.endIndex));
+                xyT0 = baseCh.t[s];
+                xyT1 = baseCh.t[e - 1];
+              }
+            }
+            const m = computeXYAlignedTrajectory(xCh, yCh, xyT0, xyT1).metrics;
+            const phaseTxt =
+              m.lissajousPhaseDeg !== null
+                ? `${m.lissajousPhaseDeg > 0 ? '+' : ''}${m.lissajousPhaseDeg.toFixed(1)}°`
+                : '--';
+            xyReadout.innerHTML = `
+              <div class="flex justify-between"><span>Status / Cov:</span><span class="${m.valid ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(m.valid ? `OK (${m.coveragePct.toFixed(0)}%)` : m.status)}</span></div>
+              <div class="flex justify-between"><span>X Span:</span><span>${escapeHtml(m.valid ? formatEng(m.xMax - m.xMin, xCh.unit, 2) : '--')}</span></div>
+              <div class="flex justify-between"><span>Y Span:</span><span>${escapeHtml(m.valid ? formatEng(m.yMax - m.yMin, yCh.unit, 2) : '--')}</span></div>
+              <div class="flex justify-between"><span>Circularity:</span><span class="text-cyan-300">${m.circularityPct !== null ? m.circularityPct.toFixed(1) + '%' : '--'}</span></div>
+              <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-amber-300">${escapeHtml(phaseTxt)}</span></div>
+              ${!m.valid && m.invalidReason ? `<div class="text-[10px] text-amber-300 leading-snug pt-0.5">${escapeHtml(m.invalidReason)}</div>` : ''}
+            `;
+          }
         }
       }
     }
@@ -4910,7 +4945,7 @@ export class OscilloscopeApp {
     ch: WaveformChannel,
     customDef: CustomMeasurementDefinition,
     meas: ChannelMeasurements
-  ): number | null {
+  ): CustomMeasurementDetailedResult {
     const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
     const cacheKey = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${ch.timeShiftSec || 0}_${this.editVersion}`;
     let entry = this.customMeasCache[ch.id];
@@ -4918,8 +4953,9 @@ export class OscilloscopeApp {
       entry = { key: cacheKey, values: {} };
       this.customMeasCache[ch.id] = entry;
     }
-    if (Object.prototype.hasOwnProperty.call(entry.values, customDef.id)) {
-      return entry.values[customDef.id];
+    const exprKey = `${customDef.id}:${customDef.expression}`;
+    if (Object.prototype.hasOwnProperty.call(entry.values, exprKey)) {
+      return entry.values[exprKey];
     }
     const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
     const hasCustomTime = Boolean(
@@ -4928,7 +4964,7 @@ export class OscilloscopeApp {
         (ch.t !== primaryCh.t || ch.t.length !== primaryCh.t.length || (ch.timeShiftSec || 0) !== 0)
     );
     const viewBounds = hasCustomTime && primaryCh ? getTimeBoundsForView(tab, primaryCh) : undefined;
-    const val = evaluateCustomMeasurement(
+    const detail = evaluateCustomMeasurementDetailed(
       customDef,
       ch,
       meas,
@@ -4937,8 +4973,8 @@ export class OscilloscopeApp {
       tab.cursors,
       viewBounds ? { tStart: viewBounds.tStart, tEnd: viewBounds.tEnd } : undefined
     );
-    entry.values[customDef.id] = val;
-    return val;
+    entry.values[exprKey] = detail;
+    return detail;
   }
 
   private lastMeasStripKey: string = '';
@@ -4977,13 +5013,35 @@ export class OscilloscopeApp {
 
       let shortLabel = '';
       let valStr = '';
+      let cardInvalid = m.valid === false;
+      let statusBadge: string | null = m.valid === false
+        ? (m.status === 'NO_OVERLAP'
+            ? 'NO OVERLAP'
+            : m.status === 'INSUFFICIENT_DATA'
+            ? 'NO DATA'
+            : 'INVALID')
+        : null;
+      let statusTip = m.statusMessage || '';
+
       if (typeof item.metric === 'string' && item.metric.startsWith('custom:')) {
         const customId = item.metric.slice(7);
         const customDef = (tab.customMeasurements || []).find((c) => c.id === customId);
         if (!customDef) continue;
-        const customVal = this.getCachedCustomMeasurementValue(tab, ch, customDef, m);
+        const customDetail = this.getCachedCustomMeasurementValue(tab, ch, customDef, m);
         shortLabel = customDef.shortLabel || customDef.label;
-        valStr = formatCustomMeasurementValue(customVal, customDef, ch.unit);
+        valStr = formatCustomMeasurementValue(customDetail.value, customDef, ch.unit);
+        if (!customDetail.valid) {
+          cardInvalid = true;
+          statusBadge =
+            customDetail.status === 'NO_OVERLAP'
+              ? 'NO OVERLAP'
+              : customDetail.status === 'INSUFFICIENT_DATA'
+              ? 'NO DATA'
+              : customDetail.status === 'EVAL_ERROR'
+              ? 'EVAL ERR'
+              : 'INVALID';
+          statusTip = customDetail.reason || statusTip;
+        }
       } else {
         const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
         if (!def) continue;
@@ -4997,12 +5055,21 @@ export class OscilloscopeApp {
       card.style.borderTopWidth = '2px';
       card.style.borderTopStyle = isComputed ? 'dashed' : 'solid';
       card.style.borderTopColor = ch.color;
+      if (statusTip) {
+        card.title = statusTip;
+      }
 
       const fxTag = isComputed ? `<span class="text-[9px] font-mono text-purple-300 mr-1">[${escapeHtml(ch.derivedBadge || 'fx')}]</span>` : '';
+      const warnTag =
+        cardInvalid
+          ? `<span class="text-[9px] font-mono text-amber-400 ml-1" title="${escapeHtml(statusTip || 'Invalid window')}">[${escapeHtml(statusBadge || 'INVALID')}]</span>`
+          : (m.gapCount || 0) > 0
+          ? `<span class="text-[9px] font-mono text-amber-300 ml-1" title="Segmented across ${m.gapCount} gap(s)">[${m.gapCount}g]</span>`
+          : '';
       card.innerHTML = `
         <div class="flex flex-col leading-tight">
-          <span class="text-[10px] text-slate-400 truncate max-w-[135px]">${fxTag}${escapeHtml(ch.name)} · ${escapeHtml(shortLabel)}</span>
-          <span class="font-mono font-semibold text-slate-100 tabular-nums">${escapeHtml(valStr)}</span>
+          <span class="text-[10px] text-slate-400 truncate max-w-[165px]">${fxTag}${escapeHtml(ch.name)} · ${escapeHtml(shortLabel)}${warnTag}</span>
+          <span class="font-mono font-semibold ${cardInvalid ? 'text-amber-300' : 'text-slate-100'} tabular-nums">${escapeHtml(valStr)}</span>
         </div>
         <button class="meas-card-remove text-slate-500 hover:text-red-300 px-0.5 font-mono cursor-pointer" title="Remove metric">×</button>
       `;

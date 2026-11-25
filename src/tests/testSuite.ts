@@ -3282,17 +3282,18 @@ export function runAllTests(): TestResult[] {
       Math.abs(meas.minDutyCycle - 25) < 3.0;
     const absMeanOk = meas.absAverage !== null && Math.abs(meas.absAverage - 4.0) < 0.2;
 
-    // Non-uniform trapezoidal RMS check: 1V for 0.1s (10 samples of 0.01s) + 0V for 0.9s (1 giant step)
-    const tNu = new Float64Array([0, 0.02, 0.04, 0.06, 0.08, 0.1, 1.0]);
-    const vNu = new Float32Array([1, 1, 1, 1, 1, 0, 0]);
+    // Non-uniform trapezoidal check: variable step sizes within <=3x median dt (dense 1V for 0.1s, sparser 0V for 0.3s)
+    // Trapezoidal area = 4*0.02 + 0.5*(1+0)*0.02 = 0.09 over 0.40s -> avg = 0.225 (unweighted mean would be 5/11 = 0.455)
+    const tNu = new Float64Array([0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.16, 0.22, 0.28, 0.34, 0.4]);
+    const vNu = new Float32Array([1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
     const nuCh: WaveformChannel = { ...mCh, id: 'nu', t: tNu, v: vNu, metadata: analyzeSamplingQuality(tNu) };
     const nuMeas = computeMeasurements(
       nuCh,
       'entire',
-      { startIndex: 0, endIndex: 6 },
+      { startIndex: 0, endIndex: 10 },
       { enabled: false, x1: null, x2: null, y1: null, y2: null, trackingChannel: null }
     );
-    const nuTrapOk = nuMeas.average !== null && nuMeas.average < 0.15; // sample-count would give ~0.71!
+    const nuTrapOk = nuMeas.average !== null && Math.abs(nuMeas.average - 0.225) < 0.02; // unweighted mean ~0.455
 
     // Custom metric evaluation ("maxduty - minduty" & "peak / vrms")
     const customSpread = evaluateCustomMeasurement(

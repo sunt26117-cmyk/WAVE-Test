@@ -185,6 +185,7 @@ export class ThermalWorkbenchController {
   // P1: DPT State
   private lastDptResult: DptAnalysisResult | null = null;
   private dptMatrix: DptOperatingPoint[] = [];
+  private useDptMatrixInFoc: boolean = false;
 
   constructor(app: OscilloscopeApp) {
     this.app = app;
@@ -1022,6 +1023,7 @@ export class ThermalWorkbenchController {
     document.getElementById('dptApplyMatrixToFocBtn')?.addEventListener('click', () => this.applyDptMatrixToFoc());
     document.getElementById('dptClearMatrixBtn')?.addEventListener('click', () => {
       this.dptMatrix = [];
+      this.useDptMatrixInFoc = false;
       this.renderDptMatrixTable();
     });
 
@@ -1031,9 +1033,14 @@ export class ThermalWorkbenchController {
       'focStallRsInput',
       'focStallDutyModeSelect',
     ]);
+    const manualEswIds = new Set(['focEswInput', 'focQrrInput', 'focVrefInput', 'focIrefInput']);
     const handleFocPanelMutation = (ev: Event) => {
       const target = ev.target as HTMLElement | null;
       if (!target || !target.id) return;
+      if (manualEswIds.has(target.id) && this.useDptMatrixInFoc) {
+        this.useDptMatrixInFoc = false;
+        this.activeFocHandoffNote = '已手动修改单点 Esw/Qrr 参数，当前切换回单点标量 V/I 缩放模式。';
+      }
       if (stallOnlyInputIds.has(target.id)) {
         this.invalidateFocCaches(false);
       } else {
@@ -2675,6 +2682,8 @@ export class ThermalWorkbenchController {
       activePathMode: this.activePathMode,
       cauerSig,
       eonInclQrr,
+      useDptMatrix: this.useDptMatrixInFoc,
+      dptMatrixLen: this.dptMatrix.length,
       params: paramIds.map((id) => valOf(id)),
     });
   }
@@ -2724,6 +2733,7 @@ export class ThermalWorkbenchController {
       vRefV: Math.max(1, num('focVrefInput', 48)),
       iRefA: Math.max(1, num('focIrefInput', 30)),
       eonIncludesQrr: (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ?? false,
+      dptLut: this.useDptMatrixInFoc && this.dptMatrix.length > 0 ? this.dptMatrix.map((pt) => ({ ...pt })) : undefined,
     };
     const ctrl: FocControlParams = {
       modulation: mod,
@@ -2845,12 +2855,25 @@ export class ThermalWorkbenchController {
       singleWarn.classList.toggle('hidden', !model.isHeuristicSingleStageSplit);
     }
 
+    const box = document.getElementById('focSpiceTextarea') as HTMLTextAreaElement | null;
+    const spBadge = document.getElementById('focSpiceValidBadge');
+    if (model.splitFeasible === false) {
+      const reason =
+        model.splitMeta?.warning ||
+        'JC/Board 热路径拆分未通过物理约束校验（请补充器件手册 RθJC 约束），已阻止生成 6-MOS LTspice 热网络。';
+      if (box) box.value = `* [SPICE EXPORT BLOCKED]\n* ${reason}`;
+      if (spBadge) {
+        spBadge.innerText = 'SPICE BLOCKED';
+        spBadge.title = reason;
+        spBadge.className = 'px-1.5 py-0.5 bg-red-950/75 border border-red-500/60 text-red-200 font-mono text-[10px] rounded-xs';
+      }
+      return;
+    }
+
     const netlist = focModelToSpice(model, tAmb, 'INV_6MOS_THERM');
     const val = validateFocSpiceNetlist(netlist, model);
-    const box = document.getElementById('focSpiceTextarea') as HTMLTextAreaElement | null;
     if (box) box.value = netlist;
 
-    const spBadge = document.getElementById('focSpiceValidBadge');
     if (spBadge) {
       spBadge.innerText = val.valid
         ? val.nodalMathVerified
@@ -3774,10 +3797,14 @@ export class ThermalWorkbenchController {
     setVal('focVrefInput', vTarget.toFixed(1));
     const qrrChk = document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null;
     if (qrrChk) qrrChk.checked = true;
-    this.activeFocHandoffNote = `已基于 Tab 5 ${this.dptMatrix.length} 点 DPT 矩阵按目标 (Vbus=${vTarget.toFixed(1)}V, Iref=${iTarget.toFixed(1)}A) 反距离加权插值并同步至 FOC (eonIncludesQrr=true): Esw=${interp.eSwTotalUj.toFixed(2)}µJ, Qrr=${interp.qRrNc.toFixed(1)}nC。`;
+    this.useDptMatrixInFoc = true;
+    const extrapNote = interp.extrapolated
+      ? `（注：参考点超出 LUT 范围 [${interp.vRange[0].toFixed(1)}~${interp.vRange[1].toFixed(1)}]V × [${interp.iRange[0].toFixed(1)}~${interp.iRange[1].toFixed(1)}]A）`
+      : '';
+    this.activeFocHandoffNote = `已激活 Tab 5 的 ${this.dptMatrix.length} 点 DPT 查找表用于 6-MOS 逐点 (Vbus, |I_phase|) 插值 (eonIncludesQrr=true)${extrapNote}；参考标量 @ (${vTarget.toFixed(1)}V, ${iTarget.toFixed(1)}A): Esw=${interp.eSwTotalUj.toFixed(2)}µJ, Qrr=${interp.qRrNc.toFixed(1)}nC。`;
     this.invalidateFocCaches(true);
     this.switchTab('foc');
-    this.app.showToast(`Interpolated ${this.dptMatrix.length}-point DPT LUT -> FOC Tab 4.`, 'info');
+    this.app.showToast(`Activated ${this.dptMatrix.length}-point DPT LUT -> FOC Tab 4.`, interp.extrapolated ? 'warn' : 'info');
   }
 
   private drawDptCanvas(): void {

@@ -276,7 +276,7 @@ export class FilterWorkbenchController {
       } else if (this.config.regionMode === 'cursors') {
         regionMeta.innerText = hasCursors
           ? `Cursors: ${formatEng(Math.min(tab.cursors.x1!, tab.cursors.x2!), 's', 3)} ~ ${formatEng(Math.max(tab.cursors.x1!, tab.cursors.x2!), 's', 3)}`
-          : '▲ Enable X Cursors on scope first (or falls back to full trace).';
+          : '▲ Enable X1/X2 Cursors on scope first (partial filtering refuses full-trace fallback).';
       } else {
         regionMeta.innerText = `Custom Slice: ${formatEng(t0Val, 's', 3)} ~ ${formatEng(t1Val, 's', 3)}`;
       }
@@ -387,6 +387,23 @@ export class FilterWorkbenchController {
       cursorX1: tab.cursors.enabled ? tab.cursors.x1 : null,
       cursorX2: tab.cursors.enabled ? tab.cursors.x2 : null,
     });
+
+    if (res.partialRegionSkipped) {
+      if (statusBanner) {
+        statusBanner.className = 'rounded-sm border px-2.5 py-1.5 text-[11px] bg-rose-950/50 border-rose-500/60 text-rose-200';
+        statusBanner.innerText = `✖ ${res.warning || 'Partial filter window is invalid.'}`;
+        statusBanner.classList.remove('hidden');
+      }
+      if (applyBtn) applyBtn.disabled = true;
+      this.drawEmptyPreview(res.warning || 'Invalid partial filter slice');
+      return;
+    }
+
+    if (statusBanner && res.warning && !check.warning) {
+      statusBanner.className = 'rounded-sm border px-2.5 py-1.5 text-[11px] bg-amber-950/50 border-amber-500/60 text-amber-200';
+      statusBanner.innerText = `▲ ${res.warning}`;
+      statusBanner.classList.remove('hidden');
+    }
 
     const m = res.metrics;
     const kpiPts = this.el('filtKpiPoints');

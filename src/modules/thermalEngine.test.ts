@@ -1700,3 +1700,72 @@ test('Torque ripple requires a valid one-to-one waveform and verified source bef
   assert.match(invalid.invalidReason || '', /重复或倒退/);
 });
 
+test('MOS Thermal MT-03..MT-05: DPT LUT extrapolation/0A-rolloff and FOC 6-MOS LUT switching integration', () => {
+  const lut = [
+    { id: 'd1', vBusV: 40, iLoadA: 20, tjC: 25, rgOhm: 5, eOnUj: 30, eOffUj: 20, qRrNc: 250, eOnSansQrrUj: 25 },
+    { id: 'd2', vBusV: 80, iLoadA: 40, tjC: 25, rgOhm: 5, eOnUj: 90, eOffUj: 60, qRrNc: 500, eOnSansQrrUj: 75 },
+  ];
+
+  // Below I_min (10 A < 20 A at 40 V) linearly scales down toward 0 A without negative energy, marked extrapolated
+  const lowI = interpolateDptSwitchingLoss(lut, 40, 10);
+  assert.ok(lowI !== null);
+  assert.equal(lowI!.extrapolated, true);
+  assert.ok(Math.abs(lowI!.eOnUj - 15) < 1e-6);
+  assert.ok(Math.abs(lowI!.eOffUj - 10) < 1e-6);
+
+  // Zero current yields 0 switching loss
+  const zeroI = interpolateDptSwitchingLoss(lut, 40, 0);
+  assert.ok(zeroI !== null && Math.abs(zeroI!.eOnUj) < 1e-9 && Math.abs(zeroI!.eOffUj) < 1e-9);
+
+  // Above V_max (100 V > 80 V) flags extrapolated=true and reports LUT coverage bounds
+  const highV = interpolateDptSwitchingLoss(lut, 100, 40);
+  assert.ok(highV !== null);
+  assert.equal(highV!.extrapolated, true);
+  assert.deepEqual(highV!.vRange, [40, 80]);
+  assert.deepEqual(highV!.iRange, [20, 40]);
+  assert.ok(Number.isFinite(highV!.eOnUj) && highV!.eOnUj > 60);
+
+  // Inside convex grid (60 V, 30 A) is not extrapolated
+  const inside = interpolateDptSwitchingLoss(lut, 60, 30);
+  assert.ok(inside !== null);
+  assert.equal(inside!.extrapolated, false);
+
+  // computePhaseMosLosses & simulateFoc6Mos honor dptLut and eonIncludesQrr flag
+  const mosBase = {
+    rdsOn25Mohm: 4.5,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.9,
+    eonPlusEoffUj: 50,
+    vRefV: 48,
+    iRefA: 25,
+    qrrNc: 60,
+    eossUj: 0,
+    dptLut: lut,
+  };
+  const lossLutNoQrr = computePhaseMosLosses(30, 0.7, 60, 25, 25, 'SVPWM', 20000, 200, {
+    ...mosBase,
+    eonIncludesQrr: false,
+  });
+  const lossLutWithQrr = computePhaseMosLosses(30, 0.7, 60, 25, 25, 'SVPWM', 20000, 200, {
+    ...mosBase,
+    eonIncludesQrr: true,
+  });
+  assert.ok(Math.abs(lossLutWithQrr.pHighSw - 20000 * inside!.eSwTotalUj * 1e-6) < 1e-6);
+  assert.ok(lossLutWithQrr.pHighSw < lossLutNoQrr.pHighSw, 'eonIncludesQrr=true uses Eon+Eoff directly instead of Eon_sansQrr+Qrr*Vbus');
+
+  const n = 100;
+  const t = Float64Array.from({ length: n }, (_, i) => i * 5e-4);
+  const ia = Float32Array.from(t, (x) => 30 * Math.sin(2 * Math.PI * 50 * x));
+  const ib = Float32Array.from(t, (x) => 30 * Math.sin(2 * Math.PI * 50 * x - (2 * Math.PI) / 3));
+  const simLut = simulateFoc6Mos(
+    makeChannel('lut_ia', 'Ia', 'A', t, ia),
+    makeChannel('lut_ib', 'Ib', 'A', t, ib),
+    DEFAULT_FOC_MODEL,
+    { ...mosBase, eonIncludesQrr: true },
+    { modulation: 'SVPWM', fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 25, vBusConstV: 60 }
+  );
+  assert.ok(simLut.pInvMeanW > 0 && Number.isFinite(simLut.tjMaxGlobalC));
+  assert.ok(simLut.warnings.some((w) => w.includes('DPT 查找表')));
+});
+
+

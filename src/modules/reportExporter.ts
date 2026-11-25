@@ -94,12 +94,14 @@ export function buildEngineeringReportHTML(
       <section class="card">
         <h2>Golden Reference Tolerance Verification</h2>
         <div class="summary-grid">
-          <div><span>Status</span><strong class="${goldenEval.pass ? 'pass' : 'fail'}">${goldenEval.pass ? 'PASS' : 'FAIL'}</strong></div>
+          <div><span>Status</span><strong class="${goldenEval.status === 'PASS' ? 'pass' : goldenEval.status === 'FAIL' ? 'fail' : 'warn'}">${esc(goldenEval.status)}</strong></div>
           <div><span>Channel</span><strong>${esc(tab.channels[tab.goldenBand?.channelId || '']?.name || '--')}</strong></div>
+          <div><span>Coverage</span><strong>${goldenEval.coveragePct.toFixed(1)}% (${goldenEval.totalCompared.toLocaleString()} / ${goldenEval.totalTargetSamples.toLocaleString()})</strong></div>
           <div><span>Tolerance Band</span><strong>±${formatEng(goldenEval.bandHalfWidth, tab.channels[tab.goldenBand?.channelId || '']?.unit || 'V', 3)}</strong></div>
           <div><span>Violations</span><strong>${goldenEval.violationCount.toLocaleString()} / ${goldenEval.totalCompared.toLocaleString()} pts</strong></div>
           <div><span>Max Deviation</span><strong>${formatEng(goldenEval.maxDeviation, tab.channels[tab.goldenBand?.channelId || '']?.unit || 'V', 3)}</strong></div>
         </div>
+        ${goldenEval.invalidReason ? `<div style="margin-top:8px;font-size:11px;color:#b45309;">Note: ${esc(goldenEval.invalidReason)}</div>` : ''}
       </section>
     `
     : '';
@@ -151,6 +153,7 @@ export function buildEngineeringReportHTML(
   .summary-grid strong { font-family: "JetBrains Mono", monospace; font-size: 13px; }
   .pass { color: #059669; }
   .fail { color: #dc2626; }
+  .warn { color: #d97706; }
   .shot { width: 100%; border: 1px solid #0f172a; display: block; }
   table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: "JetBrains Mono", monospace; }
   th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }

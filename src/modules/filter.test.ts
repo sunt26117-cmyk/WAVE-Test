@@ -275,3 +275,64 @@ test('Partial waveform filtering [tStart, tEnd] leaves outside samples untouched
   const legacy = lowPassFilter(t, v, { cutoffHz: 300, order: 2, zeroPhase: true });
   assert.equal(legacy.length, v.length);
 });
+
+test('Filter AN-04/AN-05: partial region fails closed (<3 samples/missing cursors) and isolates NaN/sampling gaps', () => {
+  const fs = 10000;
+  const n = 200;
+  const t = makeTimebase(n, fs);
+  const v = new Float32Array(n);
+  for (let i = 0; i < n; i++) v[i] = Math.sin(2 * Math.PI * 50 * t[i]) + 0.5 * Math.sin(2 * Math.PI * 2000 * t[i]);
+
+  // AN-04: missing cursors or <3 samples in custom slice must abort without filtering full trace
+  const cfgCursors = { ...createDefaultFilterConfig(fs), regionMode: 'cursors' as const, cutoffHz: 200 };
+  const noCursorRes = applyWaveformFilter(t, v, cfgCursors, { cursorX1: null, cursorX2: null });
+  assert.equal(noCursorRes.partialRegionSkipped, true);
+  assert.equal(noCursorRes.metrics.sampleCountFiltered, 0);
+  assert.deepEqual(Array.from(noCursorRes.v), Array.from(v));
+
+  const tinySliceCfg = {
+    ...createDefaultFilterConfig(fs),
+    regionMode: 'custom' as const,
+    tStart: 0.005,
+    tEnd: 0.00505, // covers <= 1 sample
+    cutoffHz: 200,
+  };
+  const tinyRes = applyWaveformFilter(t, v, tinySliceCfg);
+  assert.equal(tinyRes.partialRegionSkipped, true);
+  assert.deepEqual(Array.from(tinyRes.v), Array.from(v));
+
+  // AN-05: NaN segment stays NaN and never bridges across adjacent segments in applyWaveformFilter or lowPassFilter
+  const vNan = Float32Array.from(v);
+  vNan[80] = Number.NaN;
+  vNan[81] = Number.NaN;
+  // Isolate a 2-sample valid island [82, 83] followed by NaN at 84 (<3 samples -> left unfiltered)
+  vNan[84] = Number.NaN;
+  const nanCfg = { ...createDefaultFilterConfig(fs), cutoffHz: 200 };
+  const nanRes = applyWaveformFilter(t, vNan, nanCfg);
+  assert.ok(Number.isNaN(nanRes.v[80]));
+  assert.ok(Number.isNaN(nanRes.v[81]));
+  assert.ok(Number.isNaN(nanRes.v[84]));
+  assert.equal(nanRes.v[82], vNan[82], '<3 sample island must remain unfiltered');
+  assert.ok((nanRes.unfilteredShortSegmentCount || 0) >= 1);
+
+  const legNan = lowPassFilter(t, vNan, { cutoffHz: 200, order: 2, zeroPhase: true });
+  assert.ok(Number.isNaN(legNan[80]));
+  assert.ok(Number.isNaN(legNan[81]));
+
+  // AN-05: Isolated 10x+ sampling gap separates DC levels without cross-gap transient smear
+  const tGap = new Float64Array([
+    0.0, 0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007,
+    0.05, 0.0501, 0.0502, 0.0503, 0.0504, 0.0505, 0.0506, 0.0507,
+  ]);
+  const vGap = new Float32Array([
+    0, 0, 0, 0, 0, 0, 0, 0,
+    10, 10, 10, 10, 10, 10, 10, 10,
+  ]);
+  const gapRes = applyWaveformFilter(tGap, vGap, { ...createDefaultFilterConfig(10000), cutoffHz: 500 });
+  assert.ok(Math.abs(gapRes.v[7] - 0) < 1e-4, `Pre-gap flat 0V must not smear toward 10V, got ${gapRes.v[7]}`);
+  assert.ok(Math.abs(gapRes.v[8] - 10) < 1e-4, `Post-gap flat 10V must not smear toward 0V, got ${gapRes.v[8]}`);
+  const legGap = lowPassFilter(tGap, vGap, { cutoffHz: 500, order: 2, zeroPhase: true });
+  assert.ok(Math.abs(legGap[7] - 0) < 1e-4);
+  assert.ok(Math.abs(legGap[8] - 10) < 1e-4);
+});
+

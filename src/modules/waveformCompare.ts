@@ -14,6 +14,12 @@ import {
   isLtspiceExportText,
   parseLtspiceText,
 } from '../parsers/ltspiceParser';
+import {
+  DEFAULT_SAMPLING_GAP_FACTOR,
+  resolveUnitPairCompatibility,
+  sampleSeriesAtTimeStrict,
+  validateChannelIntegrity,
+} from './timeSync';
 
 export interface CompareGroupTheme {
   id: string;
@@ -84,16 +90,32 @@ export function getCompareGroupTraceColor(
   return theme.familyShades[indexInGroup % theme.familyShades.length];
 }
 
+export type CompareStatus = 'OK' | 'INVALID' | 'INSUFFICIENT_DATA';
+
 export interface AlignedCompareResult {
+  valid: boolean;
+  status: CompareStatus;
+  invalidReason?: string | null;
   alignedRefV: Float32Array;
   diffV: Float32Array;
   overlapCount: number;
+  totalTargetSamples: number;
+  invalidCount: number;
+  gapSkippedCount: number;
+  coveragePct: number;
+  unitScaleApplied: number;
   targetMeanApplied: number;
   refMeanApplied: number;
 }
 
 export interface WaveformCompareMetrics {
+  valid: boolean;
+  status: CompareStatus;
+  invalidReason?: string | null;
   comparedSamples: number;
+  totalSamples: number;
+  invalidCount: number;
+  coveragePct: number;
   rmse: number | null;
   mae: number | null;
   maxAbsDiff: number | null;
@@ -109,33 +131,11 @@ function sampleRefAtTime(
   refT: Float64Array,
   refCh: WaveformChannel,
   refMean: number,
-  qTime: number
-): number {
-  const n = Math.min(refT.length, refCh.v.length);
-  if (n === 0 || !isFinite(qTime)) return NaN;
-  if (qTime < refT[0] || qTime > refT[n - 1]) return NaN;
-  if (n === 1) return getChannelDisplayValue(refCh, 0, refMean);
-
-  let lo = 0;
-  let hi = n - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (refT[mid] <= qTime) lo = mid;
-    else hi = mid;
-  }
-
-  const t0 = refT[lo];
-  const t1 = refT[hi];
-  const v0 = getChannelDisplayValue(refCh, lo, refMean);
-  const v1 = getChannelDisplayValue(refCh, hi, refMean);
-  if (!isFinite(v0) && !isFinite(v1)) return NaN;
-  if (!isFinite(v0)) return v1;
-  if (!isFinite(v1)) return v0;
-
-  const dt = t1 - t0;
-  if (dt <= 1e-18) return v0;
-  const frac = (qTime - t0) / dt;
-  return v0 + frac * (v1 - v0);
+  qTime: number,
+  gapThresholdSec = Infinity
+): { value: number; isGap: boolean } {
+  const res = sampleSeriesAtTimeStrict(refT, refCh, qTime, refMean, gapThresholdSec);
+  return { value: res.value, isGap: res.reason === 'gap' };
 }
 
 /**
@@ -212,7 +212,8 @@ export function detectRecommendedTimeScale(
 
 /**
  * Aligns refCh onto targetCh.t grid with optional timeShiftSec (ref shifted forward by +timeShiftSec),
- * optional timeScale (scales ref relative to refCh.t[0], e.g. 0.001 for ms->s), and optional DC offset removal.
+ * optional timeScale (scales ref relative to refCh.t[0], e.g. 0.001 for ms->s), SI unit normalization,
+ * and optional DC offset removal. Strictly rejects mismatched/non-monotonic/cross-dimension inputs.
  */
 export function alignAndInterpolateReference(
   targetCh: WaveformChannel,
@@ -221,40 +222,77 @@ export function alignAndInterpolateReference(
   removeDcOffset: boolean = false,
   timeScale: number = 1
 ): AlignedCompareResult {
-  const n = Math.min(targetCh.t.length, targetCh.v.length);
-  const alignedRefV = new Float32Array(n);
-  const diffV = new Float32Array(n);
+  const tgtIntegrity = validateChannelIntegrity(targetCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const refIntegrity = validateChannelIntegrity(refCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const nT = targetCh?.t?.length || 0;
+  const alignedRefV = new Float32Array(tgtIntegrity.valid ? nT : 0);
+  const diffV = new Float32Array(tgtIntegrity.valid ? nT : 0);
   alignedRefV.fill(NaN);
   diffV.fill(NaN);
 
-  if (n === 0 || refCh.t.length === 0 || refCh.v.length === 0) {
+  if (!tgtIntegrity.valid || !refIntegrity.valid) {
     return {
+      valid: false,
+      status: 'INVALID',
+      invalidReason: tgtIntegrity.invalidReason || refIntegrity.invalidReason || 'Invalid channel integrity.',
       alignedRefV,
       diffV,
       overlapCount: 0,
+      totalTargetSamples: tgtIntegrity.valid ? nT : 0,
+      invalidCount: tgtIntegrity.valid ? nT : 0,
+      gapSkippedCount: 0,
+      coveragePct: 0,
+      unitScaleApplied: 1,
       targetMeanApplied: 0,
       refMeanApplied: 0,
     };
   }
 
+  const unitCheck = resolveUnitPairCompatibility(targetCh.unit, refCh.unit);
+  if (!unitCheck.compatible) {
+    return {
+      valid: false,
+      status: 'INVALID',
+      invalidReason: unitCheck.reason || `Incompatible units: ${targetCh.unit} vs ${refCh.unit}`,
+      alignedRefV,
+      diffV,
+      overlapCount: 0,
+      totalTargetSamples: nT,
+      invalidCount: nT,
+      gapSkippedCount: 0,
+      coveragePct: 0,
+      unitScaleApplied: 1,
+      targetMeanApplied: 0,
+      refMeanApplied: 0,
+    };
+  }
+
+  const refScaleToTarget = unitCheck.scaleBToA;
   const safeScale = isFinite(timeScale) && timeScale > 0 ? timeScale : 1;
   const refT0 = refCh.t[0];
+  const refGapLimit = refIntegrity.timebase.gapThresholdSec;
   const targetAcMean = targetCh.coupling === 'AC' ? computeChannelMean(targetCh) : 0;
   const refAcMean = refCh.coupling === 'AC' ? computeChannelMean(refCh) : 0;
 
   let overlapCount = 0;
+  let invalidCount = 0;
+  let gapSkippedCount = 0;
   let sumT = 0;
   let sumR = 0;
 
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < nT; i++) {
     const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
     const qRefTime = refT0 + (targetCh.t[i] - timeShiftSec - refT0) / safeScale;
-    const rv = sampleRefAtTime(refCh.t, refCh, refAcMean, qRefTime);
+    const sampled = sampleRefAtTime(refCh.t, refCh, refAcMean, qRefTime, refGapLimit);
+    const rv = isFinite(sampled.value) ? sampled.value * refScaleToTarget : NaN;
+    if (sampled.isGap) gapSkippedCount++;
     if (isFinite(tv) && isFinite(rv)) {
       alignedRefV[i] = rv;
       sumT += tv;
       sumR += rv;
       overlapCount++;
+    } else {
+      invalidCount++;
     }
   }
 
@@ -265,7 +303,7 @@ export function alignAndInterpolateReference(
     refShift = sumR / overlapCount;
   }
 
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < nT; i++) {
     const rv = alignedRefV[i];
     if (!isFinite(rv)) continue;
     const tv = getChannelDisplayValue(targetCh, i, targetAcMean) - targetShift;
@@ -276,10 +314,21 @@ export function alignAndInterpolateReference(
     diffV[i] = tv - adjR;
   }
 
+  const coveragePct = nT > 0 ? (overlapCount / nT) * 100 : 0;
+  const hasEnough = overlapCount >= 2 || (nT === 1 && overlapCount === 1);
+
   return {
+    valid: hasEnough,
+    status: hasEnough ? 'OK' : 'INSUFFICIENT_DATA',
+    invalidReason: hasEnough ? null : 'No sufficient finite overlapping points between target and reference.',
     alignedRefV,
     diffV,
     overlapCount,
+    totalTargetSamples: nT,
+    invalidCount,
+    gapSkippedCount,
+    coveragePct,
+    unitScaleApplied: refScaleToTarget,
     targetMeanApplied: targetShift,
     refMeanApplied: refShift,
   };
@@ -292,7 +341,7 @@ export interface MappedReferenceTrace {
 
 /**
  * Maps all samples of refCh into targetCh's time coordinate frame (applying timeScale,
- * timeShiftSec, AC/inverted display conditioning, and optional DC offset alignment)
+ * timeShiftSec, SI unit normalization, AC/inverted display conditioning, and optional DC offset alignment)
  * WITHOUT truncating refCh to targetCh's duration, allowing the time axis to extend
  * to the longest imported Compare waveform.
  */
@@ -305,10 +354,19 @@ export function buildMappedReferenceTrace(
   targetMeanApplied?: number,
   refMeanApplied?: number
 ): MappedReferenceTrace {
-  const nR = Math.min(refCh.t.length, refCh.v.length);
+  const refIntegrity = validateChannelIntegrity(refCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!refIntegrity.valid) {
+    return { t: new Float64Array(0), v: new Float32Array(0) };
+  }
+  const unitCheck = resolveUnitPairCompatibility(targetCh.unit, refCh.unit);
+  if (!unitCheck.compatible) {
+    return { t: new Float64Array(0), v: new Float32Array(0) };
+  }
+  const refScaleToTarget = unitCheck.scaleBToA;
+
+  const nR = refCh.t.length;
   const mappedT = new Float64Array(nR);
   const mappedV = new Float32Array(nR);
-  if (nR === 0) return { t: mappedT, v: mappedV };
 
   const safeScale = isFinite(timeScale) && timeScale > 0 ? timeScale : 1;
   const refT0 = refCh.t[0];
@@ -337,7 +395,7 @@ export function buildMappedReferenceTrace(
       let sR = 0;
       let cR = 0;
       for (let i = 0; i < nR; i++) {
-        const rv = getChannelDisplayValue(refCh, i, refAcMean);
+        const rv = getChannelDisplayValue(refCh, i, refAcMean) * refScaleToTarget;
         if (isFinite(rv)) {
           sR += rv;
           cR++;
@@ -349,7 +407,7 @@ export function buildMappedReferenceTrace(
 
   for (let i = 0; i < nR; i++) {
     mappedT[i] = refT0 + (refCh.t[i] - refT0) * safeScale + timeShiftSec;
-    const raw = getChannelDisplayValue(refCh, i, refAcMean);
+    const raw = getChannelDisplayValue(refCh, i, refAcMean) * refScaleToTarget;
     if (!isFinite(raw)) {
       mappedV[i] = NaN;
     } else {
@@ -361,8 +419,10 @@ export function buildMappedReferenceTrace(
 }
 
 function findFirstRisingCrossingTime(ch: WaveformChannel): number | null {
-  const n = Math.min(ch.t.length, ch.v.length);
-  if (n < 4) return null;
+  const integrity = validateChannelIntegrity(ch, 4, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!integrity.valid) return null;
+  const n = ch.t.length;
+  const gapThreshold = integrity.timebase.gapThresholdSec;
   const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
   let mn = Infinity;
   let mx = -Infinity;
@@ -383,20 +443,25 @@ function findFirstRisingCrossingTime(ch: WaveformChannel): number | null {
   for (let i = 1; i < n; i++) {
     const prev = getChannelDisplayValue(ch, i - 1, mean);
     const curr = getChannelDisplayValue(ch, i, mean);
-    if (!isFinite(prev) || !isFinite(curr)) continue;
+    const dt = ch.t[i] - ch.t[i - 1];
+    if (!isFinite(prev) || !isFinite(curr) || (Number.isFinite(gapThreshold) && dt > gapThreshold)) {
+      armed = false;
+      continue;
+    }
     if (prev <= mid - hyst) armed = true;
     if (armed && prev < mid && curr >= mid) {
       const denom = curr - prev;
       const frac = denom > 1e-15 ? (mid - prev) / denom : 0;
-      return ch.t[i - 1] + frac * (ch.t[i] - ch.t[i - 1]);
+      return ch.t[i - 1] + frac * dt;
     }
   }
   return null;
 }
 
 function findPeakTime(ch: WaveformChannel): number | null {
-  const n = Math.min(ch.t.length, ch.v.length);
-  if (n === 0) return null;
+  const integrity = validateChannelIntegrity(ch, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!integrity.valid) return null;
+  const n = ch.t.length;
   const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
   let bestIdx = -1;
   let bestVal = -Infinity;
@@ -419,7 +484,10 @@ export function computeAutoTimeAlignShift(
   mode: 'start' | 'rising-edge' | 'first-peak' | 'xcorr',
   timeScale: number = 1
 ): number {
-  if (targetCh.t.length === 0 || refCh.t.length === 0) return 0;
+  const tgtInt = validateChannelIntegrity(targetCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  const refInt = validateChannelIntegrity(refCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tgtInt.valid || !refInt.valid) return 0;
+
   const safeScale = isFinite(timeScale) && timeScale > 0 ? timeScale : 1;
   const refT0 = refCh.t[0];
 
@@ -462,24 +530,39 @@ export function computeAutoTimeAlignShift(
   const dtGrid = minDur / bins;
   const meanT = targetCh.coupling === 'AC' ? computeChannelMean(targetCh) : 0;
   const meanR = refCh.coupling === 'AC' ? computeChannelMean(refCh) : 0;
+  const tgtGapLimit = tgtInt.timebase.gapThresholdSec;
+  const refGapLimit = refInt.timebase.gapThresholdSec;
 
   const sigT = new Float64Array(bins);
   const sigR = new Float64Array(bins);
+  const validT = new Uint8Array(bins);
+  const validR = new Uint8Array(bins);
   let avgT = 0;
+  let cntT = 0;
   let avgR = 0;
+  let cntR = 0;
   for (let i = 0; i < bins; i++) {
-    const tv = sampleRefAtTime(targetCh.t, targetCh, meanT, t0T + i * dtGrid);
-    const rv = sampleRefAtTime(refCh.t, refCh, meanR, refT0 + (i * dtGrid) / safeScale);
-    sigT[i] = isFinite(tv) ? tv : 0;
-    sigR[i] = isFinite(rv) ? rv : 0;
-    avgT += sigT[i];
-    avgR += sigR[i];
+    const tv = sampleRefAtTime(targetCh.t, targetCh, meanT, t0T + i * dtGrid, tgtGapLimit).value;
+    const rv = sampleRefAtTime(refCh.t, refCh, meanR, refT0 + (i * dtGrid) / safeScale, refGapLimit).value;
+    if (isFinite(tv)) {
+      sigT[i] = tv;
+      validT[i] = 1;
+      avgT += tv;
+      cntT++;
+    }
+    if (isFinite(rv)) {
+      sigR[i] = rv;
+      validR[i] = 1;
+      avgR += rv;
+      cntR++;
+    }
   }
-  avgT /= bins;
-  avgR /= bins;
+  if (cntT < 4 || cntR < 4) return t0T - refT0;
+  avgT /= cntT;
+  avgR /= cntR;
   for (let i = 0; i < bins; i++) {
-    sigT[i] -= avgT;
-    sigR[i] -= avgR;
+    sigT[i] = validT[i] ? sigT[i] - avgT : 0;
+    sigR[i] = validR[i] ? sigR[i] - avgR : 0;
   }
 
   const maxLag = Math.floor(bins * 0.45);
@@ -490,15 +573,17 @@ export function computeAutoTimeAlignShift(
     let num = 0;
     let dT = 0;
     let dR = 0;
+    let pairCnt = 0;
     for (let i = 0; i < bins; i++) {
       const j = i - lag;
-      if (j < 0 || j >= bins) continue;
+      if (j < 0 || j >= bins || !validT[i] || !validR[j]) continue;
       num += sigT[i] * sigR[j];
       dT += sigT[i] * sigT[i];
       dR += sigR[j] * sigR[j];
+      pairCnt++;
     }
     const denom = Math.sqrt(dT * dR);
-    if (denom > 1e-18) {
+    if (pairCnt >= 8 && denom > 1e-18) {
       const c = num / denom;
       if (c > bestCorr) {
         bestCorr = c;
@@ -516,26 +601,49 @@ export function computeAutoTimeAlignShift(
 export function computeWaveformCompareMetrics(
   targetCh: WaveformChannel,
   alignedRefV: Float32Array,
-  removeDcOffset: boolean = false
+  removeDcOffset: boolean = false,
+  alignedContext?: Pick<AlignedCompareResult, 'valid' | 'status' | 'invalidReason'>
 ): WaveformCompareMetrics {
-  const n = Math.min(targetCh.t.length, targetCh.v.length, alignedRefV.length);
-  if (n === 0) {
-    return {
-      comparedSamples: 0,
-      rmse: null,
-      mae: null,
-      maxAbsDiff: null,
-      maxAbsDiffTime: null,
-      maxAbsDiffIndex: null,
-      correlation: null,
-      similarityPct: null,
-      targetVpp: null,
-      refVpp: null,
-    };
+  const mkEmpty = (status: CompareStatus, invalidReason?: string | null, total = 0, invalidCnt = total): WaveformCompareMetrics => ({
+    valid: false,
+    status,
+    invalidReason: invalidReason || null,
+    comparedSamples: 0,
+    totalSamples: total,
+    invalidCount: invalidCnt,
+    coveragePct: 0,
+    rmse: null,
+    mae: null,
+    maxAbsDiff: null,
+    maxAbsDiffTime: null,
+    maxAbsDiffIndex: null,
+    correlation: null,
+    similarityPct: null,
+    targetVpp: null,
+    refVpp: null,
+  });
+
+  if (alignedContext && !alignedContext.valid && alignedContext.status === 'INVALID') {
+    return mkEmpty('INVALID', alignedContext.invalidReason, targetCh?.t?.length || 0);
+  }
+
+  const tgtInt = validateChannelIntegrity(targetCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (!tgtInt.valid) {
+    return mkEmpty('INVALID', tgtInt.invalidReason);
+  }
+
+  const n = targetCh.t.length;
+  if (alignedRefV.length !== n) {
+    return mkEmpty(
+      'INVALID',
+      `Aligned reference length (${alignedRefV.length}) does not match target length (${n}).`,
+      n
+    );
   }
 
   const targetAcMean = targetCh.coupling === 'AC' ? computeChannelMean(targetCh) : 0;
   let count = 0;
+  let invalidCount = 0;
   let sumT = 0;
   let sumR = 0;
   let minT = Infinity;
@@ -546,7 +654,10 @@ export function computeWaveformCompareMetrics(
   for (let i = 0; i < n; i++) {
     const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
     const rv = alignedRefV[i];
-    if (!isFinite(tv) || !isFinite(rv)) continue;
+    if (!isFinite(tv) || !isFinite(rv)) {
+      invalidCount++;
+      continue;
+    }
     sumT += tv;
     sumR += rv;
     if (tv < minT) minT = tv;
@@ -557,18 +668,7 @@ export function computeWaveformCompareMetrics(
   }
 
   if (count === 0) {
-    return {
-      comparedSamples: 0,
-      rmse: null,
-      mae: null,
-      maxAbsDiff: null,
-      maxAbsDiffTime: null,
-      maxAbsDiffIndex: null,
-      correlation: null,
-      similarityPct: null,
-      targetVpp: null,
-      refVpp: null,
-    };
+    return mkEmpty('INSUFFICIENT_DATA', 'No finite overlapping samples to compare.', n, invalidCount);
   }
 
   const meanT = sumT / count;
@@ -618,7 +718,13 @@ export function computeWaveformCompareMetrics(
       : null;
 
   return {
+    valid: true,
+    status: 'OK',
+    invalidReason: null,
     comparedSamples: count,
+    totalSamples: n,
+    invalidCount,
+    coveragePct: n > 0 ? (count / n) * 100 : 0,
     rmse,
     mae,
     maxAbsDiff: maxAbs >= 0 ? maxAbs : null,
