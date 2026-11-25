@@ -13,10 +13,14 @@ import {
   forwardVerifyPoint,
   isMonotonicTimestamps,
   movingAverageFilter,
+  movingAverageFilterWithDiagnostics,
+  partitionContinuousTimeSegments,
   processRuntimeLog,
+  processRuntimeLogWithAudit,
   solveSinglePoint,
 } from './motorPhysics';
 import {
+  analyzeDynamicIdentifiability,
   autoMapColumns,
   detectHeaderEngineeringScale,
   detectHeaderEtaFormat,
@@ -37,6 +41,14 @@ import {
 } from './demoData';
 import { synthesizeSixMosWaveform } from './thermalExporter';
 import { PYTHON_BUNDLE_FILES } from './pythonBundle';
+import {
+  buildDynamicPmsmCsv,
+  buildDynamicPmsmScopeTab,
+  buildDynamicPresetScenario,
+  calcDynamicPmsmTorque,
+  kePrimeToPsiF,
+  simulateDynamicPmsm,
+} from './dynamicPmsm';
 import {
   buildOscilloscopeTabFromSixMos,
   buildOscilloscopeTabFromBatchLog,
@@ -716,14 +728,21 @@ test('Audit items #2, #12, #20, #21: iqSignAmbiguous, trapezoidal filter, Dyno k
   const stallAmb = solveSinglePoint(13.5, 1.5, 0, DEMO_MOTOR_PARAMS);
   assert.equal(stallAmb.alerts.iqSignAmbiguous, true);
 
-  // #12: Trapezoidal time-weighted movingAverageFilter resists dense-burst skew
-  // Piecewise linear / flat step over [0, 0.05]: dense 10 pts @ 0..0.0009s (val=100), then 0.05s (val=0)
-  // Window 100 ms covers whole [0, 0.05] interval; arithmetic mean would be ~91 whereas true time average is ~2.8
-  const tsBurst = [0, 0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.05];
-  const vsBurst = [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 0];
-  const trapFilt = movingAverageFilter(vsBurst, tsBurst, 100);
-  // Exact integral: 100*0.0009 + 0.5*(100+0)*(0.05-0.0009) = 0.09 + 2.455 = 2.545 over 0.05s => 50.9 (not 90.9!)
-  assert.ok(Math.abs(trapFilt[5] - 50.9) < 0.05, `Expected trapezoidal mean 50.9, got ${trapFilt[5]}`);
+  // #12 / FD-01: Non-uniform trapezoidal filter without gap vs gap isolation (no cross-gap bridging!)
+  // A: Continuous non-uniform sampling without gap (max dt = 0.0003 <= 3.5 * 0.0001): trapezoidal resists burst skew
+  const tsContJitter = [0, 0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.0012];
+  const vsContJitter = [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 0];
+  const trapCont = movingAverageFilter(vsContJitter, tsContJitter, 100);
+  // Exact integral: 100*0.0009 + 0.5*(100+0)*(0.0012-0.0009) = 0.09 + 0.015 = 0.105 over 0.0012s => 87.5 (not arithmetic 90.9)
+  assert.ok(Math.abs(trapCont[5] - 87.5) < 0.05, `Expected continuous trapezoidal mean 87.5, got ${trapCont[5]}`);
+
+  // B: True 491x gap at [0.0009 -> 0.05] cuts window at gap boundary; pre-gap side stays 100 and isolated post-gap point becomes NaN
+  const tsBurstGap = [0, 0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.05];
+  const vsBurstGap = [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 0];
+  const trapGap = movingAverageFilterWithDiagnostics(vsBurstGap, tsBurstGap, 100);
+  assert.equal(trapGap.gapCount, 1);
+  assert.ok(Math.abs(trapGap.values[5] - 100) < 1e-9, `Expected pre-gap mean 100 without bridging, got ${trapGap.values[5]}`);
+  assert.ok(Number.isNaN(trapGap.values[10]), `Expected gap-isolated singleton to be NaN, got ${trapGap.values[10]}`);
 
   // #20: Dyno power unit normalization (kW -> W, mW -> W) and non-power warning
   const pwrCsv = parseCsvText(
@@ -1017,4 +1036,387 @@ print(json.dumps(sanitize({
     }
   }
 });
+
+test('FD-01 & Python bundle P1..P4: segmented gap filter, valid Python AST, width="stretch", exp_v key-only, P3/P4 markers', () => {
+  // 1. Uniform sampling: exact smoothing
+  const tUnif = Array.from({ length: 21 }, (_, i) => i * 0.001);
+  const vUnif = tUnif.map((_, i) => (i < 10 ? 2 : 2));
+  const diagUnif = movingAverageFilterWithDiagnostics(vUnif, tUnif, 5);
+  assert.equal(diagUnif.gapCount, 0);
+  assert.equal(diagUnif.segmentCount, 1);
+  assert.ok(diagUnif.values.every((x) => Math.abs(x - 2) < 1e-12));
+
+  // 2. 10x and 50x gaps with sharp step across gap: never blurs pre-gap (1A) with post-gap (10A)
+  const timesGap = [
+    0.0, 0.001, 0.002, 0.003, 0.004,
+    0.024, 0.025, 0.026, 0.027, 0.028, // 20x gap (0.020s vs 0.001s)
+    0.088, 0.089, 0.090, 0.091,        // 60x gap (0.060s vs 0.001s)
+    0.150,                             // isolated singleton after 59x gap
+  ];
+  const valsGap = [
+    1, 1, 1, 1, 1,
+    10, 10, 10, 10, 10,
+    20, 20, 20, 20,
+    99,
+  ];
+  const segDiag = partitionContinuousTimeSegments(timesGap);
+  assert.equal(segDiag.gapIndices.length, 3);
+  assert.equal(segDiag.segments.length, 4);
+
+  const fGap = movingAverageFilterWithDiagnostics(valsGap, timesGap, 20);
+  assert.equal(fGap.gapCount, 3);
+  assert.equal(fGap.segmentCount, 4);
+  for (let i = 0; i <= 4; i++) assert.ok(Math.abs(fGap.values[i] - 1) < 1e-12, `seg0 idx=${i}`);
+  for (let i = 5; i <= 9; i++) assert.ok(Math.abs(fGap.values[i] - 10) < 1e-12, `seg1 idx=${i}`);
+  for (let i = 10; i <= 13; i++) assert.ok(Math.abs(fGap.values[i] - 20) < 1e-12, `seg2 idx=${i}`);
+  assert.ok(Number.isNaN(fGap.values[14]), 'Isolated point separated by gap must return NaN');
+  assert.deepEqual(fGap.isolatedIndices, [14]);
+
+  const logAudit = processRuntimeLogWithAudit(
+    timesGap.map((t, i) => ({ timeS: t, vMeasV: 13.5, iBusA: valsGap[i], nRpm: 1000 })),
+    20,
+    DEMO_MOTOR_PARAMS
+  );
+  assert.equal(logAudit.filterDiagnostics.gapCount, 3);
+  assert.equal(logAudit.rows[14].filterValid, false);
+  assert.equal(logAudit.rows[14].result.alerts.invalidBus, true);
+
+  // 3. Python bundle static AST compile + P1..P4 & FD-01 parity verification
+  const appPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'app.py')?.content || '';
+  const motorPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'motor_physics.py')?.content || '';
+  const dynoPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dyno_calibrator.py')?.content || '';
+  const thermPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'thermal_exporter.py')?.content || '';
+  const dynPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dynamic_pmsm.py')?.content || '';
+  assert.ok(dynPy.length > 500, 'dynamic_pmsm.py must be present in PYTHON_BUNDLE_FILES');
+
+  // P1: Zero use_container_width remaining; >= 4 width="stretch" calls (Tab1 + Tab2 + Tab3 + Tab4)
+  assert.equal(appPy.includes('use_container_width'), false);
+  assert.ok((appPy.match(/width="stretch"/g) || []).length >= 4);
+  // P2: exp_v, exp_i, exp_n must NOT pass positional default when key= is bound to session_state
+  assert.equal(appPy.includes('st.session_state["exp_v"]), format'), false);
+  assert.ok(appPy.includes('min_value=-20.0, max_value=200.0, format="%.2f", key="exp_v"'));
+  // P3: plot columns & explicit red marker warning in app.py
+  assert.ok(motorPy.includes('res["solution_valid"] = sol_valid'));
+  assert.ok(motorPy.includes('res["is_held_prev_iq"]'));
+  assert.ok(appPy.includes('该时刻无实数解（已标红点，数值未虚构）'));
+  // P4: nearest exterior fill + z_extrap_mask + explicit warning in app.py
+  assert.ok(dynoPy.includes('method="nearest"'));
+  assert.ok(dynoPy.includes('"z_extrap_mask": z_extrap_mask'));
+  assert.ok(appPy.includes('外推区不可信'));
+
+  // Compile all 5 Python files & verify Python partition_continuous_time_segments parity via python3
+  const pyCheck = `
+import json, math, sys, types
+np_stub = types.ModuleType("numpy")
+np_stub.ndarray = list
+def _diff(a):
+    return [a[i] - a[i - 1] for i in range(1, len(a))]
+def _isfinite(a):
+    return [math.isfinite(x) for x in a]
+class _FakeArr(list):
+    def __and__(self, other):
+        return _FakeArr([x and y for x, y in zip(self, other)])
+    def __gt__(self, val):
+        return _FakeArr([x > val for x in self])
+class _DiffArr(_FakeArr):
+    def __getitem__(self, item):
+        if isinstance(item, list):
+            return [x for x, keep in zip(self, item) if keep]
+        return super().__getitem__(item)
+np_stub.diff = lambda a: _DiffArr(_diff(a))
+np_stub.isfinite = lambda a: _FakeArr(_isfinite(a))
+def _median(a):
+    s = sorted(a)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 == 1 else 0.5 * (s[m - 1] + s[m])
+np_stub.median = _median
+pd_stub = types.ModuleType("pandas")
+pd_stub.DataFrame = dict
+sys.modules["numpy"] = np_stub
+sys.modules["pandas"] = pd_stub
+
+files = json.loads(sys.stdin.read())
+for fname, code in files.items():
+    compile(code, fname, "exec")
+
+ns = {}
+exec(files["motor_physics.py"], ns)
+segs, gaps, med_dt, thresh = ns["partition_continuous_time_segments"](${JSON.stringify(timesGap)})
+print(json.dumps({"segs": [list(s) for s in segs], "gaps": gaps, "med_dt": med_dt}))
+`;
+  const proc = spawnSync('python3', ['-c', pyCheck], {
+    input: JSON.stringify({
+      'motor_physics.py': motorPy,
+      'dyno_calibrator.py': dynoPy,
+      'thermal_exporter.py': thermPy,
+      'dynamic_pmsm.py': dynPy,
+      'app.py': appPy,
+    }),
+    encoding: 'utf8',
+  });
+  assert.equal(proc.status, 0, `Python AST/parity check failed: ${proc.stderr}`);
+  const pyRes = JSON.parse(proc.stdout);
+  assert.deepEqual(pyRes.gaps, segDiag.gapIndices);
+  assert.deepEqual(
+    pyRes.segs,
+    segDiag.segments.map((s) => [s.startIdx, s.endIdx])
+  );
+});
+
+test('FD-02: normalized Jacobian SVD, 95% CI, correlation matrix, and rank-deficient fallback retain baseline', () => {
+  const olDs = buildDemoOpenLoopDataset();
+  const clDs = buildDemoClosedLoopDataset();
+  const olMap = autoMapColumns(olDs.headers);
+  const clMap = autoMapColumns(clDs.headers);
+  const olPts = normalizeDynoDataset(olDs, olMap, 'Nm', '0-1', { requireTorque: false }).points;
+  const clPts = normalizeDynoDataset(clDs, clMap, 'Nm', '0-1', { requireTorque: true }).points;
+
+  // 1a) Rich multi-speed / multi-torque dataset in locked mode -> IDENTIFIABLE with finite 95% CIs on betaSat & P0
+  const lockedReport = runStepwiseCalibration(olPts, clPts, DEMO_MOTOR_PARAMS, {
+    keSource: 'open_loop_auto',
+    manualN0Rpm: 1450,
+    manualVTestV: 13.5,
+    manualKv: 107.4,
+    rsFitMode: 'locked',
+  });
+  const lockedId = lockedReport.identifiabilityReport;
+  assert.ok(lockedId, 'identifiabilityReport must be attached');
+  assert.equal(lockedId.overallStatus, 'IDENTIFIABLE');
+  assert.equal(lockedId.baselineRetained, false);
+  assert.equal(lockedId.numericalRank, 1);
+  assert.equal(lockedId.fullRank, 1);
+  for (const sym of ['p0A', 'p0B', 'betaSat']) {
+    const entry = lockedId.parameters.find((p) => p.symbol === sym);
+    assert.ok(entry, `Missing ${sym}`);
+    assert.ok(Number.isFinite(entry.stdError) && entry.stdError > 0, `${sym} SE must be finite > 0`);
+    assert.ok(entry.ci95Low < entry.value && entry.value < entry.ci95High, `${sym} value must sit inside 95% CI`);
+  }
+
+  // 1b) In bounded_15pct mode on single-Vbus demo data, SVD captures true physical (betaSat, rsEff) collinearity (|r| >= 0.90)
+  const boundedReport = runStepwiseCalibration(olPts, clPts, DEMO_MOTOR_PARAMS, {
+    keSource: 'open_loop_auto',
+    manualN0Rpm: 1450,
+    manualVTestV: 13.5,
+    manualKv: 107.4,
+    rsFitMode: 'bounded_15pct',
+  });
+  const idRep = boundedReport.identifiabilityReport;
+  assert.ok(idRep, 'identifiabilityReport must be attached');
+  assert.equal(idRep.overallStatus, 'WEAKLY_IDENTIFIABLE');
+  assert.equal(idRep.baselineRetained, false);
+  assert.equal(idRep.numericalRank, 2);
+  assert.equal(idRep.fullRank, 2);
+  assert.ok(Number.isFinite(idRep.conditionNumber) && idRep.conditionNumber < 40, `kappa=${idRep.conditionNumber}`);
+  assert.ok(idRep.dof > 5);
+  assert.equal(idRep.correlationMatrix.matrix.length, 2);
+  assert.ok(Math.abs(idRep.correlationMatrix.matrix[0][0] - 1) < 1e-9);
+  assert.ok(Math.abs(idRep.correlationMatrix.matrix[0][1] - idRep.correlationMatrix.matrix[1][0]) < 1e-9);
+  assert.equal(idRep.highCollinearityPairs.length, 1);
+  assert.ok(Math.abs(idRep.highCollinearityPairs[0].correlation) >= 0.9);
+  for (const sym of ['p0A', 'p0B', 'betaSat', 'rsEff']) {
+    const p = idRep.parameters.find((item) => item.symbol === sym);
+    assert.ok(p, `Missing ${sym}`);
+    assert.ok(Number.isFinite(p.stdError) && p.stdError > 0, `${sym} SE must be finite > 0`);
+    assert.ok(p.ci95Low < p.value && p.value < p.ci95High, `${sym} value must sit inside 95% CI`);
+  }
+
+  // 2) Rank-deficient constant operating point dataset -> NOT_IDENTIFIABLE & retains baseline params
+  const baselineInit = { ...DEMO_MOTOR_PARAMS, betaSat: 0.0088 };
+  const expectedRsAnchor = calcRsAnchorOhm(baselineInit.rLL25Ohm, baselineInit.tCoilC);
+  const degenCl = Array.from({ length: 8 }, () => ({
+    nRpm: 1000,
+    tNm: 0.12,
+    vBusV: 13.5,
+    iBusA: 1.5,
+    pInW: 20.25,
+    pOutW: 12.56637,
+    etaMeas: 12.56637 / 20.25,
+  }));
+  const degenReport = runStepwiseCalibration(olPts, degenCl, baselineInit, {
+    keSource: 'open_loop_auto',
+    manualN0Rpm: 1450,
+    manualVTestV: 13.5,
+    manualKv: 107.4,
+    rsFitMode: 'bounded_15pct',
+  });
+  assert.ok(degenReport.identifiabilityReport);
+  assert.equal(degenReport.identifiabilityReport.overallStatus, 'NOT_IDENTIFIABLE');
+  assert.equal(degenReport.identifiabilityReport.baselineRetained, true);
+  assert.equal(degenReport.status, 'warn');
+  assert.ok(Math.abs(degenReport.betaSat - baselineInit.betaSat) < 1e-12);
+  assert.ok(Math.abs(degenReport.rsEffOhm - expectedRsAnchor) < 1e-12);
+
+  // 3) Dynamic rotordynamics (J, B, Kt) identifiability: rich excitation vs constant speed (dOmega/dt = 0)
+  const jTrue = 1.8e-4;
+  const bTrue = 2.4e-4;
+  const ktTrue = 0.085;
+  const richDynSamples = Array.from({ length: 40 }, (_, k) => {
+    const omegaM = 300 + 240 * Math.sin(k * 0.31) + 90 * Math.cos(k * 0.77);
+    const dOmegaDt = 1400 * Math.cos(k * 0.43) - 600 * Math.sin(k * 0.91);
+    const iqA = 0.8 + 2.5 * Math.sin(k * 0.25) + 0.9 * Math.cos(k * 0.63);
+    const tLoadNm = ktTrue * iqA - jTrue * dOmegaDt - bTrue * omegaM + (k % 2 === 0 ? 1e-5 : -1e-5);
+    return { omegaM, dOmegaDt, iqA, tLoadNm };
+  });
+  const dynRichRes = analyzeDynamicIdentifiability(richDynSamples, {
+    jKgM2: 1e-4,
+    bNmSPerRad: 1e-4,
+    ktNmPerA: 0.05,
+  });
+  assert.equal(dynRichRes.overallStatus, 'IDENTIFIABLE');
+  assert.equal(dynRichRes.baselineRetained, false);
+  assert.equal(dynRichRes.numericalRank, 3);
+  assert.ok(Math.abs(dynRichRes.jKgM2 - jTrue) < 1e-6);
+  assert.ok(Math.abs(dynRichRes.bNmSPerRad - bTrue) < 1e-6);
+  assert.ok(Math.abs(dynRichRes.ktNmPerA - ktTrue) < 1e-5);
+
+  const constSpeedSamples = Array.from({ length: 20 }, (_, k) => {
+    const omegaM = 100 + 20 * (k % 3);
+    const dOmegaDt = 0; // zero angular acceleration -> J column strictly unobservable
+    const iqA = 0.5 + 0.3 * k;
+    return { omegaM, dOmegaDt, iqA, tLoadNm: ktTrue * iqA - bTrue * omegaM };
+  });
+  const dynZeroAccRes = analyzeDynamicIdentifiability(constSpeedSamples, {
+    jKgM2: 1.5e-4,
+    bNmSPerRad: 2.0e-4,
+    ktNmPerA: 0.075,
+  });
+  assert.equal(dynZeroAccRes.overallStatus, 'NOT_IDENTIFIABLE');
+  assert.equal(dynZeroAccRes.baselineRetained, true);
+  assert.ok(dynZeroAccRes.numericalRank < 3);
+  assert.equal(dynZeroAccRes.parameters[0].symbol, 'J');
+  assert.equal(dynZeroAccRes.parameters[0].status, 'NOT_IDENTIFIABLE');
+  assert.ok(Math.abs(dynZeroAccRes.jKgM2 - 1.5e-4) < 1e-12);
+
+  // Collinear omegaM == 10 * iqA -> rank drop / baseline retention
+  const collinearSamples = Array.from({ length: 20 }, (_, k) => {
+    const iqA = 0.5 + 0.2 * k;
+    const omegaM = 10 * iqA;
+    const dOmegaDt = 50 * Math.sin(k * 0.5);
+    return { omegaM, dOmegaDt, iqA, tLoadNm: ktTrue * iqA - jTrue * dOmegaDt - bTrue * omegaM };
+  });
+  const dynCollinearRes = analyzeDynamicIdentifiability(collinearSamples, {
+    jKgM2: 1.5e-4,
+    bNmSPerRad: 2.0e-4,
+    ktNmPerA: 0.075,
+  });
+  assert.equal(dynCollinearRes.overallStatus, 'NOT_IDENTIFIABLE');
+  assert.equal(dynCollinearRes.baselineRetained, true);
+
+  // Verify Python mirror exposes normalized Jacobian SVD & identifiability_report
+  const dynoPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dyno_calibrator.py')?.content || '';
+  assert.ok(dynoPy.includes('_analyze_normalized_jacobian_svd'));
+  assert.ok(dynoPy.includes('analyze_dynamic_identifiability'));
+  assert.ok(dynoPy.includes('"identifiability_report": identifiability_report'));
+});
+
+test('FD-03: standalone dynamic PMSM dq ODE solver (MTPA, FW, 4-quadrant, steady parity, Python match)', () => {
+  // 1) IPM MTPA + high-speed field weakening + SVPWM voltage circle clamp + provenance isolation
+  const { paramsPatch, config } = buildDynamicPresetScenario('ipm_mtpa_fw');
+  const ipmParams = {
+    polePairs: paramsPatch.polePairs ?? 4,
+    rsOhm: paramsPatch.rsOhm ?? 0.045,
+    ldH: paramsPatch.ldH ?? 0.18e-3,
+    lqH: paramsPatch.lqH ?? 0.42e-3,
+    psiFVs: paramsPatch.psiFVs ?? 0.015,
+    jKgM2: paramsPatch.jKgM2 ?? 6.5e-5,
+    bNmSPerRad: paramsPatch.bNmSPerRad ?? 8e-5,
+    tCoulombNm: paramsPatch.tCoulombNm ?? 0.005,
+    vBusV: paramsPatch.vBusV ?? 24,
+    iMaxA: paramsPatch.iMaxA ?? 18,
+    controlMode: 'mtpa_current_loop' as const,
+  };
+  const ipmRes = simulateDynamicPmsm(ipmParams, config);
+  assert.equal(ipmRes.provenance, 'synthetic_assumed_uncalibrated');
+  assert.ok(ipmRes.time.length > 500);
+  // Negative d-axis current during motoring & field weakening for salient IPM (Ld < Lq)
+  const minId = Math.min(...ipmRes.idA);
+  assert.ok(minId < -0.5, `Expected MTPA/FW negative id < -0.5 A, got ${minId}`);
+  const teWithId = calcDynamicPmsmTorque(-4, 10, ipmParams.polePairs, ipmParams.psiFVs, ipmParams.ldH, ipmParams.lqH);
+  const teIdZero = calcDynamicPmsmTorque(0, 10, ipmParams.polePairs, ipmParams.psiFVs, ipmParams.ldH, ipmParams.lqH);
+  assert.ok(teWithId > teIdZero, 'Salient IPM negative id must increase positive reluctance torque');
+  // SVPWM voltage circle clamp & current clamp
+  const vCircle = ipmParams.vBusV / Math.sqrt(3);
+  for (let i = 0; i < ipmRes.time.length; i++) {
+    assert.ok(Math.hypot(ipmRes.vdV[i], ipmRes.vqV[i]) <= vCircle + 1e-6);
+    assert.ok(Math.hypot(ipmRes.idA[i], ipmRes.iqA[i]) <= ipmParams.iMaxA + 0.15);
+  }
+  assert.ok(ipmRes.voltageLimitHits > 0, 'High-speed 4800 RPM step must engage SVPWM voltage circle limit');
+
+  // 2) 4-quadrant reversal preset must show positive & negative speeds plus motoring & regen modes
+  const quadPreset = buildDynamicPresetScenario('four_quadrant_regen');
+  const quadParams = {
+    polePairs: 7,
+    rsOhm: 0.395,
+    ldH: 0.22e-3,
+    lqH: 0.22e-3,
+    psiFVs: kePrimeToPsiF(DEMO_MOTOR_PARAMS.kePrime, 7),
+    jKgM2: 1.2e-4,
+    bNmSPerRad: 1.5e-4,
+    tCoulombNm: 0.005,
+    vBusV: quadPreset.paramsPatch.vBusV ?? 24,
+    iMaxA: quadPreset.paramsPatch.iMaxA ?? 15,
+    controlMode: 'mtpa_current_loop' as const,
+  };
+  const quadRes = simulateDynamicPmsm(quadParams, quadPreset.config);
+  assert.ok(quadRes.peakSpeedRpm > 800);
+  assert.ok(quadRes.minSpeedRpm < -400);
+  assert.ok(quadRes.quadrantMode.includes('motoring'));
+  assert.ok(quadRes.quadrantMode.includes('regen'));
+
+  // 3) Steady-state convergence check on constant command run
+  const steadyRes = simulateDynamicPmsm(
+    {
+      ...quadParams,
+      jKgM2: 5e-5,
+      controlMode: 'id_zero',
+    },
+    {
+      durationSec: 0.4,
+      dtOutSec: 5e-4,
+      initialSpeedRpm: 0,
+      scenario: [{ tStartSec: 0, tEndSec: 0.4, tLoadNm: 0.06, speedRefRpm: 1100 }],
+    }
+  );
+  assert.ok(steadyRes.steadyCheck.torqueDiffNm < 1e-3);
+  assert.ok(steadyRes.steadyCheck.voltageDiffV < 0.05, `voltageDiffV=${steadyRes.steadyCheck.voltageDiffV}`);
+
+  // 4) Strict provenance tags on CSV & Scope handoff
+  const csvTxt = buildDynamicPmsmCsv(steadyRes);
+  assert.ok(csvTxt.includes('# WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED'));
+  const scopeTab = buildDynamicPmsmScopeTab(steadyRes);
+  assert.ok(scopeTab);
+  assert.equal(scopeTab.channels.ch_iq.metadata.dataProvenance, 'synthetic_assumed_uncalibrated');
+
+  // 5) Full Python RK4 execution parity against TS simulateDynamicPmsm
+  const dynPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dynamic_pmsm.py')?.content || '';
+  const pyParityScript = `
+import json, sys
+code = sys.stdin.read()
+ns = {}
+exec(code, ns)
+patch, cfg = ns["build_dynamic_preset_scenario"]("ipm_mtpa_fw")
+p = ns["DynamicPmsmParams"](**patch)
+res = ns["simulate_dynamic_pmsm"](p, cfg)
+print(json.dumps({
+    "provenance": res["provenance"],
+    "last_rpm": res["n_rpm"][-1],
+    "last_id": res["id_a"][-1],
+    "last_iq": res["iq_a"][-1],
+    "last_te": res["te_nm"][-1],
+    "volt_hits": res["voltage_limit_hits"],
+    "volt_diff": res["steady_check"]["voltage_diff_v"],
+}))
+`;
+  const pyProc = spawnSync('python3', ['-c', pyParityScript], { input: dynPy, encoding: 'utf8' });
+  assert.equal(pyProc.status, 0, `Python dynamic_pmsm execution failed: ${pyProc.stderr}`);
+  const pyOut = JSON.parse(pyProc.stdout);
+  assert.equal(pyOut.provenance, 'synthetic_assumed_uncalibrated');
+  const lastIdx = ipmRes.time.length - 1;
+  assert.ok(Math.abs(pyOut.last_rpm - ipmRes.nRpm[lastIdx]) < 1e-6);
+  assert.ok(Math.abs(pyOut.last_id - ipmRes.idA[lastIdx]) < 1e-6);
+  assert.ok(Math.abs(pyOut.last_iq - ipmRes.iqA[lastIdx]) < 1e-6);
+  assert.ok(Math.abs(pyOut.last_te - ipmRes.teNm[lastIdx]) < 1e-7);
+  assert.equal(pyOut.volt_hits, ipmRes.voltageLimitHits);
+});
+
 

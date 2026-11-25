@@ -8,6 +8,13 @@ import {
   computeLossWithDeskewAndEoss,
   parseSiUnitScale,
   validateCauerSpiceNetlist,
+  simulateCauerZoh,
+  simulateCauerZohWithDiagnostics,
+  integrateQossToEossCurve,
+  integrateCossToEossCurve,
+  evaluatePchipMonotone,
+  evaluateNonlinearEossUj,
+  validateTemperatureChannel,
 } from './thermalEngine';
 import { evaluateDynamicSoa, interpolateSoaCurveAtVds, SOA_PRESETS } from './dynamicSoa';
 import {
@@ -17,6 +24,7 @@ import {
   focModelToSpice,
   getModulationLinearCeiling,
   reconstructSensorlessDutySample,
+  resolveSpatialThermalNetwork,
   runFocStallSweep,
   simulateFoc6Mos,
   splitCauerToFocModel,
@@ -29,8 +37,7 @@ import { inferCsvChannelUnit, previewCsv, parseFullCsv, computeCsvPreviewQuality
 import { inferUnitFromHeader } from '../parsers/excelParser';
 import { computeFFT } from './fft';
 import { analyzeThreePhaseBalance, analyzePwmSwitchingAndDeadTime, analyzeTorqueAndCurrentRipple } from './bldcAnalysis';
-import { analyzeDoublePulseTest, generateDptDemoChannels } from './dptAnalyzer';
-import { validateTemperatureChannel } from './thermalEngine';
+import { analyzeDoublePulseTest, generateDptDemoChannels, interpolateDptSwitchingLoss } from './dptAnalyzer';
 
 function makeChannel(
   id: string,
@@ -1809,3 +1816,317 @@ test('MT-06: DPT analyzer trims bounded deskew without clamping, rejects excessi
   );
   assert.equal(nGap, 2000);
 });
+
+test('MT-01: True 4D DPT LUT interpolation across (Vbus, Iload, Tj, Rg_on/off) with explicit diagnostics', () => {
+  // Exact 2^4 = 16-point multilinear grid:
+  // Eon(V,I,T,Rg) = 0.4*V + 0.8*I + 0.1*(T-25) + 3.0*Rg
+  // Eoff(V,I,T,Rg) = 0.25*V + 0.5*I + 0.08*(T-25) + 2.0*Rg
+  // Qrr(V,I,T,Rg) = 20 + 2*I + 0.5*(T-25) + 1.5*Rg
+  const vLvls = [40, 80];
+  const iLvls = [10, 30];
+  const tLvls = [25, 125];
+  const rLvls = [2, 10];
+  const lut4d = [];
+  for (const v of vLvls) {
+    for (const i of iLvls) {
+      for (const tj of tLvls) {
+        for (const rg of rLvls) {
+          lut4d.push({
+            id: `p_${v}_${i}_${tj}_${rg}`,
+            vBusV: v,
+            iLoadA: i,
+            tjC: tj,
+            rgOhm: rg,
+            eOnUj: 0.4 * v + 0.8 * i + 0.1 * (tj - 25) + 3.0 * rg,
+            eOffUj: 0.25 * v + 0.5 * i + 0.08 * (tj - 25) + 2.0 * rg,
+            qRrNc: 20 + 2 * i + 0.5 * (tj - 25) + 1.5 * rg,
+          });
+        }
+      }
+    }
+  }
+
+  // Interior query with asymmetric Rg_on=4 Ohm and Rg_off=8 Ohm at (60V, 20A, Tj=75°C)
+  const res = interpolateDptSwitchingLoss(lut4d, {
+    vBusV: 60,
+    iLoadA: 20,
+    tjC: 75,
+    rgOnOhm: 4,
+    rgOffOhm: 8,
+    tjProvenance: 'measured',
+    rgProvenance: 'measured',
+  });
+  assert.ok(res !== null);
+  assert.equal(res!.status, 'VALID');
+  assert.equal(res!.method, '4d_multilinear_grid');
+  assert.equal(res!.extrapolated, false);
+  assert.deepEqual(res!.activeDimensions, ['Vbus', 'Iload', 'Tj', 'Rg']);
+  assert.deepEqual(res!.collapsedDimensions, []);
+
+  const expectedEon = 0.4 * 60 + 0.8 * 20 + 0.1 * (75 - 25) + 3.0 * 4; // 57
+  const expectedEoff = 0.25 * 60 + 0.5 * 20 + 0.08 * (75 - 25) + 2.0 * 8; // 45
+  const expectedQrr = 20 + 2 * 20 + 0.5 * (75 - 25) + 1.5 * 4; // 91
+  assert.ok(Math.abs(res!.eOnUj - expectedEon) < 1e-6);
+  assert.ok(Math.abs(res!.eOffUj - expectedEoff) < 1e-6);
+  assert.ok(Math.abs(res!.qRrNc - expectedQrr) < 1e-6);
+
+  // Out-of-range query (Tj=150 > 125) must surface OUT_OF_RANGE explicitly
+  const oor = interpolateDptSwitchingLoss(lut4d, {
+    vBusV: 60,
+    iLoadA: 20,
+    tjC: 150,
+    rgOnOhm: 4,
+    rgOffOhm: 4,
+  });
+  assert.equal(oor!.status, 'OUT_OF_RANGE');
+  assert.equal(oor!.extrapolated, true);
+  assert.ok(oor!.outOfRangeAxes.includes('Tj'));
+
+  // Single-point LUT returns INSUFFICIENT_LUT
+  const single = interpolateDptSwitchingLoss([lut4d[0]], { vBusV: 50, iLoadA: 15 });
+  assert.equal(single!.status, 'INSUFFICIENT_LUT');
+
+  // Invalid negative Vbus / NaN data returns INVALID_DATA
+  const bad = interpolateDptSwitchingLoss([{ ...lut4d[0], eOnUj: -5 }], { vBusV: 40, iLoadA: 10 });
+  assert.equal(bad!.status, 'INVALID_DATA');
+
+  // FOC 6-MOS closed-loop thermal coupling with 4D LUT reports diagnostics & Rg sensitivity
+  const n = 80;
+  const t = Float64Array.from({ length: n }, (_, k) => k * 5e-4);
+  const ia = Float32Array.from(t, (x) => 24 * Math.sin(2 * Math.PI * 50 * x));
+  const ib = Float32Array.from(t, (x) => 24 * Math.sin(2 * Math.PI * 50 * x - (2 * Math.PI) / 3));
+  const mosLoRg = {
+    rdsOn25Mohm: 4.5,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.9,
+    eonPlusEoffUj: 50,
+    vRefV: 48,
+    iRefA: 25,
+    qrrNc: 60,
+    eossUj: 0,
+    rgOnOhm: 2,
+    rgOffOhm: 2,
+    rgProvenance: 'measured' as const,
+    dptLut: lut4d,
+  };
+  const simLoRg = simulateFoc6Mos(
+    makeChannel('f4d_ia', 'Ia', 'A', t, ia),
+    makeChannel('f4d_ib', 'Ib', 'A', t, ib),
+    DEFAULT_FOC_MODEL,
+    mosLoRg,
+    { modulation: 'SVPWM', fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 75, vBusConstV: 60 }
+  );
+  const simHiRg = simulateFoc6Mos(
+    makeChannel('f4d_ia', 'Ia', 'A', t, ia),
+    makeChannel('f4d_ib', 'Ib', 'A', t, ib),
+    DEFAULT_FOC_MODEL,
+    { ...mosLoRg, rgOnOhm: 10, rgOffOhm: 10 },
+    { modulation: 'SVPWM', fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 75, vBusConstV: 60 }
+  );
+  assert.ok(simLoRg.dptLutDiagnostics?.activeDimensions.includes('Rg'));
+  assert.ok(simHiRg.pInvMeanW > simLoRg.pInvMeanW + 0.5, 'Higher Rg_on/Rg_off must raise switching loss via 4D LUT');
+});
+
+test('MT-02: Adaptive step-doubling Cauer solver removes 32/64 cap and converges on stiff dt >> tau_min', () => {
+  // Fast stage tau_min = 0.05 * 0.002 = 1e-4 s (100 us), coarse step dt = 50 ms = 500 * tau_min!
+  // Old Math.min(64, ...) would use h = 50ms / 64 = 781 us >> tau_min = 100 us.
+  const stages = [
+    { r: 0.25, c: 0.0004, tauEst: 1e-4, layerLabel: 'Die' },
+    { r: 0.45, c: 0.02, tauEst: 0.009, layerLabel: 'Pkg' },
+    { r: 0.8, c: 0.5, tauEst: 0.4, layerLabel: 'PCB' },
+  ];
+  const coarseDt = 0.05;
+  const coarseT = Float64Array.from({ length: 11 }, (_, i) => i * coarseDt);
+  const coarseP = Float32Array.from({ length: 11 }, () => 40);
+
+  const coarseDiag = simulateCauerZohWithDiagnostics(coarseT, coarseP, stages, 25);
+  assert.equal(coarseDiag.solverStatus, 'CONVERGED');
+  assert.ok(coarseDiag.maxSubsteps > 64, `Expected >64 substeps on stiff dt=${coarseDt}s, got ${coarseDiag.maxSubsteps}`);
+  assert.ok(coarseDiag.minActualStepSec <= 1e-4 * 0.05 + 1e-12);
+
+  // Compare at shared timestamps against ultra-dense analytical/fine step simulation (dt_ref = 5 us)
+  const fineDt = 5e-6;
+  const nFine = Math.round(0.5 / fineDt) + 1;
+  const fineT = Float64Array.from({ length: nFine }, (_, i) => i * fineDt);
+  const fineP = Float32Array.from({ length: nFine }, () => 40);
+  const fineTj = simulateCauerZoh(fineT, fineP, stages, 25);
+
+  let maxDiffC = 0;
+  for (let k = 0; k < coarseT.length; k++) {
+    const fineIdx = Math.round(coarseT[k] / fineDt);
+    const diff = Math.abs(coarseDiag.tj[k] - fineTj[fineIdx]);
+    if (diff > maxDiffC) maxDiffC = diff;
+  }
+  assert.ok(maxDiffC < 0.05, `Adaptive solver vs dense reference max error ${maxDiffC.toFixed(4)}°C >= 0.05°C`);
+});
+
+test('MT-03: 6-MOS PCB spatial coupled thermal matrix models lateral heating, validates passivity/symmetry, and passes SPICE nodal check', () => {
+  const n = 200;
+  const t = Float64Array.from({ length: n }, (_, i) => i * 5e-3); // 1.0 s total
+  // Excite ONLY Phase A (Ia != 0, Ib = 0, Ic = -Ia? Wait: to heat only leg A without leg B/C, use Ia=20A, Ib=0, Ic=0 explicit)
+  // Actually let's test Ic=0 explicit via a short symmetric test or unbalanced single-phase current Ia=28A, Ib=0, Ic=0!
+  const ia = Float32Array.from(t, () => 28);
+  const ib = Float32Array.from(t, () => 0);
+  const ic = Float32Array.from(t, () => 0);
+  const mos = {
+    rdsOn25Mohm: 6,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.9,
+    eonPlusEoffUj: 40,
+    vRefV: 48,
+    iRefA: 25,
+    qrrNc: 50,
+    eossUj: 0,
+  };
+  const ctrl = {
+    modulation: 'SVPWM' as const,
+    fswHz: 20000,
+    tDeadNs: 200,
+    modDepthM: 0.8,
+    pfAngleDeg: 0,
+    tAmbC: 25,
+    vBusConstV: 48,
+  };
+
+  // High lateral copper coupling (4 oz, 8 mm pitch) with vertical R_vert > 0
+  const spatialModel = {
+    zthJC: DEFAULT_FOC_MODEL.zthJC,
+    zthBoard: DEFAULT_FOC_MODEL.zthBoard,
+    thermalTopologyMode: 'pcb_spatial_coupled' as const,
+    spatialMatrix: {
+      copperOz: 4.0,
+      layoutPitchMm: 10,
+      zoneVerticalRthCPerW: [1.8, 1.8, 1.8, 1.8, 1.8, 1.8],
+      zoneThermalCapJPerC: [0.08, 0.08, 0.08, 0.08, 0.08, 0.08],
+    },
+  };
+  const indepModel = {
+    ...spatialModel,
+    thermalTopologyMode: 'independent' as const,
+  };
+
+  const simSpatial = simulateFoc6Mos(
+    makeChannel('sp_ia', 'Ia', 'A', t, ia),
+    makeChannel('sp_ib', 'Ib', 'A', t, ib),
+    spatialModel,
+    mos,
+    ctrl,
+    { icCh: makeChannel('sp_ic', 'Ic', 'A', t, ic) }
+  );
+  const simIndep = simulateFoc6Mos(
+    makeChannel('in_ia', 'Ia', 'A', t, ia),
+    makeChannel('in_ib', 'Ib', 'A', t, ib),
+    indepModel,
+    mos,
+    ctrl,
+    { icCh: makeChannel('in_ic', 'Ic', 'A', t, ic) }
+  );
+
+  // Leg B & C have zero current loss; under spatial PCB coupling, B/C zones warm above T_amb and closer B is warmer than distant C
+  const pcbB_spatial = simSpatial.tBoardByKey!.BH;
+  const pcbC_spatial = simSpatial.tBoardByKey!.CH;
+  const pcbB_indep = simIndep.tBoardByKey!.BH;
+  assert.ok(pcbB_spatial > 26.0, `Expected spatial lateral heating on unpowered leg B (>26°C), got ${pcbB_spatial.toFixed(2)}°C`);
+  assert.ok(pcbB_spatial > pcbC_spatial, `Adjacent leg B (${pcbB_spatial.toFixed(2)}°C) must be warmer than distant leg C (${pcbC_spatial.toFixed(2)}°C)`);
+  assert.ok(Math.abs(pcbB_indep - 25) < 1e-6, `Independent mode must have zero cross-heating on unpowered leg B, got ${pcbB_indep}`);
+
+  // Passivity & reciprocity validation rejects negative or asymmetric mutual conductance
+  const badAsym = Array.from({ length: 6 }, () => Array(6).fill(0));
+  badAsym[0][2] = 0.4;
+  badAsym[2][0] = 0.1;
+  assert.throws(
+    () => resolveSpatialThermalNetwork({ ...spatialModel, spatialMatrix: { mutualConductanceMatrixWPerC: badAsym } }),
+    /互易|非对称/
+  );
+  const badNeg = Array.from({ length: 6 }, () => Array(6).fill(0));
+  badNeg[0][2] = -0.2;
+  badNeg[2][0] = -0.2;
+  assert.throws(
+    () => resolveSpatialThermalNetwork({ ...spatialModel, spatialMatrix: { mutualConductanceMatrixWPerC: badNeg } }),
+    /非负|无源性/
+  );
+
+  // SPICE export & exact DC nodal verification across all 3 topologies
+  for (const mode of ['shared_board', 'pcb_spatial_coupled', 'independent'] as const) {
+    const m = { ...spatialModel, thermalTopologyMode: mode };
+    const netlist = focModelToSpice(m, 25, 'INV_6MOS_THERM');
+    const val = validateFocSpiceNetlist(netlist, m);
+    assert.equal(val.valid, true, `SPICE validation failed for ${mode}: ${val.errors.join('; ')}`);
+    assert.equal(val.nodalMathVerified, true, `DC nodal matrix verification failed for ${mode}`);
+  }
+});
+
+test('MT-04: Nonlinear Eoss(V)/Qoss(V)/Coss(V) integration, monotone PCHIP accuracy, domain gating & anti-double-count', () => {
+  // Known power-law Coss(V) = C0 / sqrt(1 + V/V0): Q(V) = 2*C0*V0*(sqrt(1+V/V0)-1),
+  // exact Eoss(V) = integral_0^V v * Coss(v) dv = 2*C0*V0^2 * ((1+V/V0)^(3/2)/3 - sqrt(1+V/V0) + 2/3)
+  const c0Pf = 2000;
+  const v0 = 10;
+  const qossExactNc = (v: number) => 2 * (c0Pf * 1e-3) * v0 * (Math.sqrt(1 + v / v0) - 1);
+  const eossExactUj = (v: number) => {
+    const u = 1 + v / v0;
+    return 2 * (c0Pf * 1e-6) * v0 * v0 * (Math.pow(u, 1.5) / 3 - Math.sqrt(u) + 2 / 3);
+  };
+
+  const vSamples = [0, 5, 10, 20, 35, 50, 75, 100];
+  const qCurve = integrateQossToEossCurve(
+    vSamples.map((v) => ({ vdsV: v, val: qossExactNc(v) })),
+    'Analytical Qoss'
+  );
+  const cCurve = integrateCossToEossCurve(
+    vSamples.map((v) => ({ vdsV: v, val: c0Pf / Math.sqrt(1 + v / v0) })),
+    'Analytical Coss'
+  );
+
+  // Check PCHIP accuracy at non-knot interior voltage V=62V and strict monotonicity
+  const evalQ = evaluateNonlinearEossUj(qCurve, 62);
+  const evalC = evaluateNonlinearEossUj(cCurve, 62);
+  const exact62 = eossExactUj(62);
+  assert.equal(evalQ.outOfRange, false);
+  assert.ok(Math.abs(evalQ.eossUj - exact62) / exact62 < 0.03, `Qoss curve error too large: ${evalQ.eossUj} vs ${exact62}`);
+  assert.ok(Math.abs(evalC.eossUj - exact62) / exact62 < 0.04, `Coss curve error too large: ${evalC.eossUj} vs ${exact62}`);
+
+  // Monotonicity check across dense sweep
+  let prevE = -1;
+  for (let v = 0; v <= 100; v += 2) {
+    const curE = evaluatePchipMonotone(qCurve.points, v).value;
+    assert.ok(curE >= prevE - 1e-12, `PCHIP non-monotone at V=${v}`);
+    prevE = curE;
+  }
+
+  // Constant-C approximation error vs nonlinear Eoss: 0.5 * C(0) * V^2 overestimates > 2x (actual 2.17x for C0/sqrt(1+V/10) at 62V)
+  const constC0ApproxUj = 0.5 * (c0Pf * 1e-6) * 62 * 62;
+  assert.ok(constC0ApproxUj > 2.0 * exact62);
+
+  // Out-of-range domain gating (150V > 100V max) clamps cleanly and flags outOfRange=true
+  const oorEval = evaluateNonlinearEossUj(qCurve, 150);
+  assert.equal(oorEval.outOfRange, true);
+  assert.ok(Math.abs(oorEval.eossUj - qCurve.points[qCurve.points.length - 1].val) < 1e-6);
+
+  // eossAlreadyIncludedInEsw=true prevents double counting Eoss in computePhaseMosLosses
+  const mosWithCurve = {
+    rdsOn25Mohm: 4.5,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.9,
+    eonPlusEoffUj: 50,
+    vRefV: 48,
+    iRefA: 25,
+    qrrNc: 0,
+    eossUj: 0,
+    eossCurve: qCurve,
+  };
+  const lossWithEoss = computePhaseMosLosses(20, 0.7, 62, 25, 25, 'SVPWM', 20000, 200, {
+    ...mosWithCurve,
+    eossAlreadyIncludedInEsw: false,
+  });
+  const lossNoDoubleCount = computePhaseMosLosses(20, 0.7, 62, 25, 25, 'SVPWM', 20000, 200, {
+    ...mosWithCurve,
+    eossAlreadyIncludedInEsw: true,
+  });
+  const expectedAddedW = 20000 * evalQ.eossUj * 1e-6;
+  const actualDiffW = (lossWithEoss.pHighSw + lossWithEoss.pLowSw) - (lossNoDoubleCount.pHighSw + lossNoDoubleCount.pLowSw);
+  assert.ok(
+    Math.abs(actualDiffW - expectedAddedW) < 1e-5,
+    `Expected Eoss delta ${expectedAddedW.toFixed(4)}W, got ${actualDiffW.toFixed(4)}W`
+  );
+});
+

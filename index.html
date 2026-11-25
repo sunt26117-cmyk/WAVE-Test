@@ -2256,23 +2256,65 @@
                 </div>
               </div>
 
-              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-[#1b222c]">
+              <div class="grid grid-cols-2 sm:grid-cols-6 gap-2 pt-1 border-t border-[#1b222c]">
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5" title="可选：输入器件数据手册 RθJC (Ω=°C/W) 约束 JC 与 Board 的物理拆分边界；留空则按 τ_split 自动拆分。">手册 RθJC 约束 (Ω, 可选)</label>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="可选：输入器件数据手册 RθJC (Ω=°C/W) 约束 JC 与 Board 的物理拆分边界；留空则按 τ_split 自动拆分。">手册 RθJC 约束 (Ω)</label>
                   <input id="focRjcOverrideInput" type="number" step="0.02" min="0.01" placeholder="Auto (τ_split)" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5" title="PCB 空间非对称热阻：用于模拟三相中臂 (B相) 铜箔散热受限或边缘管更凉 (如 +15% 则 B相 +15%，C相 -7.5%)。">PCB 热路径非对称 (%)</label>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="开通驱动电阻 Rg_on (Ω)，用于 4D DPT LUT 开通能量 Eon/Qrr 插值。">Rg_on (Ω)</label>
+                  <input id="focRgonInput" type="number" step="0.5" min="0" value="4.7" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="关断驱动电阻 Rg_off (Ω)，用于 4D DPT LUT 关断能量 Eoff 插值。">Rg_off (Ω)</label>
+                  <input id="focRgoffInput" type="number" step="0.5" min="0" value="4.7" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-amber-200 font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="6-MOS PCB 热耦合拓扑模式：共享单节点 TBRD、6 区横向铜箔互导矩阵或六管完全独立路径。">PCB 热拓扑模式</label>
+                  <select id="focTopologyModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]">
+                    <option value="shared_board" selected>shared_board (共享TBRD)</option>
+                    <option value="pcb_spatial_coupled">pcb_spatial_coupled (6区耦合)</option>
+                    <option value="independent">independent (六管独立)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="空间热耦合模式下 PCB 铜箔厚度 (oz) 与布局节距 (mm)。">铜厚 (oz) / 节距 (mm)</label>
+                  <div class="grid grid-cols-2 gap-1">
+                    <input id="focPcbCopperOzInput" type="number" step="0.5" min="0.5" value="2.0" title="铜厚 oz" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-white font-mono text-[11px]" />
+                    <input id="focPcbPitchMmInput" type="number" step="1" min="4" value="14" title="相邻半桥节距 mm" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1 py-1 text-white font-mono text-[11px]" />
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="PCB 空间非对称热阻：用于模拟三相中臂 (B相) 铜箔散热受限或边缘管更凉。">热路径非对称 (%)</label>
                   <input id="focRjcSpreadPctInput" type="number" step="5" min="0" max="60" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]" />
                 </div>
-                <div class="col-span-2 flex flex-col justify-end gap-1 pb-0.5">
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 pt-1 border-t border-[#1b222c] items-end">
+                <div class="sm:col-span-4">
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="非线性电容损耗曲线模式：采用单调 PCHIP 与数值积分 ∫v dQ，避免 0.5·C·V² 常数误差。">非线性 Eoss(V)/Qoss(V) 曲线</label>
+                  <select id="focEossCurveModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-sky-200 font-mono text-[11px]">
+                    <option value="scalar" selected>标量 Eoss·(V/Vref)² 近似</option>
+                    <option value="preset_si_80v">预设 Si 80V Qoss(V) 曲线</option>
+                    <option value="preset_sic_650v">预设 SiC 650V Coss(V) 曲线</option>
+                    <option value="custom_qoss">自定义 V:Qoss(nC) 对</option>
+                    <option value="custom_coss">自定义 V:Coss(pF) 对</option>
+                    <option value="custom_eoss">自定义 V:Eoss(µJ) 对</option>
+                  </select>
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="格式示例：0:0, 12:22, 24:36, 48:55, 80:78">曲线数据点 (V:val, 逗号分隔)</label>
+                  <input id="focEossCurveInput" type="text" placeholder="0:0, 12:22, 24:36, 48:55, 80:78" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-sky-200 font-mono text-[11px]" />
+                </div>
+                <div class="sm:col-span-4 flex flex-col justify-end gap-1 pb-0.5">
                   <label class="inline-flex items-center gap-1.5 text-[11px] text-emerald-200 cursor-pointer" title="当 Esw 来自双脉冲波形实测积分 Eon+Eoff 时，Eon 已包含二极管反向恢复功耗，勾选后可防止与 Qrr 重复叠加。">
                     <input id="focEonIncludesQrrChk" type="checkbox" class="accent-emerald-400 cursor-pointer" />
-                    <span>Esw 已含反向恢复 Qrr 损耗（避免与 Qrr 重复叠加）</span>
+                    <span>Esw 已含 Qrr 损耗（防与 Qrr 重复叠加）</span>
                   </label>
-                  <div class="text-[10px] font-mono text-slate-400 leading-snug">
-                    若 Tab 1 反演为焊盘→环境 (Pad→Amb)，请填写手册 RθJC 或明确其仅反映板级温升偏差。
-                  </div>
+                  <label class="inline-flex items-center gap-1.5 text-[11px] text-sky-200 cursor-pointer" title="若 Eon 已包含 Coss 电容放电损耗，勾选此项可自动屏蔽额外 Eoss 计算，防止重复计损。">
+                    <input id="focEossIncludedChk" type="checkbox" class="accent-sky-400 cursor-pointer" />
+                    <span>Esw 已含 Eoss 电容损耗（防重复计损）</span>
+                  </label>
                 </div>
               </div>
 
@@ -2450,18 +2492,22 @@
             <!-- Multi-Point DPT Operating Matrix LUT -->
             <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 space-y-2">
               <div class="flex flex-wrap items-center justify-between gap-2">
-                <span class="text-[11px] font-semibold text-cyan-300">多工况 DPT 查找表矩阵 (Vbus, Iload, Tj, Rg → Eon / Eoff / Qrr LUT)</span>
+                <span class="text-[11px] font-semibold text-cyan-300">多工况 4D DPT 查找表矩阵 (Vbus, Iload, Tj, Rg_on/off → Eon / Eoff / Qrr LUT)</span>
                 <div class="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
                   <label class="flex items-center gap-1 text-slate-400">
                     <span>Tj(°C)</span>
                     <input id="dptMatrixTjInput" type="number" step="5" value="25" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" />
                   </label>
                   <label class="flex items-center gap-1 text-slate-400">
-                    <span>Rg(Ω)</span>
-                    <input id="dptMatrixRgInput" type="number" step="0.5" min="0" value="4.7" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" />
+                    <span>Rg_on(Ω)</span>
+                    <input id="dptMatrixRgonInput" type="number" step="0.5" min="0" value="4.7" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-cyan-200" />
+                  </label>
+                  <label class="flex items-center gap-1 text-slate-400">
+                    <span>Rg_off(Ω)</span>
+                    <input id="dptMatrixRgoffInput" type="number" step="0.5" min="0" value="4.7" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200" />
                   </label>
                   <button id="dptAddToMatrixBtn" type="button" class="px-2 py-0.5 bg-cyan-950/60 hover:bg-cyan-900/70 border border-cyan-500/60 text-cyan-200 rounded-xs cursor-pointer">+ 保存当前点到矩阵</button>
-                  <button id="dptApplyMatrixToFocBtn" type="button" disabled class="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-40 border border-emerald-500/60 text-emerald-200 rounded-xs cursor-pointer disabled:cursor-not-allowed">LUT 多点插值注入 FOC</button>
+                  <button id="dptApplyMatrixToFocBtn" type="button" disabled class="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-40 border border-emerald-500/60 text-emerald-200 rounded-xs cursor-pointer disabled:cursor-not-allowed">4D LUT 插值注入 FOC</button>
                   <button id="dptClearMatrixBtn" type="button" class="px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-xs cursor-pointer">清空</button>
                 </div>
               </div>
@@ -2472,7 +2518,7 @@
                       <th class="px-2 py-1">Vbus (V)</th>
                       <th class="px-2 py-1">Iload (A)</th>
                       <th class="px-2 py-1">Tj (°C)</th>
-                      <th class="px-2 py-1">Rg (Ω)</th>
+                      <th class="px-2 py-1">Rg_on / Rg_off (Ω)</th>
                       <th class="px-2 py-1 text-emerald-300">Eon (µJ)</th>
                       <th class="px-2 py-1 text-amber-300">Eoff (µJ)</th>
                       <th class="px-2 py-1 text-cyan-300">Esw (µJ)</th>
@@ -2481,7 +2527,7 @@
                     </tr>
                   </thead>
                   <tbody id="dptMatrixTableBody">
-                    <tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」积累多电压/电流插值表。</td></tr>
+                    <tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」积累多电压/电流/结温/门极电阻 4D 插值表。</td></tr>
                   </tbody>
                 </table>
               </div>

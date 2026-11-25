@@ -14,7 +14,7 @@ import {
   SinglePointResult,
   forwardVerifyPoint,
   isMonotonicTimestamps,
-  processRuntimeLog,
+  processRuntimeLogWithAudit,
   solveSinglePoint,
 } from '../../modules/focDyno/motorPhysics';
 import { RawRuntimeLogEntry } from '../../modules/focDyno/demoData';
@@ -94,10 +94,12 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
   const singleRes = useMemo(() => solveSinglePoint(vMeas, iBus, nRpm, params), [vMeas, iBus, nRpm, params]);
   const fwdRes = useMemo(() => forwardVerifyPoint(fwdIq, fwdN, fwdV, params), [fwdIq, fwdN, fwdV, params]);
 
-  const logProcessed = useMemo(
-    () => processRuntimeLog(logRows, filterMs, params),
+  const logAudit = useMemo(
+    () => processRuntimeLogWithAudit(logRows, filterMs, params),
     [logRows, filterMs, params]
   );
+  const logProcessed = logAudit.rows;
+  const logFilterDiag = logAudit.filterDiagnostics;
 
   const batchAlertsSummary = useMemo(() => {
     let lowSpeed = 0;
@@ -853,6 +855,15 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
           <div className="dyno-well rounded-sm border px-3.5 py-1.5 text-[11px] dyno-text-muted">
             离线分析说明：I_bus 采用零相位双向中心时间窗 [t−W/2, t+W/2] 平滑（适合离线日志，实时控制器需考虑 W/2 相位延迟）；物理模型按稳态 Y 型接法 Id = 0 反推。
           </div>
+
+          {logFilterDiag.gapCount > 0 && (
+            <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">
+              ▲ 检测到 {logFilterDiag.gapCount} 处时间缺口（&gt;{(logFilterDiag.gapThresholdSec * 1e3).toFixed(2)} ms），已拆分为 {logFilterDiag.segmentCount} 个连续片段并在缺口边界重置滤波状态
+              {logFilterDiag.isolatedIndices.length > 0
+                ? `；其中 ${logFilterDiag.isolatedIndices.length} 个缺口孤立单点已置为 NaN（无跨缺口伪平滑）。`
+                : '。'}
+            </div>
+          )}
 
           {(batchAlertsSummary.regenLimit > 0 || batchAlertsSummary.invalidBus > 0 || batchAlertsSummary.iqSignAmbiguous > 0) && (
             <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">

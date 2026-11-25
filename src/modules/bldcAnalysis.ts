@@ -636,6 +636,12 @@ export function analyzeBldcHallCommutation(
 
 export type PwmHighSignalRole = 'gate_h' | 'sw_node';
 
+export type MeasurementQuality =
+  | 'RELIABLE'
+  | 'APPROXIMATE'
+  | 'INSUFFICIENT_RESOLUTION'
+  | 'INVALID';
+
 export interface PwmAnalyzeOptions {
   tStart?: number;
   tEnd?: number;
@@ -661,6 +667,14 @@ export interface PwmDeadTimeResult {
   highSignalRole: PwmHighSignalRole;
   worstEventIndex: number | null;
   worstEventTime: number | null;
+  freqQuality: MeasurementQuality;
+  dutyQuality: MeasurementQuality;
+  dvDtQuality: MeasurementQuality;
+  ringingQuality: MeasurementQuality;
+  deadTimeQuality: MeasurementQuality;
+  shootThroughQuality: MeasurementQuality;
+  downsampledBySyncCap: boolean;
+  edgeTimeResolutionSec: number | null;
   warnings: string[];
 }
 
@@ -683,7 +697,8 @@ export function analyzePwmSwitchingAndDeadTime(
   const synced = alignChannelsToCommonTimebase(chLow ? [chHigh, chLow] : [chHigh], opts.tStart, opts.tEnd);
   const warnings = [...synced.warnings];
   const n = synced.time.length;
-  let deadTimeReliable = Boolean(chLow) && highSignalRole === 'gate_h';
+  const downsampledBySyncCap = Boolean(synced.downsampledBySyncCap);
+  let deadTimeReliable = Boolean(chLow) && highSignalRole === 'gate_h' && !downsampledBySyncCap;
 
   const empty: PwmDeadTimeResult = {
     valid: false,
@@ -704,9 +719,23 @@ export function analyzePwmSwitchingAndDeadTime(
     highSignalRole,
     worstEventIndex: null,
     worstEventTime: null,
+    freqQuality: 'INVALID',
+    dutyQuality: 'INVALID',
+    dvDtQuality: 'INVALID',
+    ringingQuality: 'INVALID',
+    deadTimeQuality: 'INVALID',
+    shootThroughQuality: 'INVALID',
+    downsampledBySyncCap,
+    edgeTimeResolutionSec: null,
     warnings,
   };
   if (!synced.valid || n < 6) return empty;
+
+  if (downsampledBySyncCap) {
+    warnings.push(
+      '多路同步点数超过 262,144 上限并触发降采样：时间轴分辨率已下降，死区/直通/dV/dt/LC振铃等纳秒级瞬态指标已降级为 INSUFFICIENT_RESOLUTION（禁用高可信绿灯）。'
+    );
+  }
 
   let vScaleH = 1;
   try {
@@ -717,6 +746,7 @@ export function analyzePwmSwitchingAndDeadTime(
   }
 
   let vScaleL = 1;
+  let lowLooksNonGate = false;
   if (chLow) {
     try {
       vScaleL = parseSiUnitScale(chLow.unit, 'V', chLow.name, { strict: true });
@@ -724,7 +754,7 @@ export function analyzePwmSwitchingAndDeadTime(
       deadTimeReliable = false;
       warnings.push(err?.message || `低侧信号 "${chLow.name}" 单位非电压 (V/mV)，已禁用死区/直通判定。`);
     }
-    const lowLooksNonGate =
+    lowLooksNonGate =
       /(?:^|[^a-z0-9])(sw|phase|node|vds|ids|ibus|ia|ib|ic)(?:$|[^a-z0-9])/i.test(chLow.name) &&
       !/(pwm|gate|vgs|drv|lin|low)/i.test(chLow.name);
     if (lowLooksNonGate) {
@@ -745,6 +775,7 @@ export function analyzePwmSwitchingAndDeadTime(
   let mn = Infinity;
   let mx = -Infinity;
   let maxDvDt = 0;
+  let maxDvDtIdx = -1;
 
   for (let i = 0; i < n; i++) {
     const v = hArr[i];
@@ -756,7 +787,10 @@ export function analyzePwmSwitchingAndDeadTime(
       const dt = tArr[i] - tArr[i - 1];
       if (isFinite(vp) && dt > 1e-15) {
         const dvdt = Math.abs(v - vp) / (dt * 1e6); // V/us
-        if (dvdt > maxDvDt) maxDvDt = dvdt;
+        if (dvdt > maxDvDt) {
+          maxDvDt = dvdt;
+          maxDvDtIdx = i;
+        }
       }
     }
   }
@@ -873,12 +907,16 @@ export function analyzePwmSwitchingAndDeadTime(
   let shootThroughCount = 0;
   let worstEventIndex: number | null = null;
   let worstEventTime: number | null = null;
+  const deadEdgeDts: number[] = [];
+  let deadTimeDisabledByGateCheck = false;
 
   if (lArr && highSignalRole === 'sw_node') {
+    deadTimeDisabledByGateCheck = true;
     warnings.push(
       '第一路定义为 SW 相节点而非高侧栅极驱动 (Vgs_H)：死区期间体二极管续流与负载电流方向会改变 SW 电平，无法可靠判定真死区时间与直通 (Shoot-Through)，已禁用死区/直通判定。'
     );
-  } else if (lArr && deadTimeReliable) {
+  } else if (lArr && (deadTimeReliable || downsampledBySyncCap) && !lowLooksNonGate) {
+    // Gate amplitude & dead-time state-machine check (even when downsampled, inspect edge resolution honestly without green badge)
     let mnL = Infinity;
     let mxL = -Infinity;
     for (let i = 0; i < n; i++) {
@@ -891,6 +929,7 @@ export function analyzePwmSwitchingAndDeadTime(
     const spanL = mxL - mnL;
     if (!isFinite(spanL) || span < 2.0 || spanL < 2.0 || Math.max(span, spanL) / Math.min(span, spanL) > 5.0) {
       deadTimeReliable = false;
+      deadTimeDisabledByGateCheck = true;
       warnings.push(
         `栅极驱动摆幅门限校验未通过 (Vpp_H=${span.toFixed(2)}V, Vpp_L=${isFinite(spanL) ? spanL.toFixed(2) : '--'}V，要求双路 ≥ 2.0V 且量纲比 ≤ 5×)，已禁用死区/直通判定。`
       );
@@ -911,6 +950,7 @@ export function analyzePwmSwitchingAndDeadTime(
         isFinite(hArr[0]) && isFinite(lArr[0]) ? getState(hArr[0], lArr[0]) : 'INVALID';
       let segStartT = tArr[0];
       let segStartIdx = 0;
+      let segStartEdgeDt = n > 1 ? Math.max(0, tArr[1] - tArr[0]) : 0;
       let prevActiveSide: 'H' | 'L' | null = prevState === 'H' || prevState === 'L' ? prevState : null;
 
       for (let i = 1; i < n; i++) {
@@ -929,6 +969,7 @@ export function analyzePwmSwitchingAndDeadTime(
             prevState = getState(hArr[i], lArr[i]);
             segStartT = tArr[i];
             segStartIdx = i;
+            segStartEdgeDt = 0;
           } else {
             prevState = 'INVALID';
           }
@@ -940,12 +981,14 @@ export function analyzePwmSwitchingAndDeadTime(
           const tEdge = 0.5 * (tArr[i - 1] + tArr[i]);
           if (prevState === 'BOTH') {
             shootThroughCount++;
+            deadEdgeDts.push(dt);
             worstEventIndex = segStartIdx;
             worstEventTime = segStartT;
           } else if (prevState === 'DEAD' && prevActiveSide && (st === 'H' || st === 'L') && st !== prevActiveSide) {
             const dtGap = tEdge - segStartT;
             if (dtGap >= 0 && (!pwmFreqHz || dtGap < 0.25 / pwmFreqHz)) {
               deadGaps.push(dtGap);
+              deadEdgeDts.push(Math.max(segStartEdgeDt, dt));
               if (deadTimeMinSec === null || dtGap < deadTimeMinSec) {
                 deadTimeMinSec = dtGap;
                 if (shootThroughCount === 0) {
@@ -959,6 +1002,7 @@ export function analyzePwmSwitchingAndDeadTime(
           prevState = st;
           segStartT = tEdge;
           segStartIdx = i;
+          segStartEdgeDt = dt;
         }
       }
 
@@ -969,6 +1013,100 @@ export function analyzePwmSwitchingAndDeadTime(
         deadTimeAvgSec = deadGaps.reduce((a, b) => a + b, 0) / deadGaps.length;
       }
     }
+  }
+
+  const baseDtSec = pwmTb.dtMedian > 0 ? pwmTb.dtMedian : null;
+  const deadEdgeMaxDt =
+    deadEdgeDts.length > 0 ? Math.max(...deadEdgeDts) : baseDtSec;
+  const edgeTimeResolutionSec = deadEdgeMaxDt ?? baseDtSec;
+
+  const cycleDtRatio =
+    pwmFreqHz !== null && baseDtSec !== null ? baseDtSec * pwmFreqHz : null;
+  const freqQuality: MeasurementQuality =
+    pwmFreqHz === null || risingEvents.length < 2
+      ? 'INVALID'
+      : cycleDtRatio !== null && cycleDtRatio > 0.1
+      ? 'INSUFFICIENT_RESOLUTION'
+      : downsampledBySyncCap || (cycleDtRatio !== null && cycleDtRatio > 0.02)
+      ? 'APPROXIMATE'
+      : 'RELIABLE';
+  const dutyQuality: MeasurementQuality =
+    duties.length === 0
+      ? 'INVALID'
+      : cycleDtRatio !== null && cycleDtRatio > 0.1
+      ? 'INSUFFICIENT_RESOLUTION'
+      : downsampledBySyncCap || (cycleDtRatio !== null && cycleDtRatio > 0.02)
+      ? 'APPROXIMATE'
+      : 'RELIABLE';
+
+  // Count edge transition samples around max dV/dt (0.1..0.9 span) to judge dV/dt resolution
+  let dvDtQuality: MeasurementQuality = 'INVALID';
+  if (maxDvDt > 0 && maxDvDtIdx >= 0) {
+    if (downsampledBySyncCap || (cycleDtRatio !== null && cycleDtRatio > 0.1)) {
+      dvDtQuality = 'INSUFFICIENT_RESOLUTION';
+    } else {
+      let transPts = 0;
+      const loTh = vBase + 0.15 * amp;
+      const hiTh = vBase + 0.85 * amp;
+      for (let k = Math.max(0, maxDvDtIdx - 4); k <= Math.min(n - 1, maxDvDtIdx + 4); k++) {
+        if (Number.isFinite(hArr[k]) && hArr[k] >= loTh && hArr[k] <= hiTh) transPts++;
+      }
+      dvDtQuality = transPts >= 2 && !(cycleDtRatio !== null && cycleDtRatio > 0.02) ? 'RELIABLE' : 'APPROXIMATE';
+    }
+  }
+
+  let ringingQuality: MeasurementQuality = 'INVALID';
+  if (ringingFreqHz !== null) {
+    const ringRatio = baseDtSec !== null ? baseDtSec * ringingFreqHz : null;
+    if (downsampledBySyncCap || (ringRatio !== null && ringRatio > 0.25)) {
+      ringingQuality = 'INSUFFICIENT_RESOLUTION';
+    } else if (ringRatio !== null && ringRatio > 0.1) {
+      ringingQuality = 'APPROXIMATE';
+    } else {
+      ringingQuality = 'RELIABLE';
+    }
+  }
+
+  let deadTimeQuality: MeasurementQuality = 'INVALID';
+  let shootThroughQuality: MeasurementQuality = 'INVALID';
+  if (!lArr || deadTimeDisabledByGateCheck || lowLooksNonGate || vScaleH <= 0 || vScaleL <= 0) {
+    deadTimeQuality = 'INVALID';
+    shootThroughQuality = 'INVALID';
+    deadTimeReliable = false;
+  } else if (downsampledBySyncCap) {
+    deadTimeQuality = 'INSUFFICIENT_RESOLUTION';
+    shootThroughQuality = 'INSUFFICIENT_RESOLUTION';
+    deadTimeReliable = false;
+  } else if (deadTimeMinSec !== null && deadEdgeMaxDt !== null) {
+    const ratio = deadEdgeMaxDt / Math.max(deadTimeMinSec, 1e-15);
+    if (deadTimeMinSec <= 0 || ratio > 0.35) {
+      deadTimeQuality = 'INSUFFICIENT_RESOLUTION';
+      shootThroughQuality = 'INSUFFICIENT_RESOLUTION';
+      deadTimeReliable = false;
+      warnings.push(
+        `边沿采样步长 (${(deadEdgeMaxDt * 1e9).toFixed(1)} ns) 与测得最小死区 (${(deadTimeMinSec * 1e9).toFixed(1)} ns) 之比高达 ${(ratio * 100).toFixed(0)}% (>35%)，分辨率不足以可靠判定死区与直通。`
+      );
+    } else if (ratio > 0.15) {
+      deadTimeQuality = 'APPROXIMATE';
+      shootThroughQuality = 'APPROXIMATE';
+      deadTimeReliable = false;
+      warnings.push(
+        `边沿采样步长 (${(deadEdgeMaxDt * 1e9).toFixed(1)} ns) 占死区 (${(deadTimeMinSec * 1e9).toFixed(1)} ns) 的 ${(ratio * 100).toFixed(1)}% (>15%)，死区时间仅作近似估计 (±${(deadEdgeMaxDt * 1e9).toFixed(1)} ns)，已禁用高可信绿灯。`
+      );
+    } else {
+      deadTimeQuality = 'RELIABLE';
+      shootThroughQuality = 'RELIABLE';
+    }
+  } else if (cycleDtRatio !== null && cycleDtRatio > 0.02) {
+    deadTimeQuality = 'INSUFFICIENT_RESOLUTION';
+    shootThroughQuality = 'INSUFFICIENT_RESOLUTION';
+    deadTimeReliable = false;
+    warnings.push(
+      `当前采样间隔与 PWM 开关周期之比 ${(cycleDtRatio * 100).toFixed(1)}% (>2%)，未能捕捉可靠死区边沿，已标记为分辨率不足。`
+    );
+  } else if (deadTimeReliable) {
+    deadTimeQuality = 'RELIABLE';
+    shootThroughQuality = 'RELIABLE';
   }
 
   return {
@@ -990,6 +1128,14 @@ export function analyzePwmSwitchingAndDeadTime(
     highSignalRole,
     worstEventIndex,
     worstEventTime,
+    freqQuality,
+    dutyQuality,
+    dvDtQuality,
+    ringingQuality,
+    deadTimeQuality,
+    shootThroughQuality,
+    downsampledBySyncCap,
+    edgeTimeResolutionSec,
     warnings,
   };
 }

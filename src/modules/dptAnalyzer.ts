@@ -7,7 +7,24 @@
  */
 
 import { WaveformChannel } from '../types/models';
-import { parseSiUnitScale } from './thermalEngine';
+import {
+  parseSiUnitScale,
+  type CossCurvePoint,
+  type NonlinearEossCurve,
+  type EossCurveEvalResult,
+  integrateQossToEossCurve,
+  integrateCossToEossCurve,
+  evaluatePchipMonotone,
+  evaluateNonlinearEossUj,
+} from './thermalEngine';
+
+export type { CossCurvePoint, NonlinearEossCurve, EossCurveEvalResult };
+export {
+  integrateQossToEossCurve,
+  integrateCossToEossCurve,
+  evaluatePchipMonotone,
+  evaluateNonlinearEossUj,
+};
 import {
   alignChannelsToCommonTimebase,
   DEFAULT_SAMPLING_GAP_FACTOR,
@@ -81,13 +98,44 @@ export interface DptOperatingPoint {
   iLoadA: number;
   tjC: number;
   rgOhm: number;
+  rgOnOhm?: number;
+  rgOffOhm?: number;
   eOnUj: number;
   eOffUj: number;
   qRrNc: number;
   eOnSansQrrUj?: number;
 }
 
+export type DptLutStatus =
+  | 'VALID'
+  | 'INSUFFICIENT_LUT'
+  | 'OUT_OF_RANGE'
+  | 'INVALID_DATA'
+  | 'NON_CONVERGED';
+
+export type DptParameterProvenance = 'measured' | 'assumed';
+
+export type DptAxisName = 'Vbus' | 'Iload' | 'Tj' | 'Rg';
+
+export interface DptOperatingCondition {
+  vBusV: number;
+  iLoadA: number;
+  tjC?: number;
+  rgOhm?: number;
+  rgOnOhm?: number;
+  rgOffOhm?: number;
+  tjProvenance?: DptParameterProvenance;
+  rgProvenance?: DptParameterProvenance;
+}
+
 export interface DptLutInterpolationResult {
+  status: DptLutStatus;
+  method:
+    | '4d_multilinear_grid'
+    | '4d_simplex_barycentric'
+    | 'reduced_dim_interpolated'
+    | 'single_point_scaled'
+    | 'invalid';
   eOnUj: number;
   eOffUj: number;
   eSwTotalUj: number;
@@ -96,20 +144,405 @@ export interface DptLutInterpolationResult {
   extrapolated: boolean;
   vRange: [number, number];
   iRange: [number, number];
+  tjRange: [number, number];
+  rgRange: [number, number];
+  activeDimensions: DptAxisName[];
+  collapsedDimensions: DptAxisName[];
+  outOfRangeAxes: DptAxisName[];
+  tjProvenance: DptParameterProvenance;
+  rgProvenance: DptParameterProvenance;
+  warnings: string[];
+}
+
+function solveSmallLinearSystem(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  if (n === 0) return [];
+  const mat = A.map((row) => [...row]);
+  const rhs = [...b];
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    let maxAbs = Math.abs(mat[col][col]);
+    for (let r = col + 1; r < n; r++) {
+      const av = Math.abs(mat[r][col]);
+      if (av > maxAbs) {
+        maxAbs = av;
+        piv = r;
+      }
+    }
+    if (!Number.isFinite(maxAbs) || maxAbs < 1e-12) return null;
+    if (piv !== col) {
+      const tmp = mat[col];
+      mat[col] = mat[piv];
+      mat[piv] = tmp;
+      const tb = rhs[col];
+      rhs[col] = rhs[piv];
+      rhs[piv] = tb;
+    }
+    const diag = mat[col][col];
+    for (let r = col + 1; r < n; r++) {
+      const f = mat[r][col] / diag;
+      if (f === 0) continue;
+      for (let c = col; c < n; c++) mat[r][c] -= f * mat[col][c];
+      rhs[r] -= f * rhs[col];
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = rhs[r];
+    for (let c = r + 1; c < n; c++) s -= mat[r][c] * x[c];
+    x[r] = s / mat[r][r];
+    if (!Number.isFinite(x[r])) return null;
+  }
+  return x;
+}
+
+interface Clean4DPoint {
+  coords: [number, number, number, number]; // [vBusV, iLoadA, tjC, rgVal]
+  eOnUj: number;
+  eOffUj: number;
+  qRrNc: number;
+  eOnSansQrrUj: number;
+}
+
+function uniqueSortedLevels(vals: number[], eps: number): number[] {
+  const sorted = [...vals].sort((a, b) => a - b);
+  const out: number[] = [];
+  for (const v of sorted) {
+    if (out.length === 0 || Math.abs(v - out[out.length - 1]) > eps) {
+      out.push(v);
+    }
+  }
+  return out;
+}
+
+function evaluate4DScalarChannel(
+  pts: Clean4DPoint[],
+  target: [number, number, number, number],
+  activeIdx: number[],
+  axisRanges: Array<[number, number]>,
+  valueGetter: (p: Clean4DPoint) => number
+): { value: number; method: 'grid' | 'simplex' | 'idw_fallback'; enclosed: boolean } {
+  const d = activeIdx.length;
+  if (d === 0) {
+    let sum = 0;
+    for (const p of pts) sum += valueGetter(p);
+    return { value: sum / Math.max(1, pts.length), method: 'grid', enclosed: true };
+  }
+
+  // Normalize active coordinates to [0, 1] over LUT bounding box
+  const scaleCoord = (val: number, ax: number) => {
+    const [mn, mx] = axisRanges[ax];
+    const span = Math.max(1e-9, mx - mn);
+    return (val - mn) / span;
+  };
+  const qNorm = activeIdx.map((ax) => scaleCoord(target[ax], ax));
+  const ptsNorm = pts.map((p) => activeIdx.map((ax) => scaleCoord(p.coords[ax], ax)));
+
+  // 1) Try exact d-dimensional multilinear hypercube grid interpolation
+  const levelsPerAxis = activeIdx.map((ax) => {
+    const [mn, mx] = axisRanges[ax];
+    const eps = Math.max(1e-6, (mx - mn) * 1e-4);
+    return uniqueSortedLevels(
+      pts.map((p) => p.coords[ax]),
+      eps
+    );
+  });
+
+  const bracketPerAxis = levelsPerAxis.map((lvls, k) => {
+    const q = target[activeIdx[k]];
+    const clampedQ = Math.max(lvls[0], Math.min(lvls[lvls.length - 1], q));
+    let hi = 1;
+    while (hi < lvls.length - 1 && lvls[hi] < clampedQ) hi++;
+    const lo = Math.max(0, hi - 1);
+    const v0 = lvls[lo];
+    const v1 = lvls[hi];
+    const frac = Math.abs(v1 - v0) > 1e-12 ? (clampedQ - v0) / (v1 - v0) : 0;
+    return { v0, v1, frac: Math.max(0, Math.min(1, frac)), tol: Math.max(1e-6, (axisRanges[activeIdx[k]][1] - axisRanges[activeIdx[k]][0]) * 1e-3) };
+  });
+
+  const cornerCount = 1 << d;
+  const cornerVals: number[] = [];
+  let gridComplete = true;
+  for (let mask = 0; mask < cornerCount; mask++) {
+    let foundSum = 0;
+    let foundCnt = 0;
+    for (const p of pts) {
+      let match = true;
+      for (let k = 0; k < d; k++) {
+        const b = bracketPerAxis[k];
+        const expected = (mask & (1 << k)) !== 0 ? b.v1 : b.v0;
+        if (Math.abs(p.coords[activeIdx[k]] - expected) > b.tol) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        foundSum += valueGetter(p);
+        foundCnt++;
+      }
+    }
+    if (foundCnt === 0) {
+      gridComplete = false;
+      break;
+    }
+    cornerVals.push(foundSum / foundCnt);
+  }
+
+  if (gridComplete) {
+    let val = 0;
+    for (let mask = 0; mask < cornerCount; mask++) {
+      let w = 1;
+      for (let k = 0; k < d; k++) {
+        const f = bracketPerAxis[k].frac;
+        w *= (mask & (1 << k)) !== 0 ? f : 1 - f;
+      }
+      val += w * cornerVals[mask];
+    }
+    return { value: Math.max(0, val), method: 'grid', enclosed: true };
+  }
+
+  // Check exact / near-exact point hit
+  const distSqList = pts.map((p, idx) => {
+    let d2 = 0;
+    for (let k = 0; k < d; k++) {
+      const diff = ptsNorm[idx][k] - qNorm[k];
+      d2 += diff * diff;
+    }
+    return { idx, d2, val: valueGetter(p) };
+  });
+  distSqList.sort((a, b) => a.d2 - b.d2);
+  if (distSqList[0].d2 < 1e-12) {
+    return { value: Math.max(0, distSqList[0].val), method: 'simplex', enclosed: true };
+  }
+
+  // 2) Try simplex barycentric interpolation over enclosing non-degenerate (m+1)-simplex
+  // Also handles lower-dimensional affine subspaces (e.g. 2 points in 2D Vbus-Iload diagonal)
+  const poolSize = Math.min(pts.length, Math.max(8, 2 * d + 4));
+  const pool = distSqList.slice(0, poolSize).map((item) => item.idx);
+
+  const trySimplexDim = (subDim: number): { value: number; enclosed: boolean } | null => {
+    const need = subDim + 1;
+    if (pool.length < need) return null;
+    const picked: number[] = [];
+    const maxSearch = Math.min(pool.length, 10);
+
+    const searchCombos = (start: number): { value: number; enclosed: boolean } | null => {
+      if (picked.length === need) {
+        if (subDim === d) {
+          const mat: number[][] = Array.from({ length: need }, (_, r) =>
+            picked.map((pIdx) => (r === 0 ? 1 : ptsNorm[pIdx][r - 1]))
+          );
+          const rhs = [1, ...qNorm];
+          const lambdas = solveSmallLinearSystem(mat, rhs);
+          if (lambdas && lambdas.every((l) => l >= -1e-5 && l <= 1 + 1e-5)) {
+            let v = 0;
+            for (let j = 0; j < need; j++) v += lambdas[j] * valueGetter(pts[picked[j]]);
+            return { value: Math.max(0, v), enclosed: true };
+          }
+        } else if (subDim === 1 && need === 2) {
+          // 1D line segment projection between two nearest distinct points
+          const a = ptsNorm[picked[0]];
+          const b = ptsNorm[picked[1]];
+          let ab2 = 0;
+          let aqAb = 0;
+          for (let k = 0; k < d; k++) {
+            const abk = b[k] - a[k];
+            ab2 += abk * abk;
+            aqAb += (qNorm[k] - a[k]) * abk;
+          }
+          if (ab2 > 1e-10) {
+            const t = aqAb / ab2;
+            let perp2 = 0;
+            for (let k = 0; k < d; k++) {
+              const proj = a[k] + t * (b[k] - a[k]);
+              const diff = qNorm[k] - proj;
+              perp2 += diff * diff;
+            }
+            if (perp2 < 1e-6 && t >= -1e-5 && t <= 1 + 1e-5) {
+              const tc = Math.max(0, Math.min(1, t));
+              const v = (1 - tc) * valueGetter(pts[picked[0]]) + tc * valueGetter(pts[picked[1]]);
+              return { value: Math.max(0, v), enclosed: true };
+            }
+          }
+        }
+        return null;
+      }
+      for (let i = start; i <= maxSearch - (need - picked.length); i++) {
+        picked.push(pool[i]);
+        const hit = searchCombos(i + 1);
+        if (hit) return hit;
+        picked.pop();
+      }
+      return null;
+    };
+
+    return searchCombos(0);
+  };
+
+  const fullSimplex = trySimplexDim(d);
+  if (fullSimplex) {
+    return { value: fullSimplex.value, method: 'simplex', enclosed: true };
+  }
+  if (d >= 2) {
+    const colinearSeg = trySimplexDim(1);
+    if (colinearSeg) {
+      return { value: colinearSeg.value, method: 'simplex', enclosed: true };
+    }
+  }
+
+  // 3) Bounded IDW fallback across k nearest neighbors for out-of-hull / sparse query
+  const kUse = Math.min(distSqList.length, Math.max(2, d + 2));
+  let wSum = 0;
+  let acc = 0;
+  for (let i = 0; i < kUse; i++) {
+    const w = 1 / (distSqList[i].d2 + 1e-6);
+    wSum += w;
+    acc += w * distSqList[i].val;
+  }
+  return {
+    value: Math.max(0, acc / Math.max(1e-12, wSum)),
+    method: 'idw_fallback',
+    enclosed: false,
+  };
 }
 
 /**
- * Bilinear / inverse-distance-weighted multi-point DPT operating matrix interpolation
- * across (Vbus, Iload) with bounds/extrapolation reporting.
+ * True 4D DPT switching loss interpolation across (Vbus, Iload, Tj, Rg).
+ * - Uses exact d-dimensional multilinear interpolation when enclosing tensor-grid hypercube exists.
+ * - Uses affine/simplex barycentric interpolation for scattered irregular LUT points.
+ * - Evaluates Turn-On (Eon, Qrr) with rgOnOhm and Turn-Off (Eoff) with rgOffOhm separately.
+ * - Reports missing/collapsed dimensions, out-of-range extrapolation, and parameter provenance explicitly.
  */
 export function interpolateDptSwitchingLoss(
   lut: DptOperatingPoint[],
-  vBusTargetV: number,
-  iLoadTargetA: number
+  vBusOrCond: number | DptOperatingCondition,
+  iLoadTargetA?: number
 ): DptLutInterpolationResult | null {
   if (!lut || lut.length === 0) return null;
-  const vSafe = Math.max(0, Number.isFinite(vBusTargetV) ? vBusTargetV : 0);
-  const iSafe = Math.max(0, Number.isFinite(iLoadTargetA) ? iLoadTargetA : 0);
+
+  const cond: DptOperatingCondition =
+    typeof vBusOrCond === 'object' && vBusOrCond !== null
+      ? vBusOrCond
+      : {
+          vBusV: vBusOrCond,
+          iLoadA: iLoadTargetA ?? 0,
+          tjProvenance: 'assumed',
+          rgProvenance: 'assumed',
+        };
+
+  const vSafe = Math.max(0, Number.isFinite(cond.vBusV) ? cond.vBusV : 0);
+  const iSafe = Math.max(0, Number.isFinite(cond.iLoadA) ? cond.iLoadA : 0);
+  const tjKnown = cond.tjC !== undefined && Number.isFinite(cond.tjC);
+  const rgOnKnown = (cond.rgOnOhm ?? cond.rgOhm) !== undefined && Number.isFinite(cond.rgOnOhm ?? cond.rgOhm);
+  const rgOffKnown = (cond.rgOffOhm ?? cond.rgOhm) !== undefined && Number.isFinite(cond.rgOffOhm ?? cond.rgOhm);
+  const tjProvenance: DptParameterProvenance = cond.tjProvenance ?? (tjKnown ? 'measured' : 'assumed');
+  const rgProvenance: DptParameterProvenance = cond.rgProvenance ?? (rgOnKnown || rgOffKnown ? 'measured' : 'assumed');
+
+  for (const pt of lut) {
+    if (
+      !Number.isFinite(pt.vBusV) ||
+      pt.vBusV <= 0 ||
+      !Number.isFinite(pt.iLoadA) ||
+      pt.iLoadA < 0 ||
+      !Number.isFinite(pt.tjC) ||
+      !Number.isFinite(pt.rgOhm) ||
+      pt.rgOhm < 0 ||
+      !Number.isFinite(pt.eOnUj) ||
+      pt.eOnUj < 0 ||
+      !Number.isFinite(pt.eOffUj) ||
+      pt.eOffUj < 0 ||
+      !Number.isFinite(pt.qRrNc) ||
+      pt.qRrNc < 0
+    ) {
+      return {
+        status: 'INVALID_DATA',
+        method: 'invalid',
+        eOnUj: Number.NaN,
+        eOffUj: Number.NaN,
+        eSwTotalUj: Number.NaN,
+        qRrNc: Number.NaN,
+        eOnSansQrrUj: Number.NaN,
+        extrapolated: true,
+        vRange: [0, 0],
+        iRange: [0, 0],
+        tjRange: [0, 0],
+        rgRange: [0, 0],
+        activeDimensions: [],
+        collapsedDimensions: ['Vbus', 'Iload', 'Tj', 'Rg'],
+        outOfRangeAxes: [],
+        tjProvenance,
+        rgProvenance,
+        warnings: ['DPT LUT 包含非法负值、非正 Vbus 或 NaN/Inf 字段，已拒绝插值。'],
+      };
+    }
+  }
+
+  let vMin = Infinity;
+  let vMax = -Infinity;
+  let iMin = Infinity;
+  let iMax = -Infinity;
+  let tjMin = Infinity;
+  let tjMax = -Infinity;
+  let rgMin = Infinity;
+  let rgMax = -Infinity;
+  for (const pt of lut) {
+    const rgEff = pt.rgOnOhm ?? pt.rgOffOhm ?? pt.rgOhm;
+    if (pt.vBusV < vMin) vMin = pt.vBusV;
+    if (pt.vBusV > vMax) vMax = pt.vBusV;
+    if (pt.iLoadA < iMin) iMin = pt.iLoadA;
+    if (pt.iLoadA > iMax) iMax = pt.iLoadA;
+    if (pt.tjC < tjMin) tjMin = pt.tjC;
+    if (pt.tjC > tjMax) tjMax = pt.tjC;
+    if (rgEff < rgMin) rgMin = rgEff;
+    if (rgEff > rgMax) rgMax = rgEff;
+  }
+
+  const tjTarget = tjKnown ? cond.tjC! : 0.5 * (tjMin + tjMax);
+  const rgDefaultMid = 0.5 * (rgMin + rgMax);
+  const rgOnTarget = rgOnKnown ? Math.max(0, (cond.rgOnOhm ?? cond.rgOhm)!) : rgDefaultMid;
+  const rgOffTarget = rgOffKnown ? Math.max(0, (cond.rgOffOhm ?? cond.rgOhm)!) : rgDefaultMid;
+
+  const axisNames: DptAxisName[] = ['Vbus', 'Iload', 'Tj', 'Rg'];
+  const axisRanges: Array<[number, number]> = [
+    [vMin, vMax],
+    [iMin, iMax],
+    [tjMin, tjMax],
+    [rgMin, rgMax],
+  ];
+  const activeIdx: number[] = [];
+  const collapsedDimensions: DptAxisName[] = [];
+  axisRanges.forEach(([mn, mx], idx) => {
+    const tol = idx === 2 ? 0.5 : idx === 3 ? 0.05 : 1e-4;
+    if (mx - mn > tol) activeIdx.push(idx);
+    else collapsedDimensions.push(axisNames[idx]);
+  });
+  const activeDimensions = activeIdx.map((idx) => axisNames[idx]);
+
+  const outOfRangeAxes: DptAxisName[] = [];
+  if (vSafe < vMin - 1e-6 || vSafe > vMax + 1e-6) outOfRangeAxes.push('Vbus');
+  if (iSafe < iMin - 1e-6 || iSafe > iMax + 1e-6) outOfRangeAxes.push('Iload');
+  if (tjTarget < tjMin - 0.1 || tjTarget > tjMax + 0.1) outOfRangeAxes.push('Tj');
+  if (
+    rgOnTarget < rgMin - 1e-4 ||
+    rgOnTarget > rgMax + 1e-4 ||
+    rgOffTarget < rgMin - 1e-4 ||
+    rgOffTarget > rgMax + 1e-4
+  ) {
+    outOfRangeAxes.push('Rg');
+  }
+
+  const warnings: string[] = [];
+  if (collapsedDimensions.length > 0) {
+    warnings.push(
+      `DPT LUT 缺少 ${collapsedDimensions.join(' / ')} 维度的多点变化（已退化为常数轴），无法反映这些维度变化引起的开关损耗漂移。`
+    );
+  }
+  if (tjProvenance === 'assumed' && activeDimensions.includes('Tj')) {
+    warnings.push('DPT LUT 查询中的结温 Tj 未由闭环求解器或传感器实测提供，当前按默认假设中值代入。');
+  }
+  if (rgProvenance === 'assumed' && activeDimensions.includes('Rg')) {
+    warnings.push('DPT LUT 查询中的门极电阻 Rg 未显式输入，当前按 LUT 范围默认假设中值代入。');
+  }
 
   if (lut.length === 1) {
     const p = lut[0];
@@ -121,7 +554,10 @@ export function interpolateDptSwitchingLoss(
     const extrapolated =
       Math.abs(vSafe - p.vBusV) > 0.05 * Math.max(1, p.vBusV) ||
       Math.abs(iSafe - p.iLoadA) > 0.05 * Math.max(1, p.iLoadA);
+    warnings.push('DPT LUT 仅含 1 个工作点 (INSUFFICIENT_LUT)，结果仅为按 Vbus·Iload 线性缩放的近似值。');
     return {
+      status: 'INSUFFICIENT_LUT',
+      method: 'single_point_scaled',
       eOnUj,
       eOffUj,
       eSwTotalUj: eOnUj + eOffUj,
@@ -130,77 +566,103 @@ export function interpolateDptSwitchingLoss(
       extrapolated,
       vRange: [p.vBusV, p.vBusV],
       iRange: [p.iLoadA, p.iLoadA],
+      tjRange: [p.tjC, p.tjC],
+      rgRange: [p.rgOnOhm ?? p.rgOhm, p.rgOffOhm ?? p.rgOhm],
+      activeDimensions,
+      collapsedDimensions,
+      outOfRangeAxes,
+      tjProvenance,
+      rgProvenance,
+      warnings,
     };
   }
 
-  let vMin = Infinity;
-  let vMax = -Infinity;
-  let iMin = Infinity;
-  let iMax = -Infinity;
-  for (const pt of lut) {
-    if (pt.vBusV < vMin) vMin = pt.vBusV;
-    if (pt.vBusV > vMax) vMax = pt.vBusV;
-    if (pt.iLoadA < iMin) iMin = pt.iLoadA;
-    if (pt.iLoadA > iMax) iMax = pt.iLoadA;
-  }
-
-  const extrapolated =
-    vSafe < vMin - 1e-6 ||
-    vSafe > vMax + 1e-6 ||
-    iSafe < iMin - 1e-6 ||
-    iSafe > iMax + 1e-6;
-
-  // When target current is below minimum recorded LUT point, interpolate at iMin and scale linearly toward 0 A
-  // (preventing IDW from holding high-current switching energy near 0 A)
   const iEval = iSafe < iMin && iMin > 1e-6 ? iMin : iSafe;
   const lowCurrentScale = iSafe < iMin && iMin > 1e-6 ? iSafe / iMin : 1;
 
-  const vNorm = Math.max(1, vSafe);
-  const iNorm = Math.max(1, iEval);
-  let wSum = 0;
-  let eOnAcc = 0;
-  let eOffAcc = 0;
-  let qRrAcc = 0;
-  let eOnSansAcc = 0;
-  for (const pt of lut) {
-    const dv = (pt.vBusV - vSafe) / vNorm;
-    const di = (pt.iLoadA - iEval) / iNorm;
-    const d2 = dv * dv + di * di;
-    if (d2 < 1e-10) {
-      const eOnSans = (pt.eOnSansQrrUj ?? pt.eOnUj) * lowCurrentScale;
-      const eOnUj = pt.eOnUj * lowCurrentScale;
-      const eOffUj = pt.eOffUj * lowCurrentScale;
-      return {
-        eOnUj,
-        eOffUj,
-        eSwTotalUj: eOnUj + eOffUj,
-        qRrNc: pt.qRrNc * lowCurrentScale,
-        eOnSansQrrUj: eOnSans,
-        extrapolated,
-        vRange: [vMin, vMax],
-        iRange: [iMin, iMax],
-      };
-    }
-    const w = 1 / (d2 + 1e-6);
-    wSum += w;
-    eOnAcc += w * pt.eOnUj;
-    eOffAcc += w * pt.eOffUj;
-    qRrAcc += w * pt.qRrNc;
-    eOnSansAcc += w * (pt.eOnSansQrrUj ?? pt.eOnUj);
+  // Build separate 4D point clouds for Turn-On (Rg_on) and Turn-Off (Rg_off)
+  const ptsOn: Clean4DPoint[] = lut.map((pt) => ({
+    coords: [pt.vBusV, pt.iLoadA, pt.tjC, pt.rgOnOhm ?? pt.rgOhm],
+    eOnUj: pt.eOnUj,
+    eOffUj: pt.eOffUj,
+    qRrNc: pt.qRrNc,
+    eOnSansQrrUj: pt.eOnSansQrrUj ?? pt.eOnUj,
+  }));
+  const ptsOff: Clean4DPoint[] = lut.map((pt) => ({
+    coords: [pt.vBusV, pt.iLoadA, pt.tjC, pt.rgOffOhm ?? pt.rgOhm],
+    eOnUj: pt.eOnUj,
+    eOffUj: pt.eOffUj,
+    qRrNc: pt.qRrNc,
+    eOnSansQrrUj: pt.eOnSansQrrUj ?? pt.eOnUj,
+  }));
+
+  // Evaluate channels cleanly
+  const vClamped = Math.max(vMin, Math.min(vMax, vSafe));
+  const iClamped = Math.max(iMin, Math.min(iMax, iEval));
+  const tjClamped = Math.max(tjMin, Math.min(tjMax, tjTarget));
+  const rgOnClamped = Math.max(rgMin, Math.min(rgMax, rgOnTarget));
+  const rgOffClamped = Math.max(rgMin, Math.min(rgMax, rgOffTarget));
+
+  const qOn: [number, number, number, number] = [vClamped, iClamped, tjClamped, rgOnClamped];
+  const qOff: [number, number, number, number] = [vClamped, iClamped, tjClamped, rgOffClamped];
+
+  const onRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdx, axisRanges, (p) => p.eOnUj);
+  const onSansRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdx, axisRanges, (p) => p.eOnSansQrrUj);
+  const qrrRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdx, axisRanges, (p) => p.qRrNc);
+  const offRes = evaluate4DScalarChannel(ptsOff, qOff, activeIdx, axisRanges, (p) => p.eOffUj);
+
+  // If strictly above Vmax or Imax (non-zero side out-of-range), gently scale beyond boundary by V/I ratio vs boundary evaluation
+  const vHiScale = vSafe > vMax && vMax > 1e-6 ? vSafe / vMax : 1;
+  const iHiScale = iSafe > iMax && iMax > 1e-6 ? iSafe / iMax : 1;
+  const vLoScale = vSafe < vMin && vMin > 1e-6 ? vSafe / vMin : 1;
+  const scaleOut = vLoScale * vHiScale * lowCurrentScale * iHiScale;
+
+  const eOnUj = onRes.value * scaleOut;
+  const eOffUj = offRes.value * scaleOut;
+  const eOnSansQrrUj = onSansRes.value * scaleOut;
+  const qRrNc = qrrRes.value * lowCurrentScale * iHiScale;
+
+  const outsideConvex = outOfRangeAxes.length > 0 || !onRes.enclosed || !offRes.enclosed;
+  if (outsideConvex) {
+    warnings.push(
+      outOfRangeAxes.length > 0
+        ? `查询工况在 [${outOfRangeAxes.join(', ')}] 维度超出 DPT LUT 实测范围 (OUT_OF_RANGE)，当前采用边界约束与比例外推。`
+        : '查询工况位于 DPT LUT 实测散点凸包外 (OUT_OF_RANGE)，采用最近邻凸权重近似。'
+    );
   }
-  const eOnUj = (eOnAcc / wSum) * lowCurrentScale;
-  const eOffUj = (eOffAcc / wSum) * lowCurrentScale;
+
+  let method: DptLutInterpolationResult['method'] = '4d_simplex_barycentric';
+  if (activeIdx.length < 4 && (onRes.method === 'grid' || onRes.method === 'simplex')) {
+    method = activeIdx.length <= 2 ? 'reduced_dim_interpolated' : onRes.method === 'grid' ? '4d_multilinear_grid' : '4d_simplex_barycentric';
+  } else if (onRes.method === 'grid' && offRes.method === 'grid') {
+    method = '4d_multilinear_grid';
+  }
+
+  const status: DptLutStatus = outsideConvex ? 'OUT_OF_RANGE' : 'VALID';
+
   return {
+    status,
+    method,
     eOnUj,
     eOffUj,
     eSwTotalUj: eOnUj + eOffUj,
-    qRrNc: (qRrAcc / wSum) * lowCurrentScale,
-    eOnSansQrrUj: (eOnSansAcc / wSum) * lowCurrentScale,
-    extrapolated,
+    qRrNc,
+    eOnSansQrrUj,
+    extrapolated: outsideConvex,
     vRange: [vMin, vMax],
     iRange: [iMin, iMax],
+    tjRange: [tjMin, tjMax],
+    rgRange: [rgMin, rgMax],
+    activeDimensions,
+    collapsedDimensions,
+    outOfRangeAxes,
+    tjProvenance,
+    rgProvenance,
+    warnings,
   };
 }
+
+// MT-04 Nonlinear Eoss(V)/Qoss(V)/Coss(V) helpers are defined in thermalEngine.ts and re-exported above.
 
 function estimateRingingFreqMHz(time: Float64Array, sig: Float32Array, idx0: number, idx1: number): number | null {
   const n = idx1 - idx0 + 1;

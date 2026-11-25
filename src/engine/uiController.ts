@@ -4526,7 +4526,7 @@ export class OscilloscopeApp {
               <div class="flex justify-between"><span>Status / Cov:</span><span class="text-amber-300">NO CURSOR</span></div>
               <div class="flex justify-between"><span>X Span:</span><span>--</span></div>
               <div class="flex justify-between"><span>Y Span:</span><span>--</span></div>
-              <div class="flex justify-between"><span>Circularity:</span><span class="text-slate-400">--</span></div>
+              <div class="flex justify-between"><span>Circle Fit Qual:</span><span class="text-slate-400">--</span></div>
               <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-slate-400">--</span></div>
               <div class="text-[10px] text-amber-300 leading-snug pt-0.5">当前 XY 范围设为 Cursors，但 X1/X2 光标未启用；已阻断回退到整段轨迹。</div>
             `;
@@ -4548,15 +4548,22 @@ export class OscilloscopeApp {
             const m = computeXYAlignedTrajectory(xCh, yCh, xyT0, xyT1).metrics;
             const phaseTxt =
               m.lissajousPhaseDeg !== null
-                ? `${m.lissajousPhaseDeg > 0 ? '+' : ''}${m.lissajousPhaseDeg.toFixed(1)}°`
+                ? `${m.lissajousPhaseDeg > 0 ? '+' : ''}${m.lissajousPhaseDeg.toFixed(1)}°${m.isNonSinusoidal ? ' (基波)' : ''}`
                 : '--';
+            const fitQualTxt =
+              m.circleFitQualityPct !== null
+                ? `${m.circleFitQualityPct.toFixed(1)}% (Err ${m.circleFitErrorPct !== null ? m.circleFitErrorPct.toFixed(1) : '--'}%)`
+                : m.trajectoryShapeHint === 'open_arc'
+                ? '开弧 (未闭合)'
+                : '--';
+            const notes = [m.invalidReason, m.circleFitNote, m.phaseNote].filter((v): v is string => Boolean(v));
             xyReadout.innerHTML = `
               <div class="flex justify-between"><span>Status / Cov:</span><span class="${m.valid ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(m.valid ? `OK (${m.coveragePct.toFixed(0)}%)` : m.status)}</span></div>
               <div class="flex justify-between"><span>X Span:</span><span>${escapeHtml(m.valid ? formatEng(m.xMax - m.xMin, xCh.unit, 2) : '--')}</span></div>
               <div class="flex justify-between"><span>Y Span:</span><span>${escapeHtml(m.valid ? formatEng(m.yMax - m.yMin, yCh.unit, 2) : '--')}</span></div>
-              <div class="flex justify-between"><span>Circularity:</span><span class="text-cyan-300">${m.circularityPct !== null ? m.circularityPct.toFixed(1) + '%' : '--'}</span></div>
+              <div class="flex justify-between"><span>Circle Fit Qual:</span><span class="text-cyan-300">${escapeHtml(fitQualTxt)}</span></div>
               <div class="flex justify-between"><span>Lissajous ΔΦ:</span><span class="text-amber-300">${escapeHtml(phaseTxt)}</span></div>
-              ${!m.valid && m.invalidReason ? `<div class="text-[10px] text-amber-300 leading-snug pt-0.5">${escapeHtml(m.invalidReason)}</div>` : ''}
+              ${notes.length > 0 ? `<div class="text-[10px] text-amber-300 leading-snug pt-0.5">${notes.map((n) => escapeHtml(n)).join('<br/>')}</div>` : ''}
             `;
           }
         }

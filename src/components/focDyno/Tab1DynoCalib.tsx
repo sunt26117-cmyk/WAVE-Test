@@ -548,6 +548,119 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
           模型适用边界：稳态集总参数代数模型，假定 Y 型接法非凸极 SPMSM 且 Id = 0（不含高速弱磁 Id &lt; 0 与转子电感瞬态 dI/dt）。
         </div>
       </div>
+
+      {/* FD-02: Parameter Identifiability, Normalized Jacobian SVD, 95% CI & Correlation Matrix */}
+      {report.identifiabilityReport && (
+        <div className="dyno-card rounded-sm border p-4 space-y-3 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold dyno-text-primary">参数可辨识性与 95% 置信区间诊断 (SVD 归一化雅可比)</h3>
+              <span
+                className={`rounded-xs border px-2 py-0.5 font-mono text-[11px] font-semibold ${
+                  report.identifiabilityReport.overallStatus === 'NOT_IDENTIFIABLE'
+                    ? 'dyno-alert-danger'
+                    : report.identifiabilityReport.overallStatus === 'WEAKLY_IDENTIFIABLE'
+                    ? 'dyno-alert-warn'
+                    : 'dyno-alert-ok border-emerald-500/40'
+                }`}
+              >
+                {report.identifiabilityReport.overallStatus}
+              </span>
+              {report.identifiabilityReport.baselineRetained && (
+                <span className="rounded-xs border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 font-mono text-[10px] text-amber-300">
+                  已保留基准参数
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-4 font-mono text-[11px] dyno-text-secondary">
+              <span>
+                秩: <strong className="dyno-text-primary">{report.identifiabilityReport.numericalRank}/{report.identifiabilityReport.fullRank}</strong>
+              </span>
+              <span>
+                条件数 κ: <strong className="dyno-text-primary">
+                  {Number.isFinite(report.identifiabilityReport.conditionNumber)
+                    ? report.identifiabilityReport.conditionNumber.toFixed(2)
+                    : '∞'}
+                </strong>
+              </span>
+              <span>
+                DOF: <strong className="dyno-text-primary">{report.identifiabilityReport.dof}</strong>
+              </span>
+              <span>
+                P0 条件数: <strong className="dyno-text-primary">
+                  {Number.isFinite(report.identifiabilityReport.p0Identifiability.conditionNumber)
+                    ? report.identifiabilityReport.p0Identifiability.conditionNumber.toFixed(1)
+                    : '∞'}
+                </strong>
+              </span>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-left font-mono text-[11px]">
+              <thead>
+                <tr className="border-b dyno-border dyno-text-muted">
+                  <th className="py-1.5 pr-3">参数</th>
+                  <th className="py-1.5 pr-3">估计/采用值</th>
+                  <th className="py-1.5 pr-3">标准误 SE</th>
+                  <th className="py-1.5 pr-3">95% 置信区间</th>
+                  <th className="py-1.5 pr-3">状态</th>
+                  <th className="py-1.5">判定依据</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y dyno-divide">
+                {report.identifiabilityReport.parameters.map((p) => (
+                  <tr key={p.symbol}>
+                    <td className="py-1.5 pr-3 font-sans dyno-text-primary">
+                      {p.name} <span className="font-mono dyno-text-muted">({p.symbol})</span>
+                    </td>
+                    <td className="py-1.5 pr-3 tabular-nums dyno-text-primary">
+                      {Math.abs(p.value) > 0 && Math.abs(p.value) < 1e-3 ? p.value.toExponential(3) : p.value.toFixed(5)} {p.unit}
+                    </td>
+                    <td className="py-1.5 pr-3 tabular-nums dyno-text-secondary">
+                      {Number.isFinite(p.stdError)
+                        ? Math.abs(p.stdError) < 1e-3 && p.stdError > 0
+                          ? p.stdError.toExponential(2)
+                          : p.stdError.toFixed(5)
+                        : '—'}
+                    </td>
+                    <td className="py-1.5 pr-3 tabular-nums dyno-text-secondary">
+                      {Number.isFinite(p.ci95Low) && Number.isFinite(p.ci95High)
+                        ? `[${Math.abs(p.ci95Low) < 1e-3 && p.ci95Low !== 0 ? p.ci95Low.toExponential(2) : p.ci95Low.toFixed(4)}, ${Math.abs(p.ci95High) < 1e-3 && p.ci95High !== 0 ? p.ci95High.toExponential(2) : p.ci95High.toFixed(4)}]`
+                        : '—'}
+                    </td>
+                    <td className="py-1.5 pr-3">
+                      <span
+                        className={`rounded-xs border px-1.5 py-0.5 text-[10px] ${
+                          p.status === 'NOT_IDENTIFIABLE'
+                            ? 'dyno-alert-danger'
+                            : p.status === 'WEAKLY_IDENTIFIABLE'
+                            ? 'dyno-alert-warn'
+                            : p.status === 'FIXED'
+                            ? 'border-slate-600 text-slate-300'
+                            : 'dyno-alert-ok border-emerald-500/40'
+                        }`}
+                      >
+                        {p.status}
+                      </span>
+                    </td>
+                    <td className="py-1.5 font-sans dyno-text-muted">{p.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {report.identifiabilityReport.highCollinearityPairs.length > 0 && (
+            <div className="rounded-xs border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 font-mono text-[11px] text-amber-200">
+              共线性热点:{' '}
+              {report.identifiabilityReport.highCollinearityPairs
+                .map((pr) => `${pr.paramA} ↔ ${pr.paramB} (r=${pr.correlation.toFixed(3)})`)
+                .join(' · ')}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

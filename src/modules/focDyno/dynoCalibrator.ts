@@ -105,6 +105,87 @@ export interface CalibrationSensitivity {
 
 export type CalibrationStatus = 'ok' | 'warn' | 'failed';
 
+export type ParameterIdentifiabilityStatus =
+  | 'IDENTIFIABLE'
+  | 'WEAKLY_IDENTIFIABLE'
+  | 'NOT_IDENTIFIABLE'
+  | 'FIXED';
+
+export interface ParameterIdentifiabilityEntry {
+  name: string;
+  symbol: string;
+  unit: string;
+  value: number;
+  stdError: number;
+  ci95Low: number;
+  ci95High: number;
+  relativeCiPct: number;
+  status: ParameterIdentifiabilityStatus;
+  reason: string;
+}
+
+export interface IdentifiabilityReport {
+  overallStatus: 'IDENTIFIABLE' | 'WEAKLY_IDENTIFIABLE' | 'NOT_IDENTIFIABLE';
+  conditionNumber: number;
+  numericalRank: number;
+  fullRank: number;
+  singularValues: number[];
+  residualRmsNm: number;
+  dof: number;
+  parameters: ParameterIdentifiabilityEntry[];
+  correlationMatrix: {
+    names: string[];
+    matrix: number[][];
+  };
+  highCollinearityPairs: Array<{ paramA: string; paramB: string; correlation: number }>;
+  p0Identifiability: {
+    identifiable: boolean;
+    conditionNumber: number;
+    rank: number;
+    speedLevels: number;
+    speedSpanRpm: number;
+    correlationAB: number;
+    status: ParameterIdentifiabilityStatus;
+  };
+  excitation: {
+    closedLoopCount: number;
+    torqueSpanNm: number;
+    speedSpanRpm: number;
+    vBusSpanV: number;
+    sufficient: boolean;
+  };
+  baselineRetained: boolean;
+  warnings: string[];
+}
+
+export interface DynamicIdentifiabilitySample {
+  omegaM: number;
+  dOmegaDt: number;
+  iqA: number;
+  tLoadNm: number;
+}
+
+export interface DynamicIdentifiabilityResult {
+  overallStatus: 'IDENTIFIABLE' | 'WEAKLY_IDENTIFIABLE' | 'NOT_IDENTIFIABLE';
+  jKgM2: number;
+  bNmSPerRad: number;
+  ktNmPerA: number;
+  conditionNumber: number;
+  numericalRank: number;
+  fullRank: number;
+  singularValues: number[];
+  residualRmsNm: number;
+  dof: number;
+  parameters: ParameterIdentifiabilityEntry[];
+  correlationMatrix: {
+    names: string[];
+    matrix: number[][];
+  };
+  highCollinearityPairs: Array<{ paramA: string; paramB: string; correlation: number }>;
+  baselineRetained: boolean;
+  warnings: string[];
+}
+
 export interface CalibrationReport {
   status: CalibrationStatus;
   warnings: string[];
@@ -121,6 +202,7 @@ export interface CalibrationReport {
   validationMetrics?: CalibrationValidationMetrics;
   operatingEnvelope?: OperatingEnvelopeBounds;
   paramSensitivity?: CalibrationSensitivity;
+  identifiabilityReport?: IdentifiabilityReport;
   grid2D: EfficiencyGrid2D;
   fitNotes: string[];
 }
@@ -743,10 +825,76 @@ export function runStepwiseCalibration(
     rsEffOverrideOhm: rsAnchorOhm,
   };
 
-  let bestBeta = 0;
+  let bestBeta = Math.max(0, baseParams.betaSat);
   let bestRs = rsAnchorOhm;
+  let identifiabilityReport: IdentifiabilityReport;
+
+  // Step 2 P0 covariance/correlation breakdown if identifiable
+  let p0StdErrA = Number.NaN;
+  let p0StdErrB = Number.NaN;
+  let p0CorrAB = Number.NaN;
+  if (p0Identifiable && p0FiniteSamples.length > 2) {
+    const p0Design = p0FiniteSamples.map((s) => [Math.abs(s.n), s.n * s.n]);
+    const p0Res = p0FiniteSamples.map((s) => p0A * Math.abs(s.n) + p0B * s.n * s.n - s.p0);
+    const p0Scales = [Math.max(Math.abs(p0A), 1e-4), Math.max(Math.abs(p0B), 1e-7)];
+    const p0Diag = analyzeNormalizedJacobianSvd(p0Design, p0Res, p0Scales, ['a', 'b'], ['a', 'b'], ['W/RPM', 'W/RPM²'], [p0A, p0B]);
+    p0StdErrA = p0Diag.entries[0]?.stdError ?? Number.NaN;
+    p0StdErrB = p0Diag.entries[1]?.stdError ?? Number.NaN;
+    p0CorrAB = p0Diag.correlationMatrix.matrix[0]?.[1] ?? Number.NaN;
+  }
+
+  const p0Dof = Math.max(0, p0FiniteSamples.length - 2);
+  const tCritP0 = tCritical95(p0Dof);
+  const p0Entries: ParameterIdentifiabilityEntry[] = [
+    {
+      name: '空载线性损耗系数 a',
+      symbol: 'p0A',
+      unit: 'W/RPM',
+      value: p0A,
+      stdError: p0StdErrA,
+      ci95Low: Number.isFinite(p0StdErrA) ? p0A - tCritP0 * p0StdErrA : Number.NaN,
+      ci95High: Number.isFinite(p0StdErrA) ? p0A + tCritP0 * p0StdErrA : Number.NaN,
+      relativeCiPct: Number.isFinite(p0StdErrA) && Math.abs(p0A) > 1e-9 ? ((tCritP0 * p0StdErrA) / Math.abs(p0A)) * 100 : Number.NaN,
+      status: p0Identifiable ? (p0DesignConditionNumber > 20 ? 'WEAKLY_IDENTIFIABLE' : 'IDENTIFIABLE') : 'NOT_IDENTIFIABLE',
+      reason: p0Identifiable
+        ? `设计矩阵条件数 ${p0DesignConditionNumber.toFixed(1)} ≤ 40`
+        : `设计矩阵条件数 ${Number.isFinite(p0DesignConditionNumber) ? p0DesignConditionNumber.toFixed(1) : '∞'} 或转速跨度不足，保留基准`,
+    },
+    {
+      name: '空载二次损耗系数 b',
+      symbol: 'p0B',
+      unit: 'W/RPM²',
+      value: p0B,
+      stdError: p0StdErrB,
+      ci95Low: Number.isFinite(p0StdErrB) ? p0B - tCritP0 * p0StdErrB : Number.NaN,
+      ci95High: Number.isFinite(p0StdErrB) ? p0B + tCritP0 * p0StdErrB : Number.NaN,
+      relativeCiPct: Number.isFinite(p0StdErrB) && Math.abs(p0B) > 1e-12 ? ((tCritP0 * p0StdErrB) / Math.abs(p0B)) * 100 : Number.NaN,
+      status: p0Identifiable ? (p0DesignConditionNumber > 20 ? 'WEAKLY_IDENTIFIABLE' : 'IDENTIFIABLE') : 'NOT_IDENTIFIABLE',
+      reason: p0Identifiable
+        ? `设计矩阵条件数 ${p0DesignConditionNumber.toFixed(1)} ≤ 40`
+        : `设计矩阵条件数 ${Number.isFinite(p0DesignConditionNumber) ? p0DesignConditionNumber.toFixed(1) : '∞'} 或转速跨度不足，保留基准`,
+    },
+  ];
+
+  const keEntry: ParameterIdentifiabilityEntry = {
+    name: '反电势常数 Ke\'',
+    symbol: "Ke'",
+    unit: 'Vp/(rad/s)',
+    value: kePrime,
+    stdError: Number.NaN,
+    ci95Low: Number.NaN,
+    ci95High: Number.NaN,
+    relativeCiPct: Number.NaN,
+    status: options.keSource === 'open_loop_auto' ? 'WEAKLY_IDENTIFIABLE' : 'FIXED',
+    reason:
+      options.keSource === 'open_loop_auto'
+        ? `依赖开环空载假设 m_norm=${modScale.toFixed(3)}`
+        : `由 ${options.keSource === 'manual_kv' ? '手动 KV' : '手动 (n0, V_test)'} 锁定`,
+  };
 
   if (closedLoopPoints.length > 0) {
+    bestBeta = 0;
+    bestRs = rsAnchorOhm;
     const evalObjective = (beta: number, rs: number): number => {
       const testParams: MotorParams = {
         ...step3ParamsBase,
@@ -819,12 +967,224 @@ export function runStepwiseCalibration(
       }
     }
 
+    // FD-02: Compute scaled/normalized Jacobian J_norm, SVD, condition number, numerical rank,
+    // parameter covariance, 95% confidence intervals, and parameter correlation matrix.
+    const solvedPts: Array<{ pt: NormalizedDynoPoint; tEst: number }> = [];
+    const fittedParamsPreCheck: MotorParams = {
+      ...step3ParamsBase,
+      betaSat: bestBeta,
+      rsEffOverrideOhm: bestRs,
+    };
+    for (const pt of closedLoopPoints) {
+      const r0 = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, fittedParamsPreCheck);
+      if (Number.isFinite(r0.tEstNm)) {
+        solvedPts.push({ pt, tEst: r0.tEstNm });
+      }
+    }
+
+    const fitNames = options.rsFitMode === 'bounded_15pct' ? ['磁饱和系数 β', '等效相电阻 Rs_eff'] : ['磁饱和系数 β'];
+    const fitSymbols = options.rsFitMode === 'bounded_15pct' ? ['betaSat', 'rsEff'] : ['betaSat'];
+    const fitUnits = options.rsFitMode === 'bounded_15pct' ? ['A⁻²', 'Ω'] : ['A⁻²'];
+    const thetaVec = options.rsFitMode === 'bounded_15pct' ? [bestBeta, bestRs] : [bestBeta];
+    const scaleVec =
+      options.rsFitMode === 'bounded_15pct'
+        ? [Math.max(bestBeta, 0.01), Math.max(bestRs, 0.005)]
+        : [Math.max(bestBeta, 0.01)];
+
+    const Jraw: number[][] = [];
+    const residualVec: number[] = [];
+    const hBeta = 2e-4;
+    const hRs = Math.max(1e-5, 1e-3 * rsAnchorOhm);
+
+    for (const { pt, tEst } of solvedPts) {
+      residualVec.push(tEst - pt.tNm);
+      const row: number[] = [];
+
+      // dT/dbeta (forward difference at boundary beta=0, centered otherwise)
+      let dBetaDeriv = 0;
+      if (bestBeta < hBeta) {
+        const rp = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, {
+          ...fittedParamsPreCheck,
+          betaSat: bestBeta + hBeta,
+        });
+        dBetaDeriv = Number.isFinite(rp.tEstNm) ? (rp.tEstNm - tEst) / hBeta : 0;
+      } else {
+        const rp = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, {
+          ...fittedParamsPreCheck,
+          betaSat: bestBeta + hBeta,
+        });
+        const rm = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, {
+          ...fittedParamsPreCheck,
+          betaSat: Math.max(0, bestBeta - hBeta),
+        });
+        if (Number.isFinite(rp.tEstNm) && Number.isFinite(rm.tEstNm)) {
+          const denom = bestBeta + hBeta - Math.max(0, bestBeta - hBeta);
+          dBetaDeriv = denom > 0 ? (rp.tEstNm - rm.tEstNm) / denom : 0;
+        }
+      }
+      row.push(dBetaDeriv);
+
+      if (options.rsFitMode === 'bounded_15pct') {
+        const rp = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, {
+          ...fittedParamsPreCheck,
+          rsEffOverrideOhm: bestRs + hRs,
+        });
+        const rm = solveSinglePoint(pt.vBusV, pt.iBusA, pt.nRpm, {
+          ...fittedParamsPreCheck,
+          rsEffOverrideOhm: Math.max(1e-5, bestRs - hRs),
+        });
+        let dRsDeriv = 0;
+        if (Number.isFinite(rp.tEstNm) && Number.isFinite(rm.tEstNm)) {
+          const denom = bestRs + hRs - Math.max(1e-5, bestRs - hRs);
+          dRsDeriv = denom > 0 ? (rp.tEstNm - rm.tEstNm) / denom : 0;
+        }
+        row.push(dRsDeriv);
+      }
+      Jraw.push(row);
+    }
+
+    const clTorques = closedLoopPoints.map((p) => p.tNm);
+    const clSpeeds = closedLoopPoints.map((p) => p.nRpm);
+    const clVbus = closedLoopPoints.map((p) => p.vBusV);
+    const torqueSpanNm = clTorques.length > 0 ? Math.max(...clTorques) - Math.min(...clTorques) : 0;
+    const speedSpanRpm = clSpeeds.length > 0 ? Math.max(...clSpeeds) - Math.min(...clSpeeds) : 0;
+    const vBusSpanV = clVbus.length > 0 ? Math.max(...clVbus) - Math.min(...clVbus) : 0;
+
+    const svdDiag = analyzeNormalizedJacobianSvd(Jraw, residualVec, scaleVec, fitNames, fitSymbols, fitUnits, thetaVec);
+
+    // Check excitation sufficiency & Step 3 identifiability gate
+    const fullRank = fitSymbols.length;
+    const step3Unidentifiable =
+      svdDiag.numericalRank < fullRank ||
+      svdDiag.dof <= 0 ||
+      !Number.isFinite(svdDiag.conditionNumber) ||
+      svdDiag.conditionNumber > 40 ||
+      svdDiag.entries.some((e) => e.status === 'NOT_IDENTIFIABLE');
+
+    let baselineRetained = false;
+    const idWarnings: string[] = [...svdDiag.warnings];
+    if (step3Unidentifiable) {
+      baselineRetained = true;
+      bestBeta = Math.max(0, baseParams.betaSat);
+      bestRs = rsAnchorOhm;
+      elevateStatus('warn');
+      const condText = Number.isFinite(svdDiag.conditionNumber) ? svdDiag.conditionNumber.toFixed(1) : '∞';
+      idWarnings.push(
+        `闭环参数辨识退化 (NOT_IDENTIFIABLE: 秩 ${svdDiag.numericalRank}/${fullRank}, 归一化雅可比条件数 κ=${condText}, dof=${svdDiag.dof})；激励不足或参数高度共线，已回退并保留基准 β=${bestBeta.toFixed(5)} 与 Rs_eff=${bestRs.toFixed(4)} Ω。`
+      );
+      warnings.push(idWarnings[idWarnings.length - 1]);
+    } else if (svdDiag.overallStatus === 'WEAKLY_IDENTIFIABLE') {
+      elevateStatus('warn');
+      idWarnings.push(
+        `闭环参数弱可辨识 (WEAKLY_IDENTIFIABLE: κ=${svdDiag.conditionNumber.toFixed(1)}，存在较大 95% 置信区间或参数相关性)，建议补充高/低负载及跨转速多工况测点。`
+      );
+      warnings.push(idWarnings[idWarnings.length - 1]);
+    }
+
+    const step3Entries: ParameterIdentifiabilityEntry[] = svdDiag.entries.map((entry, idx) =>
+      step3Unidentifiable
+        ? {
+            ...entry,
+            value: idx === 0 ? bestBeta : bestRs,
+            stdError: Number.NaN,
+            ci95Low: Number.NaN,
+            ci95High: Number.NaN,
+            relativeCiPct: Number.NaN,
+            status: 'NOT_IDENTIFIABLE',
+            reason: '雅可比矩阵秩亏或条件数超限，回退保留基准参数',
+          }
+        : entry
+    );
+
     if (options.rsFitMode === 'locked') {
-      fitNotes.push(`Step 3 (防过拟合锁定 Rs): Rs_eff = ${bestRs.toFixed(4)} Ω (R_LL/2 温修基准), 拟合 β = ${bestBeta.toFixed(5)} A⁻²`);
+      step3Entries.push({
+        name: '等效相电阻 Rs_eff',
+        symbol: 'rsEff',
+        unit: 'Ω',
+        value: bestRs,
+        stdError: Number.NaN,
+        ci95Low: Number.NaN,
+        ci95High: Number.NaN,
+        relativeCiPct: Number.NaN,
+        status: 'FIXED',
+        reason: '已由 R_LL@25°C 铜温基准锁定（防过拟合）',
+      });
+    }
+
+    const overallStatus: IdentifiabilityReport['overallStatus'] = step3Unidentifiable
+      ? 'NOT_IDENTIFIABLE'
+      : svdDiag.overallStatus === 'WEAKLY_IDENTIFIABLE' || !p0Identifiable
+      ? 'WEAKLY_IDENTIFIABLE'
+      : 'IDENTIFIABLE';
+
+    identifiabilityReport = {
+      overallStatus,
+      conditionNumber: svdDiag.conditionNumber,
+      numericalRank: svdDiag.numericalRank,
+      fullRank,
+      singularValues: svdDiag.singularValues,
+      residualRmsNm: svdDiag.residualRmsNm,
+      dof: svdDiag.dof,
+      parameters: [keEntry, ...p0Entries, ...step3Entries],
+      correlationMatrix: svdDiag.correlationMatrix,
+      highCollinearityPairs: svdDiag.highCollinearityPairs,
+      p0Identifiability: {
+        identifiable: p0Identifiable,
+        conditionNumber: p0DesignConditionNumber,
+        rank: p0Identifiable ? 2 : p0Speeds.length >= 2 ? 1 : 0,
+        speedLevels: p0Speeds.length,
+        speedSpanRpm: p0SpeedSpan,
+        correlationAB: p0CorrAB,
+        status: p0Identifiable ? (p0DesignConditionNumber > 20 ? 'WEAKLY_IDENTIFIABLE' : 'IDENTIFIABLE') : 'NOT_IDENTIFIABLE',
+      },
+      excitation: {
+        closedLoopCount: closedLoopPoints.length,
+        torqueSpanNm,
+        speedSpanRpm,
+        vBusSpanV,
+        sufficient: !step3Unidentifiable && closedLoopPoints.length >= 4 && torqueSpanNm > 0.02,
+      },
+      baselineRetained,
+      warnings: idWarnings,
+    };
+
+    if (options.rsFitMode === 'locked') {
+      fitNotes.push(`Step 3 (防过拟合锁定 Rs): Rs_eff = ${bestRs.toFixed(4)} Ω (R_LL/2 温修基准), ${baselineRetained ? '保留基准 ' : '拟合 '}β = ${bestBeta.toFixed(5)} A⁻²`);
     } else {
       const pctDiff = ((bestRs - rsAnchorOhm) / rsAnchorOhm) * 100;
-      fitNotes.push(`Step 3 (±15% 微调 Rs): Rs_eff = ${bestRs.toFixed(4)} Ω (${pctDiff >= 0 ? '+' : ''}${pctDiff.toFixed(1)}%), 拟合 β = ${bestBeta.toFixed(5)} A⁻²`);
+      fitNotes.push(`Step 3 (±15% 微调 Rs): Rs_eff = ${bestRs.toFixed(4)} Ω (${pctDiff >= 0 ? '+' : ''}${pctDiff.toFixed(1)}%), ${baselineRetained ? '保留基准 ' : '拟合 '}β = ${bestBeta.toFixed(5)} A⁻²`);
     }
+  } else {
+    identifiabilityReport = {
+      overallStatus: 'NOT_IDENTIFIABLE',
+      conditionNumber: Infinity,
+      numericalRank: 0,
+      fullRank: options.rsFitMode === 'bounded_15pct' ? 2 : 1,
+      singularValues: [],
+      residualRmsNm: Number.NaN,
+      dof: 0,
+      parameters: [keEntry, ...p0Entries],
+      correlationMatrix: { names: [], matrix: [] },
+      highCollinearityPairs: [],
+      p0Identifiability: {
+        identifiable: p0Identifiable,
+        conditionNumber: p0DesignConditionNumber,
+        rank: p0Identifiable ? 2 : 0,
+        speedLevels: p0Speeds.length,
+        speedSpanRpm: p0SpeedSpan,
+        correlationAB: p0CorrAB,
+        status: p0Identifiable ? 'IDENTIFIABLE' : 'NOT_IDENTIFIABLE',
+      },
+      excitation: {
+        closedLoopCount: 0,
+        torqueSpanNm: 0,
+        speedSpanRpm: 0,
+        vBusSpanV: 0,
+        sufficient: false,
+      },
+      baselineRetained: true,
+      warnings: ['闭环测功数据为空，Step 3 参数不可辨识。'],
+    };
   }
 
   const finalParams: MotorParams = {
@@ -1113,8 +1473,413 @@ export function runStepwiseCalibration(
     validationMetrics,
     operatingEnvelope,
     paramSensitivity,
+    identifiabilityReport,
     grid2D,
     fitNotes,
+  };
+}
+
+/** Student-t two-sided 95% critical quantile t_{0.975, dof}. */
+function tCritical95(dof: number): number {
+  if (!Number.isFinite(dof) || dof <= 0) return Infinity;
+  const table = [
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+  ];
+  const k = Math.floor(dof);
+  if (k <= 30) return table[k - 1];
+  return 1.96;
+}
+
+/**
+ * One-sided Jacobi thin SVD: A (m x p) = U * diag(S) * V^T, with V orthogonal (p x p)
+ * and singular values sorted descending. Numerically stable without squaring A^T A.
+ */
+export function computeThinSvd(A: number[][]): {
+  U: number[][];
+  S: number[];
+  V: number[][];
+} {
+  const m = A.length;
+  const p = m > 0 ? A[0].length : 0;
+  if (m === 0 || p === 0) {
+    return { U: [], S: [], V: [] };
+  }
+  const W = A.map((row) => row.slice());
+  const V = Array.from({ length: p }, (_, i) =>
+    Array.from({ length: p }, (__, j) => (i === j ? 1 : 0))
+  );
+
+  for (let sweep = 0; sweep < 50; sweep++) {
+    let maxOff = 0;
+    for (let j = 0; j < p - 1; j++) {
+      for (let k = j + 1; k < p; k++) {
+        let gjj = 0;
+        let gkk = 0;
+        let gjk = 0;
+        for (let i = 0; i < m; i++) {
+          const wj = W[i][j];
+          const wk = W[i][k];
+          gjj += wj * wj;
+          gkk += wk * wk;
+          gjk += wj * wk;
+        }
+        const denomNorm = Math.sqrt(gjj * gkk);
+        if (denomNorm <= 1e-30) continue;
+        const rel = Math.abs(gjk) / denomNorm;
+        if (rel > maxOff) maxOff = rel;
+        if (rel <= 1e-14) continue;
+
+        const tau = (gkk - gjj) / (2 * gjk);
+        const t =
+          tau >= 0
+            ? 1 / (tau + Math.sqrt(1 + tau * tau))
+            : -1 / (-tau + Math.sqrt(1 + tau * tau));
+        const c = 1 / Math.sqrt(1 + t * t);
+        const s = t * c;
+
+        for (let i = 0; i < m; i++) {
+          const wj = W[i][j];
+          const wk = W[i][k];
+          W[i][j] = c * wj - s * wk;
+          W[i][k] = s * wj + c * wk;
+        }
+        for (let i = 0; i < p; i++) {
+          const vj = V[i][j];
+          const vk = V[i][k];
+          V[i][j] = c * vj - s * vk;
+          V[i][k] = s * vj + c * vk;
+        }
+      }
+    }
+    if (maxOff <= 1e-14) break;
+  }
+
+  const norms = Array.from({ length: p }, (_, j) => {
+    let ss = 0;
+    for (let i = 0; i < m; i++) ss += W[i][j] * W[i][j];
+    return Math.sqrt(ss);
+  });
+  const order = Array.from({ length: p }, (_, j) => j).sort((a, b) => norms[b] - norms[a]);
+
+  const S = order.map((idx) => norms[idx]);
+  const U = Array.from({ length: m }, () => new Array<number>(p).fill(0));
+  const Vsorted = Array.from({ length: p }, () => new Array<number>(p).fill(0));
+  for (let col = 0; col < p; col++) {
+    const src = order[col];
+    const sig = norms[src];
+    for (let i = 0; i < m; i++) {
+      U[i][col] = sig > 1e-15 ? W[i][src] / sig : 0;
+    }
+    for (let i = 0; i < p; i++) {
+      Vsorted[i][col] = V[i][src];
+    }
+  }
+  return { U, S, V: Vsorted };
+}
+
+function analyzeNormalizedJacobianSvd(
+  Jraw: number[][],
+  residuals: number[],
+  scales: number[],
+  names: string[],
+  symbols: string[],
+  units: string[],
+  values: number[]
+): {
+  overallStatus: 'IDENTIFIABLE' | 'WEAKLY_IDENTIFIABLE' | 'NOT_IDENTIFIABLE';
+  conditionNumber: number;
+  numericalRank: number;
+  singularValues: number[];
+  residualRmsNm: number;
+  dof: number;
+  entries: ParameterIdentifiabilityEntry[];
+  correlationMatrix: { names: string[]; matrix: number[][] };
+  highCollinearityPairs: Array<{ paramA: string; paramB: string; correlation: number }>;
+  warnings: string[];
+} {
+  const m = Jraw.length;
+  const p = symbols.length;
+  const warnings: string[] = [];
+
+  if (m === 0 || p === 0) {
+    return {
+      overallStatus: 'NOT_IDENTIFIABLE',
+      conditionNumber: Infinity,
+      numericalRank: 0,
+      singularValues: [],
+      residualRmsNm: Number.NaN,
+      dof: 0,
+      entries: symbols.map((sym, idx) => ({
+        name: names[idx],
+        symbol: sym,
+        unit: units[idx],
+        value: values[idx],
+        stdError: Number.NaN,
+        ci95Low: Number.NaN,
+        ci95High: Number.NaN,
+        relativeCiPct: Number.NaN,
+        status: 'NOT_IDENTIFIABLE',
+        reason: '有效样本不足',
+      })),
+      correlationMatrix: { names: symbols, matrix: [] },
+      highCollinearityPairs: [],
+      warnings: ['有效可求解样本为 0，雅可比矩阵为空。'],
+    };
+  }
+
+  const Jnorm = Jraw.map((row) =>
+    row.map((val, j) => (Number.isFinite(val) ? val * scales[j] : 0))
+  );
+  const { S, V } = computeThinSvd(Jnorm);
+  const sMax = S[0] ?? 0;
+  const rankTol = Math.max(1e-8, Math.max(m, p) * 1e-8 * Math.max(sMax, 1e-12));
+  let numericalRank = 0;
+  for (const s of S) {
+    if (s > rankTol) numericalRank++;
+  }
+  const sMin = S[p - 1] ?? 0;
+  const conditionNumber =
+    numericalRank === p && sMin > 1e-12 ? sMax / sMin : Infinity;
+
+  const rss = residuals.reduce((acc, r) => acc + (Number.isFinite(r) ? r * r : 0), 0);
+  const dof = Math.max(0, m - numericalRank);
+  const residualRmsNm = dof > 0 ? Math.sqrt(rss / dof) : Number.NaN;
+  const s2 = dof > 0 ? rss / dof : Number.NaN;
+  const tCrit = tCritical95(dof);
+
+  const cov = Array.from({ length: p }, () => new Array<number>(p).fill(Number.NaN));
+  const corr = Array.from({ length: p }, (_, i) =>
+    Array.from({ length: p }, (__, j) => (i === j ? 1 : Number.NaN))
+  );
+
+  const nullEnergy = new Array<number>(p).fill(0);
+  for (let j = 0; j < p; j++) {
+    let e = 0;
+    for (let k = numericalRank; k < p; k++) {
+      e += V[j][k] * V[j][k];
+    }
+    nullEnergy[j] = e;
+  }
+
+  if (Number.isFinite(s2) && numericalRank > 0) {
+    for (let a = 0; a < p; a++) {
+      for (let b = 0; b < p; b++) {
+        let sum = 0;
+        for (let k = 0; k < numericalRank; k++) {
+          sum += (V[a][k] * V[b][k]) / (S[k] * S[k]);
+        }
+        cov[a][b] = s2 * scales[a] * scales[b] * sum;
+      }
+    }
+  }
+
+  const highCollinearityPairs: Array<{ paramA: string; paramB: string; correlation: number }> = [];
+  for (let a = 0; a < p; a++) {
+    for (let b = 0; b < p; b++) {
+      if (a === b) continue;
+      const vaa = cov[a][a];
+      const vbb = cov[b][b];
+      if (
+        nullEnergy[a] < 0.05 &&
+        nullEnergy[b] < 0.05 &&
+        Number.isFinite(vaa) &&
+        vaa > 0 &&
+        Number.isFinite(vbb) &&
+        vbb > 0
+      ) {
+        const c = Math.max(-1, Math.min(1, cov[a][b] / Math.sqrt(vaa * vbb)));
+        corr[a][b] = c;
+        if (a < b && Math.abs(c) >= 0.9) {
+          highCollinearityPairs.push({ paramA: symbols[a], paramB: symbols[b], correlation: c });
+        }
+      }
+    }
+  }
+
+  if (highCollinearityPairs.length > 0) {
+    const pairText = highCollinearityPairs
+      .map((pair) => `(${pair.paramA}, ${pair.paramB}: r=${pair.correlation.toFixed(3)})`)
+      .join('、');
+    warnings.push(`检测到参数强共线性 ${pairText} (|r| ≥ 0.90)，参数间存在等效权衡，单独置信区间可能失真。`);
+  }
+
+  const entries: ParameterIdentifiabilityEntry[] = symbols.map((sym, j) => {
+    const isNull = nullEnergy[j] >= 0.05 || numericalRank === 0;
+    const se = !isNull && Number.isFinite(cov[j][j]) && cov[j][j] >= 0 ? Math.sqrt(cov[j][j]) : Number.NaN;
+    const ciHalf = Number.isFinite(se) && Number.isFinite(tCrit) ? tCrit * se : Number.NaN;
+    const relCi = Number.isFinite(ciHalf) ? (ciHalf / Math.max(Math.abs(values[j]), scales[j] * 0.1)) * 100 : Number.NaN;
+
+    let status: ParameterIdentifiabilityStatus = 'IDENTIFIABLE';
+    let reason = `奇异值有效，95% CI 相对半宽 ${Number.isFinite(relCi) ? relCi.toFixed(1) : 'N/A'}%`;
+    if (isNull || dof <= 0) {
+      status = 'NOT_IDENTIFIABLE';
+      reason = dof <= 0 ? `自由度 dof=${dof} 不足` : '位于归一化雅可比零空间/奇异值退化';
+    } else if (!Number.isFinite(conditionNumber) || conditionNumber > 40) {
+      status = 'NOT_IDENTIFIABLE';
+      reason = `条件数 κ=${Number.isFinite(conditionNumber) ? conditionNumber.toFixed(1) : '∞'} > 40`;
+    } else if (conditionNumber > 15 || (Number.isFinite(relCi) && relCi > 50) || highCollinearityPairs.some((pr) => pr.paramA === sym || pr.paramB === sym)) {
+      status = 'WEAKLY_IDENTIFIABLE';
+      reason = `条件数 κ=${conditionNumber.toFixed(1)} 或相关性/CI 偏高`;
+    }
+    return {
+      name: names[j],
+      symbol: sym,
+      unit: units[j],
+      value: values[j],
+      stdError: isNull ? Number.NaN : se,
+      ci95Low: !isNull && Number.isFinite(ciHalf) ? values[j] - ciHalf : Number.NaN,
+      ci95High: !isNull && Number.isFinite(ciHalf) ? values[j] + ciHalf : Number.NaN,
+      relativeCiPct: isNull ? Number.NaN : relCi,
+      status,
+      reason,
+    };
+  });
+
+  const overallStatus: 'IDENTIFIABLE' | 'WEAKLY_IDENTIFIABLE' | 'NOT_IDENTIFIABLE' =
+    numericalRank < p || dof <= 0 || !Number.isFinite(conditionNumber) || conditionNumber > 40 || entries.some((e) => e.status === 'NOT_IDENTIFIABLE')
+      ? 'NOT_IDENTIFIABLE'
+      : entries.some((e) => e.status === 'WEAKLY_IDENTIFIABLE') || highCollinearityPairs.length > 0
+      ? 'WEAKLY_IDENTIFIABLE'
+      : 'IDENTIFIABLE';
+
+  return {
+    overallStatus,
+    conditionNumber,
+    numericalRank,
+    singularValues: S,
+    residualRmsNm,
+    dof,
+    entries,
+    correlationMatrix: { names: symbols, matrix: corr },
+    highCollinearityPairs,
+    warnings,
+  };
+}
+
+/**
+ * Dynamic rotordynamics parameter identifiability & OLS-SVD estimator for (J, B, Kt):
+ *   Kt * iq - J * dOmega/dt - B * omega_m ≈ T_load
+ */
+export function analyzeDynamicIdentifiability(
+  samples: DynamicIdentifiabilitySample[],
+  baseline: { jKgM2: number; bNmSPerRad: number; ktNmPerA: number }
+): DynamicIdentifiabilityResult {
+  const valid = samples.filter(
+    (s) =>
+      Number.isFinite(s.omegaM) &&
+      Number.isFinite(s.dOmegaDt) &&
+      Number.isFinite(s.iqA) &&
+      Number.isFinite(s.tLoadNm)
+  );
+  const scales = [
+    Math.max(Math.abs(baseline.jKgM2), 1e-4),
+    Math.max(Math.abs(baseline.bNmSPerRad), 1e-4),
+    Math.max(Math.abs(baseline.ktNmPerA), 0.05),
+  ];
+  const names = ['转动惯量 J', '粘滞阻尼 B', '转矩常数 Kt'];
+  const symbols = ['J', 'B', 'Kt'];
+  const units = ['kg·m²', 'N·m·s/rad', 'N·m/A'];
+
+  if (valid.length < 4) {
+    return {
+      overallStatus: 'NOT_IDENTIFIABLE',
+      jKgM2: baseline.jKgM2,
+      bNmSPerRad: baseline.bNmSPerRad,
+      ktNmPerA: baseline.ktNmPerA,
+      conditionNumber: Infinity,
+      numericalRank: 0,
+      fullRank: 3,
+      singularValues: [0, 0, 0],
+      residualRmsNm: Number.NaN,
+      dof: 0,
+      parameters: symbols.map((sym, idx) => ({
+        name: names[idx],
+        symbol: sym,
+        unit: units[idx],
+        value: [baseline.jKgM2, baseline.bNmSPerRad, baseline.ktNmPerA][idx],
+        stdError: Number.NaN,
+        ci95Low: Number.NaN,
+        ci95High: Number.NaN,
+        relativeCiPct: Number.NaN,
+        status: 'NOT_IDENTIFIABLE',
+        reason: '动态样本少于 4 点，无法辨识 (J, B, Kt)',
+      })),
+      correlationMatrix: { names: symbols, matrix: [[1, Number.NaN, Number.NaN], [Number.NaN, 1, Number.NaN], [Number.NaN, Number.NaN, 1]] },
+      highCollinearityPairs: [],
+      baselineRetained: true,
+      warnings: ['动态辨识有效样本不足 4 点，保留基准参数。'],
+    };
+  }
+
+  const Xraw = valid.map((s) => [-s.dOmegaDt, -s.omegaM, s.iqA]);
+  const Xnorm = Xraw.map((row) => row.map((v, j) => v * scales[j]));
+  const { U, S, V } = computeThinSvd(Xnorm);
+
+  const sMax = S[0] ?? 0;
+  const rankTol = Math.max(1e-8, valid.length * 1e-8 * Math.max(sMax, 1e-12));
+  let numericalRank = 0;
+  for (const s of S) {
+    if (s > rankTol) numericalRank++;
+  }
+  const sMin = S[2] ?? 0;
+  const condPre = numericalRank === 3 && sMin > 1e-12 ? sMax / sMin : Infinity;
+
+  const thetaNorm = [0, 0, 0];
+  for (let k = 0; k < numericalRank; k++) {
+    let uty = 0;
+    for (let i = 0; i < valid.length; i++) {
+      uty += U[i][k] * valid[i].tLoadNm;
+    }
+    const coeff = uty / S[k];
+    for (let j = 0; j < 3; j++) {
+      thetaNorm[j] += coeff * V[j][k];
+    }
+  }
+  const thetaHat = thetaNorm.map((v, j) => v * scales[j]);
+  const unidentifiablePre = numericalRank < 3 || !Number.isFinite(condPre) || condPre > 40;
+  const usedTheta = unidentifiablePre
+    ? [baseline.jKgM2, baseline.bNmSPerRad, baseline.ktNmPerA]
+    : thetaHat;
+
+  const residuals = valid.map(
+    (s) =>
+      usedTheta[2] * s.iqA - usedTheta[0] * s.dOmegaDt - usedTheta[1] * s.omegaM - s.tLoadNm
+  );
+  const diag = analyzeNormalizedJacobianSvd(Xraw, residuals, scales, names, symbols, units, usedTheta);
+  const baselineRetained = diag.overallStatus === 'NOT_IDENTIFIABLE';
+  const finalTheta = baselineRetained
+    ? [baseline.jKgM2, baseline.bNmSPerRad, baseline.ktNmPerA]
+    : thetaHat;
+
+  const warnings = [...diag.warnings];
+  if (baselineRetained) {
+    warnings.push(
+      `动态参数 (J, B, Kt) 不可充分辨识 (秩 ${diag.numericalRank}/3, κ=${Number.isFinite(diag.conditionNumber) ? diag.conditionNumber.toFixed(1) : '∞'})，已保留基准参数。`
+    );
+  }
+
+  return {
+    overallStatus: diag.overallStatus,
+    jKgM2: finalTheta[0],
+    bNmSPerRad: finalTheta[1],
+    ktNmPerA: finalTheta[2],
+    conditionNumber: diag.conditionNumber,
+    numericalRank: diag.numericalRank,
+    fullRank: 3,
+    singularValues: diag.singularValues,
+    residualRmsNm: diag.residualRmsNm,
+    dof: diag.dof,
+    parameters: diag.entries.map((entry, idx) =>
+      baselineRetained && entry.status === 'NOT_IDENTIFIABLE'
+        ? { ...entry, value: finalTheta[idx] }
+        : entry
+    ),
+    correlationMatrix: diag.correlationMatrix,
+    highCollinearityPairs: diag.highCollinearityPairs,
+    baselineRetained,
+    warnings,
   };
 }
 

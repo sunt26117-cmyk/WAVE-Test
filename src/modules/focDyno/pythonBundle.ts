@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 SVPWM_LINEAR_LIMIT = 2.0 / math.sqrt(3.0)  # 1.1547005383792517
+DEFAULT_SAMPLING_GAP_FACTOR = 3.5
 
 
 @dataclass
@@ -407,6 +408,28 @@ def is_monotonic_timestamps(times: np.ndarray) -> bool:
     return bool(np.all(np.isfinite(times)) and np.all(np.diff(times) > 0.0))
 
 
+def partition_continuous_time_segments(times: np.ndarray, gap_factor: float = DEFAULT_SAMPLING_GAP_FACTOR) -> tuple[list[tuple[int, int]], list[int], float, float]:
+    n_pts = len(times)
+    if n_pts == 0:
+        return [], [], 0.0, float("inf")
+    if n_pts == 1:
+        return [(0, 0)], [], 0.0, float("inf")
+    diffs = np.diff(times)
+    pos_dts = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+    median_dt = float(np.median(pos_dts)) if len(pos_dts) > 0 else 0.0
+    gap_threshold = max(1e-12, gap_factor * median_dt) if median_dt > 0.0 else float("inf")
+    segments: list[tuple[int, int]] = []
+    gap_indices: list[int] = []
+    seg_start = 0
+    for idx in range(1, n_pts):
+        if float(diffs[idx - 1]) > gap_threshold:
+            segments.append((seg_start, idx - 1))
+            gap_indices.append(idx)
+            seg_start = idx
+    segments.append((seg_start, n_pts - 1))
+    return segments, gap_indices, median_dt, gap_threshold
+
+
 def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: MotorParams) -> pd.DataFrame:
     times = df["Time"].to_numpy(dtype=float)
     raw_i = df["I_bus"].to_numpy(dtype=float)
@@ -421,72 +444,67 @@ def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: Motor
     if n_pts > 1 and not monotonic:
         raise ValueError("Runtime Log timestamps must be strictly increasing; sample-index fallback is disabled.")
 
+    segments, gap_indices, median_dt, gap_threshold = partition_continuous_time_segments(times)
+    isolated_indices: list[int] = []
     if n_pts == 0 or filter_window_ms <= 0.0:
         i_bus_filt = raw_i.copy()
-    elif monotonic:
+    else:
         half_w = (filter_window_ms * 1e-3) * 0.5
         i_bus_filt = np.empty(n_pts, dtype=float)
-        finite = np.isfinite(raw_i)
-        prefix = np.concatenate([[0.0], np.cumsum(np.where(finite, raw_i, 0.0))])
-        valid_prefix = np.concatenate([[0], np.cumsum(finite.astype(int))])
-        has_nan = bool(valid_prefix[-1] < n_pts)
-        if not has_nan:
-            dts = np.diff(times)
-            trap_segs = 0.5 * (raw_i[:-1] + raw_i[1:]) * dts
+        for s0, s1 in segments:
+            if s0 == s1:
+                if n_pts >= 2:
+                    i_bus_filt[s0] = float("nan")
+                    isolated_indices.append(s0)
+                else:
+                    i_bus_filt[s0] = raw_i[s0]
+                continue
+            seg_t = times[s0 : s1 + 1]
+            seg_i = raw_i[s0 : s1 + 1]
+            dts = np.diff(seg_t)
+            trap_segs = 0.5 * (seg_i[:-1] + seg_i[1:]) * dts
             trap_prefix = np.concatenate([[0.0], np.cumsum(trap_segs)])
-        else:
-            trap_prefix = None
-        left = 0
-        right = 0
-        for i in range(n_pts):
-            ti = times[i]
-            while left < i and ti - times[left] > half_w + 1e-12:
-                left += 1
-            if right < i:
-                right = i
-            while right + 1 < n_pts and times[right + 1] - ti <= half_w + 1e-12:
-                right += 1
-            if trap_prefix is not None:
+            left = s0
+            right = s0
+            for i in range(s0, s1 + 1):
+                ti = times[i]
+                while left < i and ti - times[left] > half_w + 1e-12:
+                    left += 1
+                if right < i:
+                    right = i
+                while right + 1 <= s1 and times[right + 1] - ti <= half_w + 1e-12:
+                    right += 1
                 span = times[right] - times[left]
                 if span > 1e-12:
-                    i_bus_filt[i] = (trap_prefix[right] - trap_prefix[left]) / span
+                    i_bus_filt[i] = (trap_prefix[right - s0] - trap_prefix[left - s0]) / span
                 else:
-                    cnt = right - left + 1
-                    i_bus_filt[i] = (prefix[right + 1] - prefix[left]) / cnt
-            else:
-                area = 0.0
-                first_t = float("nan")
-                last_t = float("nan")
-                prev_t = float("nan")
-                prev_v = float("nan")
-                f_sum = 0.0
-                f_cnt = 0
-                for k in range(left, right + 1):
-                    vk = raw_i[k]
-                    if not math.isfinite(vk):
-                        continue
-                    tk = times[k]
-                    f_sum += vk
-                    f_cnt += 1
-                    if not math.isfinite(first_t):
-                        first_t = tk
-                    else:
-                        area += 0.5 * (prev_v + vk) * (tk - prev_t)
-                    last_t = tk
-                    prev_t = tk
-                    prev_v = vk
-                span = (last_t - first_t) if (math.isfinite(first_t) and math.isfinite(last_t)) else 0.0
-                i_bus_filt[i] = (area / span) if span > 1e-12 else ((f_sum / f_cnt) if f_cnt > 0 else float("nan"))
+                    i_bus_filt[i] = raw_i[i]
 
     records = []
+    held_cols = ("iq", "t_est", "m_motor", "m_cmd", "vq_motor", "vq_cmd")
+    last_valid = {col: float("nan") for col in held_cols}
     for t, v, ib_raw, ib_f, n in zip(times, df["V_bus"], df["I_bus"], i_bus_filt, df["n_rpm"]):
         res = solve_single_point(float(v), float(ib_f), float(n), params)
+        sol_valid = bool(res["mode"] not in ("invalid_bus", "regen_limit") and math.isfinite(res["iq"]))
         res["time_s"] = float(t)
         res["i_bus_raw"] = float(ib_raw)
         res["i_bus_filt"] = float(ib_f)
+        res["solution_valid"] = sol_valid
+        res["is_held_prev_iq"] = bool((not sol_valid) and math.isfinite(last_valid["iq"]))
+        for col in held_cols:
+            if sol_valid and math.isfinite(res[col]):
+                last_valid[col] = float(res[col])
+                res[f"{col}_plot"] = float(res[col])
+            else:
+                res[f"{col}_plot"] = float(last_valid[col])
         records.append(res)
     out_df = pd.DataFrame(records)
     out_df.attrs["time_monotonic"] = monotonic
+    out_df.attrs["gap_count"] = len(gap_indices)
+    out_df.attrs["segment_count"] = len(segments)
+    out_df.attrs["isolated_count"] = len(isolated_indices)
+    out_df.attrs["median_dt_s"] = median_dt
+    out_df.attrs["gap_threshold_s"] = gap_threshold
     return out_df
 `;
 
@@ -951,6 +969,7 @@ def run_stepwise_calibration(
             "grid_t": None,
             "z_meas": None,
             "z_pred": None,
+            "z_extrap_mask": None,
         }
 
     def _step3_objective(points: pd.DataFrame, beta: float, rs: float) -> float:
@@ -1000,6 +1019,91 @@ def run_stepwise_calibration(
         if not improved:
             d_beta *= 0.5
             d_rs *= 0.5
+
+    # FD-02: Scaled/normalized Jacobian SVD identifiability, covariance, 95% CI & correlation matrix
+    solved_cl_rows = []
+    p_pre = MotorParams(**{**step3_base.__dict__, "beta_sat": best_beta, "rs_eff_override": best_rs})
+    for _, row in df_closed.iterrows():
+        rr = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), p_pre)
+        if math.isfinite(rr["t_est"]):
+            solved_cl_rows.append((row, float(rr["t_est"])))
+
+    fit_names = ["磁饱和系数 β", "等效相电阻 Rs_eff"] if rs_fit_mode == "bounded_15pct" else ["磁饱和系数 β"]
+    fit_symbols = ["betaSat", "rsEff"] if rs_fit_mode == "bounded_15pct" else ["betaSat"]
+    fit_units = ["A⁻²", "Ω"] if rs_fit_mode == "bounded_15pct" else ["A⁻²"]
+    theta_vec = [best_beta, best_rs] if rs_fit_mode == "bounded_15pct" else [best_beta]
+    scale_vec = [max(best_beta, 0.01), max(best_rs, 0.005)] if rs_fit_mode == "bounded_15pct" else [max(best_beta, 0.01)]
+    j_rows = []
+    res_vec = []
+    h_beta = 2e-4
+    h_rs = max(1e-5, 1e-3 * rs_anchor)
+    for row, t_est0 in solved_cl_rows:
+        vb, ib, nr, tm = float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), float(row["T_Nm"])
+        res_vec.append(t_est0 - tm)
+        j_col = []
+        if best_beta < h_beta:
+            rp = solve_single_point(vb, ib, nr, MotorParams(**{**p_pre.__dict__, "beta_sat": best_beta + h_beta}))
+            d_b = (rp["t_est"] - t_est0) / h_beta if math.isfinite(rp["t_est"]) else 0.0
+        else:
+            b_hi, b_lo = best_beta + h_beta, max(0.0, best_beta - h_beta)
+            rp = solve_single_point(vb, ib, nr, MotorParams(**{**p_pre.__dict__, "beta_sat": b_hi}))
+            rm = solve_single_point(vb, ib, nr, MotorParams(**{**p_pre.__dict__, "beta_sat": b_lo}))
+            d_b = (rp["t_est"] - rm["t_est"]) / (b_hi - b_lo) if math.isfinite(rp["t_est"]) and math.isfinite(rm["t_est"]) and (b_hi - b_lo) > 0 else 0.0
+        j_col.append(d_b)
+        if rs_fit_mode == "bounded_15pct":
+            rs_hi, rs_lo = best_rs + h_rs, max(1e-5, best_rs - h_rs)
+            rp = solve_single_point(vb, ib, nr, MotorParams(**{**p_pre.__dict__, "rs_eff_override": rs_hi}))
+            rm = solve_single_point(vb, ib, nr, MotorParams(**{**p_pre.__dict__, "rs_eff_override": rs_lo}))
+            d_r = (rp["t_est"] - rm["t_est"]) / (rs_hi - rs_lo) if math.isfinite(rp["t_est"]) and math.isfinite(rm["t_est"]) and (rs_hi - rs_lo) > 0 else 0.0
+            j_col.append(d_r)
+        j_rows.append(j_col)
+
+    svd_diag = _analyze_normalized_jacobian_svd(j_rows, res_vec, scale_vec, fit_names, fit_symbols, fit_units, theta_vec)
+    full_rank = len(fit_symbols)
+    step3_unidentifiable = (
+        svd_diag["numerical_rank"] < full_rank
+        or svd_diag["dof"] <= 0
+        or (not math.isfinite(svd_diag["condition_number"]))
+        or svd_diag["condition_number"] > 40.0
+        or any(e["status"] == "NOT_IDENTIFIABLE" for e in svd_diag["entries"])
+    )
+    baseline_retained = False
+    id_warnings = list(svd_diag["warnings"])
+    if step3_unidentifiable:
+        baseline_retained = True
+        best_beta = max(0.0, base_params.beta_sat)
+        best_rs = rs_anchor
+        _elevate("warn")
+        cond_txt = f"{svd_diag['condition_number']:.1f}" if math.isfinite(svd_diag["condition_number"]) else "∞"
+        msg = f"闭环参数辨识退化 (NOT_IDENTIFIABLE: 秩 {svd_diag['numerical_rank']}/{full_rank}, κ={cond_txt}, dof={svd_diag['dof']})；已保留基准 β={best_beta:.5f}, Rs_eff={best_rs:.4f} Ω。"
+        id_warnings.append(msg)
+        calib_warnings.append(msg)
+    elif svd_diag["overall_status"] == "WEAKLY_IDENTIFIABLE":
+        _elevate("warn")
+        msg = f"闭环参数弱可辨识 (WEAKLY_IDENTIFIABLE: κ={svd_diag['condition_number']:.1f})，建议补充跨负载/跨转速测点。"
+        id_warnings.append(msg)
+        calib_warnings.append(msg)
+
+    identifiability_report = {
+        "overall_status": "NOT_IDENTIFIABLE" if step3_unidentifiable else ("WEAKLY_IDENTIFIABLE" if (svd_diag["overall_status"] == "WEAKLY_IDENTIFIABLE" or not p0_identifiable) else "IDENTIFIABLE"),
+        "condition_number": svd_diag["condition_number"],
+        "numerical_rank": svd_diag["numerical_rank"],
+        "full_rank": full_rank,
+        "singular_values": svd_diag["singular_values"],
+        "residual_rms_nm": svd_diag["residual_rms_nm"],
+        "dof": svd_diag["dof"],
+        "entries": [
+            {**e, "value": (best_beta if idx == 0 else best_rs), "std_error": float("nan"), "ci95_low": float("nan"), "ci95_high": float("nan"), "status": "NOT_IDENTIFIABLE"}
+            if step3_unidentifiable else e
+            for idx, e in enumerate(svd_diag["entries"])
+        ],
+        "correlation_matrix": svd_diag["correlation_matrix"],
+        "high_collinearity_pairs": svd_diag["high_collinearity_pairs"],
+        "p0_condition_number": p0_design_condition_number,
+        "p0_identifiable": p0_identifiable,
+        "baseline_retained": baseline_retained,
+        "warnings": id_warnings,
+    }
 
     final_params = MotorParams(**{
         **step3_base.__dict__,
@@ -1197,15 +1301,20 @@ def run_stepwise_calibration(
         extra = "；若开环最高点受限幅未达 m_norm≈1，请改用手动 KV 或 (n0, V_test)。" if ke_source == "open_loop_auto" else "。"
         calib_warnings.append(f"扭矩回代偏差较高 (MAE={mae_t:.4f} N·m, MAPE={mape_t:.1f}%){extra}")
 
-    # Safe 2D Efficiency Map via convex hull interpolation + true model forward reconstruction
-    grid_n = grid_t = z_meas = z_pred = None
+    # Safe 2D Efficiency Map: linear interpolation inside convex hull, nearest-neighbor exterior fill marked untrusted
+    grid_n = grid_t = z_meas = z_pred = z_extrap_mask = None
     if len(df_eval) >= 4 and df_eval["n_rpm"].nunique() >= 2 and df_eval["T_Nm"].nunique() >= 2:
         try:
             grid_n = np.linspace(df_eval["n_rpm"].min(), df_eval["n_rpm"].max(), 30)
             grid_t = np.linspace(df_eval["T_Nm"].min(), df_eval["T_Nm"].max(), 24)
             gn, gt = np.meshgrid(grid_n, grid_t)
-            z_meas = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["eta"] * 100.0, (gn, gt), method="linear")
-            z_vbus = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["V_bus"], (gn, gt), method="linear")
+            z_meas_linear = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["eta"] * 100.0, (gn, gt), method="linear")
+            z_vbus_linear = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["V_bus"], (gn, gt), method="linear")
+            z_extrap_mask = ~np.isfinite(z_meas_linear)
+            z_meas_nearest = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["eta"] * 100.0, (gn, gt), method="nearest")
+            z_vbus_nearest = griddata((df_eval["n_rpm"], df_eval["T_Nm"]), df_eval["V_bus"], (gn, gt), method="nearest")
+            z_meas = np.where(z_extrap_mask, z_meas_nearest, z_meas_linear)
+            z_vbus = np.where(~np.isfinite(z_vbus_linear), z_vbus_nearest, z_vbus_linear)
             z_pred = np.full_like(z_meas, np.nan, dtype=float)
             kt0 = max(1e-6, 1.5 * final_params.ke_prime)
             beta = max(0.0, final_params.beta_sat)
@@ -1231,7 +1340,7 @@ def run_stepwise_calibration(
                     if (not fwd["invalid_bus"]) and math.isfinite(m_norm_c) and m_norm_c <= 1.0 + 1e-6 and math.isfinite(fwd["eta_est"]):
                         z_pred[j, i] = min(99.5, max(0.0, float(fwd["eta_est"]) * 100.0))
         except Exception:
-            grid_n = grid_t = z_meas = z_pred = None
+            grid_n = grid_t = z_meas = z_pred = z_extrap_mask = None
 
     return {
         "status": status,
@@ -1251,10 +1360,197 @@ def run_stepwise_calibration(
         "validation_metrics": validation_metrics,
         "operating_envelope": operating_envelope,
         "param_sensitivity": param_sensitivity,
+        "identifiability_report": identifiability_report,
         "grid_n": grid_n,
         "grid_t": grid_t,
         "z_meas": z_meas,
         "z_pred": z_pred,
+        "z_extrap_mask": z_extrap_mask,
+    }
+
+
+def _t_critical_95(dof: int) -> float:
+    if dof <= 0:
+        return math.inf
+    table = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+        2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+    ]
+    return table[dof - 1] if dof <= 30 else 1.96
+
+
+def _analyze_normalized_jacobian_svd(
+    j_raw: list[list[float]],
+    residuals: list[float],
+    scales: list[float],
+    names: list[str],
+    symbols: list[str],
+    units: list[str],
+    values: list[float],
+) -> dict:
+    m = len(j_raw)
+    p = len(symbols)
+    warnings: list[str] = []
+    if m == 0 or p == 0:
+        return {
+            "overall_status": "NOT_IDENTIFIABLE",
+            "condition_number": math.inf,
+            "numerical_rank": 0,
+            "singular_values": [],
+            "residual_rms_nm": float("nan"),
+            "dof": 0,
+            "entries": [
+                {"name": names[i], "symbol": sym, "unit": units[i], "value": values[i],
+                 "std_error": float("nan"), "ci95_low": float("nan"), "ci95_high": float("nan"),
+                 "relative_ci_pct": float("nan"), "status": "NOT_IDENTIFIABLE", "reason": "有效样本不足"}
+                for i, sym in enumerate(symbols)
+            ],
+            "correlation_matrix": {"names": symbols, "matrix": []},
+            "high_collinearity_pairs": [],
+            "warnings": ["有效样本为 0"],
+        }
+
+    j_mat = np.asarray(j_raw, dtype=float)
+    s_vec = np.asarray(scales, dtype=float)
+    j_norm = np.where(np.isfinite(j_mat), j_mat, 0.0) * s_vec[None, :]
+    _u, sigmas, vt = np.linalg.svd(j_norm, full_matrices=False)
+    v = vt.T
+    s_max = float(sigmas[0]) if len(sigmas) else 0.0
+    rank_tol = max(1e-8, max(m, p) * 1e-8 * max(s_max, 1e-12))
+    rank = int(np.sum(sigmas > rank_tol))
+    s_min = float(sigmas[p - 1]) if len(sigmas) == p else 0.0
+    cond = float(s_max / s_min) if (rank == p and s_min > 1e-12) else math.inf
+
+    r_arr = np.asarray(residuals, dtype=float)
+    rss = float(np.sum(np.where(np.isfinite(r_arr), r_arr * r_arr, 0.0)))
+    dof = max(0, m - rank)
+    rms = math.sqrt(rss / dof) if dof > 0 else float("nan")
+    s2 = rss / dof if dof > 0 else float("nan")
+    t_crit = _t_critical_95(dof)
+
+    null_energy = [float(np.sum(v[j, rank:] ** 2)) if rank < p else 0.0 for j in range(p)]
+    cov = np.full((p, p), float("nan"), dtype=float)
+    corr = np.full((p, p), float("nan"), dtype=float)
+    for i in range(p):
+        corr[i, i] = 1.0
+    if math.isfinite(s2) and rank > 0:
+        v_r = v[:, :rank]
+        inv_s2 = 1.0 / (sigmas[:rank] ** 2)
+        cov_norm = s2 * (v_r * inv_s2[None, :]) @ v_r.T
+        cov = cov_norm * np.outer(s_vec, s_vec)
+
+    high_pairs = []
+    for a in range(p):
+        for b in range(p):
+            if a == b:
+                continue
+            if null_energy[a] < 0.05 and null_energy[b] < 0.05 and math.isfinite(cov[a, a]) and cov[a, a] > 0 and math.isfinite(cov[b, b]) and cov[b, b] > 0:
+                c = max(-1.0, min(1.0, float(cov[a, b] / math.sqrt(cov[a, a] * cov[b, b]))))
+                corr[a, b] = c
+                if a < b and abs(c) >= 0.90:
+                    high_pairs.append({"paramA": symbols[a], "paramB": symbols[b], "correlation": c})
+
+    if high_pairs:
+        warnings.append("检测到参数强共线性 (|r| >= 0.90)。")
+
+    entries = []
+    for j, sym in enumerate(symbols):
+        is_null = null_energy[j] >= 0.05 or rank == 0
+        se = math.sqrt(float(cov[j, j])) if (not is_null and math.isfinite(cov[j, j]) and cov[j, j] >= 0) else float("nan")
+        ci_half = t_crit * se if math.isfinite(se) and math.isfinite(t_crit) else float("nan")
+        rel_ci = (ci_half / max(abs(values[j]), scales[j] * 0.1) * 100.0) if math.isfinite(ci_half) else float("nan")
+        if is_null or dof <= 0 or (not math.isfinite(cond)) or cond > 40.0:
+            st_p = "NOT_IDENTIFIABLE"
+            rsn = f"秩亏/条件数 κ={cond:.1f}" if math.isfinite(cond) else "奇异值退化或样本不足"
+        elif cond > 15.0 or (math.isfinite(rel_ci) and rel_ci > 50.0) or any(pr["paramA"] == sym or pr["paramB"] == sym for pr in high_pairs):
+            st_p = "WEAKLY_IDENTIFIABLE"
+            rsn = f"条件数 κ={cond:.1f} 或相关性/CI 偏高"
+        else:
+            st_p = "IDENTIFIABLE"
+            rsn = f"95% CI 相对半宽 {rel_ci:.1f}%"
+        entries.append({
+            "name": names[j],
+            "symbol": sym,
+            "unit": units[j],
+            "value": float(values[j]),
+            "std_error": se,
+            "ci95_low": float(values[j] - ci_half) if math.isfinite(ci_half) else float("nan"),
+            "ci95_high": float(values[j] + ci_half) if math.isfinite(ci_half) else float("nan"),
+            "relative_ci_pct": rel_ci,
+            "status": st_p,
+            "reason": rsn,
+        })
+
+    overall = (
+        "NOT_IDENTIFIABLE" if (rank < p or dof <= 0 or (not math.isfinite(cond)) or cond > 40.0 or any(e["status"] == "NOT_IDENTIFIABLE" for e in entries))
+        else ("WEAKLY_IDENTIFIABLE" if (any(e["status"] == "WEAKLY_IDENTIFIABLE" for e in entries) or high_pairs) else "IDENTIFIABLE")
+    )
+    return {
+        "overall_status": overall,
+        "condition_number": cond,
+        "numerical_rank": rank,
+        "singular_values": [float(x) for x in sigmas],
+        "residual_rms_nm": rms,
+        "dof": dof,
+        "entries": entries,
+        "correlation_matrix": {"names": symbols, "matrix": [[float(x) for x in row] for row in corr]},
+        "high_collinearity_pairs": high_pairs,
+        "warnings": warnings,
+    }
+
+
+def analyze_dynamic_identifiability(
+    samples: list[dict],
+    baseline_j: float = 1e-4,
+    baseline_b: float = 1e-4,
+    baseline_kt: float = 0.08,
+) -> dict:
+    valid = [
+        s for s in samples
+        if all(math.isfinite(float(s.get(k, float("nan")))) for k in ("omega_m", "domega_dt", "iq", "t_load"))
+    ]
+    scales = [max(abs(baseline_j), 1e-4), max(abs(baseline_b), 1e-4), max(abs(baseline_kt), 0.05)]
+    names = ["转动惯量 J", "粘滞阻尼 B", "转矩常数 Kt"]
+    symbols = ["J", "B", "Kt"]
+    units = ["kg·m²", "N·m·s/rad", "N·m/A"]
+    if len(valid) < 4:
+        return {
+            "overall_status": "NOT_IDENTIFIABLE",
+            "J": baseline_j, "B": baseline_b, "Kt": baseline_kt,
+            "condition_number": math.inf, "numerical_rank": 0, "full_rank": 3,
+            "baseline_retained": True, "warnings": ["动态样本不足 4 点，保留基准参数。"],
+        }
+    x_raw = [[-float(s["domega_dt"]), -float(s["omega_m"]), float(s["iq"])] for s in valid]
+    x_norm = np.asarray(x_raw, dtype=float) * np.asarray(scales, dtype=float)[None, :]
+    u, sigmas, vt = np.linalg.svd(x_norm, full_matrices=False)
+    v = vt.T
+    s_max = float(sigmas[0]) if len(sigmas) else 0.0
+    rank_tol = max(1e-8, len(valid) * 1e-8 * max(s_max, 1e-12))
+    rank = int(np.sum(sigmas > rank_tol))
+    y_vec = np.asarray([float(s["t_load"]) for s in valid], dtype=float)
+    theta_norm = np.zeros(3, dtype=float)
+    if rank > 0:
+        theta_norm = (v[:, :rank] @ ((u[:, :rank].T @ y_vec) / sigmas[:rank]))
+    theta_hat = [float(theta_norm[j] * scales[j]) for j in range(3)]
+    cond_pre = float(s_max / sigmas[2]) if (rank == 3 and sigmas[2] > 1e-12) else math.inf
+    unident_pre = rank < 3 or (not math.isfinite(cond_pre)) or cond_pre > 40.0
+    used_theta = [baseline_j, baseline_b, baseline_kt] if unident_pre else theta_hat
+    residuals = [used_theta[2] * float(s["iq"]) - used_theta[0] * float(s["domega_dt"]) - used_theta[1] * float(s["omega_m"]) - float(s["t_load"]) for s in valid]
+    diag = _analyze_normalized_jacobian_svd(x_raw, residuals, scales, names, symbols, units, used_theta)
+    retained = diag["overall_status"] == "NOT_IDENTIFIABLE"
+    final_theta = [baseline_j, baseline_b, baseline_kt] if retained else theta_hat
+    return {
+        "overall_status": diag["overall_status"],
+        "J": final_theta[0], "B": final_theta[1], "Kt": final_theta[2],
+        "condition_number": diag["condition_number"],
+        "numerical_rank": diag["numerical_rank"],
+        "full_rank": 3,
+        "entries": diag["entries"],
+        "correlation_matrix": diag["correlation_matrix"],
+        "high_collinearity_pairs": diag["high_collinearity_pairs"],
+        "baseline_retained": retained,
+        "warnings": diag["warnings"],
     }
 `;
 
@@ -1410,6 +1706,500 @@ def synthesize_6mos_csv(
     return df_wave, summary
 `;
 
+const DYNAMIC_PMSM_PY = String.raw`"""
+dynamic_pmsm.py - Standalone Dynamic PMSM dq-Axis Transient ODE Simulator (FD-03)
+
+Strictly decoupled from steady-state SPMSM dyno calibration (dyno_calibrator.py / solve_single_point).
+Amplitude-invariant Clarke/Park transient equations integrated with micro-stepped RK4:
+  di_d/dt = (v_d - Rs * i_d + omega_e * Lq * i_q) / Ld
+  di_q/dt = (v_q - Rs * i_q - omega_e * (Ld * i_d + psi_f)) / Lq
+  Te      = 1.5 * p * (psi_f * i_q + (Ld - Lq) * i_d * i_q)
+  domega_m/dt = (Te - B * omega_m - T_coulomb * tanh(omega_m / 0.5) - T_load) / J
+  dtheta_e/dt = p * omega_m
+
+Provenance: synthetic_assumed_uncalibrated
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import math
+
+
+@dataclass
+class DynamicPmsmParams:
+    pole_pairs: int = 7
+    rs_ohm: float = 0.395
+    ld_h: float = 2.2e-4
+    lq_h: float = 2.2e-4
+    psi_f_vs: float = 0.051332 / 7.0
+    j_kg_m2: float = 1.2e-4
+    b_nm_s_per_rad: float = 1.5e-4
+    t_coulomb_nm: float = 0.005
+    v_bus_v: float = 13.5
+    i_max_a: float = 12.0
+    control_mode: str = "mtpa_current_loop"  # mtpa_current_loop | id_zero | open_loop_vdq
+    current_bandwidth_rad_s: float | None = None
+    kp_speed: float | None = None
+    ki_speed: float | None = None
+
+
+@dataclass
+class DynamicScenarioStep:
+    t_start_sec: float
+    t_end_sec: float
+    t_load_nm: float = 0.0
+    speed_ref_rpm: float | None = None
+    iq_ref_a: float | None = None
+    vd_ref_v: float = 0.0
+    vq_ref_v: float = 0.0
+    v_bus_v: float | None = None
+
+
+@dataclass
+class DynamicPmsmConfig:
+    duration_sec: float = 0.3
+    dt_out_sec: float = 2e-4
+    initial_speed_rpm: float = 0.0
+    initial_id_a: float = 0.0
+    initial_iq_a: float = 0.0
+    initial_theta_e_rad: float = 0.0
+    scenario: list[DynamicScenarioStep] = field(default_factory=list)
+
+
+def ke_prime_to_psi_f(ke_prime: float, pole_pairs: int) -> float:
+    return float(ke_prime) / max(1, int(pole_pairs))
+
+
+def calc_dynamic_pmsm_torque(
+    id_a: float, iq_a: float, pole_pairs: int, psi_f_vs: float, ld_h: float, lq_h: float
+) -> float:
+    return 1.5 * pole_pairs * (psi_f_vs * iq_a + (ld_h - lq_h) * id_a * iq_a)
+
+
+def compute_mtpa_and_fw_target(
+    i_torque_cmd_a: float,
+    omega_e_rad_s: float,
+    v_bus_v: float,
+    params: DynamicPmsmParams,
+) -> dict[str, float | bool]:
+    i_max = max(0.05, float(params.i_max_a))
+    abs_cmd = abs(i_torque_cmd_a)
+    current_limited = abs_cmd > i_max + 1e-9
+    i_mag = min(abs_cmd, i_max)
+    sign_q = 1.0 if i_torque_cmd_a >= 0.0 else -1.0
+
+    id_ref = 0.0
+    iq_ref = sign_q * i_mag
+
+    if params.control_mode == "mtpa_current_loop":
+        dl = params.ld_h - params.lq_h
+        if abs(dl) > 1e-9 and i_mag > 1e-9:
+            psi = max(1e-6, params.psi_f_vs)
+            disc = psi * psi + 8.0 * dl * dl * i_mag * i_mag
+            id_ref = (-psi + math.sqrt(disc)) / (4.0 * dl)
+            id_bound = i_mag * 0.95
+            if abs(id_ref) > id_bound:
+                id_ref = math.copysign(id_bound, id_ref)
+            iq_ref = sign_q * math.sqrt(max(0.0, i_mag * i_mag - id_ref * id_ref))
+
+    v_max_eff = (max(0.5, float(v_bus_v)) / math.sqrt(3.0)) * 0.96
+    abs_we = abs(omega_e_rad_s)
+    fw_active = False
+    if abs_we > 1.0 and params.control_mode == "mtpa_current_loop":
+        v_req = math.hypot(-abs_we * params.lq_h * iq_ref, abs_we * (params.ld_h * id_ref + params.psi_f_vs))
+        if v_req > v_max_eff:
+            fw_active = True
+            lo_init = -i_max
+            hi_init = id_ref
+            best_id = lo_init
+            best_iq_abs = 0.0
+            samples = 40
+            for k in range(samples + 1):
+                id_cand = lo_init + ((hi_init - lo_init) * k) / samples
+                iq_cap_cur = math.sqrt(max(0.0, i_max * i_max - id_cand * id_cand))
+                vd_back = abs_we * (params.ld_h * id_cand + params.psi_f_vs)
+                rem_v2 = v_max_eff * v_max_eff - vd_back * vd_back
+                if rem_v2 <= 0.0:
+                    continue
+                iq_cap_volt = math.sqrt(rem_v2) / max(1e-7, abs_we * params.lq_h)
+                iq_feas = min(iq_cap_cur, iq_cap_volt)
+                if iq_feas > best_iq_abs:
+                    best_iq_abs = iq_feas
+                    best_id = id_cand
+            id_ref = best_id
+            iq_ref = sign_q * min(abs(iq_ref), best_iq_abs)
+
+    return {
+        "id_ref_a": id_ref,
+        "iq_ref_a": iq_ref,
+        "current_limited": current_limited,
+        "field_weakening_active": fw_active,
+    }
+
+
+def _sample_scenario_at(
+    t_sec: float, params: DynamicPmsmParams, scenario: list[DynamicScenarioStep]
+) -> dict[str, float | None]:
+    if not scenario:
+        return {
+            "t_load_nm": 0.0,
+            "v_bus_v": params.v_bus_v,
+            "speed_ref_rpm": None,
+            "iq_ref_a": 0.0,
+            "vd_ref_v": 0.0,
+            "vq_ref_v": 0.0,
+        }
+    chosen = scenario[-1]
+    for step in scenario:
+        if step.t_start_sec - 1e-12 <= t_sec <= step.t_end_sec + 1e-12:
+            chosen = step
+            break
+    v_step = chosen.v_bus_v if (chosen.v_bus_v is not None and math.isfinite(chosen.v_bus_v) and chosen.v_bus_v > 0.5) else params.v_bus_v
+    return {
+        "t_load_nm": chosen.t_load_nm if math.isfinite(chosen.t_load_nm) else 0.0,
+        "v_bus_v": float(v_step),
+        "speed_ref_rpm": chosen.speed_ref_rpm,
+        "iq_ref_a": chosen.iq_ref_a,
+        "vd_ref_v": float(chosen.vd_ref_v) if math.isfinite(chosen.vd_ref_v) else 0.0,
+        "vq_ref_v": float(chosen.vq_ref_v) if math.isfinite(chosen.vq_ref_v) else 0.0,
+    }
+
+
+def build_dynamic_preset_scenario(preset: str) -> tuple[dict[str, float | int | str], DynamicPmsmConfig]:
+    if preset == "four_quadrant_regen":
+        return (
+            {"control_mode": "mtpa_current_loop", "i_max_a": 15.0, "v_bus_v": 24.0},
+            DynamicPmsmConfig(
+                duration_sec=0.35,
+                dt_out_sec=2e-4,
+                initial_speed_rpm=0.0,
+                scenario=[
+                    DynamicScenarioStep(0.0, 0.12, t_load_nm=0.05, speed_ref_rpm=1400.0),
+                    DynamicScenarioStep(0.12, 0.24, t_load_nm=0.05, speed_ref_rpm=-900.0),
+                    DynamicScenarioStep(0.24, 0.35, t_load_nm=-0.08, speed_ref_rpm=-900.0),
+                ],
+            ),
+        )
+    if preset == "ipm_mtpa_fw":
+        return (
+            {
+                "pole_pairs": 4,
+                "rs_ohm": 0.045,
+                "ld_h": 0.18e-3,
+                "lq_h": 0.42e-3,
+                "psi_f_vs": 0.015,
+                "j_kg_m2": 6.5e-5,
+                "b_nm_s_per_rad": 8e-5,
+                "t_coulomb_nm": 0.005,
+                "v_bus_v": 24.0,
+                "i_max_a": 18.0,
+                "control_mode": "mtpa_current_loop",
+            },
+            DynamicPmsmConfig(
+                duration_sec=0.25,
+                dt_out_sec=2e-4,
+                initial_speed_rpm=0.0,
+                scenario=[
+                    DynamicScenarioStep(0.0, 0.08, t_load_nm=0.25, speed_ref_rpm=1500.0),
+                    DynamicScenarioStep(0.08, 0.25, t_load_nm=0.15, speed_ref_rpm=4800.0),
+                ],
+            ),
+        )
+    return (
+        {"control_mode": "mtpa_current_loop"},
+        DynamicPmsmConfig(
+            duration_sec=0.3,
+            dt_out_sec=2e-4,
+            initial_speed_rpm=0.0,
+            scenario=[
+                DynamicScenarioStep(0.0, 0.12, t_load_nm=0.02, speed_ref_rpm=1000.0),
+                DynamicScenarioStep(0.12, 0.22, t_load_nm=0.16, speed_ref_rpm=1000.0),
+                DynamicScenarioStep(0.22, 0.3, t_load_nm=0.05, speed_ref_rpm=1300.0),
+            ],
+        ),
+    )
+
+
+def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsmConfig) -> dict:
+    p = max(1, int(round(raw_params.pole_pairs)))
+    rs = max(1e-4, float(raw_params.rs_ohm))
+    ld = max(1e-6, float(raw_params.ld_h))
+    lq = max(1e-6, float(raw_params.lq_h))
+    psi_f = max(1e-5, float(raw_params.psi_f_vs))
+    j_rot = max(1e-7, float(raw_params.j_kg_m2))
+    b_visc = max(0.0, float(raw_params.b_nm_s_per_rad))
+    t_coul = max(0.0, float(raw_params.t_coulomb_nm))
+    params = DynamicPmsmParams(
+        pole_pairs=p,
+        rs_ohm=rs,
+        ld_h=ld,
+        lq_h=lq,
+        psi_f_vs=psi_f,
+        j_kg_m2=j_rot,
+        b_nm_s_per_rad=b_visc,
+        t_coulomb_nm=t_coul,
+        v_bus_v=max(1.0, float(raw_params.v_bus_v)),
+        i_max_a=max(0.1, float(raw_params.i_max_a)),
+        control_mode=raw_params.control_mode,
+        current_bandwidth_rad_s=raw_params.current_bandwidth_rad_s,
+        kp_speed=raw_params.kp_speed,
+        ki_speed=raw_params.ki_speed,
+    )
+
+    duration = max(1e-3, min(10.0, float(raw_config.duration_sec)))
+    dt_out = max(1e-5, min(0.02, float(raw_config.dt_out_sec)))
+    n_out = max(2, min(4000, int(math.floor(duration / dt_out)) + 1))
+    eff_dt_out = duration / (n_out - 1)
+
+    tau_elec_min = min(ld, lq) / rs
+    max_step_h = min(2e-5, 0.05 * tau_elec_min, eff_dt_out)
+    substeps = max(1, int(math.ceil(eff_dt_out / max(1e-7, max_step_h))))
+    h = eff_dt_out / substeps
+
+    bw_i = max(100.0, float(raw_params.current_bandwidth_rad_s)) if raw_params.current_bandwidth_rad_s is not None else 2.0 * math.pi * 300.0
+    kp_d = ld * bw_i
+    ki_d = rs * bw_i
+    kp_q = lq * bw_i
+    ki_q = rs * bw_i
+
+    kt0 = 1.5 * p * psi_f
+    bw_w = min(bw_i * 0.15, 120.0)
+    kp_w = float(raw_params.kp_speed) if raw_params.kp_speed is not None else (j_rot * bw_w) / max(1e-4, kt0)
+    ki_w = float(raw_params.ki_speed) if raw_params.ki_speed is not None else (kp_w * bw_w * 0.25)
+
+    warnings = [
+        "此模块为合成假设动态模型 (synthetic_assumed_uncalibrated)，使用独立的 Ld/Lq/J/B 参数与 RK4 求解，不等同于 Tab 1 稳态测功标定或实测示波器采集。"
+    ]
+
+    time_arr: list[float] = []
+    theta_e_arr: list[float] = []
+    omega_m_arr: list[float] = []
+    n_rpm_arr: list[float] = []
+    id_arr: list[float] = []
+    iq_arr: list[float] = []
+    vd_arr: list[float] = []
+    vq_arr: list[float] = []
+    ia_arr: list[float] = []
+    ib_arr: list[float] = []
+    ic_arr: list[float] = []
+    te_arr: list[float] = []
+    t_load_arr: list[float] = []
+    v_bus_arr: list[float] = []
+    m_norm_arr: list[float] = []
+    volt_lim_arr: list[int] = []
+    curr_lim_arr: list[int] = []
+    quadrant_arr: list[str] = []
+
+    id_a = float(raw_config.initial_id_a) if math.isfinite(raw_config.initial_id_a) else 0.0
+    iq_a = float(raw_config.initial_iq_a) if math.isfinite(raw_config.initial_iq_a) else 0.0
+    omega_m = (float(raw_config.initial_speed_rpm) * 2.0 * math.pi / 60.0) if math.isfinite(raw_config.initial_speed_rpm) else 0.0
+    theta_e = float(raw_config.initial_theta_e_rad) if math.isfinite(raw_config.initial_theta_e_rad) else 0.0
+    int_id = 0.0
+    int_iq = 0.0
+    int_w = 0.0
+
+    def eval_control(t_sec: float, cur_id: float, cur_iq: float, cur_omega_m: float):
+        cmd = _sample_scenario_at(t_sec, params, raw_config.scenario)
+        v_bus = float(cmd["v_bus_v"])
+        v_max = v_bus / math.sqrt(3.0)
+        we = p * cur_omega_m
+        vd_cmd = float(cmd["vd_ref_v"])
+        vq_cmd = float(cmd["vq_ref_v"])
+        curr_limited = False
+
+        if params.control_mode != "open_loop_vdq":
+            if cmd["iq_ref_a"] is not None and math.isfinite(cmd["iq_ref_a"]):
+                i_torq_cmd = float(cmd["iq_ref_a"])
+            else:
+                w_ref = (float(cmd["speed_ref_rpm"] or 0.0) * 2.0 * math.pi) / 60.0
+                i_torq_cmd = kp_w * (w_ref - cur_omega_m) + int_w
+            tgt = compute_mtpa_and_fw_target(i_torq_cmd, we, v_bus, params)
+            curr_limited = bool(tgt["current_limited"])
+            err_d = float(tgt["id_ref_a"]) - cur_id
+            err_q = float(tgt["iq_ref_a"]) - cur_iq
+            vd_cmd = kp_d * err_d + int_id - we * lq * cur_iq
+            vq_cmd = kp_q * err_q + int_iq + we * (ld * cur_id + psi_f)
+
+        v_mag = math.hypot(vd_cmd, vq_cmd)
+        v_limited = v_mag > v_max
+        scale = (v_max / v_mag) if (v_limited and v_mag > 1e-12) else 1.0
+        return {
+            "cmd": cmd,
+            "vd": vd_cmd * scale,
+            "vq": vq_cmd * scale,
+            "vd_cmd": vd_cmd,
+            "vq_cmd": vq_cmd,
+            "v_max": v_max,
+            "v_limited": v_limited,
+            "curr_limited": curr_limited,
+        }
+
+    def rhs(cur_id: float, cur_iq: float, cur_omega_m: float, vd: float, vq: float, t_load_nm: float):
+        we = p * cur_omega_m
+        d_id = (vd - rs * cur_id + we * lq * cur_iq) / ld
+        d_iq = (vq - rs * cur_iq - we * (ld * cur_id + psi_f)) / lq
+        te = calc_dynamic_pmsm_torque(cur_id, cur_iq, p, psi_f, ld, lq)
+        fric = b_visc * cur_omega_m + t_coul * math.tanh(cur_omega_m / 0.5)
+        d_omega_m = (te - fric - t_load_nm) / j_rot
+        return d_id, d_iq, d_omega_m, we
+
+    peak_abs_i = 0.0
+    peak_abs_t = 0.0
+    peak_rpm = -float("inf")
+    min_rpm = float("inf")
+    volt_hits = 0
+    curr_hits = 0
+    last_vd = 0.0
+    last_vq = 0.0
+    last_tload = 0.0
+
+    for k in range(n_out):
+        t_cur = k * eff_dt_out
+        ctrl = eval_control(t_cur, id_a, iq_a, omega_m)
+        te_now = calc_dynamic_pmsm_torque(id_a, iq_a, p, psi_f, ld, lq)
+        n_rpm_now = (omega_m * 60.0) / (2.0 * math.pi)
+
+        ia = id_a * math.cos(theta_e) - iq_a * math.sin(theta_e)
+        ib = id_a * math.cos(theta_e - (2.0 * math.pi) / 3.0) - iq_a * math.sin(theta_e - (2.0 * math.pi) / 3.0)
+        ic = -(ia + ib)
+
+        v_mag = math.hypot(ctrl["vd"], ctrl["vq"])
+        m_norm = (v_mag / ctrl["v_max"]) if ctrl["v_max"] > 0.0 else 0.0
+
+        time_arr.append(t_cur)
+        theta_e_arr.append(theta_e)
+        omega_m_arr.append(omega_m)
+        n_rpm_arr.append(n_rpm_now)
+        id_arr.append(id_a)
+        iq_arr.append(iq_a)
+        vd_arr.append(ctrl["vd"])
+        vq_arr.append(ctrl["vq"])
+        ia_arr.append(ia)
+        ib_arr.append(ib)
+        ic_arr.append(ic)
+        te_arr.append(te_now)
+        t_load_arr.append(float(ctrl["cmd"]["t_load_nm"]))
+        v_bus_arr.append(float(ctrl["cmd"]["v_bus_v"]))
+        m_norm_arr.append(m_norm)
+        volt_lim_arr.append(1 if ctrl["v_limited"] else 0)
+        curr_lim_arr.append(1 if ctrl["curr_limited"] else 0)
+
+        p_mech = omega_m * te_now
+        if abs(omega_m) < 0.05 and abs(te_now) < 1e-3:
+            q_mode = "standstill"
+        elif p_mech < -1e-3:
+            q_mode = "regen"
+        else:
+            q_mode = "motoring"
+        quadrant_arr.append(q_mode)
+
+        peak_abs_i = max(peak_abs_i, math.hypot(id_a, iq_a))
+        peak_abs_t = max(peak_abs_t, abs(te_now))
+        peak_rpm = max(peak_rpm, n_rpm_now)
+        min_rpm = min(min_rpm, n_rpm_now)
+        if ctrl["v_limited"]:
+            volt_hits += 1
+        if ctrl["curr_limited"]:
+            curr_hits += 1
+        last_vd = ctrl["vd"]
+        last_vq = ctrl["vq"]
+        last_tload = float(ctrl["cmd"]["t_load_nm"])
+
+        if k == n_out - 1:
+            break
+
+        for s in range(substeps):
+            ts = t_cur + s * h
+            cs = eval_control(ts, id_a, iq_a, omega_m)
+            t_ld = float(cs["cmd"]["t_load_nm"])
+            k1 = rhs(id_a, iq_a, omega_m, cs["vd"], cs["vq"], t_ld)
+            k2 = rhs(id_a + 0.5 * h * k1[0], iq_a + 0.5 * h * k1[1], omega_m + 0.5 * h * k1[2], cs["vd"], cs["vq"], t_ld)
+            k3 = rhs(id_a + 0.5 * h * k2[0], iq_a + 0.5 * h * k2[1], omega_m + 0.5 * h * k2[2], cs["vd"], cs["vq"], t_ld)
+            k4 = rhs(id_a + h * k3[0], iq_a + h * k3[1], omega_m + h * k3[2], cs["vd"], cs["vq"], t_ld)
+
+            id_a += (h / 6.0) * (k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0])
+            iq_a += (h / 6.0) * (k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1])
+            omega_m += (h / 6.0) * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2])
+            theta_e += (h / 6.0) * (k1[3] + 2.0 * k2[3] + 2.0 * k3[3] + k4[3])
+
+            if params.control_mode != "open_loop_vdq":
+                we_n = p * omega_m
+                if cs["cmd"]["iq_ref_a"] is not None and math.isfinite(cs["cmd"]["iq_ref_a"]):
+                    i_torq_cmd = float(cs["cmd"]["iq_ref_a"])
+                else:
+                    w_ref = (float(cs["cmd"]["speed_ref_rpm"] or 0.0) * 2.0 * math.pi) / 60.0
+                    err_w = w_ref - omega_m
+                    unsat_i = kp_w * err_w + int_w
+                    sat_i = max(-params.i_max_a, min(params.i_max_a, unsat_i))
+                    int_w += h * (ki_w * err_w + 0.25 * bw_w * (sat_i - unsat_i))
+                    i_torq_cmd = sat_i
+                tgt = compute_mtpa_and_fw_target(i_torq_cmd, we_n, float(cs["cmd"]["v_bus_v"]), params)
+                err_d = float(tgt["id_ref_a"]) - id_a
+                err_q = float(tgt["iq_ref_a"]) - iq_a
+                aw_d = (cs["vd"] - cs["vd_cmd"]) * 0.5 if cs["v_limited"] else 0.0
+                aw_q = (cs["vq"] - cs["vq_cmd"]) * 0.5 if cs["v_limited"] else 0.0
+                int_id += h * (ki_d * err_d + bw_i * aw_d)
+                int_iq += h * (ki_q * err_q + bw_i * aw_q)
+
+    we_end = p * omega_m
+    analytical_vd = rs * id_a - we_end * lq * iq_a
+    analytical_vq = rs * iq_a + we_end * (ld * id_a + psi_f)
+    analytical_te = calc_dynamic_pmsm_torque(id_a, iq_a, p, psi_f, ld, lq)
+    end_rhs = rhs(id_a, iq_a, omega_m, last_vd, last_vq, last_tload)
+
+    if volt_hits > 0:
+        warnings.append(f"仿真中有 {volt_hits} 个采样点触发 SVPWM 电压圆限幅 (|Vdq| >= Vbus/sqrt(3))。")
+    if curr_hits > 0:
+        warnings.append(f"仿真中有 {curr_hits} 个采样点触发相电流上限限幅 (|I| >= {params.i_max_a:.1f} A)。")
+
+    return {
+        "provenance": "synthetic_assumed_uncalibrated",
+        "source_model": "dynamic_pmsm_dq_rk4",
+        "warnings": warnings,
+        "dt_internal_sec": h,
+        "substeps_per_output": substeps,
+        "time": time_arr,
+        "theta_e": theta_e_arr,
+        "omega_m": omega_m_arr,
+        "n_rpm": n_rpm_arr,
+        "id_a": id_arr,
+        "iq_a": iq_arr,
+        "vd_v": vd_arr,
+        "vq_v": vq_arr,
+        "ia_a": ia_arr,
+        "ib_a": ib_arr,
+        "ic_a": ic_arr,
+        "te_nm": te_arr,
+        "t_load_nm": t_load_arr,
+        "v_bus_v": v_bus_arr,
+        "m_norm": m_norm_arr,
+        "voltage_limited": volt_lim_arr,
+        "current_limited": curr_lim_arr,
+        "quadrant_mode": quadrant_arr,
+        "peak_abs_current_a": peak_abs_i,
+        "peak_abs_torque_nm": peak_abs_t,
+        "peak_speed_rpm": peak_rpm,
+        "min_speed_rpm": min_rpm,
+        "voltage_limit_hits": volt_hits,
+        "current_limit_hits": curr_hits,
+        "steady_check": {
+            "final_speed_rpm": (omega_m * 60.0) / (2.0 * math.pi),
+            "final_id_a": id_a,
+            "final_iq_a": iq_a,
+            "analytical_te_nm": analytical_te,
+            "analytical_vd_v": analytical_vd,
+            "analytical_vq_v": analytical_vq,
+            "sim_te_nm": te_arr[-1],
+            "sim_vd_v": last_vd,
+            "sim_vq_v": last_vq,
+            "torque_diff_nm": abs(te_arr[-1] - analytical_te),
+            "voltage_diff_v": math.hypot(last_vd - analytical_vd, last_vq - analytical_vq),
+            "di_dt_norm_aps": math.hypot(end_rhs[0], end_rhs[1]),
+            "domega_dt_norm_rad_s2": abs(end_rhs[2]),
+        },
+    }
+`;
+
 const APP_PY = String.raw`"""
 app.py - BLDC/FOC Dyno Calibration, Runtime Iq/Vq Estimation & 6-MOS Exporter (V2.0)
 Run locally with: streamlit run app.py
@@ -1425,6 +2215,13 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from dyno_calibrator import auto_map_columns, normalize_dyno_df, run_stepwise_calibration
+from dynamic_pmsm import (
+    DynamicPmsmConfig,
+    DynamicPmsmParams,
+    DynamicScenarioStep,
+    build_dynamic_preset_scenario,
+    simulate_dynamic_pmsm,
+)
 from motor_physics import (
     MotorParams,
     SVPWM_LINEAR_LIMIT,
@@ -1610,7 +2407,12 @@ with st.sidebar:
     p.f_sw_khz = st.number_input("开关频率 f_sw (kHz)", 1.0, 200.0, float(p.f_sw_khz), format="%.1f")
     p.v_sd = st.number_input("体二极管压降 V_SD (V)", 0.2, 2.5, float(p.v_sd), format="%.2f")
 
-tab1, tab2, tab3 = st.tabs(["Tab 1: 测功仪标定与 2D Map", "Tab 2: 运行态推算与告警", "Tab 3: 6-MOS 波形与参数导出"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Tab 1: 测功仪标定与 2D Map",
+    "Tab 2: 运行态推算与告警",
+    "Tab 3: 6-MOS 波形与参数导出",
+    "Tab 4: 动态 dq 瞬态仿真 (非标定)",
+])
 
 with tab1:
     u_col1, u_col2 = st.columns(2)
@@ -1719,6 +2521,16 @@ with tab1:
             )
         if audit_parts:
             st.caption(" | ".join(audit_parts))
+        id_rep = report.get("identifiability_report")
+        if id_rep:
+            cond_txt = f"{id_rep['condition_number']:.2f}" if math.isfinite(id_rep["condition_number"]) else "∞"
+            st.info(
+                f"参数可辨识性: {id_rep['overall_status']} | 秩={id_rep['numerical_rank']}/{id_rep['full_rank']} | "
+                f"κ={cond_txt} | DOF={id_rep['dof']}"
+                + (" | 已回退保留基准参数" if id_rep.get("baseline_retained") else "")
+            )
+            if id_rep.get("entries"):
+                st.dataframe(pd.DataFrame(id_rep["entries"]), width="stretch", hide_index=True)
 
         df_eval = report["eval_df"].sort_values(["n_rpm", "T_Nm"]).reset_index(drop=True)
         fig_cmp = make_subplots(rows=1, cols=2, subplot_titles=("实测 vs 预测扭矩 (N·m)", "实测 vs 预测效率 (%)"))
@@ -1727,15 +2539,59 @@ with tab1:
         fig_cmp.add_trace(go.Scatter(y=df_eval["eta"] * 100.0, name="eta_meas", mode="lines+markers", line=dict(dash="dash", color="#94A3B8")), row=1, col=2)
         fig_cmp.add_trace(go.Scatter(y=df_eval["eta_est"] * 100.0, name="eta_est", mode="lines+markers", line=dict(color="#F59E0B")), row=1, col=2)
         fig_cmp.update_layout(template="plotly_dark", height=340)
-        st.plotly_chart(fig_cmp, use_container_width=True)
+        st.plotly_chart(fig_cmp, width="stretch")
 
         if report["grid_n"] is not None:
+            extrap_mask = report.get("z_extrap_mask")
+            hover_labels = (
+                np.where(extrap_mask, "⚠ 外推区不可信（最近邻填充）", "实测凸包内插")
+                if extrap_mask is not None
+                else None
+            )
             fig = make_subplots(rows=1, cols=2, subplot_titles=("实测效率 Map η(n, T)", "模型重构效率 Map η(n, T)"))
-            fig.add_trace(go.Heatmap(x=report["grid_n"], y=report["grid_t"], z=report["z_meas"], colorscale="Viridis"), row=1, col=1)
-            fig.add_trace(go.Heatmap(x=report["grid_n"], y=report["grid_t"], z=report["z_pred"], colorscale="Viridis"), row=1, col=2)
+            fig.add_trace(
+                go.Heatmap(
+                    x=report["grid_n"],
+                    y=report["grid_t"],
+                    z=report["z_meas"],
+                    colorscale="Viridis",
+                    customdata=hover_labels,
+                    hovertemplate="n=%{x:.0f} RPM<br>T=%{y:.3f} N·m<br>η=%{z:.2f}%<br>%{customdata}<extra></extra>" if hover_labels is not None else None,
+                ),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Heatmap(
+                    x=report["grid_n"],
+                    y=report["grid_t"],
+                    z=report["z_pred"],
+                    colorscale="Viridis",
+                    customdata=hover_labels,
+                    hovertemplate="n=%{x:.0f} RPM<br>T=%{y:.3f} N·m<br>η=%{z:.2f}%<br>%{customdata}<extra></extra>" if hover_labels is not None else None,
+                ),
+                row=1,
+                col=2,
+            )
+            if extrap_mask is not None and np.any(extrap_mask):
+                for col_idx in (1, 2):
+                    fig.add_trace(
+                        go.Contour(
+                            x=report["grid_n"],
+                            y=report["grid_t"],
+                            z=extrap_mask.astype(float),
+                            showscale=False,
+                            contours=dict(start=0.5, end=0.5, size=1, coloring="none"),
+                            line=dict(color="#F43F5E", width=2, dash="dot"),
+                            name="凸包边界(外侧为外推区)",
+                            hoverinfo="skip",
+                        ),
+                        row=1,
+                        col=col_idx,
+                    )
             fig.update_layout(template="plotly_dark", height=400)
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("注：图中空白四角为实测凸包外区域（不做盲目外推）。")
+            st.plotly_chart(fig, width="stretch")
+            st.caption("注：红色虚线外侧已采用最近邻填充以保持连续视图，但属于实测凸包外区域——外推区不可信，仅作视觉参考。")
         else:
             st.info("当前数据为单转速或单扭矩 1D 曲线（或点数不足 4 个），已自动跳过 2D 效率 Map 插值。")
 
@@ -1839,22 +2695,64 @@ with tab2:
     df_log_out = process_runtime_log(st.session_state["df_log"], win_ms, st.session_state["params"])
     if not df_log_out.attrs.get("time_monotonic", True):
         st.warning("检测到日志时间戳非严格单调递增，已降级为按正中位步长点数滑动滤波。")
+    if df_log_out.attrs.get("gap_count", 0) > 0:
+        st.warning(
+            f"检测到 {df_log_out.attrs['gap_count']} 处时间采样缺口（分为 {df_log_out.attrs.get('segment_count', 1)} 个连续片段），已在缺口边界重置平滑滤波状态，不跨缺口插值；"
+            f"缺口孤立单点 ({df_log_out.attrs.get('isolated_count', 0)} 个) 已标记为 NaN。"
+        )
     n_regen_lim = int(df_log_out["alert_regen_limit"].sum())
     n_inv_bus = int(df_log_out["alert_invalid_bus"].sum())
+    invalid_rows = df_log_out.loc[~df_log_out["solution_valid"]]
     if n_regen_lim > 0 or n_inv_bus > 0:
-        st.warning(f"日志中检测到 {n_regen_lim} 个超发电极限点、{n_inv_bus} 个母线压降异常点（在曲线中以断点显示）。")
+        st.warning(f"日志中检测到 {n_regen_lim} 个超发电极限点、{n_inv_bus} 个母线压降异常点（该时刻无实数解，曲线中已标红点并用前值示踪，底层数值仍保持 NaN）。")
 
     fig_log = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=("母线与相电流 (A)", "双调制比 m_motor / m_cmd", "双 q轴电压 Vq_motor / Vq_cmd (V)"))
     fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["i_bus_raw"], name="I_bus_raw", line=dict(dash="dot", color="#64748B")), row=1, col=1)
     fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["i_bus_filt"], name="I_bus_filt", line=dict(color="#F59E0B")), row=1, col=1)
-    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["iq"], name="Iq_est", line=dict(color="#06B6D4")), row=1, col=1)
-    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["m_motor"], name="m_motor", line=dict(color="#06B6D4")), row=2, col=1)
-    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["m_cmd"], name="m_cmd", line=dict(color="#F43F5E")), row=2, col=1)
+    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["iq_plot"], name="Iq_est", line=dict(color="#06B6D4")), row=1, col=1)
+    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["m_motor_plot"], name="m_motor", line=dict(color="#06B6D4")), row=2, col=1)
+    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["m_cmd_plot"], name="m_cmd", line=dict(color="#F43F5E")), row=2, col=1)
     fig_log.add_hline(y=SVPWM_LINEAR_LIMIT, line_dash="dash", line_color="#F59E0B", row=2, col=1)
-    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["vq_motor"], name="Vq_motor", line=dict(color="#06B6D4")), row=3, col=1)
-    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["vq_cmd"], name="Vq_cmd", line=dict(color="#F59E0B")), row=3, col=1)
+    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["vq_motor_plot"], name="Vq_motor", line=dict(color="#06B6D4")), row=3, col=1)
+    fig_log.add_trace(go.Scatter(x=df_log_out["time_s"], y=df_log_out["vq_cmd_plot"], name="Vq_cmd", line=dict(color="#F59E0B")), row=3, col=1)
+    if len(invalid_rows) > 0:
+        fig_log.add_trace(
+            go.Scatter(
+                x=invalid_rows["time_s"],
+                y=invalid_rows["iq_plot"],
+                mode="markers",
+                name="该时刻无实数解（已标红点，数值未虚构）",
+                marker=dict(color="#EF4444", size=9, symbol="x"),
+            ),
+            row=1,
+            col=1,
+        )
+        fig_log.add_trace(
+            go.Scatter(
+                x=invalid_rows["time_s"],
+                y=invalid_rows["m_cmd_plot"],
+                mode="markers",
+                showlegend=False,
+                marker=dict(color="#EF4444", size=9, symbol="x"),
+            ),
+            row=2,
+            col=1,
+        )
+        fig_log.add_trace(
+            go.Scatter(
+                x=invalid_rows["time_s"],
+                y=invalid_rows["vq_cmd_plot"],
+                mode="markers",
+                showlegend=False,
+                marker=dict(color="#EF4444", size=9, symbol="x"),
+            ),
+            row=3,
+            col=1,
+        )
     fig_log.update_layout(template="plotly_dark", height=680)
-    st.plotly_chart(fig_log, use_container_width=True)
+    st.plotly_chart(fig_log, width="stretch")
+    if len(invalid_rows) > 0:
+        st.caption("注：红叉位置表示该时刻无实数解（已标红点，数值未虚构；DataFrame 底层仍保留 NaN 与告警标志）。")
 
 with tab3:
     top_t3_l, top_t3_r = st.columns([3, 1])
@@ -1867,9 +2765,9 @@ with tab3:
         st.rerun()
 
     c1, c2, c3, c4 = st.columns(4)
-    exp_v = c1.number_input("稳态 V_meas (V)", -20.0, 200.0, float(st.session_state["exp_v"]), format="%.2f", key="exp_v")
-    exp_i = c2.number_input("稳态 I_bus (A)", -30.0, 100.0, float(st.session_state["exp_i"]), format="%.3f", key="exp_i")
-    exp_n = c3.number_input("稳态转速 n (RPM, 0=堵转)", -30000.0, 30000.0, float(st.session_state["exp_n"]), format="%.1f", key="exp_n")
+    exp_v = c1.number_input("稳态 V_meas (V)", min_value=-20.0, max_value=200.0, format="%.2f", key="exp_v")
+    exp_i = c2.number_input("稳态 I_bus (A)", min_value=-30.0, max_value=100.0, format="%.3f", key="exp_i")
+    exp_n = c3.number_input("稳态转速 n (RPM, 0=堵转)", min_value=-30000.0, max_value=30000.0, format="%.1f", key="exp_n")
     exp_mod = c4.selectbox("占空比调制方式 (用于 Duty_A/B/C)", ["SVPWM", "DPWM1"])
 
     d1, d2, d3, d4 = st.columns(4)
@@ -1896,7 +2794,7 @@ with tab3:
         fig_w.add_trace(go.Scatter(x=df_prev["Time"], y=df_prev["Ib"], name="Ib (A)", line=dict(color="#F59E0B")))
         fig_w.add_trace(go.Scatter(x=df_prev["Time"], y=df_prev["Ic"], name="Ic (A)", line=dict(color="#10B981")))
         fig_w.update_layout(template="plotly_dark", title="导出波形预览 (前 3 个电周期或堵转直流偏相)", xaxis_title="Time (s)", yaxis_title="Current (A)", height=340)
-        st.plotly_chart(fig_w, use_container_width=True)
+        st.plotly_chart(fig_w, width="stretch")
 
         st.subheader("对齐 6-MOS 模拟器参数摘要卡（同时列明 m 与 m_norm）")
         st.json(summary)
@@ -1909,6 +2807,77 @@ with tab3:
         )
     except ValueError as exc:
         st.error(f"无法导出波形：{exc}")
+
+with tab4:
+    st.subheader("独立 PMSM 动态 dq 轴 ODE 瞬态仿真 (FD-03)")
+    st.warning(
+        "来源标识: synthetic_assumed_uncalibrated (MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED) — "
+        "本标签页仅执行独立的动态 dq 电磁-机械常微分方程仿真，参数 (Ld/Lq/J/B) 独立设定，绝不混入 Tab 1 稳态测功标定或实测示波器采集。"
+    )
+    d_preset = st.selectbox("快速场景预设", ["startup_load_step", "four_quadrant_regen", "ipm_mtpa_fw"], key="dyn_preset")
+    patch, base_cfg = build_dynamic_preset_scenario(d_preset)
+
+    dc1, dc2, dc3, dc4 = st.columns(4)
+    d_ld = float(dc1.number_input("Ld (mH)", 0.01, 50.0, float(patch.get("ld_h", 0.22e-3)) * 1e3, format="%.3f")) * 1e-3
+    d_lq = float(dc2.number_input("Lq (mH)", 0.01, 50.0, float(patch.get("lq_h", 0.22e-3)) * 1e3, format="%.3f")) * 1e-3
+    d_j = float(dc3.number_input("转动惯量 J (kg·m²)", 1e-6, 1.0, float(patch.get("j_kg_m2", 1.2e-4)), format="%.6f"))
+    d_b = float(dc4.number_input("粘滞阻尼 B (N·m·s/rad)", 0.0, 0.1, float(patch.get("b_nm_s_per_rad", 1.5e-4)), format="%.6f"))
+
+    dc5, dc6, dc7 = st.columns(3)
+    d_vbus = float(dc5.number_input("直流母线 Vbus (V)", 2.0, 400.0, float(patch.get("v_bus_v", 13.5)), format="%.2f"))
+    d_imax = float(dc6.number_input("相电流上限 Imax (A)", 0.5, 200.0, float(patch.get("i_max_a", 12.0)), format="%.1f"))
+    d_mode = dc7.selectbox("控制策略", ["mtpa_current_loop", "id_zero", "open_loop_vdq"], key="dyn_mode")
+
+    dyn_p = DynamicPmsmParams(
+        pole_pairs=int(patch.get("pole_pairs", st.session_state["params"].pole_pairs)),
+        rs_ohm=float(patch.get("rs_ohm", 0.395)),
+        ld_h=d_ld,
+        lq_h=d_lq,
+        psi_f_vs=float(patch.get("psi_f_vs", st.session_state["params"].ke_prime / max(1, st.session_state["params"].pole_pairs))),
+        j_kg_m2=d_j,
+        b_nm_s_per_rad=d_b,
+        t_coulomb_nm=float(patch.get("t_coulomb_nm", 0.005)),
+        v_bus_v=d_vbus,
+        i_max_a=d_imax,
+        control_mode=d_mode,
+    )
+    dyn_res = simulate_dynamic_pmsm(dyn_p, base_cfg)
+    for w in dyn_res["warnings"]:
+        st.info(w)
+
+    dm1, dm2, dm3, dm4 = st.columns(4)
+    dm1.metric("峰值 |I| (A)", f"{dyn_res['peak_abs_current_a']:.3f}")
+    dm2.metric("峰值 |Te| (N·m)", f"{dyn_res['peak_abs_torque_nm']:.4f}")
+    dm3.metric("电压圆限幅点数", f"{dyn_res['voltage_limit_hits']}")
+    dm4.metric("末态稳态电压残差 (V)", f"{dyn_res['steady_check']['voltage_diff_v']:.4f}")
+
+    fig_dyn = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=("dq 电流 Id / Iq (A)", "电磁与负载转矩 Te / T_load (N·m)", "机械转速 n (RPM)"))
+    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["id_a"], name="Id (A)", line=dict(color="#60A5FA")), row=1, col=1)
+    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["iq_a"], name="Iq (A)", line=dict(color="#F472B6")), row=1, col=1)
+    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["te_nm"], name="Te (N·m)", line=dict(color="#FB923C")), row=2, col=1)
+    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["t_load_nm"], name="T_load (N·m)", line=dict(dash="dash", color="#94A3B8")), row=2, col=1)
+    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["n_rpm"], name="n (RPM)", line=dict(color="#A78BFA")), row=3, col=1)
+    fig_dyn.update_layout(template="plotly_dark", height=620)
+    st.plotly_chart(fig_dyn, width="stretch")
+
+    df_dyn_csv = pd.DataFrame({
+        "Time_s": dyn_res["time"],
+        "n_rpm": dyn_res["n_rpm"],
+        "Id_A": dyn_res["id_a"],
+        "Iq_A": dyn_res["iq_a"],
+        "Vd_V": dyn_res["vd_v"],
+        "Vq_V": dyn_res["vq_v"],
+        "Te_Nm": dyn_res["te_nm"],
+        "T_load_Nm": dyn_res["t_load_nm"],
+        "quadrant": dyn_res["quadrant_mode"],
+    })
+    csv_header = "# WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED\n# SOURCE_MODEL=dynamic_pmsm_dq_rk4\n"
+    st.download_button(
+        f"下载动态仿真 CSV ({len(df_dyn_csv)} 行)",
+        data=(csv_header + df_dyn_csv.to_csv(index=False)).encode("utf-8"),
+        file_name="dynamic_pmsm_synthetic.csv",
+        mime="text/csv",
+    )
 `;
 
 export async function downloadPythonBundleZip(): Promise<void> {
@@ -1917,6 +2886,7 @@ export async function downloadPythonBundleZip(): Promise<void> {
   zip.file('motor_physics.py', MOTOR_PHYSICS_PY);
   zip.file('dyno_calibrator.py', DYNO_CALIBRATOR_PY);
   zip.file('thermal_exporter.py', THERMAL_EXPORTER_PY);
+  zip.file('dynamic_pmsm.py', DYNAMIC_PMSM_PY);
   zip.file('app.py', APP_PY);
 
   const blob = await zip.generateAsync({ type: 'blob' });
@@ -1935,5 +2905,6 @@ export const PYTHON_BUNDLE_FILES: Array<{ name: string; content: string }> = [
   { name: 'motor_physics.py', content: MOTOR_PHYSICS_PY },
   { name: 'dyno_calibrator.py', content: DYNO_CALIBRATOR_PY },
   { name: 'thermal_exporter.py', content: THERMAL_EXPORTER_PY },
+  { name: 'dynamic_pmsm.py', content: DYNAMIC_PMSM_PY },
   { name: 'app.py', content: APP_PY },
 ];

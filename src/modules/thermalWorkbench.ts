@@ -20,6 +20,9 @@ import {
   ThermalPathMode,
   LossSimulationResult,
   ViPowerResult,
+  NonlinearEossCurve,
+  integrateQossToEossCurve,
+  integrateCossToEossCurve,
   deconvolveThermalImpedance,
   detectThermalStepOnset,
   computePowerFromVISources,
@@ -46,6 +49,7 @@ import {
   FocMosParams,
   FocControlParams,
   FocThermalModel,
+  FocThermalTopologyMode,
   FocSimulationResult,
   FocStallSweepResult,
   FocControlSweepResult,
@@ -1013,7 +1017,20 @@ export class ThermalWorkbenchController {
     document.getElementById('focTambInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focRjcOverrideInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focRjcSpreadPctInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
+    document.getElementById('focTopologyModeSelect')?.addEventListener('change', () => this.refreshFocModelAndSpice());
+    document.getElementById('focPcbCopperOzInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
+    document.getElementById('focPcbPitchMmInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focEonIncludesQrrChk')?.addEventListener('change', () => this.invalidateFocCaches(true));
+    document.getElementById('focEossIncludedChk')?.addEventListener('change', () => this.invalidateFocCaches(true));
+    document.getElementById('focEossCurveModeSelect')?.addEventListener('change', (ev) => {
+      const mode = (ev.target as HTMLSelectElement).value;
+      const inp = document.getElementById('focEossCurveInput') as HTMLInputElement | null;
+      if (inp) {
+        if (mode === 'preset_si_80v') inp.value = '0:0, 12:18, 24:31, 48:50, 60:58, 80:72';
+        else if (mode === 'preset_sic_650v') inp.value = '0:1400, 25:620, 100:240, 200:145, 400:98, 650:78';
+      }
+      this.invalidateFocCaches(true);
+    });
 
     // Tab 5 controls (DPT & multi-point LUT matrix)
     document.getElementById('dptLoadDemoBtn')?.addEventListener('click', () => this.loadDptDemoTab());
@@ -2626,6 +2643,20 @@ export class ThermalWorkbenchController {
       baseModel.perSwitchPadOffsetCPerW = [0, 0, rBrd * s * 0.5, rBrd * s * 0.5, 0, 0];
     }
 
+    const topoRaw = (document.getElementById('focTopologyModeSelect') as HTMLSelectElement | null)?.value || 'shared_board';
+    const topologyMode: FocThermalTopologyMode =
+      topoRaw === 'pcb_spatial_coupled' || topoRaw === 'independent' ? topoRaw : 'shared_board';
+    const copperOzRaw = parseFloat((document.getElementById('focPcbCopperOzInput') as HTMLInputElement | null)?.value || '2.0');
+    const pitchMmRaw = parseFloat((document.getElementById('focPcbPitchMmInput') as HTMLInputElement | null)?.value || '14');
+    baseModel.thermalTopologyMode = topologyMode;
+    if (topologyMode !== 'shared_board') {
+      baseModel.spatialMatrix = {
+        copperOz: Number.isFinite(copperOzRaw) && copperOzRaw > 0 ? copperOzRaw : 2.0,
+        layoutPitchMm: Number.isFinite(pitchMmRaw) && pitchMmRaw >= 4 ? pitchMmRaw : 14,
+        provenance: 'geometry_estimated',
+      };
+    }
+
     return baseModel;
   }
 
@@ -2668,9 +2699,17 @@ export class ThermalWorkbenchController {
       'focIrefInput',
       'focTauSplitMsInput',
       'focRjcOverrideInput',
+      'focRgonInput',
+      'focRgoffInput',
+      'focTopologyModeSelect',
+      'focPcbCopperOzInput',
+      'focPcbPitchMmInput',
       'focRjcSpreadPctInput',
+      'focEossCurveModeSelect',
+      'focEossCurveInput',
     ];
     const eonInclQrr = (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ? '1' : '0';
+    const eossIncl = (document.getElementById('focEossIncludedChk') as HTMLInputElement | null)?.checked ? '1' : '0';
     return JSON.stringify({
       tabId: tab?.id || '',
       view: tab?.view ? `${tab.view.startIndex}:${tab.view.endIndex}` : '',
@@ -2682,6 +2721,7 @@ export class ThermalWorkbenchController {
       activePathMode: this.activePathMode,
       cauerSig,
       eonInclQrr,
+      eossIncl,
       useDptMatrix: this.useDptMatrixInFoc,
       dptMatrixLen: this.dptMatrix.length,
       params: paramIds.map((id) => valOf(id)),
@@ -2717,21 +2757,82 @@ export class ThermalWorkbenchController {
     }
   }
 
+  private parseFocNonlinearEossCurve(): NonlinearEossCurve | undefined {
+    const mode = (document.getElementById('focEossCurveModeSelect') as HTMLSelectElement | null)?.value || 'scalar';
+    if (mode === 'scalar') return undefined;
+
+    if (mode === 'preset_si_80v') {
+      return integrateQossToEossCurve(
+        [
+          { vdsV: 0, val: 0 },
+          { vdsV: 12, val: 18 },
+          { vdsV: 24, val: 31 },
+          { vdsV: 48, val: 50 },
+          { vdsV: 60, val: 58 },
+          { vdsV: 80, val: 72 },
+        ],
+        '预设 Si 80V Qoss(V) 积分曲线'
+      );
+    }
+    if (mode === 'preset_sic_650v') {
+      return integrateCossToEossCurve(
+        [
+          { vdsV: 0, val: 1400 },
+          { vdsV: 25, val: 620 },
+          { vdsV: 100, val: 240 },
+          { vdsV: 200, val: 145 },
+          { vdsV: 400, val: 98 },
+          { vdsV: 650, val: 78 },
+        ],
+        '预设 SiC 650V Coss(V) 积分曲线'
+      );
+    }
+
+    const raw = (document.getElementById('focEossCurveInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const tokens = raw
+      .split(/[,\n;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const pts = tokens.map((tok) => {
+      const parts = tok.split(/[:\s/]+/).map((p) => parseFloat(p));
+      if (parts.length < 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) {
+        throw new Error(`非线性 Eoss/Qoss/Coss 曲线格式错误 ("${tok}")，请使用 "V:val, V:val" 格式。`);
+      }
+      return { vdsV: parts[0], val: parts[1] };
+    });
+    if (pts.length < 2) {
+      throw new Error('自定义非线性电容曲线至少需要 2 个 (V:val) 数据点。');
+    }
+    if (mode === 'custom_qoss') return integrateQossToEossCurve(pts, '自定义 Qoss(V) 曲线');
+    if (mode === 'custom_coss') return integrateCossToEossCurve(pts, '自定义 Coss(V) 曲线');
+    return { kind: 'eoss_uj', points: pts, label: '自定义 Eoss(V) 曲线' };
+  }
+
   private readFocParams(): { mos: FocMosParams; ctrl: FocControlParams; model: FocThermalModel } {
     const num = (id: string, fallback: number) => {
       const v = parseFloat((document.getElementById(id) as HTMLInputElement)?.value || '');
       return isFinite(v) ? v : fallback;
     };
     const mod = ((document.getElementById('focModSelect') as HTMLSelectElement)?.value || 'SVPWM') as FocModulationMode;
+    const rgOnRaw = (document.getElementById('focRgonInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const rgOffRaw = (document.getElementById('focRgoffInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const rgOnParsed = parseFloat(rgOnRaw);
+    const rgOffParsed = parseFloat(rgOffRaw);
+    const eossCurve = this.parseFocNonlinearEossCurve();
     const mos: FocMosParams = {
       rdsOn25Mohm: Math.max(0.1, num('focRdsInput', 4.5)),
       tempCoeffAlphaPerC: num('focAlphaInput', 0.45) / 100,
       vsdV: Math.max(0, num('focVsdInput', 0.9)),
       eonPlusEoffUj: Math.max(0, num('focEswInput', 35)),
       eossUj: Math.max(0, num('focEossInput', 0)),
+      eossCurve,
+      eossAlreadyIncludedInEsw: (document.getElementById('focEossIncludedChk') as HTMLInputElement | null)?.checked ?? false,
       qrrNc: Math.max(0, num('focQrrInput', 60)),
       vRefV: Math.max(1, num('focVrefInput', 48)),
       iRefA: Math.max(1, num('focIrefInput', 30)),
+      rgOnOhm: rgOnRaw && Number.isFinite(rgOnParsed) && rgOnParsed >= 0 ? rgOnParsed : undefined,
+      rgOffOhm: rgOffRaw && Number.isFinite(rgOffParsed) && rgOffParsed >= 0 ? rgOffParsed : undefined,
+      rgProvenance: rgOnRaw || rgOffRaw ? 'measured' : 'assumed',
       eonIncludesQrr: (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ?? false,
       dptLut: this.useDptMatrixInFoc && this.dptMatrix.length > 0 ? this.dptMatrix.map((pt) => ({ ...pt })) : undefined,
     };
@@ -2966,7 +3067,16 @@ export class ThermalWorkbenchController {
       this.lastFocStall = null;
       this.focCanvasMode = 'tj';
       this.syncFocViewButtons();
-      this.renderFocWarnings(res.warnings);
+      const extraMsgs = [...res.warnings];
+      if (res.spatialThermalProvenance) {
+        extraMsgs.push(`ℹ 热网络拓扑: ${res.spatialThermalProvenance}`);
+      }
+      if (res.dptLutDiagnostics) {
+        extraMsgs.push(
+          `ℹ 4D DPT LUT 状态=${res.dptLutDiagnostics.status} · 有效维度=[${res.dptLutDiagnostics.activeDimensions.join(',') || '无'}] · 退化维度=[${res.dptLutDiagnostics.collapsedDimensions.join(',') || '无'}] (Tj:${res.dptLutDiagnostics.tjProvenance}, Rg:${res.dptLutDiagnostics.rgProvenance})`
+        );
+      }
+      this.renderFocWarnings(extraMsgs);
 
       const hotEl = document.getElementById('focKpiHottest');
       if (hotEl) {
@@ -3721,13 +3831,18 @@ export class ThermalWorkbenchController {
       return;
     }
     const tjVal = parseFloat((document.getElementById('dptMatrixTjInput') as HTMLInputElement)?.value || '25');
-    const rgVal = parseFloat((document.getElementById('dptMatrixRgInput') as HTMLInputElement)?.value || '4.7');
+    const rgOnVal = parseFloat((document.getElementById('dptMatrixRgonInput') as HTMLInputElement)?.value || '4.7');
+    const rgOffVal = parseFloat((document.getElementById('dptMatrixRgoffInput') as HTMLInputElement)?.value || '4.7');
+    const rgOnOhm = Number.isFinite(rgOnVal) && rgOnVal >= 0 ? rgOnVal : 4.7;
+    const rgOffOhm = Number.isFinite(rgOffVal) && rgOffVal >= 0 ? rgOffVal : rgOnOhm;
     this.dptMatrix.push({
       id: `dpt_${Date.now()}_${this.dptMatrix.length}`,
       vBusV: res.vBusSteadyV,
       iLoadA: res.iLoadA,
       tjC: Number.isFinite(tjVal) ? tjVal : 25,
-      rgOhm: Number.isFinite(rgVal) && rgVal >= 0 ? rgVal : 4.7,
+      rgOhm: 0.5 * (rgOnOhm + rgOffOhm),
+      rgOnOhm,
+      rgOffOhm,
       eOnUj: res.eOnUj,
       eOffUj: res.eOffUj,
       qRrNc: res.qRrNc,
@@ -3735,7 +3850,7 @@ export class ThermalWorkbenchController {
     });
     this.renderDptMatrixTable();
     this.app.showToast(
-      `已保存工况点到 DPT LUT 矩阵 (Vbus=${res.vBusSteadyV.toFixed(1)}V, I=${res.iLoadA.toFixed(1)}A, Esw=${res.eSwTotalUj.toFixed(2)}µJ)。`,
+      `已保存工况点到 4D DPT LUT (Vbus=${res.vBusSteadyV.toFixed(1)}V, I=${res.iLoadA.toFixed(1)}A, Tj=${(Number.isFinite(tjVal) ? tjVal : 25).toFixed(0)}°C, Rg=${rgOnOhm.toFixed(1)}/${rgOffOhm.toFixed(1)}Ω)。`,
       'info'
     );
   }
@@ -3747,18 +3862,20 @@ export class ThermalWorkbenchController {
     if (!tbody) return;
     if (this.dptMatrix.length === 0) {
       tbody.innerHTML =
-        '<tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」积累多电压/电流插值表。</td></tr>';
+        '<tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」积累多电压/电流/结温/门极电阻 4D 插值表。</td></tr>';
       return;
     }
     tbody.innerHTML = '';
     this.dptMatrix.forEach((pt, idx) => {
       const tr = document.createElement('tr');
       tr.className = 'border-t border-[#222933]';
+      const rgOnStr = (pt.rgOnOhm ?? pt.rgOhm).toFixed(1);
+      const rgOffStr = (pt.rgOffOhm ?? pt.rgOhm).toFixed(1);
       tr.innerHTML = `
         <td class="px-2 py-1">${pt.vBusV.toFixed(1)}</td>
         <td class="px-2 py-1">${pt.iLoadA.toFixed(1)}</td>
         <td class="px-2 py-1">${pt.tjC.toFixed(0)}</td>
-        <td class="px-2 py-1">${pt.rgOhm.toFixed(1)}</td>
+        <td class="px-2 py-1">${rgOnStr} / ${rgOffStr}</td>
         <td class="px-2 py-1 text-emerald-300">${pt.eOnUj.toFixed(2)}</td>
         <td class="px-2 py-1 text-amber-300">${pt.eOffUj.toFixed(2)}</td>
         <td class="px-2 py-1 text-cyan-300">${(pt.eOnUj + pt.eOffUj).toFixed(2)}</td>
@@ -3785,8 +3902,22 @@ export class ThermalWorkbenchController {
     }
     const vTarget = Math.max(1, this.readFiniteInput('focVbusConstInput', 48));
     const iTarget = Math.max(1, this.readFiniteInput('focIrefInput', 30));
-    const interp = interpolateDptSwitchingLoss(this.dptMatrix, vTarget, iTarget);
-    if (!interp) return;
+    const tAmb = this.readFiniteInput('focTambInput', 25);
+    const rgOnTarget = Math.max(0, this.readFiniteInput('focRgonInput', 4.7));
+    const rgOffTarget = Math.max(0, this.readFiniteInput('focRgoffInput', 4.7));
+    const interp = interpolateDptSwitchingLoss(this.dptMatrix, {
+      vBusV: vTarget,
+      iLoadA: iTarget,
+      tjC: tAmb,
+      rgOnOhm: rgOnTarget,
+      rgOffOhm: rgOffTarget,
+      tjProvenance: 'assumed',
+      rgProvenance: 'measured',
+    });
+    if (!interp || interp.status === 'INVALID_DATA') {
+      this.app.showToast('DPT 查找表含非法数据，无法注入 FOC 仿真。', 'error');
+      return;
+    }
 
     const setVal = (id: string, val: string) => {
       const el = document.getElementById(id) as HTMLInputElement | null;
@@ -3799,12 +3930,13 @@ export class ThermalWorkbenchController {
     if (qrrChk) qrrChk.checked = true;
     this.useDptMatrixInFoc = true;
     const extrapNote = interp.extrapolated
-      ? `（注：参考点超出 LUT 范围 [${interp.vRange[0].toFixed(1)}~${interp.vRange[1].toFixed(1)}]V × [${interp.iRange[0].toFixed(1)}~${interp.iRange[1].toFixed(1)}]A）`
-      : '';
-    this.activeFocHandoffNote = `已激活 Tab 5 的 ${this.dptMatrix.length} 点 DPT 查找表用于 6-MOS 逐点 (Vbus, |I_phase|) 插值 (eonIncludesQrr=true)${extrapNote}；参考标量 @ (${vTarget.toFixed(1)}V, ${iTarget.toFixed(1)}A): Esw=${interp.eSwTotalUj.toFixed(2)}µJ, Qrr=${interp.qRrNc.toFixed(1)}nC。`;
+      ? `（注：参考点超出 LUT 范围 [${interp.outOfRangeAxes.join('/') || 'V/I'}], status=${interp.status}）`
+      : `（status=${interp.status}）`;
+    const dimNote = `有效维度=[${interp.activeDimensions.join(',') || '无'}]${interp.collapsedDimensions.length > 0 ? `, 退化维度=[${interp.collapsedDimensions.join(',')}]` : ''}`;
+    this.activeFocHandoffNote = `已激活 Tab 5 的 ${this.dptMatrix.length} 点 4D DPT LUT 用于 6-MOS 闭环 (Vbus, |I_phase|, Tj, Rg_on/off) 插值${extrapNote}；${dimNote}；参考标量 @ (${vTarget.toFixed(1)}V, ${iTarget.toFixed(1)}A, Rg=${rgOnTarget.toFixed(1)}/${rgOffTarget.toFixed(1)}Ω): Esw=${interp.eSwTotalUj.toFixed(2)}µJ, Qrr=${interp.qRrNc.toFixed(1)}nC。`;
     this.invalidateFocCaches(true);
     this.switchTab('foc');
-    this.app.showToast(`Activated ${this.dptMatrix.length}-point DPT LUT -> FOC Tab 4.`, interp.extrapolated ? 'warn' : 'info');
+    this.app.showToast(`Activated ${this.dptMatrix.length}-point 4D DPT LUT (${interp.status}) -> FOC Tab 4.`, interp.extrapolated ? 'warn' : 'info');
   }
 
   private drawDptCanvas(): void {

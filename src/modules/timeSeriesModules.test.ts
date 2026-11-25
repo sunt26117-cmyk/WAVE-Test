@@ -696,3 +696,175 @@ test('Hall AN-08: sampling gap resets state machine cleanly and NaN fails closed
   assert.equal(hallNan.valid, false);
 });
 
+// 21. XY-01: Circle Fit rejects ellipse/figure-8/collinear/open-arc traps and tracks noisy circle quality
+test('XY-01: Circle Fit Quality distinguishes circle, ellipse, figure-8, collinear line, open arc, and noisy circle', () => {
+  const n = 400;
+  const t = Float64Array.from({ length: n }, (_, i) => (i / (n - 1)) * 0.04); // 2 cycles @ 50 Hz
+  const w = 2 * Math.PI * 50;
+
+  // 1) Unit circle => ~100% quality
+  const xCirc = Float32Array.from(t, (x) => Math.cos(w * x));
+  const yCirc = Float32Array.from(t, (x) => Math.sin(w * x));
+  const mCirc = computeXYMetrics(makeChannel('xc', t, xCirc, 'A'), makeChannel('yc', t, yCirc, 'A'), 0, n);
+  assert.equal(mCirc.valid, true);
+  assert.ok(mCirc.circleFitQualityPct !== null && mCirc.circleFitQualityPct > 99.5);
+  assert.equal(mCirc.trajectoryShapeHint, 'circle');
+
+  // 2) Ellipse (1:2 axis ratio) => CircleFitQualityPct < 85%
+  const xEll = Float32Array.from(t, (x) => 2 * Math.cos(w * x));
+  const yEll = Float32Array.from(t, (x) => Math.sin(w * x));
+  const mEll = computeXYMetrics(makeChannel('xe', t, xEll, 'A'), makeChannel('ye', t, yEll, 'A'), 0, n);
+  assert.equal(mEll.valid, true);
+  assert.ok(mEll.circleFitQualityPct !== null && mEll.circleFitQualityPct < 85);
+  assert.equal(mEll.trajectoryShapeHint, 'ellipse');
+
+  // 3) Figure-8 Lissajous (same bbox width/height, passes through center!) => CircleFitQualityPct < 65% & figure_8_or_lissajous
+  const xFig8 = Float32Array.from(t, (x) => Math.sin(w * x));
+  const yFig8 = Float32Array.from(t, (x) => Math.sin(2 * w * x));
+  const mFig8 = computeXYMetrics(makeChannel('xf', t, xFig8, 'A'), makeChannel('yf', t, yFig8, 'A'), 0, n);
+  assert.equal(mFig8.valid, true);
+  assert.ok(mFig8.circleFitQualityPct !== null && mFig8.circleFitQualityPct < 65, `Expected <65%, got ${mFig8.circleFitQualityPct}`);
+  assert.equal(mFig8.trajectoryShapeHint, 'figure_8_or_lissajous');
+
+  // 4) Diagonal line y = x => 0% & 'line'
+  const xLine = Float32Array.from(t, (x) => Math.sin(w * x));
+  const yLine = Float32Array.from(t, (x) => Math.sin(w * x));
+  const mLine = computeXYMetrics(makeChannel('xl', t, xLine, 'A'), makeChannel('yl', t, yLine, 'A'), 0, n);
+  assert.equal(mLine.valid, true);
+  assert.equal(mLine.circleFitQualityPct, 0);
+  assert.equal(mLine.trajectoryShapeHint, 'line');
+
+  // 5) Open 90-deg arc => angular coverage < 70%, refuses circle quality (null) & marks open_arc
+  const tArc = Float64Array.from({ length: 100 }, (_, i) => (i / 99) * (Math.PI / 2));
+  const mArc = computeXYMetrics(
+    makeChannel('xa', tArc, Float32Array.from(tArc, (a) => Math.cos(a)), 'A'),
+    makeChannel('ya', tArc, Float32Array.from(tArc, (a) => Math.sin(a)), 'A'),
+    0,
+    100
+  );
+  assert.equal(mArc.valid, true);
+  assert.equal(mArc.circleFitQualityPct, null);
+  assert.equal(mArc.trajectoryShapeHint, 'open_arc');
+
+  // 6) Circle with radial ripple perturbation drops quality proportionally vs ideal circle
+  const xNoise = Float32Array.from(t, (x, idx) => (1 + 0.12 * Math.sin(idx * 1.7)) * Math.cos(w * x));
+  const yNoise = Float32Array.from(t, (x, idx) => (1 + 0.12 * Math.sin(idx * 1.7)) * Math.sin(w * x));
+  const mNoise = computeXYMetrics(makeChannel('xn', t, xNoise, 'A'), makeChannel('yn', t, yNoise, 'A'), 0, n);
+  assert.equal(mNoise.valid, true);
+  assert.ok(
+    mNoise.circleFitQualityPct !== null && mNoise.circleFitQualityPct < 94 && mNoise.circleFitQualityPct > 80,
+    `Expected radial error to lower quality proportionally (~88-92%), got ${mNoise.circleFitQualityPct}`
+  );
+});
+
+// 22. XY-02: Non-uniform time-weighted & gap-segmented sinusoidal LS phase, frequency mismatch, non-sinusoidal labeling
+test('XY-02: Time-weighted sinusoidal phase on non-uniform & gapped signals + mismatch & square labeling', () => {
+  const f = 50;
+  const w = 2 * Math.PI * f;
+  // Build strongly non-uniform monotonic timebase (front-dense, back-sparse) over 2 cycles (0..0.04s)
+  const pts: number[] = [];
+  for (let i = 0; i < 160; i++) pts.push((i / 160) * 0.015);
+  for (let i = 0; i <= 30; i++) pts.push(0.015 + (i / 30) * 0.025);
+  const tNu = new Float64Array(pts);
+
+  // +45 deg lag (Y = sin(wt - pi/4)) => phase = +45 deg regardless of sample clustering
+  const xNu = Float32Array.from(tNu, (x) => 4 * Math.sin(w * x));
+  const yLag45 = Float32Array.from(tNu, (x) => 4 * Math.sin(w * x - Math.PI / 4));
+  const mNu = computeXYMetrics(makeChannel('xnu', tNu, xNu, 'V'), makeChannel('ynu', tNu, yLag45, 'V'), 0, tNu.length);
+  assert.equal(mNu.valid, true);
+  assert.equal(mNu.phaseKind, 'fundamental_ls_time_weighted');
+  assert.ok(mNu.lissajousPhaseDeg !== null && Math.abs(mNu.lissajousPhaseDeg - 45) < 1.5, `Expected ~45 deg, got ${mNu.lissajousPhaseDeg}`);
+
+  // Sampling gap inside timebase
+  const tGapArr: number[] = [];
+  for (let i = 0; i < 80; i++) tGapArr.push(i * 0.0002);
+  for (let i = 0; i < 80; i++) tGapArr.push(0.03 + i * 0.0002);
+  const tGap = new Float64Array(tGapArr);
+  const mGap = computeXYMetrics(
+    makeChannel('xg', tGap, Float32Array.from(tGap, (x) => 5 * Math.sin(w * x)), 'V'),
+    makeChannel('yg', tGap, Float32Array.from(tGap, (x) => 5 * Math.sin(w * x + Math.PI / 4)), 'V'),
+    0,
+    tGap.length
+  );
+  assert.equal(mGap.valid, true);
+  assert.ok(mGap.lissajousPhaseDeg !== null && Math.abs(mGap.lissajousPhaseDeg + 45) < 2.0, `Expected ~-45 deg across gap, got ${mGap.lissajousPhaseDeg}`);
+
+  // Different frequencies fx = 50 Hz vs fy = 100 Hz => phase invalid / frequency_mismatch
+  const tUni = Float64Array.from({ length: 400 }, (_, i) => i * 1e-4);
+  const mMis = computeXYMetrics(
+    makeChannel('xm', tUni, Float32Array.from(tUni, (x) => Math.sin(2 * Math.PI * 50 * x)), 'V'),
+    makeChannel('ym', tUni, Float32Array.from(tUni, (x) => Math.sin(2 * Math.PI * 100 * x)), 'V'),
+    0,
+    400
+  );
+  assert.equal(mMis.lissajousPhaseDeg, null);
+  assert.equal(mMis.phaseKind, 'frequency_mismatch');
+
+  // Square waves with 30 deg phase offset => labeled non-sinusoidal fundamental phase
+  const mSq = computeXYMetrics(
+    makeChannel('xsq', tUni, Float32Array.from(tUni, (x) => (Math.sin(w * x) >= 0 ? 5 : -5)), 'V'),
+    makeChannel('ysq', tUni, Float32Array.from(tUni, (x) => (Math.sin(w * x - Math.PI / 6) >= 0 ? 5 : -5)), 'V'),
+    0,
+    400
+  );
+  assert.equal(mSq.valid, true);
+  assert.equal(mSq.isNonSinusoidal, true);
+  assert.equal(mSq.phaseKind, 'fundamental_non_sinusoidal');
+  assert.ok(mSq.lissajousPhaseDeg !== null && Math.abs(mSq.lissajousPhaseDeg - 30) < 3.0);
+});
+
+// 23. AN-01: PWM edge resolution check & sync-cap downsampling reliability downgrade
+test('AN-01: coarse edge dt and sync-cap downsampling downgrade PWM deadTimeQuality and block reliable green status', () => {
+  // 1) Coarse sampling around dead time: 20 kHz PWM (T=50us), 1us dt vs 1.2us dead time => ratio ~83% (>35%) -> INSUFFICIENT_RESOLUTION
+  const dtCoarse = 1e-6;
+  const nCoarse = 150;
+  const tCoarse = Float64Array.from({ length: nCoarse }, (_, i) => i * dtCoarse);
+  const vHCoarse = new Float32Array(nCoarse);
+  const vLCoarse = new Float32Array(nCoarse);
+  for (let i = 0; i < nCoarse; i++) {
+    const phase = (tCoarse[i] % 50e-6);
+    vHCoarse[i] = phase >= 2e-6 && phase < 25e-6 ? 12 : 0;
+    vLCoarse[i] = phase >= 26.2e-6 && phase < 49e-6 ? 12 : 0;
+  }
+  const coarseRes = analyzePwmSwitchingAndDeadTime(
+    makeChannel('vgs_hc', tCoarse, vHCoarse, 'V', 'Vgs_H'),
+    makeChannel('vgs_lc', tCoarse, vLCoarse, 'V', 'Vgs_L')
+  );
+  assert.equal(coarseRes.valid, true);
+  assert.equal(coarseRes.freqQuality, 'RELIABLE'); // 50 pts/cycle (dt/T = 0.02 <= 0.02) captures carrier freq, while dead-time edge dt/t_dead = 83% fails
+  assert.equal(coarseRes.deadTimeQuality, 'INSUFFICIENT_RESOLUTION');
+  assert.equal(coarseRes.deadTimeReliable, false);
+
+  // 2) Dense high-rate channel exceeding 262,144 sync cap paired with slower channel => triggers downsampledBySyncCap
+  // Use dt_dense = 5e-8 (50ns), span = 0.02s => 400,001 points (>262,144 MAX_SYNC_PTS) while slower channel is 10 kHz (201 pts)
+  const nDense = 300001;
+  const dtDense = 0.02 / (nDense - 1); // ~66.6 ns
+  const tDense = Float64Array.from({ length: nDense }, (_, i) => i * dtDense);
+  const vHDense = Float32Array.from(tDense, (x) => {
+    const ph = x % 100e-6;
+    if (ph >= 2e-6 && ph < 48e-6) {
+      const dtEdge = ph - 2e-6;
+      return 12 + 2.5 * Math.exp(-dtEdge / 1.5e-6) * Math.sin(2 * Math.PI * 2e6 * dtEdge);
+    }
+    return 0;
+  });
+  const nSlow = 4001;
+  const tSlow = Float64Array.from({ length: nSlow }, (_, i) => i * 5e-6);
+  const vLSlow = Float32Array.from(tSlow, (x) => {
+    const ph = x % 100e-6;
+    return ph >= 50e-6 && ph < 98e-6 ? 12 : 0;
+  });
+  const dsRes = analyzePwmSwitchingAndDeadTime(
+    makeChannel('vgs_hd', tDense, vHDense, 'V', 'Vgs_H'),
+    makeChannel('vgs_ld', tSlow, vLSlow, 'V', 'Vgs_L')
+  );
+  assert.equal(dsRes.valid, true);
+  assert.equal(dsRes.downsampledBySyncCap, true);
+  assert.equal(dsRes.deadTimeQuality, 'INSUFFICIENT_RESOLUTION');
+  assert.equal(dsRes.shootThroughQuality, 'INSUFFICIENT_RESOLUTION');
+  assert.equal(dsRes.dvDtQuality, 'INSUFFICIENT_RESOLUTION');
+  assert.equal(dsRes.ringingQuality, 'INSUFFICIENT_RESOLUTION');
+  assert.equal(dsRes.deadTimeReliable, false);
+});
+
+

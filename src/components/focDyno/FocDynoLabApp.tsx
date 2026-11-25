@@ -26,6 +26,7 @@ import { SidebarParams } from './SidebarParams';
 import { Tab1DynoCalib } from './Tab1DynoCalib';
 import { Tab2RuntimeEst } from './Tab2RuntimeEst';
 import { Tab3ThermalExport } from './Tab3ThermalExport';
+import { Tab4DynamicPmsm } from './Tab4DynamicPmsm';
 
 export interface FocDynoLabAppProps {
   getActiveScopeTab: () => TabState | null;
@@ -40,7 +41,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
   onSendToSixMosThermal,
   onNotify,
 }) => {
-  const [activeTab, setActiveTab] = useState<'tab1' | 'tab2' | 'tab3'>('tab1');
+  const [activeTab, setActiveTab] = useState<'tab1' | 'tab2' | 'tab3' | 'tab4'>('tab1');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [params, setParams] = useState<MotorParams>(() => ({ ...DEMO_MOTOR_PARAMS }));
 
@@ -221,6 +222,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
                 ['tab1', '01. 测功仪标定与 Map'],
                 ['tab2', '02. 运行态推算与告警'],
                 ['tab3', '03. 6-MOS 波形与导出'],
+                ['tab4', '04. 动态 dq 瞬态仿真'],
               ] as const
             ).map(([k, lbl]) => (
               <button
@@ -299,6 +301,11 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               }`}
             >
               工况点: {isExportPointDemo ? 'DEMO 额定工况 (13.5V / 1.06A / 1000RPM)' : '用户设定/日志传参'} · 波形属性: 理想对称稳态合成（非实测采样）
+            </span>
+          )}
+          {activeTab === 'tab4' && (
+            <span className="rounded-xs border px-2 py-0.5 font-mono dyno-alert-warn">
+              来源: synthetic_assumed_uncalibrated · 独立动态 PMSM dq RK4 模型（与 Tab 1 稳态标定器隔离）
             </span>
           )}
         </div>
@@ -433,6 +440,17 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               onNotify={showToast}
             />
           )}
+
+          {activeTab === 'tab4' && (
+            <Tab4DynamicPmsm
+              baseParams={params}
+              onSendTabToScope={(tab) => {
+                onSendTabToScope(tab);
+                showToast(`已打开 ${tab.fileName} 动态仿真波形`);
+              }}
+              onNotify={showToast}
+            />
+          )}
         </div>
       </div>
 
@@ -444,7 +462,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               <div>
                 <h3 className="text-sm font-semibold dyno-text-primary">Python / Streamlit 本地工程源码包 (V2.0)</h3>
                 <p className="text-xs dyno-text-muted">
-                  含 requirements.txt、motor_physics.py、dyno_calibrator.py、thermal_exporter.py、app.py
+                  含 requirements.txt、motor_physics.py、dyno_calibrator.py、thermal_exporter.py、dynamic_pmsm.py、app.py
                 </p>
               </div>
               <div className="flex items-center gap-2.5">

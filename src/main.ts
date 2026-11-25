@@ -3706,55 +3706,70 @@ function renderBldcPwm(tab: TabState) {
     return;
   }
 
+  const qualBadge = (q: string) => {
+    if (q === 'RELIABLE') {
+      return '<span class="ml-1 px-1 py-px text-[9px] rounded-xs bg-emerald-950/70 border border-emerald-500/50 text-emerald-300">RELIABLE</span>';
+    }
+    if (q === 'APPROXIMATE') {
+      return '<span class="ml-1 px-1 py-px text-[9px] rounded-xs bg-amber-950/70 border border-amber-500/50 text-amber-300">APPROX</span>';
+    }
+    if (q === 'INSUFFICIENT_RESOLUTION') {
+      return '<span class="ml-1 px-1 py-px text-[9px] rounded-xs bg-orange-950/70 border border-orange-500/50 text-orange-300">LOW RES</span>';
+    }
+    return '<span class="ml-1 px-1 py-px text-[9px] rounded-xs bg-red-950/70 border border-red-500/50 text-red-300">INVALID</span>';
+  };
+
   const warnBanner =
     res.warnings.length > 0
       ? `<div class="bg-amber-950/45 border border-amber-500/50 text-amber-200 px-2.5 py-1.5 rounded-xs text-[10px] space-y-0.5">${res.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('')}</div>`
       : '';
   const deadTimeDisableReason =
-    res.warnings.find((w) => w.includes('死区') || w.includes('直通') || w.includes('SW') || w.includes('单位') || w.includes('摆幅')) ||
-    '死区与直通判定已禁用：请确认双路均为有效 Vgs_H / Vgs_L 电压栅极驱动信号（电压单位 V/mV 且摆幅匹配）。';
+    res.warnings.find((w) => w.includes('死区') || w.includes('直通') || w.includes('降采样') || w.includes('SW') || w.includes('单位') || w.includes('摆幅') || w.includes('分辨率')) ||
+    '死区与直通判定已降级/禁用：请确认双路均为有效 Vgs_H / Vgs_L 电压栅极驱动信号且边沿采样分辨率充足。';
 
   card.innerHTML = `
     ${warnBanner}
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] pb-2 border-b border-[#222933]">
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
-        <div class="text-slate-400">Carrier Freq / Pulses</div>
+        <div class="text-slate-400 flex items-center justify-between"><span>Carrier Freq</span>${qualBadge(res.freqQuality)}</div>
         <div class="font-bold text-cyan-300">${res.pwmFreqHz !== null ? formatEng(res.pwmFreqHz, 'Hz', 2) : '--'}</div>
         <div class="text-[10px] text-slate-400">${res.pulseCount} pulses</div>
       </div>
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
-        <div class="text-slate-400">Duty (Min / Avg / Max)</div>
+        <div class="text-slate-400 flex items-center justify-between"><span>Duty</span>${qualBadge(res.dutyQuality)}</div>
         <div class="font-bold text-slate-100">${res.dutyAvgPct !== null ? res.dutyAvgPct.toFixed(1) + '%' : '--'}</div>
         <div class="text-[10px] text-slate-400">${res.dutyMinPct !== null ? res.dutyMinPct.toFixed(1) + '% ~ ' + res.dutyMaxPct?.toFixed(1) + '%' : '--'}</div>
       </div>
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
-        <div class="text-slate-400">Max dV/dt &amp; Overshoot</div>
+        <div class="text-slate-400 flex items-center justify-between"><span>Max dV/dt</span>${qualBadge(res.dvDtQuality)}</div>
         <div class="font-bold text-amber-300">${res.maxDvDtVPerUs !== null ? res.maxDvDtVPerUs.toFixed(1) + ' V/µs' : '--'}</div>
         <div class="text-[10px] text-slate-400">Overshoot: ${res.overshootPct !== null ? res.overshootPct.toFixed(1) + '%' : '--'}</div>
       </div>
       <div class="bg-[#12161c] p-2 rounded-sm border border-[#1f2732]">
-        <div class="text-slate-400">LC Ringing Freq</div>
+        <div class="text-slate-400 flex items-center justify-between"><span>LC Ringing</span>${qualBadge(res.ringingQuality)}</div>
         <div class="font-bold text-purple-300">${res.ringingFreqHz !== null ? formatEng(res.ringingFreqHz, 'Hz', 2) : '--'}</div>
-        <div class="text-[10px] text-slate-400">Post-edge oscillation</div>
+        <div class="text-[10px] text-slate-400">${res.edgeTimeResolutionSec !== null ? 'Edge dt: ' + formatEng(res.edgeTimeResolutionSec, 's', 2) : 'Post-edge oscillation'}</div>
       </div>
     </div>
     ${
       chL
-        ? res.deadTimeReliable
+        ? res.deadTimeReliable && res.deadTimeQuality === 'RELIABLE'
           ? `<div class="flex flex-wrap items-center justify-between gap-2 pt-2 text-[11px]">
-              <div>
-                Dead-Time (Min / Avg / Max):
+              <div class="flex items-center flex-wrap gap-1">
+                <span>Dead-Time (Min / Avg / Max):</span>
                 <strong class="text-emerald-300">
                   ${res.deadTimeMinSec !== null ? formatEng(res.deadTimeMinSec, 's', 2) : '--'} /
                   ${res.deadTimeAvgSec !== null ? formatEng(res.deadTimeAvgSec, 's', 2) : '--'} /
                   ${res.deadTimeMaxSec !== null ? formatEng(res.deadTimeMaxSec, 's', 2) : '--'}
                 </strong>
+                ${qualBadge(res.deadTimeQuality)}
                 <span class="text-slate-400">(${res.deadTimeCount} edges)</span>
               </div>
               <div class="flex items-center gap-2">
                 <span class="${res.shootThroughCount > 0 ? 'text-red-400 font-bold' : 'text-emerald-400'}">
                   Shoot-Through Overlaps: ${res.shootThroughCount}
                 </span>
+                ${qualBadge(res.shootThroughQuality)}
                 ${
                   res.worstEventIndex !== null
                     ? `<button id="bldcPwmJumpWorstBtn" type="button" class="px-2 py-0.5 bg-[#161b22] hover:bg-amber-950/50 border border-amber-500/60 text-amber-300 rounded-xs cursor-pointer">Jump to Min/Fault @ ${formatEng(res.worstEventTime || 0, 's', 3)}</button>`
@@ -3762,7 +3777,35 @@ function renderBldcPwm(tab: TabState) {
                 }
               </div>
             </div>`
-          : `<div class="text-[11px] text-amber-300 pt-1">${escapeHtml(deadTimeDisableReason)}</div>`
+          : res.deadTimeQuality === 'APPROXIMATE'
+          ? `<div class="space-y-1 pt-2 text-[11px]">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center flex-wrap gap-1">
+                  <span>Dead-Time (Approx Min / Avg / Max):</span>
+                  <strong class="text-amber-300">
+                    ${res.deadTimeMinSec !== null ? formatEng(res.deadTimeMinSec, 's', 2) : '--'} /
+                    ${res.deadTimeAvgSec !== null ? formatEng(res.deadTimeAvgSec, 's', 2) : '--'} /
+                    ${res.deadTimeMaxSec !== null ? formatEng(res.deadTimeMaxSec, 's', 2) : '--'}
+                  </strong>
+                  ${qualBadge(res.deadTimeQuality)}
+                  ${res.edgeTimeResolutionSec !== null ? `<span class="text-amber-200/80">(±${formatEng(res.edgeTimeResolutionSec, 's', 2)})</span>` : ''}
+                </div>
+                <div class="flex items-center gap-2">
+                  <span class="${res.shootThroughCount > 0 ? 'text-red-400 font-bold' : 'text-amber-300'}">
+                    Shoot-Through: ${res.shootThroughCount}
+                  </span>
+                  ${qualBadge(res.shootThroughQuality)}
+                </div>
+              </div>
+              <div class="text-[10px] text-amber-300">${escapeHtml(deadTimeDisableReason)}</div>
+            </div>`
+          : `<div class="space-y-1 pt-1.5 text-[11px]">
+              <div class="flex items-center gap-2 text-orange-300">
+                <span>Dead-Time / Shoot-Through Status:</span>
+                ${qualBadge(res.deadTimeQuality)}
+              </div>
+              <div class="text-amber-300">${escapeHtml(deadTimeDisableReason)}</div>
+            </div>`
         : '<div class="text-[11px] text-slate-400 pt-1">Tip: Select a complementary Low-Side gate channel above (with Vgs_H) to compute dead-time (ns) and shoot-through overlaps.</div>'
     }
   `;

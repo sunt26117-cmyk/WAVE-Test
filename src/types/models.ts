@@ -7,7 +7,7 @@ export type TimeQualityStatus = 'uniform' | 'non-uniform' | 'severe-jitter';
 
 export interface SamplingMetadata {
   /** Distinguishes acquired instrument data from analytical/model-generated samples. */
-  dataProvenance?: 'measured' | 'derived_estimate' | 'synthetic_steady_state' | 'simulated_switching';
+  dataProvenance?: 'measured' | 'derived_estimate' | 'synthetic_steady_state' | 'simulated_switching' | 'synthetic_assumed_uncalibrated';
   sourceModel?: string;
   originalSampleCount: number;
   originalTimeStart: number;

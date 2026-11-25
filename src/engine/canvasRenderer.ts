@@ -2504,14 +2504,22 @@ export function drawXYPlot(
 
   const phaseStr =
     metrics.lissajousPhaseDeg !== null
-      ? `${metrics.lissajousPhaseDeg > 0 ? '+' : ''}${metrics.lissajousPhaseDeg.toFixed(1)}°`
+      ? `${metrics.lissajousPhaseDeg > 0 ? '+' : ''}${metrics.lissajousPhaseDeg.toFixed(1)}°${metrics.isNonSinusoidal ? ' (Fund)' : ''}`
+      : metrics.phaseKind === 'frequency_mismatch'
+      ? 'N/A (fx≠fy)'
+      : '--';
+  const fitStr =
+    metrics.circleFitQualityPct !== null
+      ? `${metrics.circleFitQualityPct.toFixed(1)}% (Err ${metrics.circleFitErrorPct !== null ? metrics.circleFitErrorPct.toFixed(1) : '--'}%)`
+      : metrics.trajectoryShapeHint === 'open_arc'
+      ? 'Open Arc (<70%)'
       : '--';
   const lines = [
     `XY: ${xCh.name} (X) vs ${yCh.name} (Y)`,
     metrics.valid
       ? `Status: OK (${metrics.coveragePct.toFixed(0)}%) · Pts: ${metrics.sampleCount.toLocaleString()}`
       : `Status: ${metrics.status}`,
-    `Circularity: ${metrics.circularityPct !== null ? metrics.circularityPct.toFixed(1) + '%' : '--'}`,
+    `Circle Fit Qual: ${fitStr}`,
     `Lissajous ΔΦ: ${phaseStr}`,
   ];
 

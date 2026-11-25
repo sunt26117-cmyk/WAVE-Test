@@ -12,13 +12,27 @@
  */
 
 import { WaveformChannel } from '../types/models';
-import { CauerStage, ThermalPathMode, parseSiUnitScale, simulateCauerZoh } from './thermalEngine';
+import {
+  CauerStage,
+  ThermalPathMode,
+  NonlinearEossCurve,
+  evaluateNonlinearEossUj,
+  parseSiUnitScale,
+  simulateCauerZoh,
+} from './thermalEngine';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
 import { inspectChannelSamplingGaps } from './timeSync';
-import { DptOperatingPoint, interpolateDptSwitchingLoss } from './dptAnalyzer';
+import {
+  DptAxisName,
+  DptLutStatus,
+  DptOperatingPoint,
+  DptParameterProvenance,
+  interpolateDptSwitchingLoss,
+} from './dptAnalyzer';
 
 export type FocModulationMode = 'SVPWM' | 'DPWM1' | 'SPWM';
 export type MosSwitchKey = 'AH' | 'AL' | 'BH' | 'BL' | 'CH' | 'CL';
+export type FocThermalTopologyMode = 'shared_board' | 'pcb_spatial_coupled' | 'independent';
 export type FocModelProvenanceKind =
   | 'junction_ambient'
   | 'pad_ambient'
@@ -27,6 +41,24 @@ export type FocModelProvenanceKind =
   | 'datasheet_constrained';
 
 export const MOS_SWITCH_KEYS: MosSwitchKey[] = ['AH', 'AL', 'BH', 'BL', 'CH', 'CL'];
+
+export interface PcbZoneConfig {
+  xMm: number;
+  yMm: number;
+  cPcbJPerC?: number;
+  rVertCPerW?: number;
+}
+
+export interface PcbSpatialThermalMatrixConfig {
+  zones?: PcbZoneConfig[];
+  copperOz?: number;
+  copperWidthMm?: number;
+  layoutPitchMm?: number;
+  mutualConductanceMatrixWPerC?: number[][];
+  zoneVerticalRthCPerW?: number[];
+  zoneThermalCapJPerC?: number[];
+  provenance?: 'measured' | 'geometry_estimated' | 'user_matrix';
+}
 
 export function getModulationLinearCeiling(modulation: FocModulationMode): number {
   return modulation === 'SPWM' ? 1.0 : 2 / Math.sqrt(3);
@@ -59,6 +91,10 @@ export interface FocThermalModel {
   perSwitchRjcScale?: number[];
   /** Optional 6-element [AH, AL, BH, BL, CH, CL] extra local PCB copper spreading Rth (°C/W) between case and shared TBRD */
   perSwitchPadOffsetCPerW?: number[];
+  /** Thermal network topology: shared lumped TBRD (default), 6-zone PCB spatial coupled matrix, or independent paths */
+  thermalTopologyMode?: FocThermalTopologyMode;
+  /** Spatial 6-zone PCB thermal capacitance & mutual conductance parameters */
+  spatialMatrix?: PcbSpatialThermalMatrixConfig;
 }
 
 export interface FocMosParams {
@@ -70,8 +106,13 @@ export interface FocMosParams {
   iRefA: number;
   qrrNc: number; // reverse recovery charge (nC) at iRefA
   eossUj?: number; // optional zero-current Coss discharge energy (uJ) at vRefV (default 0 to avoid double-counting datasheet Eon)
+  eossCurve?: NonlinearEossCurve; // optional nonlinear Eoss(V)/Qoss(V)/Coss(V) curve evaluated via monotone PCHIP
+  eossAlreadyIncludedInEsw?: boolean; // explicit double-count guard when DPT Eon/Eoff already includes Coss energy
   eonIncludesQrr?: boolean; // true when Eon+Eoff comes from DPT waveform integral (Qrr already captured inside Eon)
-  /** Optional multi-point DPT lookup table; when provided, computePhaseMosLosses interpolates switching loss per (Vbus, |I_phase|) */
+  rgOnOhm?: number;
+  rgOffOhm?: number;
+  rgProvenance?: DptParameterProvenance;
+  /** Optional multi-point DPT lookup table; when provided, computePhaseMosLosses interpolates switching loss per (Vbus, |I_phase|, Tj, Rg) */
   dptLut?: DptOperatingPoint[];
 }
 
@@ -116,7 +157,9 @@ export interface FocThermalInitInfo {
 
 export interface ThermalNetworkStateSnapshot {
   armT: number[][]; // 6 x Kj junction-to-case ladder node temperatures (°C)
-  brdT: number[]; // Kb shared board/heatsink ladder node temperatures (°C)
+  pcbT?: number[]; // 6 PCB zone temperatures (°C) in pcb_spatial_coupled mode
+  brdT: number[]; // Kb board/heatsink ladder node temperatures (°C)
+  brdArmsT?: number[][]; // 6 x Kb independent board arm temperatures (°C) in independent mode
   tBoardC: number;
   tjMaxC: number;
 }
@@ -127,6 +170,9 @@ export interface FocSimulationResult {
   pMos: Record<MosSwitchKey, Float32Array>;
   pInvTotal: Float32Array;
   tBoard: Float32Array;
+  tBoardByKey?: Record<MosSwitchKey, number>;
+  thermalTopologyMode: FocThermalTopologyMode;
+  spatialThermalProvenance?: string;
   duty: { a: Float32Array; b: Float32Array; c: Float32Array };
   summaries: MosSwitchSummary[];
   hottestKey: MosSwitchKey;
@@ -150,6 +196,15 @@ export interface FocSimulationResult {
   pointsPerElecCycle: number | null;
   finalThermalState: ThermalNetworkStateSnapshot;
   dutySource: 'reconstructed' | 'external';
+  dptLutDiagnostics?: {
+    status: DptLutStatus;
+    activeDimensions: DptAxisName[];
+    collapsedDimensions: DptAxisName[];
+    outOfRangeCount: number;
+    tjProvenance: DptParameterProvenance;
+    rgProvenance: DptParameterProvenance;
+  };
+  eossSource: 'included_in_esw' | 'nonlinear_curve' | 'vbus_sq_approx' | 'none';
   alignmentWarnings: string[];
   warnings: string[];
   thermalInitInfo: FocThermalInitInfo;
@@ -244,13 +299,155 @@ export const DEFAULT_FOC_MODEL: FocThermalModel = {
   provenanceNote: '内置默认 6-MOS 参考热网络 (RθJC=0.50 °C/W, RθBoard=1.10 °C/W)，非实测器件数据。',
 };
 
+export interface ResolvedSpatialNetwork {
+  mode: FocThermalTopologyMode;
+  cPcb: Float64Array; // 6 zones (J/°C)
+  rVert: Float64Array; // 6 vertical Rth to TBRD (or TAMB in independent)
+  gLat: Float64Array[]; // 6x6 symmetric off-diagonal mutual conductances (W/°C), zero diagonal
+  provenanceLabel: string;
+}
+
+export function resolveSpatialThermalNetwork(model: FocThermalModel): ResolvedSpatialNetwork {
+  const mode: FocThermalTopologyMode = model.thermalTopologyMode ?? 'shared_board';
+  const brd = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
+  const rBrdFirst = Math.max(0.05, brd[0]?.r ?? 0.45);
+  const cBrdFirst = Math.max(0.05, brd[0]?.c ?? 0.85);
+  const cfg = model.spatialMatrix;
+
+  const cPcb = new Float64Array(6);
+  const rVert = new Float64Array(6);
+  const gLat = Array.from({ length: 6 }, () => new Float64Array(6));
+
+  if (mode === 'shared_board') {
+    for (let m = 0; m < 6; m++) {
+      cPcb[m] = cBrdFirst / 6;
+      rVert[m] = 1e-6;
+    }
+    return {
+      mode,
+      cPcb,
+      rVert,
+      gLat,
+      provenanceLabel: 'shared_board (单一集总 TBRD 节点)',
+    };
+  }
+
+  if (mode === 'independent') {
+    for (let m = 0; m < 6; m++) {
+      const cap = cfg?.zoneThermalCapJPerC?.[m] ?? cfg?.zones?.[m]?.cPcbJPerC ?? cBrdFirst / 6;
+      const rv = cfg?.zoneVerticalRthCPerW?.[m] ?? cfg?.zones?.[m]?.rVertCPerW ?? rBrdFirst * 0.4;
+      if (!Number.isFinite(cap) || cap <= 0 || !Number.isFinite(rv) || rv <= 0) {
+        throw new Error(`独立热路径第 ${m + 1} 路 PCB 热容/热阻必须为有限正数。`);
+      }
+      cPcb[m] = cap;
+      rVert[m] = rv;
+    }
+    return {
+      mode,
+      cPcb,
+      rVert,
+      gLat,
+      provenanceLabel: 'independent (六管完全独立散热臂，G_ij = 0)',
+    };
+  }
+
+  // pcb_spatial_coupled: build passive symmetric 6-zone PCB spatial network
+  const pitch = Math.max(2, cfg?.layoutPitchMm ?? 14);
+  const defaultZones: PcbZoneConfig[] = [
+    { xMm: 0, yMm: 0 },
+    { xMm: 0, yMm: pitch * 0.65 },
+    { xMm: pitch, yMm: 0 },
+    { xMm: pitch, yMm: pitch * 0.65 },
+    { xMm: 2 * pitch, yMm: 0 },
+    { xMm: 2 * pitch, yMm: pitch * 0.65 },
+  ];
+  const zones = cfg?.zones && cfg.zones.length === 6 ? cfg.zones : defaultZones;
+  const copperOz = cfg?.copperOz ?? 2.0;
+  const copperWidthMm = cfg?.copperWidthMm ?? 12.0;
+  if (!Number.isFinite(copperOz) || copperOz <= 0 || !Number.isFinite(copperWidthMm) || copperWidthMm <= 0) {
+    throw new Error('PCB 空间热网络铜厚 (oz) 与有效导热铜宽 (mm) 必须为有限正数。');
+  }
+  const copperThickM = copperOz * 34.8e-6;
+  const kCu = 385.0; // W/(m*K)
+
+  const padOffsets = model.perSwitchPadOffsetCPerW;
+  for (let m = 0; m < 6; m++) {
+    const cap = cfg?.zoneThermalCapJPerC?.[m] ?? zones[m].cPcbJPerC ?? Math.max(0.04, cBrdFirst / 6);
+    const baseRv = cfg?.zoneVerticalRthCPerW?.[m] ?? zones[m].rVertCPerW ?? Math.max(0.15, rBrdFirst * 1.4);
+    const extraPad = padOffsets && padOffsets.length === 6 && Number.isFinite(padOffsets[m]) && padOffsets[m] > 0 ? padOffsets[m] : 0;
+    const rv = baseRv + extraPad;
+    if (!Number.isFinite(cap) || cap <= 0 || !Number.isFinite(rv) || rv <= 0) {
+      throw new Error(`PCB 空间区域 ${MOS_SWITCH_KEYS[m]} 的热容 C_pcb 或垂直热阻 R_vert 必须为有限正数。`);
+    }
+    cPcb[m] = cap;
+    rVert[m] = rv;
+  }
+
+  if (cfg?.mutualConductanceMatrixWPerC) {
+    const mat = cfg.mutualConductanceMatrixWPerC;
+    if (!Array.isArray(mat) || mat.length !== 6 || mat.some((row) => !Array.isArray(row) || row.length !== 6)) {
+      throw new Error('PCB 互热导矩阵 mutualConductanceMatrixWPerC 必须为 6×6 矩阵。');
+    }
+    for (let i = 0; i < 6; i++) {
+      for (let j = i + 1; j < 6; j++) {
+        const gij = mat[i][j];
+        const gji = mat[j][i];
+        if (!Number.isFinite(gij) || !Number.isFinite(gji)) {
+          throw new Error(`PCB 互热导矩阵 (${MOS_SWITCH_KEYS[i]}, ${MOS_SWITCH_KEYS[j]}) 含非有限数值。`);
+        }
+        if (gij < -1e-12 || gji < -1e-12) {
+          throw new Error(`PCB 互热导矩阵 (${MOS_SWITCH_KEYS[i]}, ${MOS_SWITCH_KEYS[j]}) 必须为非负值以满足热力学无源性。`);
+        }
+        if (Math.abs(gij - gji) > 1e-6 * Math.max(1, Math.abs(gij), Math.abs(gji))) {
+          throw new Error(`PCB 互热导矩阵非对称 (${MOS_SWITCH_KEYS[i]}↔${MOS_SWITCH_KEYS[j]}: ${gij} vs ${gji})，违背热传导互易定理。`);
+        }
+        const gSym = Math.max(0, 0.5 * (gij + gji));
+        gLat[i][j] = gSym;
+        gLat[j][i] = gSym;
+      }
+    }
+  } else {
+    for (let i = 0; i < 6; i++) {
+      for (let j = i + 1; j < 6; j++) {
+        const dx = zones[i].xMm - zones[j].xMm;
+        const dy = zones[i].yMm - zones[j].yMm;
+        const distMm = Math.hypot(dx, dy);
+        if (!Number.isFinite(distMm) || distMm <= 1e-3) {
+          throw new Error(`PCB 空间区域 ${MOS_SWITCH_KEYS[i]} 与 ${MOS_SWITCH_KEYS[j]} 几何坐标重合或无效，无法计算横向热导。`);
+        }
+        // Only couple adjacent/moderate distance zones meaningfully via 2D copper conductance G = k * t * w / L
+        const wEffM = copperWidthMm * 1e-3;
+        const dM = distMm * 1e-3;
+        const gPair = (kCu * copperThickM * wEffM) / dM;
+        gLat[i][j] = gPair;
+        gLat[j][i] = gPair;
+      }
+    }
+  }
+
+  const prov =
+    cfg?.provenance === 'measured'
+      ? '实测热耦合矩阵 (measured)'
+      : cfg?.provenance === 'user_matrix'
+      ? '自定义对称无源互导矩阵'
+      : `几何铜箔估算 (${copperOz.toFixed(1)}oz, pitch=${pitch.toFixed(0)}mm)`;
+  return {
+    mode,
+    cPcb,
+    rVert,
+    gLat,
+    provenanceLabel: `pcb_spatial_coupled · ${prov}`,
+  };
+}
+
 export function buildPerSwitchJcChains(model: FocThermalModel): CauerStage[][] {
   const baseJc = model.zthJC.length > 0 ? model.zthJC : DEFAULT_FOC_MODEL.zthJC;
   const scales = model.perSwitchRjcScale;
   const padOffsets = model.perSwitchPadOffsetCPerW;
+  const spatialMode = (model.thermalTopologyMode ?? 'shared_board') === 'pcb_spatial_coupled';
   return MOS_SWITCH_KEYS.map((_, m) => {
     const sc = scales && scales.length === 6 && Number.isFinite(scales[m]) && scales[m] > 0 ? scales[m] : 1.0;
-    const padR = padOffsets && padOffsets.length === 6 && Number.isFinite(padOffsets[m]) && padOffsets[m] > 0 ? padOffsets[m] : 0;
+    const padR = !spatialMode && padOffsets && padOffsets.length === 6 && Number.isFinite(padOffsets[m]) && padOffsets[m] > 0 ? padOffsets[m] : 0;
     const stages = baseJc.map((s) => ({
       r: s.r * sc,
       c: s.c,
@@ -483,13 +680,20 @@ export function focModelToSpice(
   }
   const armJcs = buildPerSwitchJcChains(model);
   const brd = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
+  const spatial = resolveSpatialThermalNetwork(model);
   const lines: string[] = [
-    `* Waveform Viewer Pro - 6-MOS Star-Coupled BLDC Inverter Thermal Subcircuit`,
-    `* Provenance: ${model.provenanceNote || model.modelKind || 'Custom Model'}`,
+    `* Waveform Viewer Pro - 6-MOS BLDC Inverter Thermal Subcircuit (${spatial.mode})`,
+    `* Provenance: ${model.provenanceNote || model.modelKind || 'Custom Model'} | Topology: ${spatial.provenanceLabel}`,
     `* Ports: Q1(AH) Q2(AL) Q3(BH) Q4(BL) Q5(CH) Q6(CL) TAMB`,
-    `* Shared Board Node: TBRD`,
-    `.subckt ${subcktName} Q1 Q2 Q3 Q4 Q5 Q6 TAMB params: T_amb=${tAmbC.toFixed(2)}`,
   ];
+  if (spatial.mode === 'shared_board') {
+    lines.push(`* Shared Board Node: TBRD`);
+  } else if (spatial.mode === 'pcb_spatial_coupled') {
+    lines.push(`* Spatial 6-Zone PCB Nodes: PCB_AH..PCB_CL -> Shared Heatsink TBRD -> TAMB`);
+  } else {
+    lines.push(`* Independent Per-MOS Board Paths: TBRD_AH..TBRD_CL -> TAMB (Zero Mutual Coupling)`);
+  }
+  lines.push(`.subckt ${subcktName} Q1 Q2 Q3 Q4 Q5 Q6 TAMB params: T_amb=${tAmbC.toFixed(2)}`);
 
   const icNodes: string[] = [];
 
@@ -497,25 +701,66 @@ export function focModelToSpice(
     const port = `Q${m + 1}`;
     const label = MOS_SWITCH_KEYS[m];
     const jc = armJcs[m];
+    const endNode =
+      spatial.mode === 'shared_board'
+        ? 'TBRD'
+        : spatial.mode === 'pcb_spatial_coupled'
+        ? `PCB_${label}`
+        : `TBRD_${label}`;
     icNodes.push(`V(${port})={T_amb}`);
     lines.push(`* --- MOSFET ${port} (${label}) ZthJC ---`);
     for (let k = 0; k < jc.length; k++) {
       const left = k === 0 ? port : `N${m + 1}_${k}`;
-      const right = k === jc.length - 1 ? 'TBRD' : `N${m + 1}_${k + 1}`;
+      const right = k === jc.length - 1 ? endNode : `N${m + 1}_${k + 1}`;
       if (k < jc.length - 1) icNodes.push(`V(N${m + 1}_${k + 1})={T_amb}`);
       lines.push(`C_${label}_${k + 1} ${left} 0 ${jc[k].c.toExponential(6)}`);
       lines.push(`R_${label}_${k + 1} ${left} ${right} ${jc[k].r.toExponential(6)}`);
     }
   }
 
-  lines.push(`* --- Shared PCB / Heatsink Thermal Chain Zth_board ---`);
-  icNodes.push(`V(TBRD)={T_amb}`);
-  for (let k = 0; k < brd.length; k++) {
-    const left = k === 0 ? 'TBRD' : `BRD_${k}`;
-    const right = k === brd.length - 1 ? 'TAMB' : `BRD_${k + 1}`;
-    if (k < brd.length - 1) icNodes.push(`V(BRD_${k + 1})={T_amb}`);
-    lines.push(`C_BRD_${k + 1} ${left} 0 ${brd[k].c.toExponential(6)}`);
-    lines.push(`R_BRD_${k + 1} ${left} ${right} ${brd[k].r.toExponential(6)}`);
+  if (spatial.mode === 'pcb_spatial_coupled') {
+    lines.push(`* --- 6-MOS PCB Spatial Zones (C_pcb, R_vert, Symmetric Lateral R_lat) ---`);
+    for (let m = 0; m < 6; m++) {
+      const label = MOS_SWITCH_KEYS[m];
+      const pNode = `PCB_${label}`;
+      icNodes.push(`V(${pNode})={T_amb}`);
+      lines.push(`C_PCB_${label} ${pNode} 0 ${spatial.cPcb[m].toExponential(6)}`);
+      lines.push(`R_VERT_${label} ${pNode} TBRD ${spatial.rVert[m].toExponential(6)}`);
+    }
+    for (let i = 0; i < 6; i++) {
+      for (let j = i + 1; j < 6; j++) {
+        const g = spatial.gLat[i][j];
+        if (g > 1e-12) {
+          lines.push(`R_LAT_${MOS_SWITCH_KEYS[i]}_${MOS_SWITCH_KEYS[j]} PCB_${MOS_SWITCH_KEYS[i]} PCB_${MOS_SWITCH_KEYS[j]} ${(1 / g).toExponential(6)}`);
+        }
+      }
+    }
+  }
+
+  if (spatial.mode === 'independent') {
+    lines.push(`* --- Independent Per-MOS PCB/Heatsink Chains (6x uncoupled) ---`);
+    for (let m = 0; m < 6; m++) {
+      const label = MOS_SWITCH_KEYS[m];
+      const root = `TBRD_${label}`;
+      icNodes.push(`V(${root})={T_amb}`);
+      for (let k = 0; k < brd.length; k++) {
+        const left = k === 0 ? root : `BRD_${label}_${k}`;
+        const right = k === brd.length - 1 ? 'TAMB' : `BRD_${label}_${k + 1}`;
+        if (k < brd.length - 1) icNodes.push(`V(BRD_${label}_${k + 1})={T_amb}`);
+        lines.push(`C_BRD_${label}_${k + 1} ${left} 0 ${(brd[k].c / 6).toExponential(6)}`);
+        lines.push(`R_BRD_${label}_${k + 1} ${left} ${right} ${(brd[k].r * 6 + (k === 0 ? spatial.rVert[m] : 0)).toExponential(6)}`);
+      }
+    }
+  } else {
+    lines.push(`* --- Shared PCB / Heatsink Thermal Chain Zth_board ---`);
+    icNodes.push(`V(TBRD)={T_amb}`);
+    for (let k = 0; k < brd.length; k++) {
+      const left = k === 0 ? 'TBRD' : `BRD_${k}`;
+      const right = k === brd.length - 1 ? 'TAMB' : `BRD_${k + 1}`;
+      if (k < brd.length - 1) icNodes.push(`V(BRD_${k + 1})={T_amb}`);
+      lines.push(`C_BRD_${k + 1} ${left} 0 ${brd[k].c.toExponential(6)}`);
+      lines.push(`R_BRD_${k + 1} ${left} ${right} ${brd[k].r.toExponential(6)}`);
+    }
   }
 
   lines.push(`.ic ${icNodes.join(' ')}`);
@@ -634,6 +879,14 @@ export function validateFocSpiceNetlist(
     }
   }
 
+  const topoMode: FocThermalTopologyMode = expectedModel?.thermalTopologyMode ?? (
+    ress.some((r) => r.n1.startsWith('PCB_') || r.n2.startsWith('PCB_'))
+      ? 'pcb_spatial_coupled'
+      : ress.some((r) => r.n1.startsWith('TBRD_'))
+      ? 'independent'
+      : 'shared_board'
+  );
+
   const errors: string[] = [];
   const has7Ports = Boolean(
     subcktLine && /\bQ1\b\s+\bQ2\b\s+\bQ3\b\s+\bQ4\b\s+\bQ5\b\s+\bQ6\b\s+\bTAMB\b/i.test(subcktLine)
@@ -646,12 +899,20 @@ export function validateFocSpiceNetlist(
   const noCapOnTamb = caps.every((c) => c.n1 !== 'TAMB' && c.n2 !== 'TAMB');
   if (!noCapOnTamb) errors.push('Capacitor attached directly to TAMB would be shorted.');
 
-  const hasSharedBoardNode = ress.some((r) => r.n2 === 'TBRD') && ress.some((r) => r.n1 === 'TBRD');
-  if (!hasSharedBoardNode) errors.push('Shared TBRD coupling node not connected between ZthJC and Zth_board.');
+  const hasSharedBoardNode =
+    topoMode === 'independent'
+      ? MOS_SWITCH_KEYS.every((k) => ress.some((r) => r.n2 === `TBRD_${k}` || r.n1 === `TBRD_${k}`))
+      : ress.some((r) => r.n2 === 'TBRD') && ress.some((r) => r.n1 === 'TBRD');
+  if (!hasSharedBoardNode) errors.push('Required board/PCB coupling nodes missing in netlist.');
 
-  const requiredIc = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'TBRD'];
+  const requiredIc =
+    topoMode === 'independent'
+      ? ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', ...MOS_SWITCH_KEYS.map((k) => `TBRD_${k}`)]
+      : topoMode === 'pcb_spatial_coupled'
+      ? ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'TBRD', ...MOS_SWITCH_KEYS.map((k) => `PCB_${k}`)]
+      : ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'TBRD'];
   const hasDefensiveIc = requiredIc.every((nd) => new RegExp(`V\\(${nd}\\)\\s*=`, 'i').test(icText));
-  if (!hasDefensiveIc) errors.push('Missing .ic on one or more MOSFET/board nodes.');
+  if (!hasDefensiveIc) errors.push('Missing .ic on one or more MOSFET/board/PCB nodes.');
 
   const allValsPositive =
     ress.length > 0 &&
@@ -660,7 +921,6 @@ export function validateFocSpiceNetlist(
     caps.every((c) => Number.isFinite(c.val) && c.val > 0);
   if (!allValsPositive) errors.push('One or more netlist R/C values are non-positive or unparseable.');
 
-  // Numerical DC nodal matrix verification directly from parsed resistors (TAMB = 0°C rise ref)
   let nodalMathVerified = false;
   let rJcParsed = Number.NaN;
   let rBrdParsed = Number.NaN;
@@ -692,60 +952,80 @@ export function validateFocSpiceNetlist(
         }
       }
 
-      // Common-mode test: 1 W into Q1..Q6 (6 W total)
       const rhsCm = new Float64Array(nNodes);
-      for (let m = 1; m <= 6; m++) {
-        rhsCm[nodeIndex.get(`Q${m}`)!] = 1.0;
-      }
+      for (let m = 1; m <= 6; m++) rhsCm[nodeIndex.get(`Q${m}`)!] = 1.0;
       const solCm = solveLinearSystem(G, rhsCm);
 
-      // Single-arm test: 1 W into Q1 only
       const rhsOne = new Float64Array(nNodes);
       rhsOne[nodeIndex.get('Q1')!] = 1.0;
       const solOne = solveLinearSystem(G, rhsOne);
 
       if (solCm && solOne) {
-        const tBrdCm = solCm[nodeIndex.get('TBRD')!];
-        const rBrdCm = tBrdCm / 6;
-        const rJcArms = [1, 2, 3, 4, 5, 6].map((m) => solCm[nodeIndex.get(`Q${m}`)!] - tBrdCm);
-        const rJcMean = rJcArms.reduce((a, b) => a + b, 0) / 6;
-
-        const tQ1One = solOne[nodeIndex.get('Q1')!];
-        const tBrdOne = solOne[nodeIndex.get('TBRD')!];
-        const oneArmErr = Math.abs(tQ1One - (rJcArms[0] + rBrdCm)) + Math.abs(tBrdOne - rBrdCm);
-
-        rJcParsed = rJcMean;
-        rBrdParsed = rBrdCm;
-        let expectedErr = 0;
-        let armMismatch = 0;
-        if (expectedModel) {
-          const armExps = buildPerSwitchJcChains(expectedModel).map((chain) => chain.reduce((s, c) => s + c.r, 0));
-          for (let m = 0; m < 6; m++) {
-            armMismatch = Math.max(armMismatch, Math.abs(rJcArms[m] - armExps[m]) / Math.max(1e-6, armExps[m]));
+        if (topoMode === 'shared_board') {
+          const tBrdCm = solCm[nodeIndex.get('TBRD')!];
+          const rBrdCm = tBrdCm / 6;
+          const rJcArms = [1, 2, 3, 4, 5, 6].map((m) => solCm[nodeIndex.get(`Q${m}`)!] - tBrdCm);
+          const rJcMean = rJcArms.reduce((a, b) => a + b, 0) / 6;
+          const tQ1One = solOne[nodeIndex.get('Q1')!];
+          const tBrdOne = solOne[nodeIndex.get('TBRD')!];
+          const oneArmErr = Math.abs(tQ1One - (rJcArms[0] + rBrdCm)) + Math.abs(tBrdOne - rBrdCm);
+          rJcParsed = rJcMean;
+          rBrdParsed = rBrdCm;
+          let expectedErr = 0;
+          let armMismatch = 0;
+          if (expectedModel) {
+            const armExps = buildPerSwitchJcChains(expectedModel).map((chain) => chain.reduce((s, c) => s + c.r, 0));
+            for (let m = 0; m < 6; m++) {
+              armMismatch = Math.max(armMismatch, Math.abs(rJcArms[m] - armExps[m]) / Math.max(1e-6, armExps[m]));
+            }
+            const brdExp = (expectedModel.zthBoard.length > 0 ? expectedModel.zthBoard : DEFAULT_FOC_MODEL.zthBoard).reduce((s, c) => s + c.r, 0);
+            expectedErr = armMismatch + Math.abs(rBrdParsed - brdExp) / Math.max(1e-6, brdExp);
+          } else {
+            armMismatch = Math.max(...rJcArms.map((v) => Math.abs(v - rJcMean)));
           }
-          const brdExp = (expectedModel.zthBoard.length > 0 ? expectedModel.zthBoard : DEFAULT_FOC_MODEL.zthBoard).reduce(
-            (s, c) => s + c.r,
-            0
-          );
-          expectedErr = armMismatch + Math.abs(rBrdParsed - brdExp) / Math.max(1e-6, brdExp);
+          dcCommonModeError = armMismatch + oneArmErr;
+          if (armMismatch <= 1e-3 && oneArmErr <= 1e-4 && expectedErr <= 1e-3) {
+            nodalMathVerified = true;
+          } else {
+            errors.push(`Nodal DC matrix verification mismatch (err=${dcCommonModeError.toExponential(2)}).`);
+          }
+        } else if (topoMode === 'pcb_spatial_coupled') {
+          const tBrdCm = solCm[nodeIndex.get('TBRD')!];
+          const rBrdCm = tBrdCm / 6;
+          const rJcArms = MOS_SWITCH_KEYS.map((k, m) => solCm[nodeIndex.get(`Q${m + 1}`)!] - solCm[nodeIndex.get(`PCB_${k}`)!]);
+          const rJcMean = rJcArms.reduce((a, b) => a + b, 0) / 6;
+          // Verify lateral coupling: heating Q1 must induce nonzero rise at PCB_BH via lateral/board matrix, and DC reciprocity holds
+          const tPcbBhOne = solOne[nodeIndex.get('PCB_BH')!];
+          const rhsTwo = new Float64Array(nNodes);
+          rhsTwo[nodeIndex.get('Q3')!] = 1.0;
+          const solTwo = solveLinearSystem(G, rhsTwo);
+          const recipErr = solTwo ? Math.abs(solOne[nodeIndex.get('Q3')!] - solTwo[nodeIndex.get('Q1')!]) : 1;
+          rJcParsed = rJcMean;
+          rBrdParsed = rBrdCm;
+          dcCommonModeError = recipErr;
+          if (tPcbBhOne > 0 && recipErr <= 1e-6) {
+            nodalMathVerified = true;
+          } else {
+            errors.push(`Spatial PCB netlist failed passivity/reciprocity check (recipErr=${recipErr.toExponential(2)}).`);
+          }
         } else {
-          armMismatch = Math.max(...rJcArms.map((v) => Math.abs(v - rJcMean)));
-        }
-
-        dcCommonModeError = armMismatch + oneArmErr;
-
-        if (armMismatch <= 1e-3 && oneArmErr <= 1e-4 && expectedErr <= 1e-3) {
-          nodalMathVerified = true;
-        } else {
-          errors.push(
-            `Nodal DC matrix verification mismatch (armMismatch=${armMismatch.toExponential(2)}, oneArmErr=${oneArmErr.toExponential(2)}, modelRelErr=${expectedErr.toExponential(2)}).`
-          );
+          // Independent: heating Q1 must cause zero rise at Q3
+          const rJcArms = MOS_SWITCH_KEYS.map((k, m) => solCm[nodeIndex.get(`Q${m + 1}`)!] - solCm[nodeIndex.get(`TBRD_${k}`)!]);
+          rJcParsed = rJcArms.reduce((a, b) => a + b, 0) / 6;
+          rBrdParsed = solCm[nodeIndex.get('TBRD_AH')!] / 6;
+          const crossLeak = Math.abs(solOne[nodeIndex.get('Q3')!]);
+          dcCommonModeError = crossLeak;
+          if (crossLeak <= 1e-9) {
+            nodalMathVerified = true;
+          } else {
+            errors.push(`Independent netlist has unexpected thermal cross-leakage (${crossLeak.toExponential(2)}).`);
+          }
         }
       } else {
         errors.push('Parsed SPICE resistance matrix is singular or disconnected.');
       }
     } else {
-      errors.push('Parsed netlist is missing required junction/board nodes.');
+      errors.push('Parsed netlist is missing required junction/board/PCB nodes.');
     }
   }
 
@@ -861,6 +1141,13 @@ export function computePhaseMosLosses(
   pLowSw: number;
   pHighDead: number;
   pLowDead: number;
+  lutStatus?: DptLutStatus;
+  lutActiveDims?: DptAxisName[];
+  lutCollapsedDims?: DptAxisName[];
+  lutExtrapolated?: boolean;
+  lutTjProvenance?: DptParameterProvenance;
+  lutRgProvenance?: DptParameterProvenance;
+  eossOutOfRange?: boolean;
 } {
   const d = Math.max(0, Math.min(1, dutyHigh));
   const r25 = Math.max(1e-6, mos.rdsOn25Mohm * 1e-3);
@@ -880,23 +1167,51 @@ export function computePhaseMosLosses(
   const iSq = iPhase * iPhase;
   const pHighCond = iSq * ronH * highCondDuty;
   const pLowCond = iSq * ronL * lowCondDuty;
-  // Preserve the exact 25°C reference conduction loss for the coupled steady-state
-  // feedback solve. Dividing average hot loss by R(T_avg)/R25 is biased when I²·D
-  // and junction temperature vary together over the capture.
   const pHighCond25W = iSq * r25 * highCondDuty;
   const pLowCond25W = iSq * r25 * lowCondDuty;
 
   let pSw = 0;
   let pDead = 0;
+  let lutStatus: DptLutStatus | undefined;
+  let lutActiveDims: DptAxisName[] | undefined;
+  let lutCollapsedDims: DptAxisName[] | undefined;
+  let lutExtrapolated: boolean | undefined;
+  let lutTjProvenance: DptParameterProvenance | undefined;
+  let lutRgProvenance: DptParameterProvenance | undefined;
+  let eossOutOfRange = false;
 
   if (!clamped && fswHz > 0) {
     const iAbs = Math.abs(iPhase);
     const vPos = Math.max(0, vBus);
     const vScale = vPos / Math.max(1e-3, mos.vRefV);
-    const lutInterp = mos.dptLut && mos.dptLut.length > 0 ? interpolateDptSwitchingLoss(mos.dptLut, vPos, iAbs) : null;
+    const activeTjC = iPhase >= 0 ? tjHighC : tjLowC;
+    const rgOnKnown = mos.rgOnOhm !== undefined && Number.isFinite(mos.rgOnOhm);
+    const rgOffKnown = mos.rgOffOhm !== undefined && Number.isFinite(mos.rgOffOhm);
+    const lutInterp =
+      mos.dptLut && mos.dptLut.length > 0
+        ? interpolateDptSwitchingLoss(mos.dptLut, {
+            vBusV: vPos,
+            iLoadA: iAbs,
+            tjC: activeTjC,
+            rgOnOhm: mos.rgOnOhm,
+            rgOffOhm: mos.rgOffOhm,
+            tjProvenance: 'measured',
+            rgProvenance: mos.rgProvenance ?? (rgOnKnown || rgOffKnown ? 'measured' : 'assumed'),
+          })
+        : null;
     let eSwJ: number;
     let eQrrJ: number;
     if (lutInterp) {
+      if (lutInterp.status === 'INVALID_DATA') {
+        throw new Error(lutInterp.warnings[0] || 'DPT LUT 数据含非法字段，已拒绝开关损耗插值。');
+      }
+      lutStatus = lutInterp.status;
+      lutActiveDims = lutInterp.activeDimensions;
+      lutCollapsedDims = lutInterp.collapsedDimensions;
+      lutExtrapolated = lutInterp.extrapolated;
+      lutTjProvenance = lutInterp.tjProvenance;
+      lutRgProvenance = lutInterp.rgProvenance;
+
       if (mos.eonIncludesQrr) {
         eSwJ = Math.max(0, lutInterp.eSwTotalUj) * 1e-6;
         eQrrJ = 0;
@@ -907,11 +1222,19 @@ export function computePhaseMosLosses(
     } else {
       const iScale = iAbs / Math.max(1e-3, mos.iRefA);
       eSwJ = Math.max(0, mos.eonPlusEoffUj) * 1e-6 * vScale * iScale;
-      // When Eon+Eoff is directly imported from a DPT integral (eonIncludesQrr=true), Qrr energy is already captured in Eon
       eQrrJ = mos.eonIncludesQrr ? 0 : Math.max(0, mos.qrrNc) * 1e-9 * vPos * iScale;
     }
-    // Half-bridge active hard-switching Coss capacitive discharge loss: once per PWM cycle on the active switch
-    const eOssJ = Math.max(0, mos.eossUj ?? 0) * 1e-6 * vScale * vScale;
+
+    let eOssJ = 0;
+    if (!mos.eossAlreadyIncludedInEsw) {
+      if (mos.eossCurve) {
+        const evalRes = evaluateNonlinearEossUj(mos.eossCurve, vPos);
+        eOssJ = Math.max(0, evalRes.eossUj) * 1e-6;
+        eossOutOfRange = evalRes.outOfRange;
+      } else {
+        eOssJ = Math.max(0, mos.eossUj ?? 0) * 1e-6 * vScale * vScale;
+      }
+    }
     pSw = fswHz * (eSwJ + eQrrJ + eOssJ);
     pDead = iAbs * Math.max(0, mos.vsdV) * deadDuty;
   }
@@ -922,11 +1245,9 @@ export function computePhaseMosLosses(
   let pLowDead = 0;
 
   if (iPhase >= 0) {
-    // Positive current out of half-bridge: High-side is active hard-switching, Low-side is sync rectifier w/ dead-time diode
     pHighSw = pSw;
     pLowDead = pDead;
   } else {
-    // Negative current into half-bridge: Low-side is active hard-switching, High-side is sync rectifier w/ dead-time diode
     pLowSw = pSw;
     pHighDead = pDead;
   }
@@ -942,25 +1263,37 @@ export function computePhaseMosLosses(
     pLowSw,
     pHighDead,
     pLowDead,
+    lutStatus,
+    lutActiveDims,
+    lutCollapsedDims,
+    lutExtrapolated,
+    lutTjProvenance,
+    lutRgProvenance,
+    eossOutOfRange,
   };
 }
 
 /**
- * Exact O(6*Kj + Kb) star-coupled Implicit Backward-Euler step with Schur-complement elimination
- * across the 6 ZthJC arms into the shared Zth_board ladder.
+ * Exact O(6*Kj + Kb) Implicit Backward-Euler 6-MOS thermal solver supporting:
+ * - 'shared_board': 6 ZthJC arms -> shared TBRD -> Zth_board -> TAMB
+ * - 'pcb_spatial_coupled': 6 ZthJC arms -> 6 PCB zones (C_pcb, symmetric G_ij, R_vert) -> TBRD -> Zth_board -> TAMB
+ * - 'independent': 6 independent ZthJC + Zth_board arms -> TAMB (zero mutual coupling)
  */
 class StarCoupled6MosThermalSolver {
+  private topoMode: FocThermalTopologyMode;
+  private spatial: ResolvedSpatialNetwork;
   private armJcs: CauerStage[][]; // 6 x kj
   private brd: CauerStage[];
   private kj: number;
   private kb: number;
   private armT: Float64Array[]; // 6 x kj
-  private brdT: Float64Array; // kb
+  private pcbT: Float64Array; // 6 PCB zone temperatures
+  private brdT: Float64Array; // kb shared board nodes
+  private brdArmsT: Float64Array[]; // 6 x kb independent board nodes
   private tAmbC: number;
   private minTau: number;
   private maxSubDtOverTau: number = 0;
 
-  // Per-arm scratch buffers (supports per-switch spatial asymmetry)
   private jcSubAll: Float64Array[];
   private jcDiagAll: Float64Array[];
   private jcSupAll: Float64Array[];
@@ -969,6 +1302,7 @@ class StarCoupled6MosThermalSolver {
   private jcDPrimesAll: Float64Array[];
   private jcGammaBoard: Float64Array;
   private jcGLast: Float64Array;
+  private jcGArmEff: Float64Array;
 
   private brdSub: Float64Array;
   private brdDiag: Float64Array;
@@ -984,6 +1318,8 @@ class StarCoupled6MosThermalSolver {
     initialBoardTempC?: number,
     initialState?: ThermalNetworkStateSnapshot
   ) {
+    this.spatial = resolveSpatialThermalNetwork(model);
+    this.topoMode = this.spatial.mode;
     this.armJcs = buildPerSwitchJcChains(model);
     this.brd = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
     this.kj = this.armJcs[0].length;
@@ -1005,6 +1341,13 @@ class StarCoupled6MosThermalSolver {
       }
       return arr;
     });
+    this.pcbT = new Float64Array(6);
+    for (let m = 0; m < 6; m++) {
+      this.pcbT[m] =
+        initialState?.pcbT && initialState.pcbT.length === 6 && Number.isFinite(initialState.pcbT[m])
+          ? initialState.pcbT[m]
+          : fallbackBrdT;
+    }
     this.brdT = new Float64Array(this.kb);
     for (let k = 0; k < this.kb; k++) {
       this.brdT[k] =
@@ -1012,11 +1355,27 @@ class StarCoupled6MosThermalSolver {
           ? initialState.brdT[k]
           : fallbackBrdT;
     }
+    this.brdArmsT = Array.from({ length: 6 }, (_, m) => {
+      const arr = new Float64Array(this.kb);
+      const src = initialState?.brdArmsT?.[m];
+      for (let k = 0; k < this.kb; k++) {
+        arr[k] = src && src.length === this.kb && Number.isFinite(src[k]) ? src[k] : this.brdT[k];
+      }
+      return arr;
+    });
 
     let mt = Infinity;
     for (const s of [...this.armJcs.flat(), ...this.brd]) {
       const t = s.r * s.c;
       if (isFinite(t) && t > 1e-12 && t < mt) mt = t;
+    }
+    if (this.topoMode === 'pcb_spatial_coupled') {
+      for (let m = 0; m < 6; m++) {
+        let gSum = 1 / this.spatial.rVert[m];
+        for (let j = 0; j < 6; j++) gSum += this.spatial.gLat[m][j];
+        const tauPcb = this.spatial.cPcb[m] / Math.max(1e-9, gSum);
+        if (isFinite(tauPcb) && tauPcb > 1e-12 && tauPcb < mt) mt = tauPcb;
+      }
     }
     this.minTau = isFinite(mt) ? mt : 1e-4;
 
@@ -1028,6 +1387,7 @@ class StarCoupled6MosThermalSolver {
     this.jcDPrimesAll = Array.from({ length: 6 }, () => new Float64Array(this.kj));
     this.jcGammaBoard = new Float64Array(6);
     this.jcGLast = new Float64Array(6);
+    this.jcGArmEff = new Float64Array(6);
 
     this.brdSub = new Float64Array(this.kb);
     this.brdDiag = new Float64Array(this.kb);
@@ -1043,7 +1403,23 @@ class StarCoupled6MosThermalSolver {
   }
 
   public getBoardTemp(): number {
+    if (this.topoMode === 'pcb_spatial_coupled') {
+      let s = 0;
+      for (let m = 0; m < 6; m++) s += this.pcbT[m];
+      return s / 6;
+    }
+    if (this.topoMode === 'independent') {
+      let s = 0;
+      for (let m = 0; m < 6; m++) s += this.brdArmsT[m][0];
+      return s / 6;
+    }
     return this.brdT[0];
+  }
+
+  public getBoardTempsBySwitch(): number[] {
+    if (this.topoMode === 'pcb_spatial_coupled') return Array.from(this.pcbT);
+    if (this.topoMode === 'independent') return this.brdArmsT.map((a) => a[0]);
+    return new Array<number>(6).fill(this.brdT[0]);
   }
 
   public getMaxSubDtOverTau(): number {
@@ -1058,8 +1434,10 @@ class StarCoupled6MosThermalSolver {
     const tj = this.getJunctionTemps();
     return {
       armT: this.armT.map((arm) => Array.from(arm)),
+      pcbT: this.topoMode === 'pcb_spatial_coupled' ? Array.from(this.pcbT) : undefined,
       brdT: Array.from(this.brdT),
-      tBoardC: this.brdT[0],
+      brdArmsT: this.topoMode === 'independent' ? this.brdArmsT.map((a) => Array.from(a)) : undefined,
+      tBoardC: this.getBoardTemp(),
       tjMaxC: Math.max(...tj),
     };
   }
@@ -1070,7 +1448,8 @@ class StarCoupled6MosThermalSolver {
     if (!Array.isArray(powers) || powers.length !== 6 || powers.some((p) => !Number.isFinite(p) || p < 0)) {
       throw new Error('六管热网络每一步必须提供 6 个有限非负 MOS 损耗功率；拒绝把 NaN/负功率静默替换为 0。');
     }
-    const subSteps = Math.min(512, Math.max(1, Math.ceil(dt / Math.max(1e-8, 0.05 * this.minTau))));
+    const targetSubDt = Math.max(1e-8, 0.05 * this.minTau);
+    const subSteps = Math.max(1, Math.min(4096, Math.ceil(dt / targetSubDt)));
     const subDt = dt / subSteps;
     if (this.minTau > 0) {
       const ratio = subDt / this.minTau;
@@ -1080,7 +1459,7 @@ class StarCoupled6MosThermalSolver {
     const kj = this.kj;
     const kb = this.kb;
 
-    // Factor each MOSFET JC arm matrix (supports per-switch spatial asymmetry cleanly)
+    // Factor each MOSFET JC arm matrix
     let gArms = 0;
     for (let m = 0; m < 6; m++) {
       const jc = this.armJcs[m];
@@ -1109,10 +1488,177 @@ class StarCoupled6MosThermalSolver {
       const gammaBoard = gJcLast / lastDenomJc;
       this.jcGLast[m] = gJcLast;
       this.jcGammaBoard[m] = gammaBoard;
-      gArms += gJcLast * (1 - gammaBoard);
+      this.jcGArmEff[m] = gJcLast * (1 - gammaBoard);
+      gArms += this.jcGArmEff[m];
     }
 
-    // Factor Zth_board matrix including Schur coupling gArms on node 0 (TBRD)
+    if (this.topoMode === 'independent') {
+      // Solve each of the 6 independent ZthJC + ZthBoard_m arms separately (G_ij = 0)
+      const gVert = this.spatial.rVert.map((rv) => 1 / rv);
+      for (let m = 0; m < 6; m++) {
+        const brdSubM = new Float64Array(kb);
+        const brdDiagM = new Float64Array(kb);
+        const brdSupM = new Float64Array(kb);
+        const brdCpM = new Float64Array(kb);
+        const brdDpM = new Float64Array(kb);
+        const brdRhsM = new Float64Array(kb);
+        const brdCkDtM = new Float64Array(kb);
+        for (let k = 0; k < kb; k++) {
+          const rk = this.brd[k].r * 6 + (k === 0 ? this.spatial.rVert[m] : 0);
+          const ck = this.brd[k].c / 6;
+          brdCkDtM[k] = ck / subDt;
+          const gL = k > 0 ? 1 / (this.brd[k - 1].r * 6 + (k - 1 === 0 ? this.spatial.rVert[m] : 0)) : 0;
+          const gR = 1 / rk;
+          brdSubM[k] = k > 0 ? -gL : 0;
+          brdDiagM[k] = brdCkDtM[k] + gL + gR + (k === 0 ? this.jcGArmEff[m] : 0);
+          brdSupM[k] = k < kb - 1 ? -gR : 0;
+        }
+        brdCpM[0] = kb > 1 ? brdSupM[0] / brdDiagM[0] : 0;
+        for (let k = 1; k < kb; k++) {
+          const denom = brdDiagM[k] - brdSubM[k] * brdCpM[k - 1];
+          brdCpM[k] = k < kb - 1 ? brdSupM[k] / denom : 0;
+        }
+        const gLastM = 1 / (this.brd[kb - 1].r * 6 + (kb - 1 === 0 ? this.spatial.rVert[m] : 0));
+        const ambRhsM = this.tAmbC * gLastM;
+        void gVert;
+
+        const arm = this.armT[m];
+        const dp = this.jcDPrimesAll[m];
+        const subM = this.jcSubAll[m];
+        const diagM = this.jcDiagAll[m];
+        const cpM = this.jcCPrimeAll[m];
+        const ckDtM = this.jcCkDtAll[m];
+        const brdArm = this.brdArmsT[m];
+
+        for (let sub = 0; sub < subSteps; sub++) {
+          dp[0] = (ckDtM[0] * arm[0] + (powers[m] || 0)) / diagM[0];
+          for (let k = 1; k < kj; k++) {
+            const denom = diagM[k] - subM[k] * cpM[k - 1];
+            dp[k] = (ckDtM[k] * arm[k] - subM[k] * dp[k - 1]) / denom;
+          }
+          const pArm = this.jcGLast[m] * dp[kj - 1];
+          for (let k = 0; k < kb; k++) {
+            brdRhsM[k] = brdCkDtM[k] * brdArm[k] + (k === 0 ? pArm : 0) + (k === kb - 1 ? ambRhsM : 0);
+          }
+          brdDpM[0] = brdRhsM[0] / brdDiagM[0];
+          for (let k = 1; k < kb; k++) {
+            const denom = brdDiagM[k] - brdSubM[k] * brdCpM[k - 1];
+            brdDpM[k] = (brdRhsM[k] - brdSubM[k] * brdDpM[k - 1]) / denom;
+          }
+          brdArm[kb - 1] = brdDpM[kb - 1];
+          for (let k = kb - 2; k >= 0; k--) {
+            brdArm[k] = brdDpM[k] - brdCpM[k] * brdArm[k + 1];
+          }
+          arm[kj - 1] = dp[kj - 1] + this.jcGammaBoard[m] * brdArm[0];
+          for (let k = kj - 2; k >= 0; k--) {
+            arm[k] = dp[k] - cpM[k] * arm[k + 1];
+          }
+        }
+      }
+      return;
+    }
+
+    if (this.topoMode === 'pcb_spatial_coupled') {
+      // Backward Schur elimination of board chain T_brd[1..kb-1] into T_brd[0],
+      // then exact 6x6 symmetric linear system for PCB zones PCB_0..PCB_5
+      const gVert = new Float64Array(6);
+      let gVertSum = 0;
+      for (let m = 0; m < 6; m++) {
+        gVert[m] = 1 / this.spatial.rVert[m];
+        gVertSum += gVert[m];
+      }
+      const brdCkDt = new Float64Array(kb);
+      const uBrd = new Float64Array(kb);
+      const invDenBrd = new Float64Array(kb);
+      for (let k = kb - 1; k >= 0; k--) {
+        brdCkDt[k] = this.brd[k].c / subDt;
+        const gL = k > 0 ? 1 / this.brd[k - 1].r : 0;
+        const gR = 1 / this.brd[k].r;
+        const gNextEff = k < kb - 1 ? gR * (1 - uBrd[k + 1]) : gR;
+        const diagK = brdCkDt[k] + gL + gNextEff + (k === 0 ? gVertSum : 0);
+        invDenBrd[k] = 1 / diagK;
+        uBrd[k] = k > 0 ? gL * invDenBrd[k] : 0;
+      }
+
+      // Build 6x6 SPD conductance+capacitance matrix M6 for PCB_0..PCB_5
+      const M6 = Array.from({ length: 6 }, () => new Float64Array(6));
+      for (let i = 0; i < 6; i++) {
+        let latRowSum = 0;
+        for (let j = 0; j < 6; j++) {
+          if (i !== j) latRowSum += this.spatial.gLat[i][j];
+        }
+        const cOverDt = this.spatial.cPcb[i] / subDt;
+        M6[i][i] = cOverDt + gVert[i] + latRowSum + this.jcGArmEff[i] - gVert[i] * gVert[i] * invDenBrd[0];
+        for (let j = 0; j < 6; j++) {
+          if (i !== j) {
+            M6[i][j] = -this.spatial.gLat[i][j] - gVert[i] * gVert[j] * invDenBrd[0];
+          }
+        }
+      }
+
+      const gBrdLast = 1 / this.brd[kb - 1].r;
+      const ambTerm = this.tAmbC * gBrdLast;
+      const vBrd = new Float64Array(kb);
+      const rhs6 = new Float64Array(6);
+      const pArmsVec = new Float64Array(6);
+
+      for (let sub = 0; sub < subSteps; sub++) {
+        for (let m = 0; m < 6; m++) {
+          const arm = this.armT[m];
+          const dp = this.jcDPrimesAll[m];
+          const subM = this.jcSubAll[m];
+          const diagM = this.jcDiagAll[m];
+          const cpM = this.jcCPrimeAll[m];
+          const ckDtM = this.jcCkDtAll[m];
+
+          dp[0] = (ckDtM[0] * arm[0] + (powers[m] || 0)) / diagM[0];
+          for (let k = 1; k < kj; k++) {
+            const denom = diagM[k] - subM[k] * cpM[k - 1];
+            dp[k] = (ckDtM[k] * arm[k] - subM[k] * dp[k - 1]) / denom;
+          }
+          pArmsVec[m] = this.jcGLast[m] * dp[kj - 1];
+        }
+
+        // Backward sweep for vBrd[kb-1..0]
+        for (let k = kb - 1; k >= 0; k--) {
+          const gR = 1 / this.brd[k].r;
+          const rhsK =
+            brdCkDt[k] * this.brdT[k] +
+            (k === kb - 1 ? ambTerm : gR * vBrd[k + 1]);
+          vBrd[k] = rhsK * invDenBrd[k];
+        }
+        const offsetBrd0 = vBrd[0];
+
+        for (let i = 0; i < 6; i++) {
+          rhs6[i] = (this.spatial.cPcb[i] / subDt) * this.pcbT[i] + pArmsVec[i] + gVert[i] * offsetBrd0;
+        }
+        const nextPcb = solveLinearSystem(M6, rhs6);
+        if (!nextPcb) {
+          throw new Error('PCB 空间热耦合矩阵求解奇异，请检查 PCB 热阻/热容设置。');
+        }
+        let pcbVertFlux = 0;
+        for (let m = 0; m < 6; m++) {
+          this.pcbT[m] = nextPcb[m];
+          pcbVertFlux += gVert[m] * nextPcb[m];
+        }
+        this.brdT[0] = offsetBrd0 + pcbVertFlux * invDenBrd[0];
+        for (let k = 1; k < kb; k++) {
+          this.brdT[k] = vBrd[k] + uBrd[k] * this.brdT[k - 1];
+        }
+        for (let m = 0; m < 6; m++) {
+          const arm = this.armT[m];
+          const dp = this.jcDPrimesAll[m];
+          const cpM = this.jcCPrimeAll[m];
+          arm[kj - 1] = dp[kj - 1] + this.jcGammaBoard[m] * this.pcbT[m];
+          for (let k = kj - 2; k >= 0; k--) {
+            arm[k] = dp[k] - cpM[k] * arm[k + 1];
+          }
+        }
+      }
+      return;
+    }
+
+    // Default 'shared_board': Factor Zth_board matrix including Schur coupling gArms on node 0 (TBRD)
     for (let k = 0; k < kb; k++) {
       this.brdCkDt[k] = this.brd[k].c / subDt;
       const gL = k > 0 ? 1 / this.brd[k - 1].r : 0;
@@ -1251,76 +1797,145 @@ function solveCoupledThermalSteadyState(params: {
   rBrdTotal: number;
   tAmbC: number;
   tInitSeedC?: number[];
+  spatial?: ResolvedSpatialNetwork;
+  evalFixedPowerAtTj?: (tjVec: number[]) => number[] | null;
 }): {
   tBoardSteadyC: number;
+  tBoardSteadyByKey: number[];
   tjSteadyC: number[];
   converged: boolean;
   thermalRunaway: boolean;
 } {
-  const { pCond25W, pFixedW, alphaPerC, rJcTotalByArm, rBrdTotal, tAmbC, tInitSeedC } = params;
+  const { pCond25W, pFixedW, alphaPerC, rJcTotalByArm, rBrdTotal, tAmbC, tInitSeedC, spatial, evalFixedPowerAtTj } = params;
   const kArm = pCond25W.map((p25) => alphaPerC * p25);
   const p0Arm = pCond25W.map((p25, m) => pFixedW[m] + p25 * (1 - 25 * alphaPerC));
+  const useNonShared = Boolean(spatial && spatial.mode !== 'shared_board');
+  const hasTjSwCoupling = Boolean(evalFixedPowerAtTj);
 
-  const armStable = kArm.every((km, m) => 1 - rJcTotalByArm[m] * km > 1e-6);
-  let gLoop = Infinity;
-  let analyticOk = false;
-  let analyticBrd = tAmbC;
-  const analyticTj = new Array<number>(6).fill(tAmbC);
+  if (!useNonShared && !hasTjSwCoupling) {
+    const armStable = kArm.every((km, m) => 1 - rJcTotalByArm[m] * km > 1e-6);
+    let gLoop = Infinity;
+    let analyticOk = false;
+    let analyticBrd = tAmbC;
+    const analyticTj = new Array<number>(6).fill(tAmbC);
 
-  if (armStable) {
-    let sumKOverDen = 0;
-    let sumP0OverDen = 0;
-    for (let m = 0; m < 6; m++) {
-      const den = 1 - rJcTotalByArm[m] * kArm[m];
-      sumKOverDen += kArm[m] / den;
-      sumP0OverDen += p0Arm[m] / den;
-    }
-    gLoop = rBrdTotal * sumKOverDen;
-    if (gLoop < 1 - 1e-6) {
-      analyticBrd = (tAmbC + rBrdTotal * sumP0OverDen) / (1 - gLoop);
-      let allInsidePiecewiseLinear = Number.isFinite(analyticBrd) && analyticBrd <= 2000;
+    if (armStable) {
+      let sumKOverDen = 0;
+      let sumP0OverDen = 0;
       for (let m = 0; m < 6; m++) {
         const den = 1 - rJcTotalByArm[m] * kArm[m];
-        const tm = (analyticBrd + rJcTotalByArm[m] * p0Arm[m]) / den;
-        analyticTj[m] = tm;
-        if (!Number.isFinite(tm) || tm > 2000 || 1 + alphaPerC * (tm - 25) < 0.1) {
-          allInsidePiecewiseLinear = false;
+        sumKOverDen += kArm[m] / den;
+        sumP0OverDen += p0Arm[m] / den;
+      }
+      gLoop = rBrdTotal * sumKOverDen;
+      if (gLoop < 1 - 1e-6) {
+        analyticBrd = (tAmbC + rBrdTotal * sumP0OverDen) / (1 - gLoop);
+        let allInsidePiecewiseLinear = Number.isFinite(analyticBrd) && analyticBrd <= 2000;
+        for (let m = 0; m < 6; m++) {
+          const den = 1 - rJcTotalByArm[m] * kArm[m];
+          const tm = (analyticBrd + rJcTotalByArm[m] * p0Arm[m]) / den;
+          analyticTj[m] = tm;
+          if (!Number.isFinite(tm) || tm > 2000 || 1 + alphaPerC * (tm - 25) < 0.1) {
+            allInsidePiecewiseLinear = false;
+          }
+        }
+        if (allInsidePiecewiseLinear) {
+          analyticOk = true;
         }
       }
-      if (allInsidePiecewiseLinear) {
-        analyticOk = true;
-      }
+    }
+
+    if (analyticOk) {
+      return {
+        tBoardSteadyC: analyticBrd,
+        tBoardSteadyByKey: new Array<number>(6).fill(analyticBrd),
+        tjSteadyC: analyticTj,
+        converged: true,
+        thermalRunaway: false,
+      };
     }
   }
 
-  if (analyticOk) {
-    return {
-      tBoardSteadyC: analyticBrd,
-      tjSteadyC: analyticTj,
-      converged: true,
-      thermalRunaway: false,
-    };
+  // Build steady-state board/PCB conductance matrix G_steady (7x7 for pcb_spatial_coupled: PCB0..5 + TBRD, or independent diag)
+  const gBrdTot = 1 / Math.max(1e-6, rBrdTotal);
+  let gSpatialMat: Float64Array[] | null = null;
+  if (spatial && spatial.mode === 'pcb_spatial_coupled') {
+    gSpatialMat = Array.from({ length: 7 }, () => new Float64Array(7));
+    let gVertSum = 0;
+    for (let i = 0; i < 6; i++) {
+      const gv = 1 / spatial.rVert[i];
+      gVertSum += gv;
+      let latSum = 0;
+      for (let j = 0; j < 6; j++) {
+        if (i !== j) {
+          const gij = spatial.gLat[i][j];
+          latSum += gij;
+          gSpatialMat[i][j] = -gij;
+        }
+      }
+      gSpatialMat[i][i] = gv + latSum;
+      gSpatialMat[i][6] = -gv;
+      gSpatialMat[6][i] = -gv;
+    }
+    gSpatialMat[6][6] = gVertSum + gBrdTot;
   }
 
-  // Iterative fallback with convergence check & thermal runaway detection
   const tjVec = tInitSeedC ? [...tInitSeedC] : new Array<number>(6).fill(tAmbC + 10);
+  let tBrdByKey = new Array<number>(6).fill(tAmbC);
   let tBrd = tAmbC;
   let converged = false;
-  let runaway = !armStable || gLoop >= 1 - 1e-6;
+  let runaway = false;
 
-  for (let it = 0; it < 120; it++) {
+  for (let it = 0; it < 160; it++) {
+    const dynFixed = evalFixedPowerAtTj ? evalFixedPowerAtTj(tjVec) : null;
     const pArm = new Array<number>(6);
     let pSum = 0;
     for (let m = 0; m < 6; m++) {
       const rFactor = Math.max(0.1, 1 + alphaPerC * (tjVec[m] - 25));
-      pArm[m] = pFixedW[m] + pCond25W[m] * rFactor;
+      const pF = dynFixed ? dynFixed[m] : pFixedW[m];
+      pArm[m] = pF + pCond25W[m] * rFactor;
       pSum += pArm[m];
     }
-    const nextBrd = Math.min(2000, Math.max(-50, tAmbC + pSum * rBrdTotal));
-    let maxDelta = Math.abs(nextBrd - tBrd);
-    tBrd = nextBrd;
+
+    let maxDelta = 0;
+    if (spatial?.mode === 'pcb_spatial_coupled' && gSpatialMat) {
+      const rhs7 = new Float64Array(7);
+      for (let m = 0; m < 6; m++) rhs7[m] = pArm[m];
+      rhs7[6] = gBrdTot * tAmbC;
+      // Add tAmbC * gVert to keep affine ref exact? No: G * (T - tAmbC) = P => G * dT = P with rhs7[6] = 0!
+      rhs7[6] = 0;
+      const dT7 = solveLinearSystem(gSpatialMat, rhs7);
+      if (!dT7) {
+        runaway = true;
+        break;
+      }
+      let brdSum = 0;
+      const nextPcb: number[] = new Array(6);
+      for (let m = 0; m < 6; m++) {
+        nextPcb[m] = Math.min(2000, Math.max(-50, tAmbC + dT7[m]));
+        maxDelta = Math.max(maxDelta, Math.abs(nextPcb[m] - tBrdByKey[m]));
+        tBrdByKey[m] = nextPcb[m];
+        brdSum += nextPcb[m];
+      }
+      tBrd = brdSum / 6;
+    } else if (spatial?.mode === 'independent') {
+      let brdSum = 0;
+      for (let m = 0; m < 6; m++) {
+        const nextBm = Math.min(2000, Math.max(-50, tAmbC + pArm[m] * (rBrdTotal * 6 + spatial.rVert[m])));
+        maxDelta = Math.max(maxDelta, Math.abs(nextBm - tBrdByKey[m]));
+        tBrdByKey[m] = nextBm;
+        brdSum += nextBm;
+      }
+      tBrd = brdSum / 6;
+    } else {
+      const nextBrd = Math.min(2000, Math.max(-50, tAmbC + pSum * rBrdTotal));
+      maxDelta = Math.abs(nextBrd - tBrd);
+      tBrd = nextBrd;
+      tBrdByKey = new Array<number>(6).fill(tBrd);
+    }
+
     for (let m = 0; m < 6; m++) {
-      const candT = tBrd + pArm[m] * rJcTotalByArm[m];
+      const candT = tBrdByKey[m] + pArm[m] * rJcTotalByArm[m];
       const nextT = Number.isFinite(candT) ? Math.min(2000, Math.max(-50, candT)) : 2000;
       maxDelta = Math.max(maxDelta, Math.abs(nextT - tjVec[m]));
       tjVec[m] = nextT;
@@ -1328,7 +1943,7 @@ function solveCoupledThermalSteadyState(params: {
     if (tBrd >= 1999.9 || tjVec.some((v) => v >= 1999.9)) {
       runaway = true;
     }
-    if (maxDelta < 1e-4 && !runaway) {
+    if (maxDelta < 1e-3 && !runaway) {
       converged = true;
       break;
     }
@@ -1336,6 +1951,7 @@ function solveCoupledThermalSteadyState(params: {
 
   return {
     tBoardSteadyC: tBrd,
+    tBoardSteadyByKey: tBrdByKey,
     tjSteadyC: tjVec,
     converged: converged && !runaway,
     thermalRunaway: runaway,
@@ -1811,6 +2427,14 @@ export function simulateFoc6Mos(
   const elecCycles = zeroCrossings >= 3 ? zeroCrossings / 2 : 0;
   const pointsPerElecCycle = elecCycles >= 1.5 ? len / elecCycles : null;
 
+  let lutOutOfRangeCount = 0;
+  let lutStatusLatest: DptLutStatus | undefined;
+  let lutActiveDimsLatest: DptAxisName[] = [];
+  let lutCollapsedDimsLatest: DptAxisName[] = [];
+  let lutTjProvLatest: DptParameterProvenance = 'measured';
+  let lutRgProvLatest: DptParameterProvenance = 'assumed';
+  let eossCurveOutOfRangeCount = 0;
+
   const evalStepLossesAt = (
     idx: number,
     curTj: number[],
@@ -1890,6 +2514,22 @@ export function simulateFoc6Mos(
     const lB = computePhaseMosLosses(ib, db, vbus, curTj[2], curTj[3], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
     const lC = computePhaseMosLosses(ic, dc, vbus, curTj[4], curTj[5], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
 
+    if (countOvermod) {
+      for (const leg of [lA, lB, lC]) {
+        if (leg.lutStatus) {
+          lutStatusLatest = leg.lutStatus;
+          if (leg.lutActiveDims) lutActiveDimsLatest = leg.lutActiveDims;
+          if (leg.lutCollapsedDims) lutCollapsedDimsLatest = leg.lutCollapsedDims;
+          if (leg.lutTjProvenance) lutTjProvLatest = leg.lutTjProvenance;
+          if (leg.lutRgProvenance) lutRgProvLatest = leg.lutRgProvenance;
+          if (leg.lutExtrapolated || leg.lutStatus === 'OUT_OF_RANGE') {
+            lutOutOfRangeCount++;
+          }
+        }
+        if (leg.eossOutOfRange) eossCurveOutOfRangeCount++;
+      }
+    }
+
     return {
       da,
       db,
@@ -1905,6 +2545,7 @@ export function simulateFoc6Mos(
     };
   };
 
+  const resolvedSpatial = resolveSpatialThermalNetwork(model);
   const solver = new StarCoupled6MosThermalSolver(model, ctrl.tAmbC);
   const preheatDurationSec = i0 > preheatStartIdx ? Math.max(0, iaCh.t[i0] - iaCh.t[preheatStartIdx]) : 0;
 
@@ -2096,10 +2737,38 @@ export function simulateFoc6Mos(
   const tauMaxBoardSec = computeDominantCauerTauSec(jcStagesForTau, brdStages);
 
   const alpha = mos.tempCoeffAlphaPerC || 0;
+  const evalSwSteadyAtTj =
+    hasDptLut && lutActiveDimsLatest.includes('Tj') && mos.dptLut
+      ? (tjCand: number[]): number[] => {
+          const pSwMeanCand = [0, 0, 0, 0, 0, 0];
+          const strideSteady = Math.max(1, Math.floor(len / 240));
+          let wSum = 0;
+          for (let k = 0; k < len; k += strideSteady) {
+            const idx = i0 + k;
+            const tCurr = iaCh.t[idx];
+            const ia = iaSampler.sample(tCurr, idx);
+            const ib = ibSampler.sample(tCurr, idx);
+            const ic = icSampler ? icSampler.sample(tCurr, idx) : -(ia + ib);
+            const vbus = vbusSampler ? vbusSampler.sample(tCurr, idx) : ctrl.vBusConstV;
+            const da = duty.a[k];
+            const db = duty.b[k];
+            const dc = duty.c[k];
+            const lA = computePhaseMosLosses(ia, da, vbus, tjCand[0], tjCand[1], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+            const lB = computePhaseMosLosses(ib, db, vbus, tjCand[2], tjCand[3], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+            const lC = computePhaseMosLosses(ic, dc, vbus, tjCand[4], tjCand[5], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+            pSwMeanCand[0] += lA.pHighSw + lA.pHighDead;
+            pSwMeanCand[1] += lA.pLowSw + lA.pLowDead;
+            pSwMeanCand[2] += lB.pHighSw + lB.pHighDead;
+            pSwMeanCand[3] += lB.pLowSw + lB.pLowDead;
+            pSwMeanCand[4] += lC.pHighSw + lC.pHighDead;
+            pSwMeanCand[5] += lC.pLowSw + lC.pLowDead;
+            wSum++;
+          }
+          return pSwMeanCand.map((v) => v / Math.max(1, wSum));
+        }
+      : undefined;
+
   const steadySolve = solveCoupledThermalSteadyState({
-    // Time-average the per-sample 25°C reference conduction loss directly.
-    // This avoids the former approximation Pcond_avg / R(Tj_avg)/R25, which
-    // is not algebraically valid when I²·D is correlated with Tj over time.
     pCond25W: useTimeAvg
       ? Array.from(sumCond25Energy, (energy) => energy / accumulatedDt)
       : summaries.map((s) => s.pCondAvgW / Math.max(0.1, 1 + alpha * (s.tjAvgC - 25))),
@@ -2109,6 +2778,8 @@ export function simulateFoc6Mos(
     rBrdTotal,
     tAmbC: ctrl.tAmbC,
     tInitSeedC: summaries.map((s) => s.tjAvgC),
+    spatial: resolvedSpatial,
+    evalFixedPowerAtTj: evalSwSteadyAtTj,
   });
 
   const tBoardSteadyEstC = steadySolve.tBoardSteadyC;
@@ -2131,8 +2802,6 @@ export function simulateFoc6Mos(
     convergenceForTemperature(tjSteadyEstByKey[key], tj[key][len - 1])
   );
   const junctionConvergencePct = Math.min(...junctionConvergenceByKey);
-  // Conservative convergence is the least converged among the shared board
-  // node and all six junctions, not merely the board temperature.
   const thermalConvergencePct = Math.min(boardConvergencePct, junctionConvergencePct);
   const phaseCurrentKclRmsA = icSampler && phaseCurrentKclDurationSec > 0
     ? Math.sqrt(phaseCurrentKclEnergyA2s / phaseCurrentKclDurationSec)
@@ -2146,6 +2815,19 @@ export function simulateFoc6Mos(
 
   const maxSubDtOverTau = solver.getMaxSubDtOverTau();
   const finalThermalState = solver.getStateSnapshot();
+  const boardFinalVec = solver.getBoardTempsBySwitch();
+  const tBoardByKey = {} as Record<MosSwitchKey, number>;
+  MOS_SWITCH_KEYS.forEach((k, m) => {
+    tBoardByKey[k] = boardFinalVec[m];
+  });
+
+  const eossSource: FocSimulationResult['eossSource'] = mos.eossAlreadyIncludedInEsw
+    ? 'included_in_esw'
+    : mos.eossCurve
+    ? 'nonlinear_curve'
+    : (mos.eossUj ?? 0) > 0
+    ? 'vbus_sq_approx'
+    : 'none';
 
   const warnings: string[] = [...alignmentWarnings];
   if (model.modelKind === 'fallback_default' || model.modelKind === 'demo_builtin' || !model.modelKind) {
@@ -2154,7 +2836,11 @@ export function simulateFoc6Mos(
   if (model.zthBoard.length === 0 || model.zthJC.length === 0) {
     warnings.push('输入热模型存在空 JC/Board 阶梯，仿真已使用内置默认阶梯补齐；结果不代表实际封装与 PCB 热路径。');
   }
-  warnings.push('当前六管热网络采用六个器件支路汇入单一共享 Board 节点的集总模型；未输入 PCB 铜厚/铜箔/过孔/布局和六管互热阻矩阵时，不代表真实 PCB 空间温度场，热点结论仅适用于该集总网络。');
+  if (resolvedSpatial.mode === 'shared_board') {
+    warnings.push('当前六管热网络采用六个器件支路汇入单一共享 Board 节点的集总模型；未输入 PCB 铜厚/铜箔/过孔/布局和六管互热阻矩阵时，不代表真实 PCB 空间温度场，热点结论仅适用于该集总网络。');
+  } else {
+    warnings.push(`已启用六管热拓扑模式：${resolvedSpatial.provenanceLabel}。`);
+  }
   if (model.modelKind === 'fallback_default') {
     warnings.push('当前使用内置默认参考热网络（非具体 MOS 数据手册/实测 Zth）；结温仅为演示性或初步筛查估算，不得用于器件选型签核或安全裕量结论。');
   } else if (model.modelKind === 'pad_ambient') {
@@ -2163,12 +2849,14 @@ export function simulateFoc6Mos(
     warnings.push('当前使用内置 FOC Demo 参考热模型，切换至实测波形时请在 Tab 1 反演或手动设定器件 Zth 参数。');
   }
   if (hasDptLut && mos.dptLut) {
+    const activeLbl = lutActiveDimsLatest.length > 0 ? lutActiveDimsLatest.join('×') : '0D';
+    const collapsedLbl = lutCollapsedDimsLatest.length > 0 ? `；退化常数维度: [${lutCollapsedDimsLatest.join(', ')}]` : '';
     warnings.push(
-      `MOS 开关损耗已启用 ${mos.dptLut.length} 点 DPT 查找表按瞬时 (Vbus, |I_phase|) 逐点插值（表范围 Vbus=[${lutVMin.toFixed(1)}~${lutVMax.toFixed(1)}]V, I=[${lutIMin.toFixed(1)}~${lutIMax.toFixed(1)}]A，按单颗硬开关 MOSFET 口径分配）。`
+      `MOS 开关损耗已启用 ${mos.dptLut.length} 点 DPT 查找表 (${activeLbl} 插值, status=${lutStatusLatest || 'VALID'}, Tj来源=${lutTjProvLatest}, Rg来源=${lutRgProvLatest}${collapsedLbl})。`
     );
-    if (lutExtrapolatedSamples > 0) {
+    if (lutExtrapolatedSamples > 0 || lutOutOfRangeCount > 0) {
       warnings.push(
-        `注意：共有 ${lutExtrapolatedSamples} 步仿真运行点超出 DPT 矩阵实测边界（仿真 Vbus=[${opVMin.toFixed(1)}~${opVMax.toFixed(1)}]V, I_max=${opIMax.toFixed(1)}A vs LUT [${lutVMin.toFixed(1)}~${lutVMax.toFixed(1)}]V × [${lutIMin.toFixed(1)}~${lutIMax.toFixed(1)}]A），超界点仅作邻近外推。`
+        `注意：DPT LUT 共有 ${Math.max(lutExtrapolatedSamples, lutOutOfRangeCount)} 次查询超出实测凸包/边界 (OUT_OF_RANGE，Vbus=[${opVMin.toFixed(1)}~${opVMax.toFixed(1)}]V, I_max=${opIMax.toFixed(1)}A vs LUT [${lutVMin.toFixed(1)}~${lutVMax.toFixed(1)}]V × [${lutIMin.toFixed(1)}~${lutIMax.toFixed(1)}]A)。`
       );
     }
   } else {
@@ -2179,8 +2867,12 @@ export function simulateFoc6Mos(
       );
     }
   }
-  if ((mos.eossUj ?? 0) > 0) {
-    warnings.push('当前 Eoss 仅输入 Vref 处的单点能量，并按 Eoss∝Vbus² 缩放（等效假设 Coss 不随电压变化）；真实 MOS Coss 通常强非线性，需用器件 Eoss(V)/Qoss(V) 曲线或 DPT/LUT 替代，当前结果只作近似估算。');
+  if (eossSource === 'vbus_sq_approx') {
+    warnings.push('当前 Eoss 仅输入 Vref 处的单点能量，并按 Eoss∝Vbus² 低精度 V² 近似缩放（等效假设 Coss 不随电压变化）；真实 MOS Coss 通常强非线性，需用器件 Eoss(V)/Qoss(V) 曲线替代。');
+  } else if (eossSource === 'nonlinear_curve') {
+    warnings.push(`Eoss 已采用非线性 ${mos.eossCurve!.kind.toUpperCase()} 曲线 PCHIP 插值计算${eossCurveOutOfRangeCount > 0 ? `（其中 ${eossCurveOutOfRangeCount} 次脉冲电压超出曲线上限，已边界截断）` : ''}。`);
+  } else if (eossSource === 'included_in_esw') {
+    warnings.push('已启用 Eoss 防重算保护 (eossAlreadyIncludedInEsw=true)：Esw 已涵盖 Coss 充放电损耗，独立 Eoss 项置零。');
   }
   if (partialDutySelected) {
     warnings.push('仅选择了部分外部 Duty 通道，需同时指定 Duty_A / Duty_B / Duty_C 三路才会启用外部占空比，当前已回退为无传感器重构。');
@@ -2222,7 +2914,7 @@ export function simulateFoc6Mos(
   }
   if (maxSubDtOverTau > 0.25) {
     warnings.push(
-      `波形采样步长远大于最快热时间常数 τ_min=${(solver.getMinTau() * 1e3).toFixed(3)}ms，即使经 512 级子步细分后仍有 max(subDt/τ_min)=${maxSubDtOverTau.toFixed(2)} > 0.25，快瞬态芯片结温峰值可能被数值平滑。`
+      `波形采样步长远大于最快热时间常数 τ_min=${(solver.getMinTau() * 1e3).toFixed(3)}ms，经 4096 级子步细分后仍有 max(subDt/τ_min)=${maxSubDtOverTau.toFixed(2)} > 0.25，快瞬态芯片结温峰值可能被数值平滑。`
     );
   }
   if (i0 > 0) {
@@ -2252,6 +2944,9 @@ export function simulateFoc6Mos(
     pMos,
     pInvTotal,
     tBoard,
+    tBoardByKey,
+    thermalTopologyMode: resolvedSpatial.mode,
+    spatialThermalProvenance: resolvedSpatial.provenanceLabel,
     duty,
     summaries,
     hottestKey,
@@ -2275,6 +2970,17 @@ export function simulateFoc6Mos(
     pointsPerElecCycle,
     finalThermalState,
     dutySource: useExternalDuty ? 'external' : 'reconstructed',
+    dptLutDiagnostics: hasDptLut
+      ? {
+          status: lutStatusLatest || 'VALID',
+          activeDimensions: lutActiveDimsLatest,
+          collapsedDimensions: lutCollapsedDimsLatest,
+          outOfRangeCount: lutOutOfRangeCount,
+          tjProvenance: lutTjProvLatest,
+          rgProvenance: lutRgProvLatest,
+        }
+      : undefined,
+    eossSource,
     alignmentWarnings,
     warnings,
     thermalInitInfo,
@@ -2375,6 +3081,7 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
   let stallSteadyConverged = true;
   let stallThermalRunaway = false;
 
+  const stallSpatial = resolveSpatialThermalNetwork(opts.model);
   for (let deg = 0; deg < 360; deg += 5) {
     const rad = (deg * Math.PI) / 180;
     const ia = opts.iPeakA * Math.cos(rad);
@@ -2407,6 +3114,7 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
       rJcTotalByArm: rJcByArm,
       rBrdTotal: rBrd,
       tAmbC: opts.tAmbC,
+      spatial: stallSpatial,
     });
     const tjSteady = stallSteady.tjSteadyC;
     if (!stallSteady.converged) stallSteadyConverged = false;

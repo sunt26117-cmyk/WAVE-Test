@@ -14,6 +14,8 @@
  *     Matches focThermal reconstructSensorlessDutySample(theta_V = theta_I + pfAngleDeg).
  */
 
+import { DEFAULT_SAMPLING_GAP_FACTOR } from '../timeSync';
+
 export type OperatingMode = 'motoring' | 'regen' | 'zero_drift' | 'regen_limit' | 'invalid_bus';
 
 export interface MotorParams {
@@ -121,6 +123,27 @@ export interface RuntimeLogRow {
   iBusFilteredA: number;
   nRpm: number;
   result: SinglePointResult;
+  /** True when time-domain filter output at this row is valid (false for gap-isolated singletons). */
+  filterValid?: boolean;
+  /** True when a sampling gap precedes or isolates this sample. */
+  gapBoundary?: boolean;
+}
+
+export interface MovingAverageFilterDiagnostics {
+  values: number[];
+  gapCount: number;
+  gapIndices: number[];
+  segmentCount: number;
+  segments: Array<{ startIdx: number; endIdx: number }>;
+  medianDtSec: number;
+  gapThresholdSec: number;
+  isolatedIndices: number[];
+  lowCoverageIndices: number[];
+}
+
+export interface RuntimeLogProcessAudit {
+  rows: RuntimeLogRow[];
+  filterDiagnostics: MovingAverageFilterDiagnostics;
 }
 
 export const SVPWM_LINEAR_LIMIT = 2 / Math.sqrt(3); // 1.1547005383792517
@@ -586,13 +609,59 @@ export function isMonotonicTimestamps(timesS: number[]): boolean {
   return timesS[timesS.length - 1] > timesS[0];
 }
 
-export function movingAverageFilter(
+export function partitionContinuousTimeSegments(
+  timesS: number[],
+  gapFactor: number = DEFAULT_SAMPLING_GAP_FACTOR
+): {
+  segments: Array<{ startIdx: number; endIdx: number }>;
+  gapIndices: number[];
+  medianDtSec: number;
+  gapThresholdSec: number;
+} {
+  const n = timesS.length;
+  if (n === 0) {
+    return { segments: [], gapIndices: [], medianDtSec: 0, gapThresholdSec: Infinity };
+  }
+  if (n === 1) {
+    return { segments: [{ startIdx: 0, endIdx: 0 }], gapIndices: [], medianDtSec: 0, gapThresholdSec: Infinity };
+  }
+  const posDts: number[] = [];
+  for (let i = 1; i < n; i++) {
+    const dt = timesS[i] - timesS[i - 1];
+    if (Number.isFinite(dt) && dt > 0) posDts.push(dt);
+  }
+  posDts.sort((a, b) => a - b);
+  const medianDtSec =
+    posDts.length > 0
+      ? posDts.length % 2 === 1
+        ? posDts[Math.floor(posDts.length / 2)]
+        : 0.5 * (posDts[posDts.length / 2 - 1] + posDts[posDts.length / 2])
+      : 0;
+  const gapThresholdSec = medianDtSec > 0 ? Math.max(1e-12, gapFactor * medianDtSec) : Infinity;
+
+  const segments: Array<{ startIdx: number; endIdx: number }> = [];
+  const gapIndices: number[] = [];
+  let segStart = 0;
+  for (let i = 1; i < n; i++) {
+    const dt = timesS[i] - timesS[i - 1];
+    if (dt > gapThresholdSec) {
+      segments.push({ startIdx: segStart, endIdx: i - 1 });
+      gapIndices.push(i);
+      segStart = i;
+    }
+  }
+  segments.push({ startIdx: segStart, endIdx: n - 1 });
+
+  return { segments, gapIndices, medianDtSec, gapThresholdSec };
+}
+
+export function movingAverageFilterWithDiagnostics(
   values: number[],
   timesS: number[],
-  windowMs: number
-): number[] {
+  windowMs: number,
+  options?: { gapFactor?: number }
+): MovingAverageFilterDiagnostics {
   const n = values.length;
-  if (n === 0 || windowMs <= 0) return [...values];
   if (timesS.length > 0 && timesS.length !== n) {
     throw new Error(`Runtime Log 时间轴与电流数组长度不一致：t=${timesS.length}, values=${n}。`);
   }
@@ -603,106 +672,162 @@ export function movingAverageFilter(
     throw new Error('Runtime Log 电流数据包含 NaN/Inf；拒绝通过滤波忽略无效样本。');
   }
 
-  const halfWinS = (windowMs * 1e-3) * 0.5;
-  const prefix = new Float64Array(n + 1);
-  const validPrefix = new Int32Array(n + 1);
-  for (let i = 0; i < n; i++) {
-    const finite = Number.isFinite(values[i]);
-    prefix[i + 1] = prefix[i] + (finite ? values[i] : 0);
-    validPrefix[i + 1] = validPrefix[i] + (finite ? 1 : 0);
+  if (n === 0 || windowMs <= 0) {
+    const segInfo =
+      timesS.length === n
+        ? partitionContinuousTimeSegments(timesS, options?.gapFactor ?? DEFAULT_SAMPLING_GAP_FACTOR)
+        : { segments: n > 0 ? [{ startIdx: 0, endIdx: n - 1 }] : [], gapIndices: [], medianDtSec: 0, gapThresholdSec: Infinity };
+    return {
+      values: [...values],
+      gapCount: segInfo.gapIndices.length,
+      gapIndices: segInfo.gapIndices,
+      segmentCount: segInfo.segments.length,
+      segments: segInfo.segments,
+      medianDtSec: segInfo.medianDtSec,
+      gapThresholdSec: segInfo.gapThresholdSec,
+      isolatedIndices: [],
+      lowCoverageIndices: [],
+    };
   }
 
+  const gapFactor = options?.gapFactor ?? DEFAULT_SAMPLING_GAP_FACTOR;
+  const windowS = windowMs * 1e-3;
+  const halfWinS = windowS * 0.5;
   const out = new Array<number>(n);
-  if (timesS.length === n && isMonotonicTimestamps(timesS)) {
-    // True centered time-window [t - W/2, t + W/2] trapezoidal time-weighted average (accurate for non-uniform dt)
-    const hasNan = validPrefix[n] < n;
-    const trapPrefix = hasNan ? null : new Float64Array(n);
-    if (trapPrefix) {
-      for (let i = 1; i < n; i++) {
-        const dt = timesS[i] - timesS[i - 1];
-        trapPrefix[i] = trapPrefix[i - 1] + 0.5 * (values[i - 1] + values[i]) * dt;
-      }
-    }
 
-    let left = 0;
-    let right = 0;
-    for (let i = 0; i < n; i++) {
-      const ti = timesS[i];
-      while (left < i && ti - timesS[left] > halfWinS + 1e-12) {
-        left++;
+  if (timesS.length === n) {
+    // Segmented centered time-window [t - W/2, t + W/2] clipped to continuous segments (reset across sampling gaps).
+    const { segments, gapIndices, medianDtSec, gapThresholdSec } = partitionContinuousTimeSegments(timesS, gapFactor);
+    const isolatedIndices: number[] = [];
+    const lowCoverageIndices: number[] = [];
+
+    for (const seg of segments) {
+      const s0 = seg.startIdx;
+      const s1 = seg.endIdx;
+      if (s0 === s1) {
+        // Singleton point: if isolated by a sampling gap within a multi-sample capture (n >= 2),
+        // there is zero continuous neighbor span across the filter window -> mark NaN (invalid).
+        if (n >= 2) {
+          out[s0] = Number.NaN;
+          isolatedIndices.push(s0);
+        } else {
+          out[s0] = values[s0];
+        }
+        continue;
       }
-      if (right < i) right = i;
-      while (right + 1 < n && timesS[right + 1] - ti <= halfWinS + 1e-12) {
-        right++;
+
+      const segLen = s1 - s0 + 1;
+      const trapPrefix = new Float64Array(segLen);
+      for (let k = 1; k < segLen; k++) {
+        const dt = timesS[s0 + k] - timesS[s0 + k - 1];
+        trapPrefix[k] = trapPrefix[k - 1] + 0.5 * (values[s0 + k - 1] + values[s0 + k]) * dt;
       }
-      if (trapPrefix) {
+
+      // Reset sliding window pointers cleanly at each segment boundary
+      let left = s0;
+      let right = s0;
+      for (let i = s0; i <= s1; i++) {
+        const ti = timesS[i];
+        while (left < i && ti - timesS[left] > halfWinS + 1e-12) {
+          left++;
+        }
+        if (right < i) right = i;
+        while (right + 1 <= s1 && timesS[right + 1] - ti <= halfWinS + 1e-12) {
+          right++;
+        }
+
         const span = timesS[right] - timesS[left];
         if (span > 1e-12) {
-          out[i] = (trapPrefix[right] - trapPrefix[left]) / span;
-        } else {
-          const cnt = right - left + 1;
-          out[i] = (prefix[right + 1] - prefix[left]) / cnt;
-        }
-      } else {
-        let area = 0;
-        let firstT = Number.NaN;
-        let lastT = Number.NaN;
-        let prevT = Number.NaN;
-        let prevV = Number.NaN;
-        let finiteSum = 0;
-        let finiteCnt = 0;
-        for (let k = left; k <= right; k++) {
-          const vk = values[k];
-          if (!Number.isFinite(vk)) continue;
-          const tk = timesS[k];
-          finiteSum += vk;
-          finiteCnt++;
-          if (!Number.isFinite(firstT)) {
-            firstT = tk;
-          } else {
-            area += 0.5 * (prevV + vk) * (tk - prevT);
+          out[i] = (trapPrefix[right - s0] - trapPrefix[left - s0]) / span;
+          if (gapIndices.length > 0 && span < 0.25 * windowS && (left === s0 || right === s1)) {
+            lowCoverageIndices.push(i);
           }
-          lastT = tk;
-          prevT = tk;
-          prevV = vk;
+        } else {
+          // Window narrower than local dt inside a continuous segment: single sample preserved cleanly.
+          out[i] = values[i];
         }
-        const span = Number.isFinite(firstT) && Number.isFinite(lastT) ? lastT - firstT : 0;
-        out[i] = span > 1e-12 ? area / span : finiteCnt > 0 ? finiteSum / finiteCnt : Number.NaN;
       }
     }
-    return out;
+
+    return {
+      values: out,
+      gapCount: gapIndices.length,
+      gapIndices,
+      segmentCount: segments.length,
+      segments,
+      medianDtSec,
+      gapThresholdSec,
+      isolatedIndices,
+      lowCoverageIndices,
+    };
   }
 
-  // Fallback for non-monotonic or missing timestamps: estimate positive median dt safely
-  const posDts: number[] = [];
-  for (let i = 1; i < Math.min(timesS.length, n); i++) {
-    const dt = timesS[i] - timesS[i - 1];
-    if (Number.isFinite(dt) && dt > 1e-9) posDts.push(dt);
+  // Missing timestamps array (timesS.length === 0): fixed step count window fallback
+  const prefix = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i] + values[i];
+  const medianDt = 0.002;
+  const winSamples = Math.max(1, Math.round(windowS / medianDt));
+  if (winSamples <= 1) {
+    return {
+      values: [...values],
+      gapCount: 0,
+      gapIndices: [],
+      segmentCount: 1,
+      segments: [{ startIdx: 0, endIdx: n - 1 }],
+      medianDtSec: medianDt,
+      gapThresholdSec: Infinity,
+      isolatedIndices: [],
+      lowCoverageIndices: [],
+    };
   }
-  let medianDt = 0.002;
-  if (posDts.length > 0) {
-    posDts.sort((a, b) => a - b);
-    medianDt = posDts[Math.floor(posDts.length / 2)];
-  }
-  const winSamples = Math.max(1, Math.round((windowMs * 1e-3) / medianDt));
-  if (winSamples <= 1) return [...values];
-
   const half = Math.floor(winSamples / 2);
   for (let i = 0; i < n; i++) {
     const start = Math.max(0, i - half);
     const end = Math.min(n - 1, i + half);
-    const cnt = validPrefix[end + 1] - validPrefix[start];
-    out[i] = cnt > 0 ? (prefix[end + 1] - prefix[start]) / cnt : Number.NaN;
+    out[i] = (prefix[end + 1] - prefix[start]) / (end - start + 1);
   }
-  return out;
+  return {
+    values: out,
+    gapCount: 0,
+    gapIndices: [],
+    segmentCount: 1,
+    segments: [{ startIdx: 0, endIdx: n - 1 }],
+    medianDtSec: medianDt,
+    gapThresholdSec: Infinity,
+    isolatedIndices: [],
+    lowCoverageIndices: [],
+  };
 }
 
-export function processRuntimeLog(
+export function movingAverageFilter(
+  values: number[],
+  timesS: number[],
+  windowMs: number
+): number[] {
+  return movingAverageFilterWithDiagnostics(values, timesS, windowMs).values;
+}
+
+export function processRuntimeLogWithAudit(
   rawRows: Array<{ timeS: number; vMeasV: number; iBusA: number; nRpm: number }>,
   filterWindowMs: number,
   params: MotorParams
-): RuntimeLogRow[] {
-  if (rawRows.length === 0) return [];
+): RuntimeLogProcessAudit {
+  if (rawRows.length === 0) {
+    return {
+      rows: [],
+      filterDiagnostics: {
+        values: [],
+        gapCount: 0,
+        gapIndices: [],
+        segmentCount: 0,
+        segments: [],
+        medianDtSec: 0,
+        gapThresholdSec: Infinity,
+        isolatedIndices: [],
+        lowCoverageIndices: [],
+      },
+    };
+  }
   for (let i = 0; i < rawRows.length; i++) {
     const row = rawRows[i];
     if (![row.timeS, row.vMeasV, row.iBusA, row.nRpm].every(Number.isFinite)) {
@@ -714,10 +839,13 @@ export function processRuntimeLog(
   }
   const times = rawRows.map((r) => r.timeS);
   const rawIbus = rawRows.map((r) => r.iBusA);
-  const filteredIbus = movingAverageFilter(rawIbus, times, filterWindowMs);
+  const filterDiagnostics = movingAverageFilterWithDiagnostics(rawIbus, times, filterWindowMs);
+  const gapSet = new Set(filterDiagnostics.gapIndices);
+  const isoSet = new Set(filterDiagnostics.isolatedIndices);
 
-  return rawRows.map((row, idx) => {
-    const iBusFilteredA = filteredIbus[idx];
+  const rows: RuntimeLogRow[] = rawRows.map((row, idx) => {
+    const iBusFilteredA = filterDiagnostics.values[idx];
+    const filterValid = Number.isFinite(iBusFilteredA) && !isoSet.has(idx);
     const result = solveSinglePoint(row.vMeasV, iBusFilteredA, row.nRpm, params);
     return {
       timeS: row.timeS,
@@ -726,6 +854,18 @@ export function processRuntimeLog(
       iBusFilteredA,
       nRpm: row.nRpm,
       result,
+      filterValid,
+      gapBoundary: gapSet.has(idx) || isoSet.has(idx),
     };
   });
+
+  return { rows, filterDiagnostics };
+}
+
+export function processRuntimeLog(
+  rawRows: Array<{ timeS: number; vMeasV: number; iBusA: number; nRpm: number }>,
+  filterWindowMs: number,
+  params: MotorParams
+): RuntimeLogRow[] {
+  return processRuntimeLogWithAudit(rawRows, filterWindowMs, params).rows;
 }

@@ -142,9 +142,37 @@ export interface SpiceValidationResult {
   totalSpiceR: number;
 }
 
+export interface CossCurvePoint {
+  vdsV: number;
+  val: number; // uJ for eoss_uj, nC for qoss_nc, pF for coss_pf
+}
+
+export interface NonlinearEossCurve {
+  kind: 'eoss_uj' | 'qoss_nc' | 'coss_pf';
+  points: CossCurvePoint[];
+  label?: string;
+}
+
+export interface EossCurveEvalResult {
+  eossUj: number;
+  outOfRange: boolean;
+  domain: [number, number];
+  warnings: string[];
+}
+
+export interface CauerZohResult {
+  tj: Float32Array;
+  maxSubsteps: number;
+  minActualStepSec: number;
+  peakTempErrorC: number;
+  solverStatus: 'CONVERGED' | 'STEP_CAP_REACHED';
+  warnings: string[];
+}
+
 export interface LossSimulationOptions {
   deskewNs: number;
   eossUj: number;
+  eossCurve?: NonlinearEossCurve;
   rdsOn25Mohm: number;
   tempCoeffAlphaPerC: number; // e.g. 0.0045 (/°C)
   tAmbC: number;
@@ -178,6 +206,10 @@ export interface LossSimulationResult {
   outOfCoverageCount: number;
   thermalPathMode: ThermalPathMode;
   warnings: string[];
+  maxThermalSubsteps?: number;
+  minThermalStepSec?: number;
+  peakThermalStepErrorC?: number;
+  thermalSolverStatus?: 'CONVERGED' | 'STEP_CAP_REACHED';
 }
 
 export interface ViPowerOptions {
@@ -2107,44 +2139,424 @@ export function simulateFosterZoh(
 }
 
 /**
- * O(N) unconditionally stable Backward-Euler / sub-stepped Cauer ladder simulator.
- * Useful when users supply direct Cauer stages and want physical internal node evolution.
+ * Integrates nonlinear Qoss(V) [nC vs V] via E_oss(V) = int_0^V v dQ_oss(v)
+ * returning a strictly monotonic E_oss(V) curve in microjoules (µJ).
  */
-export function simulateCauerZoh(
+export function integrateQossToEossCurve(qossPoints: CossCurvePoint[], label?: string): NonlinearEossCurve {
+  if (!qossPoints || qossPoints.length < 2) {
+    throw new Error('Qoss(V) 曲线至少需要 2 个单调递增的 Vds 数据点。');
+  }
+  const sorted = [...qossPoints].sort((a, b) => a.vdsV - b.vdsV);
+  for (let i = 0; i < sorted.length; i++) {
+    if (!Number.isFinite(sorted[i].vdsV) || sorted[i].vdsV < 0 || !Number.isFinite(sorted[i].val) || sorted[i].val < 0) {
+      throw new Error(`Qoss(V) 第 ${i + 1} 点包含负值或非有限值。`);
+    }
+    if (i > 0) {
+      if (sorted[i].vdsV <= sorted[i - 1].vdsV) {
+        throw new Error(`Qoss(V) 电压点 ${sorted[i].vdsV}V 存在重复或未严格递增。`);
+      }
+      if (sorted[i].val < sorted[i - 1].val - 1e-9) {
+        throw new Error(`Qoss(V) 在 ${sorted[i].vdsV}V 处电荷量下降，违背物理单调增特性。`);
+      }
+    }
+  }
+  const out: CossCurvePoint[] = [];
+  let accumUj = 0;
+  if (sorted[0].vdsV > 1e-6) {
+    out.push({ vdsV: 0, val: 0 });
+    accumUj = 0.5 * sorted[0].vdsV * sorted[0].val * 1e-3;
+    out.push({ vdsV: sorted[0].vdsV, val: accumUj });
+  } else {
+    out.push({ vdsV: sorted[0].vdsV, val: 0 });
+  }
+  for (let i = 1; i < sorted.length; i++) {
+    const v0 = sorted[i - 1].vdsV;
+    const v1 = sorted[i].vdsV;
+    const dQ = Math.max(0, sorted[i].val - sorted[i - 1].val);
+    accumUj += 0.5 * (v0 + v1) * dQ * 1e-3;
+    out.push({ vdsV: v1, val: accumUj });
+  }
+  return {
+    kind: 'eoss_uj',
+    points: out,
+    label: label || 'Qoss(V) 积分 Eoss(V)',
+  };
+}
+
+/**
+ * Integrates Coss(V) [pF vs V] via E_oss(V) = int_0^V v C(v) dv
+ * returning a strictly monotonic E_oss(V) curve in microjoules (µJ).
+ */
+export function integrateCossToEossCurve(cossPoints: CossCurvePoint[], label?: string): NonlinearEossCurve {
+  if (!cossPoints || cossPoints.length < 2) {
+    throw new Error('Coss(V) 曲线至少需要 2 个单调递增的 Vds 数据点。');
+  }
+  const sorted = [...cossPoints].sort((a, b) => a.vdsV - b.vdsV);
+  for (let i = 0; i < sorted.length; i++) {
+    if (!Number.isFinite(sorted[i].vdsV) || sorted[i].vdsV < 0 || !Number.isFinite(sorted[i].val) || sorted[i].val < 0) {
+      throw new Error(`Coss(V) 第 ${i + 1} 点包含负值或非有限值。`);
+    }
+    if (i > 0 && sorted[i].vdsV <= sorted[i - 1].vdsV) {
+      throw new Error(`Coss(V) 电压点 ${sorted[i].vdsV}V 存在重复或未严格递增。`);
+    }
+  }
+  const out: CossCurvePoint[] = [];
+  let accumUj = 0;
+  if (sorted[0].vdsV > 1e-6) {
+    out.push({ vdsV: 0, val: 0 });
+    accumUj = 0.5 * sorted[0].vdsV * sorted[0].vdsV * sorted[0].val * 1e-6;
+    out.push({ vdsV: sorted[0].vdsV, val: accumUj });
+  } else {
+    out.push({ vdsV: sorted[0].vdsV, val: 0 });
+  }
+  for (let i = 1; i < sorted.length; i++) {
+    const v0 = sorted[i - 1].vdsV;
+    const v1 = sorted[i].vdsV;
+    const c0 = sorted[i - 1].val;
+    const c1 = sorted[i].val;
+    const dV = v1 - v0;
+    const slope = (c1 - c0) / dV;
+    const intVC =
+      c0 * 0.5 * (v1 * v1 - v0 * v0) +
+      slope * ((v1 * v1 * v1 - v0 * v0 * v0) / 3 - v0 * 0.5 * (v1 * v1 - v0 * v0));
+    accumUj += Math.max(0, intVC) * 1e-6;
+    out.push({ vdsV: v1, val: accumUj });
+  }
+  return {
+    kind: 'eoss_uj',
+    points: out,
+    label: label || 'Coss(V) 积分 Eoss(V)',
+  };
+}
+
+/**
+ * Fritsch-Carlson Monotone Piecewise Cubic Hermite Interpolation (PCHIP).
+ */
+export function evaluatePchipMonotone(
+  points: CossCurvePoint[],
+  xQuery: number
+): { value: number; outOfRange: boolean; domain: [number, number] } {
+  if (!points || points.length < 2) {
+    throw new Error('PCHIP 曲线至少需要 2 个采样点。');
+  }
+  const pts = [...points].sort((a, b) => a.vdsV - b.vdsV);
+  const n = pts.length;
+  const h = new Array<number>(n - 1);
+  const delta = new Array<number>(n - 1);
+  for (let i = 0; i < n - 1; i++) {
+    h[i] = pts[i + 1].vdsV - pts[i].vdsV;
+    if (!(h[i] > 0)) throw new Error('PCHIP 曲线电压轴必须严格单调递增。');
+    delta[i] = (pts[i + 1].val - pts[i].val) / h[i];
+  }
+
+  const domain: [number, number] = [pts[0].vdsV, pts[n - 1].vdsV];
+  const outOfRange = xQuery < domain[0] - 1e-6 || xQuery > domain[1] + 1e-6;
+  const x = Math.max(domain[0], Math.min(domain[1], xQuery));
+
+  if (n === 2) {
+    const t = (x - pts[0].vdsV) / h[0];
+    return {
+      value: Math.max(0, pts[0].val + t * (pts[1].val - pts[0].val)),
+      outOfRange,
+      domain,
+    };
+  }
+
+  const d = new Array<number>(n).fill(0);
+  for (let k = 1; k < n - 1; k++) {
+    if (delta[k - 1] * delta[k] > 0) {
+      const w1 = 2 * h[k] + h[k - 1];
+      const w2 = h[k] + 2 * h[k - 1];
+      d[k] = (w1 + w2) / (w1 / delta[k - 1] + w2 / delta[k]);
+    }
+  }
+  const edgeSlope = (h0: number, h1: number, del0: number, del1: number) => {
+    let val = ((2 * h0 + h1) * del0 - h0 * del1) / (h0 + h1);
+    if (Math.sign(val) !== Math.sign(del0)) val = 0;
+    else if (Math.sign(del0) !== Math.sign(del1) && Math.abs(val) > Math.abs(3 * del0)) {
+      val = 3 * del0;
+    }
+    return val;
+  };
+  d[0] = edgeSlope(h[0], h[1], delta[0], delta[1]);
+  d[n - 1] = edgeSlope(h[n - 2], h[n - 3], delta[n - 2], delta[n - 3]);
+
+  let seg = 0;
+  while (seg < n - 2 && x > pts[seg + 1].vdsV) seg++;
+  const s = (x - pts[seg].vdsV) / h[seg];
+  const s2 = s * s;
+  const s3 = s2 * s;
+  const h00 = 2 * s3 - 3 * s2 + 1;
+  const h10 = s3 - 2 * s2 + s;
+  const h01 = -2 * s3 + 3 * s2;
+  const h11 = s3 - s2;
+  const val = h00 * pts[seg].val + h10 * h[seg] * d[seg] + h01 * pts[seg + 1].val + h11 * h[seg] * d[seg + 1];
+  return { value: Math.max(0, val), outOfRange, domain };
+}
+
+export function evaluateNonlinearEossUj(
+  curve: NonlinearEossCurve,
+  vBusV: number,
+  options?: { allowOutOfDomainClamp?: boolean }
+): EossCurveEvalResult {
+  if (!curve || !Array.isArray(curve.points) || curve.points.length < 2) {
+    throw new Error('非线性 Eoss(V)/Qoss(V) 曲线至少需要 2 个有效采样点。');
+  }
+  const eossPts =
+    curve.kind === 'qoss_nc'
+      ? integrateQossToEossCurve(curve.points).points
+      : curve.kind === 'coss_pf'
+      ? integrateCossToEossCurve(curve.points).points
+      : [...curve.points].sort((a, b) => a.vdsV - b.vdsV);
+
+  for (let i = 0; i < eossPts.length; i++) {
+    if (!Number.isFinite(eossPts[i].vdsV) || eossPts[i].vdsV < 0 || !Number.isFinite(eossPts[i].val) || eossPts[i].val < 0) {
+      throw new Error(`Eoss(V) 曲线第 ${i + 1} 点含非法负值或 NaN/Inf。`);
+    }
+    if (i > 0 && eossPts[i].vdsV <= eossPts[i - 1].vdsV) {
+      throw new Error(`Eoss(V) 曲线电压点 ${eossPts[i].vdsV}V 存在重复或非单调。`);
+    }
+  }
+
+  const vSafe = Math.max(0, Number.isFinite(vBusV) ? vBusV : 0);
+  const domain: [number, number] = [eossPts[0].vdsV, eossPts[eossPts.length - 1].vdsV];
+  const warnings: string[] = [];
+
+  if (vSafe > domain[1] + 1e-6) {
+    if (options?.allowOutOfDomainClamp === false) {
+      throw new Error(
+        `母线电压 ${vSafe.toFixed(1)}V 超出 Eoss(V)/Qoss(V) 曲线定义域 [${domain[0]}V, ${domain[1]}V] 上限，已拒绝无依据外推。`
+      );
+    }
+    warnings.push(
+      `母线电压 ${vSafe.toFixed(1)}V 超出 Eoss(V) 曲线上限 ${domain[1].toFixed(1)}V (OUT_OF_RANGE)，已截断于边界最大值而非外推。`
+    );
+  }
+  if (vSafe < domain[0] && domain[0] > 1e-6) {
+    const f = vSafe / domain[0];
+    return {
+      eossUj: eossPts[0].val * f * f,
+      outOfRange: false,
+      domain,
+      warnings,
+    };
+  }
+
+  const res = evaluatePchipMonotone(eossPts, vSafe);
+  return {
+    eossUj: res.value,
+    outOfRange: res.outOfRange,
+    domain: res.domain,
+    warnings,
+  };
+}
+
+interface CauerScratch {
+  aSub: Float64Array;
+  bDiag: Float64Array;
+  cSup: Float64Array;
+  rhs: Float64Array;
+  cPrime: Float64Array;
+  dPrime: Float64Array;
+  ckOverSubDt: Float64Array;
+  t1: Float64Array;
+  t2: Float64Array;
+}
+
+function createCauerScratch(m: number): CauerScratch {
+  const len = Math.max(1, m);
+  return {
+    aSub: new Float64Array(len),
+    bDiag: new Float64Array(len),
+    cSup: new Float64Array(len),
+    rhs: new Float64Array(len),
+    cPrime: new Float64Array(len),
+    dPrime: new Float64Array(len),
+    ckOverSubDt: new Float64Array(len),
+    t1: new Float64Array(len),
+    t2: new Float64Array(len),
+  };
+}
+
+function singleCauerBackwardEuler(
+  cauer: CauerStage[],
+  tIn: Float64Array,
+  tOut: Float64Array,
+  dt: number,
+  pW: number,
+  tAmbC: number,
+  sc: CauerScratch
+): void {
+  const m = cauer.length;
+  for (let k = 0; k < m; k++) {
+    sc.ckOverSubDt[k] = cauer[k].c / dt;
+    const gLeft = k > 0 ? 1 / cauer[k - 1].r : 0;
+    const gRight = 1 / cauer[k].r;
+    sc.aSub[k] = k > 0 ? -gLeft : 0;
+    sc.bDiag[k] = sc.ckOverSubDt[k] + gLeft + gRight;
+    sc.cSup[k] = k < m - 1 ? -gRight : 0;
+  }
+  sc.cPrime[0] = m > 1 ? sc.cSup[0] / sc.bDiag[0] : 0;
+  for (let k = 1; k < m; k++) {
+    const denom = sc.bDiag[k] - sc.aSub[k] * sc.cPrime[k - 1];
+    sc.cPrime[k] = k < m - 1 ? sc.cSup[k] / denom : 0;
+  }
+  const gLast = 1 / cauer[m - 1].r;
+  const ambTerm = tAmbC * gLast;
+  for (let k = 0; k < m; k++) {
+    sc.rhs[k] = sc.ckOverSubDt[k] * tIn[k] + (k === 0 ? pW : 0) + (k === m - 1 ? ambTerm : 0);
+  }
+  sc.dPrime[0] = sc.rhs[0] / sc.bDiag[0];
+  for (let k = 1; k < m; k++) {
+    const denom = sc.bDiag[k] - sc.aSub[k] * sc.cPrime[k - 1];
+    sc.dPrime[k] = (sc.rhs[k] - sc.aSub[k] * sc.dPrime[k - 1]) / denom;
+  }
+  tOut[m - 1] = sc.dPrime[m - 1];
+  for (let k = m - 2; k >= 0; k--) {
+    tOut[k] = sc.dPrime[k] - sc.cPrime[k] * tOut[k + 1];
+  }
+}
+
+/**
+ * Adaptive step-doubling Backward-Euler Cauer ODE integrator across ALL thermal nodes.
+ * Enforces initial step h <= 0.05 * tau_min and verifies global node error |T2 - T1| <= tol
+ * without artificial 32/64 substep caps.
+ */
+function advanceCauerAdaptive(
+  cauer: CauerStage[],
+  nodeT: Float64Array,
+  dtTotal: number,
+  pW: number,
+  tAmbC: number,
+  minTau: number,
+  maxTau: number,
+  sc: CauerScratch
+): {
+  substepsUsed: number;
+  minStepSec: number;
+  peakStepErrorC: number;
+  hitStepCap: boolean;
+} {
+  const m = cauer.length;
+  if (m === 0 || dtTotal <= 0) {
+    return { substepsUsed: 0, minStepSec: dtTotal, peakStepErrorC: 0, hitStepCap: false };
+  }
+  const MAX_SUBSTEPS = 32768;
+  const hInitMax = Math.max(1e-12, 0.05 * minTau);
+  // Once fast modes decay (elapsed > 8 * minTau) under constant pW, step-doubling
+  // error control may relax h up to 0.05 * maxTau while preserving strict tolerance across all nodes.
+  const hSlowMax = Math.max(hInitMax, 0.02 * maxTau);
+  let h = Math.min(dtTotal, hInitMax);
+  let elapsed = 0;
+  let substepsUsed = 0;
+  let minStepSec = h;
+  let peakStepErrorC = 0;
+  let hitStepCap = false;
+  const tempMid = new Float64Array(m);
+
+  while (elapsed < dtTotal - 1e-15 * Math.max(1, dtTotal)) {
+    if (substepsUsed >= MAX_SUBSTEPS) {
+      hitStepCap = true;
+      break;
+    }
+    const rem = dtTotal - elapsed;
+    const hMaxNow = elapsed < 8 * minTau ? hInitMax : hSlowMax;
+    const hTry = Math.min(rem, h, hMaxNow);
+
+    // Coarse full step (T1) and two fine half steps (T2)
+    singleCauerBackwardEuler(cauer, nodeT, sc.t1, hTry, pW, tAmbC, sc);
+    singleCauerBackwardEuler(cauer, nodeT, tempMid, 0.5 * hTry, pW, tAmbC, sc);
+    singleCauerBackwardEuler(cauer, tempMid, sc.t2, 0.5 * hTry, pW, tAmbC, sc);
+
+    let maxErr = 0;
+    let worstRatio = 0;
+    for (let k = 0; k < m; k++) {
+      const errK = Math.abs(sc.t2[k] - sc.t1[k]);
+      const tolK = 0.001 + 1e-4 * Math.max(1, Math.abs(sc.t2[k] - tAmbC));
+      if (errK > maxErr) maxErr = errK;
+      const ratio = errK / tolK;
+      if (ratio > worstRatio) worstRatio = ratio;
+    }
+
+    if (worstRatio <= 1 || hTry <= Math.max(1e-15, dtTotal * 1e-11)) {
+      for (let k = 0; k < m; k++) nodeT[k] = sc.t2[k];
+      elapsed += hTry;
+      substepsUsed++;
+      if (hTry < minStepSec) minStepSec = hTry;
+      if (maxErr > peakStepErrorC) peakStepErrorC = maxErr;
+
+      // Grow step conservatively if error is well within tolerance
+      if (worstRatio < 0.15) {
+        h = Math.min(hMaxNow, hTry * 1.8);
+      } else if (worstRatio < 0.5) {
+        h = Math.min(hMaxNow, hTry * 1.25);
+      } else {
+        h = Math.min(hMaxNow, hTry);
+      }
+    } else {
+      h = Math.max(1e-15, 0.5 * hTry);
+      substepsUsed++;
+    }
+  }
+
+  return { substepsUsed, minStepSec, peakStepErrorC, hitStepCap };
+}
+
+/**
+ * Exact O(N) adaptive step-doubling Backward-Euler Cauer ladder simulator with diagnostics.
+ * Guarantees h <= 0.05 * tau_min initially and full-vector node convergence across every RC node.
+ */
+export function simulateCauerZohWithDiagnostics(
   time: Float64Array,
   power: Float32Array | Float64Array,
   cauer: CauerStage[],
   tAmbC: number
-): Float32Array {
+): CauerZohResult {
   const n = Math.min(time.length, power.length);
   const tj = new Float32Array(n);
   const m = cauer.length;
-  if (n === 0) return tj;
+  if (n === 0) {
+    return {
+      tj,
+      maxSubsteps: 0,
+      minActualStepSec: 0,
+      peakTempErrorC: 0,
+      solverStatus: 'CONVERGED',
+      warnings: [],
+    };
+  }
   if (m === 0) {
     tj.fill(tAmbC);
-    return tj;
+    return {
+      tj,
+      maxSubsteps: 0,
+      minActualStepSec: 0,
+      peakTempErrorC: 0,
+      solverStatus: 'CONVERGED',
+      warnings: [],
+    };
   }
 
   let minTau = Infinity;
+  let maxTau = 0;
   for (let k = 0; k < m; k++) {
     const tauK = cauer[k].r * cauer[k].c;
-    if (isFinite(tauK) && tauK > 1e-12 && tauK < minTau) minTau = tauK;
+    if (isFinite(tauK) && tauK > 1e-12) {
+      if (tauK < minTau) minTau = tauK;
+      if (tauK > maxTau) maxTau = tauK;
+    }
   }
   if (!isFinite(minTau)) minTau = 1e-4;
+  if (!(maxTau > 0)) maxTau = minTau;
 
   const nodeT = new Float64Array(m).fill(tAmbC);
   tj[0] = tAmbC;
 
-  // Tridiagonal Thomas solver per step: (C/dt + G) T_next = (C/dt) T_prev + rhs
-  const aSub = new Float64Array(m);
-  const bDiag = new Float64Array(m);
-  const cSup = new Float64Array(m);
-  const rhs = new Float64Array(m);
-  const cPrime = new Float64Array(m);
-  const dPrime = new Float64Array(m);
-  const ckOverSubDt = new Float64Array(m);
-
-  let prevSubDt = -1;
+  const sc = createCauerScratch(m);
+  let maxSubsteps = 1;
+  let minActualStepSec = Infinity;
+  let peakTempErrorC = 0;
+  let hitStepCap = false;
 
   for (let i = 1; i < n; i++) {
     const dt = Math.max(0, time[i] - time[i - 1]);
@@ -2153,49 +2565,41 @@ export function simulateCauerZoh(
       continue;
     }
     const p = isFinite(power[i - 1]) ? Math.max(0, power[i - 1]) : 0;
-    const subSteps = Math.min(64, Math.max(1, Math.ceil(dt / Math.max(1e-8, 0.04 * minTau))));
-    const subDt = dt / subSteps;
-
-    // Pre-factor tridiagonal matrix when subDt changes
-    if (Math.abs(subDt - prevSubDt) > 1e-15 * Math.max(1, subDt)) {
-      prevSubDt = subDt;
-      for (let k = 0; k < m; k++) {
-        ckOverSubDt[k] = cauer[k].c / subDt;
-        const gLeft = k > 0 ? 1 / cauer[k - 1].r : 0;
-        const gRight = 1 / cauer[k].r;
-        aSub[k] = k > 0 ? -gLeft : 0;
-        bDiag[k] = ckOverSubDt[k] + gLeft + gRight;
-        cSup[k] = k < m - 1 ? -gRight : 0;
-      }
-      cPrime[0] = m > 1 ? cSup[0] / bDiag[0] : 0;
-      for (let k = 1; k < m; k++) {
-        const denom = bDiag[k] - aSub[k] * cPrime[k - 1];
-        cPrime[k] = k < m - 1 ? cSup[k] / denom : 0;
-      }
-    }
-
-    const gLast = 1 / cauer[m - 1].r;
-    const ambTerm = tAmbC * gLast;
-
-    for (let s = 0; s < subSteps; s++) {
-      for (let k = 0; k < m; k++) {
-        rhs[k] = ckOverSubDt[k] * nodeT[k] + (k === 0 ? p : 0) + (k === m - 1 ? ambTerm : 0);
-      }
-      dPrime[0] = rhs[0] / bDiag[0];
-      for (let k = 1; k < m; k++) {
-        const denom = bDiag[k] - aSub[k] * cPrime[k - 1];
-        dPrime[k] = (rhs[k] - aSub[k] * dPrime[k - 1]) / denom;
-      }
-      nodeT[m - 1] = dPrime[m - 1];
-      for (let k = m - 2; k >= 0; k--) {
-        nodeT[k] = dPrime[k] - cPrime[k] * nodeT[k + 1];
-      }
-    }
-
+    const stepDiag = advanceCauerAdaptive(cauer, nodeT, dt, p, tAmbC, minTau, maxTau, sc);
+    if (stepDiag.substepsUsed > maxSubsteps) maxSubsteps = stepDiag.substepsUsed;
+    if (stepDiag.minStepSec < minActualStepSec) minActualStepSec = stepDiag.minStepSec;
+    if (stepDiag.peakStepErrorC > peakTempErrorC) peakTempErrorC = stepDiag.peakStepErrorC;
+    if (stepDiag.hitStepCap) hitStepCap = true;
     tj[i] = nodeT[0];
   }
 
-  return tj;
+  const warnings: string[] = [];
+  if (hitStepCap) {
+    warnings.push(
+      `Cauer 热网络求解达到单步最大子步保护上限 (32768)，请检查极短热时间常数或过大采样步长；当前节点最大估计误差 ${peakTempErrorC.toExponential(2)}°C。`
+    );
+  }
+
+  return {
+    tj,
+    maxSubsteps,
+    minActualStepSec: Number.isFinite(minActualStepSec) ? minActualStepSec : 0,
+    peakTempErrorC,
+    solverStatus: hitStepCap ? 'STEP_CAP_REACHED' : 'CONVERGED',
+    warnings,
+  };
+}
+
+/**
+ * Unconditionally stable adaptive Backward-Euler Cauer ladder simulator returning Tj(t).
+ */
+export function simulateCauerZoh(
+  time: Float64Array,
+  power: Float32Array | Float64Array,
+  cauer: CauerStage[],
+  tAmbC: number
+): Float32Array {
+  return simulateCauerZohWithDiagnostics(time, power, cauer, tAmbC).tj;
 }
 
 /**
@@ -2505,53 +2909,40 @@ export function computeLossWithDeskewAndEoss(
     warnings.push(`已设定脉冲前热历史初温 Tj(0)=${nodeT[0].toFixed(2)}°C（沿 Cauer 热阻占比分布至内部节点）。`);
   }
 
-  const aSub = new Float64Array(Math.max(1, mStages));
-  const bDiag = new Float64Array(Math.max(1, mStages));
-  const cSup = new Float64Array(Math.max(1, mStages));
-  const rhs = new Float64Array(Math.max(1, mStages));
-  const cPrime = new Float64Array(Math.max(1, mStages));
-  const dPrime = new Float64Array(Math.max(1, mStages));
-
+  const cauerSc = createCauerScratch(mStages);
   let minTau = Infinity;
+  let maxTau = 0;
   for (let s = 0; s < mStages; s++) {
     const tauS = cauerStages[s].r * cauerStages[s].c;
-    if (isFinite(tauS) && tauS > 1e-12 && tauS < minTau) minTau = tauS;
+    if (isFinite(tauS) && tauS > 1e-12) {
+      if (tauS < minTau) minTau = tauS;
+      if (tauS > maxTau) maxTau = tauS;
+    }
   }
   if (!isFinite(minTau)) minTau = 1e-4;
+  if (!(maxTau > 0)) maxTau = minTau;
+
+  let maxThermalSubsteps = 1;
+  let minThermalStepSec = Infinity;
+  let peakThermalStepErrorC = 0;
+  let thermalSolverStatus: 'CONVERGED' | 'STEP_CAP_REACHED' = 'CONVERGED';
 
   const advanceCauerNodeT = (dtStep: number, pStepW: number) => {
     if (mStages <= 0 || dtStep <= 0) return;
-    const subSteps = Math.min(32, Math.max(1, Math.ceil(dtStep / Math.max(1e-8, 0.05 * minTau))));
-    const subDt = dtStep / subSteps;
-    for (let s = 0; s < mStages; s++) {
-      const ckOverDt = cauerStages[s].c / subDt;
-      const gLeft = s > 0 ? 1 / cauerStages[s - 1].r : 0;
-      const gRight = 1 / cauerStages[s].r;
-      aSub[s] = s > 0 ? -gLeft : 0;
-      bDiag[s] = ckOverDt + gLeft + gRight;
-      cSup[s] = s < mStages - 1 ? -gRight : 0;
-    }
-    cPrime[0] = mStages > 1 ? cSup[0] / bDiag[0] : 0;
-    for (let s = 1; s < mStages; s++) {
-      const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
-      cPrime[s] = s < mStages - 1 ? cSup[s] / denom : 0;
-    }
-    const gLast = 1 / cauerStages[mStages - 1].r;
-    for (let sub = 0; sub < subSteps; sub++) {
-      for (let s = 0; s < mStages; s++) {
-        const ckOverDt = cauerStages[s].c / subDt;
-        rhs[s] = ckOverDt * nodeT[s] + (s === 0 ? pStepW : 0) + (s === mStages - 1 ? opts.tAmbC * gLast : 0);
-      }
-      dPrime[0] = rhs[0] / bDiag[0];
-      for (let s = 1; s < mStages; s++) {
-        const denom = bDiag[s] - aSub[s] * cPrime[s - 1];
-        dPrime[s] = (rhs[s] - aSub[s] * dPrime[s - 1]) / denom;
-      }
-      nodeT[mStages - 1] = dPrime[mStages - 1];
-      for (let s = mStages - 2; s >= 0; s--) {
-        nodeT[s] = dPrime[s] - cPrime[s] * nodeT[s + 1];
-      }
-    }
+    const diag = advanceCauerAdaptive(
+      cauerStages,
+      nodeT,
+      dtStep,
+      pStepW,
+      opts.tAmbC,
+      minTau,
+      maxTau,
+      cauerSc
+    );
+    if (diag.substepsUsed > maxThermalSubsteps) maxThermalSubsteps = diag.substepsUsed;
+    if (diag.minStepSec < minThermalStepSec) minThermalStepSec = diag.minStepSec;
+    if (diag.peakStepErrorC > peakThermalStepErrorC) peakThermalStepErrorC = diag.peakStepErrorC;
+    if (diag.hitStepCap) thermalSolverStatus = 'STEP_CAP_REACHED';
   };
 
   if (
@@ -2591,6 +2982,32 @@ export function computeLossWithDeskewAndEoss(
     }
   };
 
+  let edgeEossOutOfRange = false;
+  const computeEdgeEossJ = (startK: number, endK: number): number => {
+    if (!opts.eossCurve) return eossJ;
+    let vLo = Infinity;
+    let vHi = -Infinity;
+    for (let j = Math.max(0, startK - 1); j <= Math.min(evalLen - 1, endK + 1); j++) {
+      const vj = Math.max(0, vScaledArr[j]);
+      if (vj < vLo) vLo = vj;
+      if (vj > vHi) vHi = vj;
+    }
+    const rHi = evaluateNonlinearEossUj(opts.eossCurve, vHi);
+    const rLo = evaluateNonlinearEossUj(opts.eossCurve, vLo);
+    if (rHi.outOfRange || rLo.outOfRange) edgeEossOutOfRange = true;
+    return Math.max(0, rHi.eossUj - rLo.eossUj) * 1e-6;
+  };
+
+  if (opts.eossCurve) {
+    warnings.push(
+      `Eoss 已启用非线性 ${opts.eossCurve.kind.toUpperCase()} 曲线积分（PCHIP 单调插值：${opts.eossCurve.points.length} 点），按实测脉冲边沿电压区间精确剥离/补偿。`
+    );
+  } else if (eossUj > 0) {
+    warnings.push(
+      `当前 Eoss=${eossUj.toFixed(2)}µJ 为恒定标量/低精度 V² 近似；真实 MOSFET Coss(V) 呈强非线性，建议导入器件 Eoss(V)/Qoss(V) 曲线。`
+    );
+  }
+
   // Strip Eoss across identified turn-off (Vds rising) and hard-switched turn-on (Vds falling w/ positive Ids)
   for (let k = 0; k < evalLen; k++) {
     const vds = vScaledArr[k];
@@ -2600,7 +3017,8 @@ export function computeLossWithDeskewAndEoss(
     } else if (swState === 'trans_off') {
       if (vds >= vHighThresh) {
         if (k - transStartIdx + 1 < 4) underResolvedEdgeCount++;
-        applyExactEdgeEnergy(transStartIdx, k, -eossJ);
+        const edgeEossJ = computeEdgeEossJ(transStartIdx, k);
+        applyExactEdgeEnergy(transStartIdx, k, -edgeEossJ);
         switchingEvents++;
         swState = 'off';
       } else if (vds <= vLowThresh) {
@@ -2617,7 +3035,8 @@ export function computeLossWithDeskewAndEoss(
           if (iAlignedArr[j] > maxForwardIds) maxForwardIds = iAlignedArr[j];
         }
         if (maxForwardIds > 0.05) {
-          applyExactEdgeEnergy(transStartIdx, k, +eossJ);
+          const edgeEossJ = computeEdgeEossJ(transStartIdx, k);
+          applyExactEdgeEnergy(transStartIdx, k, +edgeEossJ);
           switchingEvents++;
         } else {
           // Zero-voltage / reverse-conduction soft turn-on: Coss was already discharged cleanly before channel turn-on
@@ -2628,6 +3047,9 @@ export function computeLossWithDeskewAndEoss(
         swState = 'off';
       }
     }
+  }
+  if (edgeEossOutOfRange) {
+    warnings.push('部分开关边沿峰值电压超出所提供非线性 Eoss(V)/Qoss(V) 曲线上限 (OUT_OF_RANGE)，已截断至曲线上限电压处能量。');
   }
 
   const truncatedEdgeCount = swState === 'trans_off' || swState === 'trans_on' ? 1 : 0;
@@ -2719,6 +3141,12 @@ export function computeLossWithDeskewAndEoss(
   const pLossMeanW =
     totalDurationSec > 1e-15 ? energyStrippedJ / totalDurationSec : evalLen > 0 ? sumLoss / evalLen : 0;
 
+  if (thermalSolverStatus === 'STEP_CAP_REACHED') {
+    warnings.push(
+      `闭环 Cauer 热网络在个别步长达到最大自适应子步保护上限 (32768)，最大估计截断误差 ${peakThermalStepErrorC.toExponential(2)}°C。`
+    );
+  }
+
   return {
     time,
     pLossW,
@@ -2738,6 +3166,10 @@ export function computeLossWithDeskewAndEoss(
     outOfCoverageCount: 0,
     thermalPathMode,
     warnings,
+    maxThermalSubsteps,
+    minThermalStepSec: Number.isFinite(minThermalStepSec) ? minThermalStepSec : 0,
+    peakThermalStepErrorC,
+    thermalSolverStatus,
   };
 }
 
