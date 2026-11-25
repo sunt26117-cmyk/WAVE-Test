@@ -864,6 +864,11 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
                 : '。'}
             </div>
           )}
+          {logFilterDiag.lowCoverageIndices.length > 0 && (
+            <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">
+              ▲ {logFilterDiag.lowCoverageIndices.length} 个日志点在当前滤波窗口内的有效时间覆盖不足 50%（居中窗口至少需要半窗有效支撑），已标记为 LOW_COVERAGE 并从有效电流反算/统计中剔除；图表会在这些点留白，不使用前值伪造数据。
+            </div>
+          )}
 
           {(batchAlertsSummary.regenLimit > 0 || batchAlertsSummary.invalidBus > 0 || batchAlertsSummary.iqSignAmbiguous > 0) && (
             <div className="dyno-alert-warn rounded-sm border px-4 py-2 text-xs">

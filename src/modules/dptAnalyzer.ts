@@ -113,7 +113,7 @@ export type DptLutStatus =
   | 'INVALID_DATA'
   | 'NON_CONVERGED';
 
-export type DptParameterProvenance = 'measured' | 'assumed';
+export type DptParameterProvenance = 'measured' | 'model_estimated' | 'design_specified' | 'assumed';
 
 export type DptAxisName = 'Vbus' | 'Iload' | 'Tj' | 'Rg';
 
@@ -435,8 +435,12 @@ export function interpolateDptSwitchingLoss(
   const tjKnown = cond.tjC !== undefined && Number.isFinite(cond.tjC);
   const rgOnKnown = (cond.rgOnOhm ?? cond.rgOhm) !== undefined && Number.isFinite(cond.rgOnOhm ?? cond.rgOhm);
   const rgOffKnown = (cond.rgOffOhm ?? cond.rgOhm) !== undefined && Number.isFinite(cond.rgOffOhm ?? cond.rgOhm);
-  const tjProvenance: DptParameterProvenance = cond.tjProvenance ?? (tjKnown ? 'measured' : 'assumed');
-  const rgProvenance: DptParameterProvenance = cond.rgProvenance ?? (rgOnKnown || rgOffKnown ? 'measured' : 'assumed');
+  const tjProvenance: DptParameterProvenance = cond.tjProvenance ?? 'assumed';
+  // A numeric Rg entry is not automatically a measurement. It must have an
+  // explicit provenance, and both turn-on/off values must be present before the
+  // Rg axis can be treated as a known operating condition.
+  const rgProvenance: DptParameterProvenance =
+    rgOnKnown && rgOffKnown ? (cond.rgProvenance ?? 'assumed') : 'assumed';
 
   for (const pt of lut) {
     if (
@@ -485,17 +489,26 @@ export function interpolateDptSwitchingLoss(
   let tjMax = -Infinity;
   let rgMin = Infinity;
   let rgMax = -Infinity;
+  let rgOnMin = Infinity;
+  let rgOnMax = -Infinity;
+  let rgOffMin = Infinity;
+  let rgOffMax = -Infinity;
   for (const pt of lut) {
-    const rgEff = pt.rgOnOhm ?? pt.rgOffOhm ?? pt.rgOhm;
+    const rgOn = pt.rgOnOhm ?? pt.rgOhm;
+    const rgOff = pt.rgOffOhm ?? pt.rgOhm;
     if (pt.vBusV < vMin) vMin = pt.vBusV;
     if (pt.vBusV > vMax) vMax = pt.vBusV;
     if (pt.iLoadA < iMin) iMin = pt.iLoadA;
     if (pt.iLoadA > iMax) iMax = pt.iLoadA;
     if (pt.tjC < tjMin) tjMin = pt.tjC;
     if (pt.tjC > tjMax) tjMax = pt.tjC;
-    if (rgEff < rgMin) rgMin = rgEff;
-    if (rgEff > rgMax) rgMax = rgEff;
+    rgOnMin = Math.min(rgOnMin, rgOn);
+    rgOnMax = Math.max(rgOnMax, rgOn);
+    rgOffMin = Math.min(rgOffMin, rgOff);
+    rgOffMax = Math.max(rgOffMax, rgOff);
   }
+  rgMin = Math.min(rgOnMin, rgOffMin);
+  rgMax = Math.max(rgOnMax, rgOffMax);
 
   const tjTarget = tjKnown ? cond.tjC! : 0.5 * (tjMin + tjMax);
   const rgDefaultMid = 0.5 * (rgMin + rgMax);
@@ -523,10 +536,10 @@ export function interpolateDptSwitchingLoss(
   if (iSafe < iMin - 1e-6 || iSafe > iMax + 1e-6) outOfRangeAxes.push('Iload');
   if (tjTarget < tjMin - 0.1 || tjTarget > tjMax + 0.1) outOfRangeAxes.push('Tj');
   if (
-    rgOnTarget < rgMin - 1e-4 ||
-    rgOnTarget > rgMax + 1e-4 ||
-    rgOffTarget < rgMin - 1e-4 ||
-    rgOffTarget > rgMax + 1e-4
+    rgOnTarget < rgOnMin - 1e-4 ||
+    rgOnTarget > rgOnMax + 1e-4 ||
+    rgOffTarget < rgOffMin - 1e-4 ||
+    rgOffTarget > rgOffMax + 1e-4
   ) {
     outOfRangeAxes.push('Rg');
   }
@@ -638,7 +651,16 @@ export function interpolateDptSwitchingLoss(
     method = '4d_multilinear_grid';
   }
 
-  const status: DptLutStatus = outsideConvex ? 'OUT_OF_RANGE' : 'VALID';
+  const status: DptLutStatus = outsideConvex
+    ? 'OUT_OF_RANGE'
+    : collapsedDimensions.length > 0
+      ? 'INSUFFICIENT_LUT'
+      : 'VALID';
+  if (!outsideConvex && collapsedDimensions.length > 0) {
+    warnings.push(
+      `DPT LUT 仅覆盖 ${activeDimensions.join('×') || '无'} 维度，缺少 ${collapsedDimensions.join('、')} 维度的数据变化；可用于有限条件估算，但不可作为完整四维损耗模型的签核依据。`
+    );
+  }
 
   return {
     status,

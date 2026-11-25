@@ -2121,7 +2121,7 @@ export function simulateFosterZoh(
 
   for (let i = 1; i < n; i++) {
     const dt = Math.max(0, time[i] - time[i - 1]);
-    const p = isFinite(power[i - 1]) ? Math.max(0, power[i - 1]) : 0;
+    const p = Math.max(0, power[i - 1]);
     let sumDt = 0;
     for (let m = 0; m < kLen; m++) {
       const { r, tau } = stages[m];
@@ -2322,21 +2322,24 @@ export function evaluateNonlinearEossUj(
   const domain: [number, number] = [eossPts[0].vdsV, eossPts[eossPts.length - 1].vdsV];
   const warnings: string[] = [];
 
-  if (vSafe > domain[1] + 1e-6) {
+  const belowDomain = vSafe < domain[0] - 1e-6;
+  const aboveDomain = vSafe > domain[1] + 1e-6;
+  if (belowDomain || aboveDomain) {
     if (options?.allowOutOfDomainClamp === false) {
+      const side = belowDomain ? '下限' : '上限';
       throw new Error(
-        `母线电压 ${vSafe.toFixed(1)}V 超出 Eoss(V)/Qoss(V) 曲线定义域 [${domain[0]}V, ${domain[1]}V] 上限，已拒绝无依据外推。`
+        `母线电压 ${vSafe.toFixed(1)}V 超出 Eoss(V)/Qoss(V) 曲线定义域 [${domain[0]}V, ${domain[1]}V]${side}，已拒绝边界截断或无依据外推。`
       );
     }
     warnings.push(
-      `母线电压 ${vSafe.toFixed(1)}V 超出 Eoss(V) 曲线上限 ${domain[1].toFixed(1)}V (OUT_OF_RANGE)，已截断于边界最大值而非外推。`
+      `母线电压 ${vSafe.toFixed(1)}V 超出 Eoss(V) 曲线定义域 [${domain[0]}V, ${domain[1]}V]，当前仅返回边界/比例预览值，不能用于签核。`
     );
   }
-  if (vSafe < domain[0] && domain[0] > 1e-6) {
+  if (belowDomain && domain[0] > 1e-6) {
     const f = vSafe / domain[0];
     return {
       eossUj: eossPts[0].val * f * f,
-      outOfRange: false,
+      outOfRange: true,
       domain,
       warnings,
     };
@@ -2512,7 +2515,26 @@ export function simulateCauerZohWithDiagnostics(
   cauer: CauerStage[],
   tAmbC: number
 ): CauerZohResult {
-  const n = Math.min(time.length, power.length);
+  if (time.length !== power.length) {
+    throw new Error(`Cauer 热求解时间和值数组长度不一致：time=${time.length}, power=${power.length}。`);
+  }
+  if (time.length === 0) {
+    throw new Error('Cauer 热求解至少需要一个时间/功率样本。');
+  }
+  if (!Number.isFinite(tAmbC)) throw new Error('Cauer 热求解环境温度必须为有限值。');
+  for (let i = 0; i < time.length; i++) {
+    if (!Number.isFinite(time[i])) throw new Error(`Cauer 热求解时间戳第 ${i + 1} 点不是有限值。`);
+    if (i > 0 && time[i] <= time[i - 1]) throw new Error(`Cauer 热求解时间轴在第 ${i + 1} 点重复或倒退。`);
+    if (!Number.isFinite(power[i]) || power[i] < -1e-12) {
+      throw new Error(`Cauer 热求解功率第 ${i + 1} 点不是有限非负值，拒绝按零功率替代。`);
+    }
+  }
+  for (let i = 0; i < cauer.length; i++) {
+    if (!Number.isFinite(cauer[i].r) || cauer[i].r <= 0 || !Number.isFinite(cauer[i].c) || cauer[i].c <= 0) {
+      throw new Error(`Cauer 热网络第 ${i + 1} 阶 R/C 必须为有限正数。`);
+    }
+  }
+  const n = time.length;
   const tj = new Float32Array(n);
   const m = cauer.length;
   if (n === 0) {
@@ -2564,7 +2586,7 @@ export function simulateCauerZohWithDiagnostics(
       tj[i] = nodeT[0];
       continue;
     }
-    const p = isFinite(power[i - 1]) ? Math.max(0, power[i - 1]) : 0;
+    const p = Math.max(0, power[i - 1]);
     const stepDiag = advanceCauerAdaptive(cauer, nodeT, dt, p, tAmbC, minTau, maxTau, sc);
     if (stepDiag.substepsUsed > maxSubsteps) maxSubsteps = stepDiag.substepsUsed;
     if (stepDiag.minStepSec < minActualStepSec) minActualStepSec = stepDiag.minStepSec;
@@ -2599,7 +2621,13 @@ export function simulateCauerZoh(
   cauer: CauerStage[],
   tAmbC: number
 ): Float32Array {
-  return simulateCauerZohWithDiagnostics(time, power, cauer, tAmbC).tj;
+  const result = simulateCauerZohWithDiagnostics(time, power, cauer, tAmbC);
+  if (result.solverStatus !== 'CONVERGED') {
+    throw new Error(
+      `Cauer 热求解未收敛 (${result.solverStatus})：${result.warnings.join('；') || '达到自适应步长保护上限'}。拒绝返回部分 Tj 曲线。`
+    );
+  }
+  return result.tj;
 }
 
 /**
@@ -2992,8 +3020,8 @@ export function computeLossWithDeskewAndEoss(
       if (vj < vLo) vLo = vj;
       if (vj > vHi) vHi = vj;
     }
-    const rHi = evaluateNonlinearEossUj(opts.eossCurve, vHi);
-    const rLo = evaluateNonlinearEossUj(opts.eossCurve, vLo);
+    const rHi = evaluateNonlinearEossUj(opts.eossCurve, vHi, { allowOutOfDomainClamp: false });
+    const rLo = evaluateNonlinearEossUj(opts.eossCurve, vLo, { allowOutOfDomainClamp: false });
     if (rHi.outOfRange || rLo.outOfRange) edgeEossOutOfRange = true;
     return Math.max(0, rHi.eossUj - rLo.eossUj) * 1e-6;
   };
@@ -3049,7 +3077,17 @@ export function computeLossWithDeskewAndEoss(
     }
   }
   if (edgeEossOutOfRange) {
-    warnings.push('部分开关边沿峰值电压超出所提供非线性 Eoss(V)/Qoss(V) 曲线上限 (OUT_OF_RANGE)，已截断至曲线上限电压处能量。');
+    const reason = '开关边沿电压超出非线性 Eoss(V)/Qoss(V) 曲线定义域；拒绝使用边界截断值继续计算损耗和结温。';
+    warnings.push(reason);
+    tjC.fill(Number.NaN);
+    pLossW.fill(Number.NaN);
+    return {
+      time, pLossW, tjC,
+      pLossMeanW: Number.NaN, tjMaxC: Number.NaN, tjMinC: Number.NaN, tjMeanC: Number.NaN,
+      energyRawMj: Number.NaN, energyDeskewedMj: Number.NaN, energyStrippedMj: Number.NaN,
+      switchingEvents, zvsTurnOnCount, incomplete: true, incompleteReasons: [reason],
+      nonFiniteMasked: 0, outOfCoverageCount: 0, thermalPathMode, warnings,
+    };
   }
 
   const truncatedEdgeCount = swState === 'trans_off' || swState === 'trans_on' ? 1 : 0;
@@ -3141,10 +3179,22 @@ export function computeLossWithDeskewAndEoss(
   const pLossMeanW =
     totalDurationSec > 1e-15 ? energyStrippedJ / totalDurationSec : evalLen > 0 ? sumLoss / evalLen : 0;
 
-  if (thermalSolverStatus === 'STEP_CAP_REACHED') {
-    warnings.push(
-      `闭环 Cauer 热网络在个别步长达到最大自适应子步保护上限 (32768)，最大估计截断误差 ${peakThermalStepErrorC.toExponential(2)}°C。`
-    );
+  // thermalSolverStatus is only reassigned inside the advanceCauerNodeT closure,
+  // which TypeScript's flow analysis does not track, so it wrongly narrows the
+  // variable to its initialiser here. Widen back to the declared union.
+  if ((thermalSolverStatus as 'CONVERGED' | 'STEP_CAP_REACHED') === 'STEP_CAP_REACHED') {
+    const reason = `闭环 Cauer 热网络在个别步长达到最大自适应子步保护上限 (32768)，最大估计截断误差 ${peakThermalStepErrorC.toExponential(2)}°C；能量积分可供诊断，但 Tj 曲线不具备收敛保证。`;
+    warnings.push(reason);
+    tjC.fill(Number.NaN);
+    return {
+      time, pLossW, tjC, pLossMeanW,
+      tjMaxC: Number.NaN, tjMinC: Number.NaN, tjMeanC: Number.NaN,
+      energyRawMj: energyRawJ * 1e3, energyDeskewedMj: energyDeskewedJ * 1e3, energyStrippedMj: energyStrippedJ * 1e3,
+      switchingEvents, zvsTurnOnCount, incomplete: true, incompleteReasons: [reason],
+      nonFiniteMasked: 0, outOfCoverageCount: 0, thermalPathMode, warnings,
+      maxThermalSubsteps, minThermalStepSec: Number.isFinite(minThermalStepSec) ? minThermalStepSec : 0,
+      peakThermalStepErrorC, thermalSolverStatus,
+    };
   }
 
   return {

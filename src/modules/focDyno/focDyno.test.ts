@@ -1081,6 +1081,34 @@ test('FD-01 & Python bundle P1..P4: segmented gap filter, valid Python AST, widt
   assert.equal(logAudit.rows[14].filterValid, false);
   assert.equal(logAudit.rows[14].result.alerts.invalidBus, true);
 
+
+  // A centered filter window needs at least half-window temporal support at a clipped segment edge.
+  const shortTimes = [0, 0.001, 0.002, 0.003];
+  const shortCoverage = processRuntimeLogWithAudit(
+    shortTimes.map((timeS) => ({ timeS, vMeasV: 13.5, iBusA: 4, nRpm: 800 })),
+    100,
+    DEMO_MOTOR_PARAMS
+  );
+  assert.deepEqual(shortCoverage.filterDiagnostics.lowCoverageIndices, [0, 1, 2, 3]);
+  assert.ok(shortCoverage.rows.every((row) => row.filterValid === false));
+  assert.ok(shortCoverage.rows.every((row) => row.filterQuality === 'LOW_COVERAGE'));
+  assert.ok(shortCoverage.rows.every((row) => Number.isNaN(row.iBusFilteredA)));
+
+  // A segment that supplies at least half of the centered filter window remains usable.
+  const adequateTimes = Array.from({ length: 71 }, (_, i) => i * 0.001);
+  const adequateCoverage = processRuntimeLogWithAudit(
+    adequateTimes.map((timeS) => ({ timeS, vMeasV: 13.5, iBusA: 4, nRpm: 800 })),
+    100,
+    DEMO_MOTOR_PARAMS
+  );
+  assert.equal(adequateCoverage.filterDiagnostics.lowCoverageIndices.length, 0);
+  assert.ok(adequateCoverage.rows.every((row) => row.filterValid));
+
+  // A filter window narrower than the sample interval has no temporal support;
+  // JS must match Python and mark these singleton window means LOW_COVERAGE.
+  const subSampleWindow = movingAverageFilterWithDiagnostics([1, 2, 3], [0, 0.001, 0.002], 0.1);
+  assert.deepEqual(subSampleWindow.lowCoverageIndices, [0, 1, 2]);
+
   // 3. Python bundle static AST compile + P1..P4 & FD-01 parity verification
   const appPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'app.py')?.content || '';
   const motorPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'motor_physics.py')?.content || '';
@@ -1098,6 +1126,10 @@ test('FD-01 & Python bundle P1..P4: segmented gap filter, valid Python AST, widt
   // P3: plot columns & explicit red marker warning in app.py
   assert.ok(motorPy.includes('res["solution_valid"] = sol_valid'));
   assert.ok(motorPy.includes('res["is_held_prev_iq"]'));
+  assert.ok(motorPy.includes('low_coverage_indices'));
+  assert.ok(motorPy.includes('low_coverage_indices.append(i)'));
+  assert.ok(motorPy.includes('res["filter_quality"] = filter_quality'));
+  assert.ok(motorPy.includes('low_coverage_count'));
   assert.ok(appPy.includes('该时刻无实数解（已标红点，数值未虚构）'));
   // P4: nearest exterior fill + z_extrap_mask + explicit warning in app.py
   assert.ok(dynoPy.includes('method="nearest"'));
@@ -1182,6 +1214,10 @@ test('FD-02: normalized Jacobian SVD, 95% CI, correlation matrix, and rank-defic
   const lockedId = lockedReport.identifiabilityReport;
   assert.ok(lockedId, 'identifiabilityReport must be attached');
   assert.equal(lockedId.overallStatus, 'IDENTIFIABLE');
+  const lqStatus = lockedId.parameters.find((entry) => entry.symbol === 'Lq');
+  assert.ok(lqStatus, 'Lq must be visible in calibration provenance report');
+  assert.equal(lqStatus.status, 'FIXED');
+  assert.match(lqStatus.reason, /未独立辨识/);
   assert.equal(lockedId.baselineRetained, false);
   assert.equal(lockedId.numericalRank, 1);
   assert.equal(lockedId.fullRank, 1);

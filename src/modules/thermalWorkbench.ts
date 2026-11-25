@@ -2701,6 +2701,7 @@ export class ThermalWorkbenchController {
       'focRjcOverrideInput',
       'focRgonInput',
       'focRgoffInput',
+      'focRgDesignConfirmedChk',
       'focTopologyModeSelect',
       'focPcbCopperOzInput',
       'focPcbPitchMmInput',
@@ -2818,6 +2819,7 @@ export class ThermalWorkbenchController {
     const rgOffRaw = (document.getElementById('focRgoffInput') as HTMLInputElement | null)?.value?.trim() || '';
     const rgOnParsed = parseFloat(rgOnRaw);
     const rgOffParsed = parseFloat(rgOffRaw);
+    const rgDesignConfirmed = (document.getElementById('focRgDesignConfirmedChk') as HTMLInputElement | null)?.checked ?? false;
     const eossCurve = this.parseFocNonlinearEossCurve();
     const mos: FocMosParams = {
       rdsOn25Mohm: Math.max(0.1, num('focRdsInput', 4.5)),
@@ -2832,7 +2834,13 @@ export class ThermalWorkbenchController {
       iRefA: Math.max(1, num('focIrefInput', 30)),
       rgOnOhm: rgOnRaw && Number.isFinite(rgOnParsed) && rgOnParsed >= 0 ? rgOnParsed : undefined,
       rgOffOhm: rgOffRaw && Number.isFinite(rgOffParsed) && rgOffParsed >= 0 ? rgOffParsed : undefined,
-      rgProvenance: rgOnRaw || rgOffRaw ? 'measured' : 'assumed',
+      // Gate resistors entered in the workbench are design/configuration values,
+      // not oscilloscope measurements. The solver additionally requires both Rg_on
+      // and Rg_off to be finite before accepting the 4D LUT query.
+      rgProvenance:
+        rgDesignConfirmed && rgOnRaw && rgOffRaw && Number.isFinite(rgOnParsed) && Number.isFinite(rgOffParsed)
+          ? 'design_specified'
+          : 'assumed',
       eonIncludesQrr: (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ?? false,
       dptLut: this.useDptMatrixInFoc && this.dptMatrix.length > 0 ? this.dptMatrix.map((pt) => ({ ...pt })) : undefined,
     };
@@ -3905,6 +3913,7 @@ export class ThermalWorkbenchController {
     const tAmb = this.readFiniteInput('focTambInput', 25);
     const rgOnTarget = Math.max(0, this.readFiniteInput('focRgonInput', 4.7));
     const rgOffTarget = Math.max(0, this.readFiniteInput('focRgoffInput', 4.7));
+    const rgDesignConfirmed = (document.getElementById('focRgDesignConfirmedChk') as HTMLInputElement | null)?.checked ?? false;
     const interp = interpolateDptSwitchingLoss(this.dptMatrix, {
       vBusV: vTarget,
       iLoadA: iTarget,
@@ -3912,10 +3921,17 @@ export class ThermalWorkbenchController {
       rgOnOhm: rgOnTarget,
       rgOffOhm: rgOffTarget,
       tjProvenance: 'assumed',
-      rgProvenance: 'measured',
+      rgProvenance: rgDesignConfirmed ? 'design_specified' : 'assumed',
     });
-    if (!interp || interp.status === 'INVALID_DATA') {
-      this.app.showToast('DPT 查找表含非法数据，无法注入 FOC 仿真。', 'error');
+    if (!interp || interp.status !== 'VALID' || (interp.activeDimensions.includes('Rg') && !rgDesignConfirmed)) {
+      const status = interp?.status ?? 'NO_LUT_RESULT';
+      const reason = interp?.activeDimensions.includes('Rg') && !rgDesignConfirmed
+        ? '尚未确认 Rg_on/Rg_off 与实际原理图或 BOM 一致；默认 4.7Ω 不能冒充已知驱动条件。'
+        : '请补齐 Vbus/Iload/Tj/Rg 四维数据覆盖，并确保查询点位于实测凸包内。';
+      this.app.showToast(
+        `DPT LUT 当前状态为 ${status}，不能激活为 FOC 正式热模型：${reason}`,
+        'error'
+      );
       return;
     }
 

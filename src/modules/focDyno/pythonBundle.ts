@@ -26,6 +26,7 @@ import pandas as pd
 
 SVPWM_LINEAR_LIMIT = 2.0 / math.sqrt(3.0)  # 1.1547005383792517
 DEFAULT_SAMPLING_GAP_FACTOR = 3.5
+MIN_RUNTIME_LOG_FILTER_COVERAGE_RATIO = 0.5
 
 
 @dataclass
@@ -446,6 +447,7 @@ def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: Motor
 
     segments, gap_indices, median_dt, gap_threshold = partition_continuous_time_segments(times)
     isolated_indices: list[int] = []
+    low_coverage_indices: list[int] = []
     if n_pts == 0 or filter_window_ms <= 0.0:
         i_bus_filt = raw_i.copy()
     else:
@@ -477,18 +479,27 @@ def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: Motor
                 span = times[right] - times[left]
                 if span > 1e-12:
                     i_bus_filt[i] = (trap_prefix[right - s0] - trap_prefix[left - s0]) / span
+                    if span + 1e-12 < MIN_RUNTIME_LOG_FILTER_COVERAGE_RATIO * (filter_window_ms * 1e-3) and (left == s0 or right == s1):
+                        low_coverage_indices.append(i)
                 else:
                     i_bus_filt[i] = raw_i[i]
+                    low_coverage_indices.append(i)
 
     records = []
     held_cols = ("iq", "t_est", "m_motor", "m_cmd", "vq_motor", "vq_cmd")
     last_valid = {col: float("nan") for col in held_cols}
-    for t, v, ib_raw, ib_f, n in zip(times, df["V_bus"], df["I_bus"], i_bus_filt, df["n_rpm"]):
-        res = solve_single_point(float(v), float(ib_f), float(n), params)
-        sol_valid = bool(res["mode"] not in ("invalid_bus", "regen_limit") and math.isfinite(res["iq"]))
+    isolated_set = set(isolated_indices)
+    low_coverage_set = set(low_coverage_indices)
+    for idx, (t, v, ib_raw, ib_f, n) in enumerate(zip(times, df["V_bus"], df["I_bus"], i_bus_filt, df["n_rpm"])):
+        filter_quality = ("ISOLATED" if idx in isolated_set else ("LOW_COVERAGE" if idx in low_coverage_set else ("INVALID" if not math.isfinite(float(ib_f)) else "VALID")))
+        filter_valid = filter_quality == "VALID"
+        res = solve_single_point(float(v), float(ib_f) if filter_valid else float("nan"), float(n), params)
+        sol_valid = bool(filter_valid and res["mode"] not in ("invalid_bus", "regen_limit") and math.isfinite(res["iq"]))
         res["time_s"] = float(t)
         res["i_bus_raw"] = float(ib_raw)
-        res["i_bus_filt"] = float(ib_f)
+        res["i_bus_filt"] = float(ib_f) if filter_valid else float("nan")
+        res["filter_valid"] = filter_valid
+        res["filter_quality"] = filter_quality
         res["solution_valid"] = sol_valid
         res["is_held_prev_iq"] = bool((not sol_valid) and math.isfinite(last_valid["iq"]))
         for col in held_cols:
@@ -503,6 +514,8 @@ def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: Motor
     out_df.attrs["gap_count"] = len(gap_indices)
     out_df.attrs["segment_count"] = len(segments)
     out_df.attrs["isolated_count"] = len(isolated_indices)
+    out_df.attrs["low_coverage_count"] = len(low_coverage_indices)
+    out_df.attrs["low_coverage_indices"] = low_coverage_indices
     out_df.attrs["median_dt_s"] = median_dt
     out_df.attrs["gap_threshold_s"] = gap_threshold
     return out_df
@@ -1093,9 +1106,18 @@ def run_stepwise_calibration(
         "residual_rms_nm": svd_diag["residual_rms_nm"],
         "dof": svd_diag["dof"],
         "entries": [
-            {**e, "value": (best_beta if idx == 0 else best_rs), "std_error": float("nan"), "ci95_low": float("nan"), "ci95_high": float("nan"), "status": "NOT_IDENTIFIABLE"}
-            if step3_unidentifiable else e
-            for idx, e in enumerate(svd_diag["entries"])
+            *[
+                {**e, "value": (best_beta if idx == 0 else best_rs), "std_error": float("nan"), "ci95_low": float("nan"), "ci95_high": float("nan"), "status": "NOT_IDENTIFIABLE"}
+                if step3_unidentifiable else e
+                for idx, e in enumerate(svd_diag["entries"])
+            ],
+            {
+                "name": "q 轴电感 Lq", "symbol": "Lq", "unit": "H",
+                "value": calc_lq_h(base_params.l_ll_mh), "std_error": float("nan"),
+                "ci95_low": float("nan"), "ci95_high": float("nan"), "relative_ci_pct": float("nan"),
+                "status": "FIXED",
+                "reason": f"由用户输入线间电感 L_LL={base_params.l_ll_mh:.4f}mH 按当前 Y 接假设换算为 Lq=L_LL/2；本次 Dyno 数据未独立辨识 Lq，也不是实测 Lq。",
+            },
         ],
         "correlation_matrix": svd_diag["correlation_matrix"],
         "high_collinearity_pairs": svd_diag["high_collinearity_pairs"],
@@ -2698,7 +2720,11 @@ with tab2:
     if df_log_out.attrs.get("gap_count", 0) > 0:
         st.warning(
             f"检测到 {df_log_out.attrs['gap_count']} 处时间采样缺口（分为 {df_log_out.attrs.get('segment_count', 1)} 个连续片段），已在缺口边界重置平滑滤波状态，不跨缺口插值；"
-            f"缺口孤立单点 ({df_log_out.attrs.get('isolated_count', 0)} 个) 已标记为 NaN。"
+            f"缺口孤立单点 ({df_log_out.attrs.get('isolated_count', 0)} 个) 已标记为 NaN；低覆盖率点 ({df_log_out.attrs.get('low_coverage_count', 0)} 个) 已从有效估算中剔除。"
+        )
+    elif df_log_out.attrs.get("low_coverage_count", 0) > 0:
+        st.warning(
+            f"当前滤波窗口有效时间覆盖不足的点共 {df_log_out.attrs['low_coverage_count']} 个，已标记为 LOW_COVERAGE 并从有效反算/统计中剔除。"
         )
     n_regen_lim = int(df_log_out["alert_regen_limit"].sum())
     n_inv_bus = int(df_log_out["alert_invalid_bus"].sum())

@@ -1438,7 +1438,6 @@ test('FOC thermal simulation rejects duplicate timestamps and incomplete auxilia
 });
 
 import { alignChannelsToCommonTimebase, inspectChannelSamplingGaps } from './timeSync';
-import { interpolateDptSwitchingLoss } from './dptAnalyzer';
 import { reconstructSingleShuntPhaseCurrents } from './singleShuntRecon';
 
 test('Round-2 P0/P1: timeSync fail-closed, SOA INDETERMINATE, Loss INCOMPLETE/preheat/Tpad, FOC splitFeasible/eonIncludesQrr, DPT LUT & Single-Shunt Recon', () => {
@@ -1732,10 +1731,11 @@ test('MOS Thermal MT-03..MT-05: DPT LUT extrapolation/0A-rolloff and FOC 6-MOS L
   assert.deepEqual(highV!.iRange, [20, 40]);
   assert.ok(Number.isFinite(highV!.eOnUj) && highV!.eOnUj > 60);
 
-  // Inside convex grid (60 V, 30 A) is not extrapolated
+  // Inside V/I convex grid is still only a 2D LUT; collapsed Tj/Rg axes make it insufficient for sign-off.
   const inside = interpolateDptSwitchingLoss(lut, 60, 30);
   assert.ok(inside !== null);
   assert.equal(inside!.extrapolated, false);
+  assert.equal(inside!.status, 'INSUFFICIENT_LUT');
 
   // computePhaseMosLosses & simulateFoc6Mos honor dptLut and eonIncludesQrr flag
   const mosBase = {
@@ -1749,30 +1749,35 @@ test('MOS Thermal MT-03..MT-05: DPT LUT extrapolation/0A-rolloff and FOC 6-MOS L
     eossUj: 0,
     dptLut: lut,
   };
-  const lossLutNoQrr = computePhaseMosLosses(30, 0.7, 60, 25, 25, 'SVPWM', 20000, 200, {
-    ...mosBase,
-    eonIncludesQrr: false,
-  });
-  const lossLutWithQrr = computePhaseMosLosses(30, 0.7, 60, 25, 25, 'SVPWM', 20000, 200, {
-    ...mosBase,
-    eonIncludesQrr: true,
-  });
-  assert.ok(Math.abs(lossLutWithQrr.pHighSw - 20000 * inside!.eSwTotalUj * 1e-6) < 1e-6);
-  assert.ok(lossLutWithQrr.pHighSw < lossLutNoQrr.pHighSw, 'eonIncludesQrr=true uses Eon+Eoff directly instead of Eon_sansQrr+Qrr*Vbus');
+  assert.throws(
+    () => computePhaseMosLosses(30, 0.7, 60, 25, 25, 'SVPWM', 20000, 200, {
+      ...mosBase,
+      eonIncludesQrr: false,
+    }),
+    /INSUFFICIENT_LUT|OUT_OF_RANGE/
+  );
+  assert.throws(
+    () => computePhaseMosLosses(30, 0.7, 60, 25, 25, 'SVPWM', 20000, 200, {
+      ...mosBase,
+      eonIncludesQrr: true,
+    }),
+    /INSUFFICIENT_LUT|OUT_OF_RANGE/
+  );
 
   const n = 100;
   const t = Float64Array.from({ length: n }, (_, i) => i * 5e-4);
   const ia = Float32Array.from(t, (x) => 30 * Math.sin(2 * Math.PI * 50 * x));
   const ib = Float32Array.from(t, (x) => 30 * Math.sin(2 * Math.PI * 50 * x - (2 * Math.PI) / 3));
-  const simLut = simulateFoc6Mos(
-    makeChannel('lut_ia', 'Ia', 'A', t, ia),
-    makeChannel('lut_ib', 'Ib', 'A', t, ib),
-    DEFAULT_FOC_MODEL,
-    { ...mosBase, eonIncludesQrr: true },
-    { modulation: 'SVPWM', fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 25, vBusConstV: 60 }
+  assert.throws(
+    () => simulateFoc6Mos(
+      makeChannel('lut_ia', 'Ia', 'A', t, ia),
+      makeChannel('lut_ib', 'Ib', 'A', t, ib),
+      DEFAULT_FOC_MODEL,
+      { ...mosBase, eonIncludesQrr: true },
+      { modulation: 'SVPWM', fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 25, vBusConstV: 60 }
+    ),
+    /INSUFFICIENT_LUT|OUT_OF_RANGE/
   );
-  assert.ok(simLut.pInvMeanW > 0 && Number.isFinite(simLut.tjMaxGlobalC));
-  assert.ok(simLut.warnings.some((w) => w.includes('DPT 查找表')));
 });
 
 test('MT-06: DPT analyzer trims bounded deskew without clamping, rejects excessive deskew, and fails closed on edge NaNs/gaps', () => {
@@ -1823,10 +1828,10 @@ test('MT-01: True 4D DPT LUT interpolation across (Vbus, Iload, Tj, Rg_on/off) w
   // Eoff(V,I,T,Rg) = 0.25*V + 0.5*I + 0.08*(T-25) + 2.0*Rg
   // Qrr(V,I,T,Rg) = 20 + 2*I + 0.5*(T-25) + 1.5*Rg
   const vLvls = [40, 80];
-  const iLvls = [10, 30];
+  const iLvls = [0, 30];
   const tLvls = [25, 125];
   const rLvls = [2, 10];
-  const lut4d = [];
+  const lut4d: Parameters<typeof interpolateDptSwitchingLoss>[0] = [];
   for (const v of vLvls) {
     for (const i of iLvls) {
       for (const tj of tLvls) {
@@ -1870,6 +1875,16 @@ test('MT-01: True 4D DPT LUT interpolation across (Vbus, Iload, Tj, Rg_on/off) w
   assert.ok(Math.abs(res!.eOffUj - expectedEoff) < 1e-6);
   assert.ok(Math.abs(res!.qRrNc - expectedQrr) < 1e-6);
 
+  // A numeric Rg is not automatically a measurement; provenance must be explicit.
+  const rgUnproven = interpolateDptSwitchingLoss(lut4d, {
+    vBusV: 60, iLoadA: 20, tjC: 75, rgOnOhm: 4, rgOffOhm: 8,
+  });
+  assert.equal(rgUnproven!.rgProvenance, 'assumed');
+  const rgPartialWithForgedMeasuredLabel = interpolateDptSwitchingLoss(lut4d, {
+    vBusV: 60, iLoadA: 20, tjC: 75, rgOnOhm: 4, rgProvenance: 'measured',
+  });
+  assert.equal(rgPartialWithForgedMeasuredLabel!.rgProvenance, 'assumed');
+
   // Out-of-range query (Tj=150 > 125) must surface OUT_OF_RANGE explicitly
   const oor = interpolateDptSwitchingLoss(lut4d, {
     vBusV: 60,
@@ -1885,6 +1900,23 @@ test('MT-01: True 4D DPT LUT interpolation across (Vbus, Iload, Tj, Rg_on/off) w
   // Single-point LUT returns INSUFFICIENT_LUT
   const single = interpolateDptSwitchingLoss([lut4d[0]], { vBusV: 50, iLoadA: 15 });
   assert.equal(single!.status, 'INSUFFICIENT_LUT');
+
+  assert.throws(
+    () => computePhaseMosLosses(15, 0.5, 50, 25, 25, 'SVPWM', 20000, 100, {
+      rdsOn25Mohm: 4.5, tempCoeffAlphaPerC: 0.0045, vsdV: 0.9,
+      eonPlusEoffUj: 50, vRefV: 48, iRefA: 25, qrrNc: 40, eossUj: 0,
+      rgOnOhm: 2, rgOffOhm: 2, dptLut: [lut4d[0]],
+    }),
+    /INSUFFICIENT_LUT/
+  );
+  assert.throws(
+    () => computePhaseMosLosses(15, 0.5, 200, 25, 25, 'SVPWM', 20000, 100, {
+      rdsOn25Mohm: 4.5, tempCoeffAlphaPerC: 0.0045, vsdV: 0.9,
+      eonPlusEoffUj: 50, vRefV: 48, iRefA: 25, qrrNc: 40, eossUj: 0,
+      rgOnOhm: 2, rgOffOhm: 2, dptLut: lut4d,
+    }),
+    /OUT_OF_RANGE/
+  );
 
   // Invalid negative Vbus / NaN data returns INVALID_DATA
   const bad = interpolateDptSwitchingLoss([{ ...lut4d[0], eOnUj: -5 }], { vBusV: 40, iLoadA: 10 });
@@ -1925,6 +1957,18 @@ test('MT-01: True 4D DPT LUT interpolation across (Vbus, Iload, Tj, Rg_on/off) w
   );
   assert.ok(simLoRg.dptLutDiagnostics?.activeDimensions.includes('Rg'));
   assert.ok(simHiRg.pInvMeanW > simLoRg.pInvMeanW + 0.5, 'Higher Rg_on/Rg_off must raise switching loss via 4D LUT');
+
+  // Caller-supplied provenance cannot make missing Rg inputs look measured.
+  assert.throws(
+    () => simulateFoc6Mos(
+      makeChannel('f4d_ia_missing_rg', 'Ia', 'A', t, ia),
+      makeChannel('f4d_ib_missing_rg', 'Ib', 'A', t, ib),
+      DEFAULT_FOC_MODEL,
+      { ...mosLoRg, rgOnOhm: undefined, rgOffOhm: undefined, rgProvenance: 'measured' },
+      { modulation: 'SVPWM', fswHz: 20000, tDeadNs: 200, modDepthM: 0.85, pfAngleDeg: 0, tAmbC: 75, vBusConstV: 60 }
+    ),
+    /Rg_on\/Rg_off 实际输入/
+  );
 });
 
 test('MT-02: Adaptive step-doubling Cauer solver removes 32/64 cap and converges on stiff dt >> tau_min', () => {
@@ -1943,6 +1987,19 @@ test('MT-02: Adaptive step-doubling Cauer solver removes 32/64 cap and converges
   assert.equal(coarseDiag.solverStatus, 'CONVERGED');
   assert.ok(coarseDiag.maxSubsteps > 64, `Expected >64 substeps on stiff dt=${coarseDt}s, got ${coarseDiag.maxSubsteps}`);
   assert.ok(coarseDiag.minActualStepSec <= 1e-4 * 0.05 + 1e-12);
+
+  // Malformed thermal series must fail closed; never truncate, skip duplicate time, or turn NaN power into zero.
+  assert.throws(() => simulateCauerZohWithDiagnostics(new Float64Array([0, 1]), new Float32Array([10]), stages, 25), /长度不一致/);
+  assert.throws(() => simulateCauerZohWithDiagnostics(new Float64Array([0, 0]), new Float32Array([10, 10]), stages, 25), /重复或倒退/);
+  assert.throws(() => simulateCauerZohWithDiagnostics(new Float64Array([0, 1]), new Float32Array([10, Number.NaN]), stages, 25), /有限非负值/);
+
+  // A pathological fast thermal pole must not leak a partial Tj curve through the convenience API.
+  const cappedStages = [{ r: 0.2, c: 5e-11, tauEst: 1e-11, layerLabel: 'Fast die' }];
+  const cappedTime = new Float64Array([0, 1]);
+  const cappedPower = new Float32Array([10, 10]);
+  const cappedDiag = simulateCauerZohWithDiagnostics(cappedTime, cappedPower, cappedStages, 25);
+  assert.equal(cappedDiag.solverStatus, 'STEP_CAP_REACHED');
+  assert.throws(() => simulateCauerZoh(cappedTime, cappedPower, cappedStages, 25), /未收敛/);
 
   // Compare at shared timestamps against ultra-dense analytical/fine step simulation (dt_ref = 5 us)
   const fineDt = 5e-6;
@@ -2101,6 +2158,19 @@ test('MT-04: Nonlinear Eoss(V)/Qoss(V)/Coss(V) integration, monotone PCHIP accur
   const oorEval = evaluateNonlinearEossUj(qCurve, 150);
   assert.equal(oorEval.outOfRange, true);
   assert.ok(Math.abs(oorEval.eossUj - qCurve.points[qCurve.points.length - 1].val) < 1e-6);
+
+  assert.throws(
+    () => evaluateNonlinearEossUj(qCurve, 150, { allowOutOfDomainClamp: false }),
+    /超出 Eoss\(V\)\/Qoss\(V\) 曲线定义域/
+  );
+  assert.throws(
+    () => computePhaseMosLosses(10, 0.5, 150, 25, 25, 'SVPWM', 20000, 100, {
+      rdsOn25Mohm: 4.5, tempCoeffAlphaPerC: 0.0045, vsdV: 0.9,
+      eonPlusEoffUj: 0, vRefV: 48, iRefA: 25, qrrNc: 0, eossUj: 0,
+      eossCurve: qCurve,
+    }),
+    /超出 Eoss\(V\)\/Qoss\(V\) 曲线定义域/
+  );
 
   // eossAlreadyIncludedInEsw=true prevents double counting Eoss in computePhaseMosLosses
   const mosWithCurve = {

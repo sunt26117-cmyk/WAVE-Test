@@ -9,6 +9,7 @@ import {
   MotorParams,
   calcKeFromKv,
   calcKeFromNoLoad,
+  calcLqH,
   calcOmegaM,
   calcP0LossW,
   calcRsAnchorOhm,
@@ -876,6 +877,19 @@ export function runStepwiseCalibration(
     },
   ];
 
+  const lqEntry: ParameterIdentifiabilityEntry = {
+    name: 'q 轴电感 Lq',
+    symbol: 'Lq',
+    unit: 'H',
+    value: calcLqH(baseParams.lLLmH),
+    stdError: Number.NaN,
+    ci95Low: Number.NaN,
+    ci95High: Number.NaN,
+    relativeCiPct: Number.NaN,
+    status: 'FIXED',
+    reason: `由用户输入线间电感 L_LL=${baseParams.lLLmH.toFixed(4)}mH 按当前 Y 接假设换算为 Lq=L_LL/2；本次 Dyno 数据未独立辨识 Lq，也不是实测 Lq。`,
+  };
+
   const keEntry: ParameterIdentifiabilityEntry = {
     name: '反电势常数 Ke\'',
     symbol: "Ke'",
@@ -1125,7 +1139,7 @@ export function runStepwiseCalibration(
       singularValues: svdDiag.singularValues,
       residualRmsNm: svdDiag.residualRmsNm,
       dof: svdDiag.dof,
-      parameters: [keEntry, ...p0Entries, ...step3Entries],
+      parameters: [keEntry, ...p0Entries, ...step3Entries, lqEntry],
       correlationMatrix: svdDiag.correlationMatrix,
       highCollinearityPairs: svdDiag.highCollinearityPairs,
       p0Identifiability: {
@@ -1163,7 +1177,7 @@ export function runStepwiseCalibration(
       singularValues: [],
       residualRmsNm: Number.NaN,
       dof: 0,
-      parameters: [keEntry, ...p0Entries],
+      parameters: [keEntry, ...p0Entries, lqEntry],
       correlationMatrix: { names: [], matrix: [] },
       highCollinearityPairs: [],
       p0Identifiability: {
@@ -1507,7 +1521,9 @@ export function computeThinSvd(A: number[][]): {
     return { U: [], S: [], V: [] };
   }
   const W = A.map((row) => row.slice());
-  const V = Array.from({ length: p }, (_, i) =>
+  // Explicit element type: without it TS infers (0 | 1)[][] from the identity
+  // initialiser and rejects the real-valued Jacobi rotations below.
+  const V: number[][] = Array.from({ length: p }, (_, i) =>
     Array.from({ length: p }, (__, j) => (i === j ? 1 : 0))
   );
 

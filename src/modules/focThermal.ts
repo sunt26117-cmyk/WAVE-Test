@@ -1195,15 +1195,25 @@ export function computePhaseMosLosses(
             tjC: activeTjC,
             rgOnOhm: mos.rgOnOhm,
             rgOffOhm: mos.rgOffOhm,
-            tjProvenance: 'measured',
-            rgProvenance: mos.rgProvenance ?? (rgOnKnown || rgOffKnown ? 'measured' : 'assumed'),
+            tjProvenance: 'model_estimated',
+            // Rg is usable as a measured LUT coordinate only when both switching
+            // directions have explicit finite inputs. A caller-supplied provenance
+            // label must never turn a missing Rg value (which the interpolator would
+            // otherwise replace with a LUT midpoint) into a measured condition.
+            rgProvenance: rgOnKnown && rgOffKnown ? (mos.rgProvenance ?? 'assumed') : 'assumed',
           })
         : null;
     let eSwJ: number;
     let eQrrJ: number;
     if (lutInterp) {
-      if (lutInterp.status === 'INVALID_DATA') {
-        throw new Error(lutInterp.warnings[0] || 'DPT LUT 数据含非法字段，已拒绝开关损耗插值。');
+      if (lutInterp.status !== 'VALID') {
+        const details = lutInterp.warnings.join('；') || `DPT LUT 状态为 ${lutInterp.status}`;
+        throw new Error(
+          `MOS 热损耗计算已拒绝非有效 DPT 查询 (${lutInterp.status})：${details}。请补齐 Vbus/Iload/Tj/Rg 四维实测范围后重新计算。`
+        );
+      }
+      if (lutInterp.rgProvenance === 'assumed' && lutInterp.activeDimensions.includes('Rg')) {
+        throw new Error('DPT LUT 的 Rg 维度有变化，但当前运行没有明确的 Rg_on/Rg_off 实际输入；禁止使用 LUT 中值冒充实际驱动条件。');
       }
       lutStatus = lutInterp.status;
       lutActiveDims = lutInterp.activeDimensions;
@@ -1228,7 +1238,7 @@ export function computePhaseMosLosses(
     let eOssJ = 0;
     if (!mos.eossAlreadyIncludedInEsw) {
       if (mos.eossCurve) {
-        const evalRes = evaluateNonlinearEossUj(mos.eossCurve, vPos);
+        const evalRes = evaluateNonlinearEossUj(mos.eossCurve, vPos, { allowOutOfDomainClamp: false });
         eOssJ = Math.max(0, evalRes.eossUj) * 1e-6;
         eossOutOfRange = evalRes.outOfRange;
       } else {

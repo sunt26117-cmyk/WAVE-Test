@@ -116,6 +116,11 @@ export interface ForwardVerifyResult {
   alerts: EngineeringAlerts;
 }
 
+// A centered moving-average window clipped at a recording/segment edge has at
+// most half of the requested width available. Less than 50% support is not a
+// defensible time-window mean and is excluded from electrical estimation.
+const MIN_RUNTIME_LOG_FILTER_COVERAGE_RATIO = 0.5;
+
 export interface RuntimeLogRow {
   timeS: number;
   vMeasV: number;
@@ -125,7 +130,8 @@ export interface RuntimeLogRow {
   result: SinglePointResult;
   /** True when time-domain filter output at this row is valid (false for gap-isolated singletons). */
   filterValid?: boolean;
-  /** True when a sampling gap precedes or isolates this sample. */
+  filterQuality?: 'VALID' | 'LOW_COVERAGE' | 'ISOLATED' | 'INVALID';
+  /** True when a sampling gap precedes, isolates, or invalidates this sample. */
   gapBoundary?: boolean;
 }
 
@@ -739,12 +745,15 @@ export function movingAverageFilterWithDiagnostics(
         const span = timesS[right] - timesS[left];
         if (span > 1e-12) {
           out[i] = (trapPrefix[right - s0] - trapPrefix[left - s0]) / span;
-          if (gapIndices.length > 0 && span < 0.25 * windowS && (left === s0 || right === s1)) {
+          if (span + 1e-12 < MIN_RUNTIME_LOG_FILTER_COVERAGE_RATIO * windowS && (left === s0 || right === s1)) {
             lowCoverageIndices.push(i);
           }
         } else {
-          // Window narrower than local dt inside a continuous segment: single sample preserved cleanly.
+          // There is no measurable time support inside the requested window.
+          // Keep the point only for diagnostics, but mark it LOW_COVERAGE so
+          // downstream estimation cannot treat a raw singleton as a valid mean.
           out[i] = values[i];
+          lowCoverageIndices.push(i);
         }
       }
     }
@@ -842,20 +851,31 @@ export function processRuntimeLogWithAudit(
   const filterDiagnostics = movingAverageFilterWithDiagnostics(rawIbus, times, filterWindowMs);
   const gapSet = new Set(filterDiagnostics.gapIndices);
   const isoSet = new Set(filterDiagnostics.isolatedIndices);
+  const lowCoverageSet = new Set(filterDiagnostics.lowCoverageIndices);
 
   const rows: RuntimeLogRow[] = rawRows.map((row, idx) => {
     const iBusFilteredA = filterDiagnostics.values[idx];
-    const filterValid = Number.isFinite(iBusFilteredA) && !isoSet.has(idx);
-    const result = solveSinglePoint(row.vMeasV, iBusFilteredA, row.nRpm, params);
+    const isIsolated = isoSet.has(idx);
+    const isLowCoverage = lowCoverageSet.has(idx);
+    const filterValid = Number.isFinite(iBusFilteredA) && !isIsolated && !isLowCoverage;
+    const filterQuality: RuntimeLogRow['filterQuality'] = !Number.isFinite(iBusFilteredA)
+      ? 'INVALID'
+      : isIsolated
+        ? 'ISOLATED'
+        : isLowCoverage
+          ? 'LOW_COVERAGE'
+          : 'VALID';
+    const result = solveSinglePoint(row.vMeasV, filterValid ? iBusFilteredA : Number.NaN, row.nRpm, params);
     return {
       timeS: row.timeS,
       vMeasV: row.vMeasV,
       iBusRawA: row.iBusA,
-      iBusFilteredA,
+      iBusFilteredA: filterValid ? iBusFilteredA : Number.NaN,
       nRpm: row.nRpm,
       result,
       filterValid,
-      gapBoundary: gapSet.has(idx) || isoSet.has(idx),
+      filterQuality,
+      gapBoundary: gapSet.has(idx) || isIsolated || isLowCoverage,
     };
   });
 
