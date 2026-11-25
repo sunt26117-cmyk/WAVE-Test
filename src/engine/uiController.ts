@@ -3327,6 +3327,12 @@ export class OscilloscopeApp {
     const ratePresetSel = document.getElementById('csvSampleRatePresetSelect') as HTMLSelectElement;
     const customRateInput = document.getElementById('csvCustomRateInput') as HTMLInputElement;
     if (ratePresetSel && customRateInput) {
+      const explicitTimeSelected = p.timeColIndex >= 0;
+      ratePresetSel.disabled = false;
+      customRateInput.disabled = false;
+      ratePresetSel.title = explicitTimeSelected
+        ? '已选择原始 Time 列：按目标采样间隔抽取真实存在的时间行，时间戳和通道数值同步保留；不插值、不重建时间轴。'
+        : '未选择 Time 列时，使用采样率和样本序号重建时间轴。';
       if (!p.sampleRateOverrideHz) {
         ratePresetSel.value = 'auto';
         customRateInput.classList.add('hidden');
@@ -3389,18 +3395,23 @@ export class OscilloscopeApp {
           : q.qualityStatus === 'non-uniform'
           ? 'text-amber-300'
           : 'text-red-400';
-      const overrideBadge = p.sampleRateOverrideHz
-        ? `<span class="text-cyan-300 font-semibold">[FORCED ${formatEng(p.sampleRateOverrideHz, 'Sa/s', 2)}]</span>`
+      const overrideBadge = p.timeColIndex >= 0
+        ? p.sampleRateOverrideHz
+          ? `<span class="text-cyan-300 font-semibold">[按原始 Time 抽取；目标间隔 ${formatEng(1 / p.sampleRateOverrideHz, 's', 3)}；不插值]</span>`
+          : `<span class="text-emerald-300 font-semibold">[原始 Time 列；全量保留]</span>`
+        : p.sampleRateOverrideHz
+        ? `<span class="text-cyan-300 font-semibold">[INDEX-BASED ${formatEng(p.sampleRateOverrideHz, 'Sa/s', 2)}]</span>`
         : '';
       auditEl.innerHTML = `
         <span>Sampling: <strong class="${statusCls}">${q.qualityStatus.toUpperCase()}</strong> ${overrideBadge}</span>
+        <span>Samples: <strong class="text-slate-100">${Math.max(0, q.originalSampleCount - (q.decimatedSampleCount || 0)).toLocaleString()}</strong> kept / ${q.originalSampleCount.toLocaleString()} source${q.decimationCountEstimated ? ' (preview estimate)' : ''}</span>
         <span>Rate: <strong class="text-slate-100">${q.sampleRate ? formatEng(q.sampleRate, 'Sa/s', 2) : 'N/A'}</strong></span>
         <span>Duration: <strong class="text-slate-100">${formatEng(dur, 's', 3)}</strong></span>
         <span>Jitter RMS: <strong class="text-slate-100">${q.jitterRms !== null ? q.jitterRms.toFixed(2) + '%' : 'N/A'}</strong></span>
         <span>Gaps: <strong class="${q.gapCount > 0 ? 'text-amber-300' : 'text-slate-100'}">${q.gapCount}</strong></span>
       `;
     } else if (auditEl) {
-      auditEl.innerHTML = '<span class="text-slate-400">No explicit Time column selected (defaults to 10 kSa/s, or choose up to 1 GSa/s in Rate above).</span>';
+      auditEl.innerHTML = '<span class="text-slate-400">未选择 Time 列：默认 10 kSa/s；可设置 Rate 按样本序号重建时间轴。选择 Time 列后，Rate 将改为按原始时间戳抽取已有数据行。</span>';
     }
   }
 
@@ -4603,6 +4614,20 @@ export class OscilloscopeApp {
           ? '<span class="text-amber-300 font-semibold">Non-uniform</span>'
           : '<span class="text-red-400 font-semibold">Severe Jitter</span>'
         : 'N/A';
+      const provenanceLabels: Record<string, string> = {
+        measured: 'Measured input',
+        derived_estimate: 'Model-derived estimate',
+        synthetic_steady_state: 'Synthetic steady-state',
+        simulated_switching: 'Simulated switching',
+      };
+      const provenanceLabel = meta?.dataProvenance
+        ? provenanceLabels[meta.dataProvenance] || 'Unverified source'
+        : 'Unverified / unspecified';
+      const provenanceClass = meta?.dataProvenance === 'measured'
+        ? 'text-emerald-300'
+        : meta?.dataProvenance === 'derived_estimate' || meta?.dataProvenance === 'synthetic_steady_state'
+        ? 'text-amber-300'
+        : 'text-slate-400';
 
       fileSummaryEl.innerHTML = `
         <div class="flex justify-between py-0.5"><span class="text-slate-400">File</span><span class="font-mono text-slate-200 truncate max-w-[175px]" title="${escapeHtml(tab.fileName)}">${escapeHtml(tab.fileName)}</span></div>
@@ -4610,6 +4635,8 @@ export class OscilloscopeApp {
         <div class="flex justify-between py-0.5"><span class="text-slate-400">Rate</span><span class="font-mono text-slate-200">${escapeHtml(sampleRateStr)}${meta?.syntheticClockUsed ? ' (10k默认)' : ''}</span></div>
         <div class="flex justify-between py-0.5"><span class="text-slate-400">Duration</span><span class="font-mono text-slate-200">${escapeHtml(durationStr)}</span></div>
         <div class="flex justify-between py-0.5"><span class="text-slate-400">Timing</span><span>${qualityBadge}${meta?.resampledFromNonUniform ? ' <span class="text-cyan-300 text-[10px]">(Resampled)</span>' : ''}</span></div>
+        <div class="flex justify-between py-0.5 gap-2"><span class="text-slate-400">Primary source</span><span class="font-semibold text-right ${provenanceClass}">${escapeHtml(provenanceLabel)}</span></div>
+        ${meta?.sourceModel ? `<div class="flex justify-between py-0.5 gap-2"><span class="text-slate-400">Model</span><span class="font-mono text-slate-300 text-right truncate max-w-[175px]" title="${escapeHtml(meta.sourceModel)}">${escapeHtml(meta.sourceModel)}</span></div>` : ''}
         ${meta && meta.jitterRms !== null ? `<div class="flex justify-between py-0.5"><span class="text-slate-400">Jitter RMS</span><span class="font-mono text-slate-200">${meta.jitterRms.toFixed(2)}%</span></div>` : ''}
         ${meta && ((meta.rawGapCount ?? meta.gapCount) > 0 || meta.gapCount > 0) ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Gaps${meta.resampledFromNonUniform ? ' (raw)' : ''}</span><span class="font-mono font-semibold">${meta.rawGapCount ?? meta.gapCount}</span></div>` : ''}
         ${meta && (meta.signalNanCount || 0) > 0 ? `<div class="flex justify-between py-0.5 text-amber-300"><span>Missing/NaN</span><span class="font-mono font-semibold">${meta.signalNanCount}</span></div>` : ''}

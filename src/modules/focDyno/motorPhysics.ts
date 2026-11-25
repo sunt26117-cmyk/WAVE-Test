@@ -579,7 +579,7 @@ export function forwardVerifyPoint(
 export function isMonotonicTimestamps(timesS: number[]): boolean {
   if (timesS.length < 2) return true;
   for (let i = 1; i < timesS.length; i++) {
-    if (!Number.isFinite(timesS[i]) || !Number.isFinite(timesS[i - 1]) || timesS[i] < timesS[i - 1]) {
+    if (!Number.isFinite(timesS[i]) || !Number.isFinite(timesS[i - 1]) || timesS[i] <= timesS[i - 1]) {
       return false;
     }
   }
@@ -593,6 +593,15 @@ export function movingAverageFilter(
 ): number[] {
   const n = values.length;
   if (n === 0 || windowMs <= 0) return [...values];
+  if (timesS.length > 0 && timesS.length !== n) {
+    throw new Error(`Runtime Log 时间轴与电流数组长度不一致：t=${timesS.length}, values=${n}。`);
+  }
+  if (timesS.length > 0 && !isMonotonicTimestamps(timesS)) {
+    throw new Error('Runtime Log 时间戳必须有限且严格递增；拒绝退回按样本序号滤波。');
+  }
+  if (values.some((value) => !Number.isFinite(value))) {
+    throw new Error('Runtime Log 电流数据包含 NaN/Inf；拒绝通过滤波忽略无效样本。');
+  }
 
   const halfWinS = (windowMs * 1e-3) * 0.5;
   const prefix = new Float64Array(n + 1);
@@ -694,6 +703,15 @@ export function processRuntimeLog(
   params: MotorParams
 ): RuntimeLogRow[] {
   if (rawRows.length === 0) return [];
+  for (let i = 0; i < rawRows.length; i++) {
+    const row = rawRows[i];
+    if (![row.timeS, row.vMeasV, row.iBusA, row.nRpm].every(Number.isFinite)) {
+      throw new Error(`Runtime Log 第 ${i + 1} 行包含 NaN/Inf，拒绝生成动态估算结果。`);
+    }
+    if (i > 0 && row.timeS <= rawRows[i - 1].timeS) {
+      throw new Error(`Runtime Log 时间戳在第 ${i + 1} 行重复或倒退；拒绝按样本序号回退滤波。`);
+    }
+  }
   const times = rawRows.map((r) => r.timeS);
   const rawIbus = rawRows.map((r) => r.iBusA);
   const filteredIbus = movingAverageFilter(rawIbus, times, filterWindowMs);

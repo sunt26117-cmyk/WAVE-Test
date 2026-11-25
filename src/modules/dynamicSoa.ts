@@ -234,11 +234,19 @@ export const SOA_PRESETS: SoaCurveSet[] = [
  * Log-log piecewise interpolation of Id_max at a single voltage along one pulse curve.
  */
 export function interpolateSoaCurveAtVds(points: SoaPoint[], vdsAbs: number): number {
-  const sorted = [...points].filter((p) => p.vds > 0 && p.id > 0).sort((a, b) => a.vds - b.vds);
-  if (sorted.length === 0) return Infinity;
+  const sorted = [...points]
+    .filter((p) => Number.isFinite(p?.vds) && Number.isFinite(p?.id) && p.vds > 0 && p.id > 0)
+    .sort((a, b) => a.vds - b.vds);
+  // An undefined SOA envelope must never be interpreted as unlimited current.
+  if (sorted.length < 2 || !Number.isFinite(vdsAbs) || vdsAbs < 0) return Number.NaN;
+  for (let i = 1; i < sorted.length; i++) {
+    if (!(sorted[i].vds > sorted[i - 1].vds)) return Number.NaN;
+  }
   const v = Math.max(1e-4, vdsAbs);
   if (v <= sorted[0].vds) return sorted[0].id;
-  if (v >= sorted[sorted.length - 1].vds) return sorted[sorted.length - 1].id;
+  // Do not flat-extrapolate the last current limit beyond the datasheet curve.
+  if (v > sorted[sorted.length - 1].vds) return Number.NaN;
+  if (v === sorted[sorted.length - 1].vds) return sorted[sorted.length - 1].id;
 
   const lv = Math.log10(v);
   for (let i = 0; i < sorted.length - 1; i++) {
@@ -260,6 +268,9 @@ export function interpolateSoaCurveAtVds(points: SoaPoint[], vdsAbs: number): nu
  * across adjacent pulse-width SOA curves on log-log axes.
  */
 export function getSoaMaxId(curveSet: SoaCurveSet, vdsAbs: number, pulseWidthSec: number): number {
+  if (!Number.isFinite(vdsAbs) || vdsAbs < 0 || !Number.isFinite(pulseWidthSec) || pulseWidthSec <= 0) {
+    return Number.NaN;
+  }
   if (vdsAbs > curveSet.vdsMaxRated) return 0; // Avalanche / BVDSS violation
 
   const keys: SoaPulseKey[] = ['10us', '100us', '1ms', '10ms', 'DC'];
@@ -282,6 +293,45 @@ export function getSoaMaxId(curveSet: SoaCurveSet, vdsAbs: number, pulseWidthSec
     }
   }
   return interpolateSoaCurveAtVds(curveSet.curves['DC'], vdsAbs);
+}
+
+const SOA_CURVE_KEYS: SoaPulseKey[] = ['DC', '10ms', '1ms', '100us', '10us'];
+
+/**
+ * A missing or truncated user-edited SOA curve is a data-integrity failure, not
+ * an unlimited-current envelope. Every pulse curve must cover the declared Vds
+ * rating so interpolation never silently flat-extrapolates outside source data.
+ */
+function validateSoaCurveSet(curveSet: SoaCurveSet): string | null {
+  if (
+    !curveSet ||
+    typeof curveSet.name !== 'string' ||
+    !Number.isFinite(curveSet.vdsMaxRated) ||
+    curveSet.vdsMaxRated <= 0
+  ) {
+    return 'SOA 器件配置缺少有效名称或 Vds 额定值，已阻止判定。';
+  }
+
+  for (const key of SOA_CURVE_KEYS) {
+    const points = curveSet.curves?.[key];
+    if (!Array.isArray(points) || points.length < 2) {
+      return `SOA ${key} 曲线缺失或少于 2 个有效点，不能将缺失边界视为无限安全电流。`;
+    }
+    const sorted = [...points].sort((a, b) => (a?.vds ?? Infinity) - (b?.vds ?? Infinity));
+    for (let i = 0; i < sorted.length; i++) {
+      const point = sorted[i];
+      if (!Number.isFinite(point?.vds) || !Number.isFinite(point?.id) || point.vds <= 0 || point.id <= 0) {
+        return `SOA ${key} 曲线第 ${i + 1} 个点包含非有限或非正 Vds/Ids 数据。`;
+      }
+      if (i > 0 && !(point.vds > sorted[i - 1].vds)) {
+        return `SOA ${key} 曲线存在重复 Vds 坐标，无法进行可靠对数插值。`;
+      }
+    }
+    if (sorted[sorted.length - 1].vds < curveSet.vdsMaxRated * 0.999) {
+      return `SOA ${key} 曲线仅覆盖至 ${sorted[sorted.length - 1].vds} V，低于声明的额定电压 ${curveSet.vdsMaxRated} V；禁止在曲线范围外外推。`;
+    }
+  }
+  return null;
 }
 
 export interface SoaTrajectoryPoint {
@@ -345,14 +395,26 @@ export function evaluateDynamicSoa(
   curveSet: SoaCurveSet,
   opts?: { tStart?: number; tEnd?: number; forcedPulseKey?: SoaPulseKey | 'auto' }
 ): DynamicSoaResult {
-  const nV = Math.min(vdsCh.t.length, vdsCh.v.length);
-  const nI = Math.min(idsCh.t.length, idsCh.v.length);
-  if (nV === 0 || nI === 0) {
-    return buildInvalidSoaResult('Vds 或 Ids 波形数据为空，无法判定 Dynamic SOA（已按 INVALID 拦截，禁止放行）。');
+  const curveError = validateSoaCurveSet(curveSet);
+  if (curveError) return buildInvalidSoaResult(`${curveError} SOA 状态：INVALID（禁止放行 PASS）。`);
+
+  if (vdsCh.t.length !== vdsCh.v.length || idsCh.t.length !== idsCh.v.length) {
+    return buildInvalidSoaResult('Vds 或 Ids 的时间戳数量与数据点数量不一致，无法确定逐点物理对应关系。');
+  }
+  const nV = vdsCh.t.length;
+  const nI = idsCh.t.length;
+  if (nV < 2 || nI < 2) {
+    return buildInvalidSoaResult('Vds 或 Ids 有效样本少于 2 点，无法判定 Dynamic SOA。');
   }
 
-  const vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name, { strict: true });
-  const iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name, { strict: true });
+  let vScale: number;
+  let iScale: number;
+  try {
+    vScale = parseSiUnitScale(vdsCh.unit, 'V', vdsCh.name, { strict: true });
+    iScale = parseSiUnitScale(idsCh.unit, 'A', idsCh.name, { strict: true });
+  } catch (error: any) {
+    return buildInvalidSoaResult(`Dynamic SOA 单位校验失败：${error?.message || 'Vds 必须为电压、Ids 必须为电流单位。'}`);
+  }
 
   const tbV = inspectTimebase(vdsCh.t, 0, nV - 1);
   const tbI = inspectTimebase(idsCh.t, 0, nI - 1);
@@ -492,6 +554,14 @@ export function evaluateDynamicSoa(
     const iAbs = validI[k];
     const pw = pulseWidthForIdx[k];
     const limitId = getSoaMaxId(curveSet, vAbs, pw);
+
+    if (!Number.isFinite(limitId)) {
+      return buildInvalidSoaResult(
+        `Vds=${vAbs.toFixed(3)}V 超出当前 SOA 曲线数据覆盖范围，无法建立 Ids 安全上限；禁止外推并判定 PASS。`,
+        len,
+        invalidSampleCount
+      );
+    }
 
     const util =
       vAbs > curveSet.vdsMaxRated

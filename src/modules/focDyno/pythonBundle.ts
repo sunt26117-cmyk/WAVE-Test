@@ -404,14 +404,22 @@ def forward_verify_point(iq: float, n_rpm: float, v_meas: float, params: MotorPa
 def is_monotonic_timestamps(times: np.ndarray) -> bool:
     if len(times) < 2:
         return True
-    return bool(np.all(np.isfinite(times)) and np.all(np.diff(times) >= 0.0) and (times[-1] > times[0]))
+    return bool(np.all(np.isfinite(times)) and np.all(np.diff(times) > 0.0))
 
 
 def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: MotorParams) -> pd.DataFrame:
     times = df["Time"].to_numpy(dtype=float)
     raw_i = df["I_bus"].to_numpy(dtype=float)
+    v_bus = df["V_bus"].to_numpy(dtype=float)
+    rpm = df["n_rpm"].to_numpy(dtype=float)
     n_pts = len(times)
+    if not (len(raw_i) == len(v_bus) == len(rpm) == n_pts):
+        raise ValueError("Runtime Log Time/V_bus/I_bus/n_rpm arrays must have identical lengths.")
+    if not (np.all(np.isfinite(times)) and np.all(np.isfinite(raw_i)) and np.all(np.isfinite(v_bus)) and np.all(np.isfinite(rpm))):
+        raise ValueError("Runtime Log contains NaN/Inf in required signals; refusing to produce a dynamic estimate.")
     monotonic = is_monotonic_timestamps(times)
+    if n_pts > 1 and not monotonic:
+        raise ValueError("Runtime Log timestamps must be strictly increasing; sample-index fallback is disabled.")
 
     if n_pts == 0 or filter_window_ms <= 0.0:
         i_bus_filt = raw_i.copy()
@@ -469,12 +477,6 @@ def process_runtime_log(df: pd.DataFrame, filter_window_ms: float, params: Motor
                     prev_v = vk
                 span = (last_t - first_t) if (math.isfinite(first_t) and math.isfinite(last_t)) else 0.0
                 i_bus_filt[i] = (area / span) if span > 1e-12 else ((f_sum / f_cnt) if f_cnt > 0 else float("nan"))
-    else:
-        diffs = np.diff(times)
-        pos_diffs = diffs[np.isfinite(diffs) & (diffs > 1e-9)]
-        med_dt = float(np.median(pos_diffs)) if len(pos_diffs) > 0 else 0.002
-        win_samples = max(1, int(round((filter_window_ms * 1e-3) / max(1e-6, med_dt))))
-        i_bus_filt = pd.Series(raw_i).rolling(window=win_samples, min_periods=1, center=True).mean().to_numpy()
 
     records = []
     for t, v, ib_raw, ib_f, n in zip(times, df["V_bus"], df["I_bus"], i_bus_filt, df["n_rpm"]):
@@ -504,7 +506,6 @@ import re
 import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
-from scipy.optimize import least_squares
 
 from motor_physics import (
     MotorParams,
@@ -564,6 +565,10 @@ def _detect_power_scale_w(col_name: str) -> tuple[float, str | None]:
             return 1.0
         if re.fullmatch(r"(?:kW|kilowatt|kilowatts)", tok, flags=re.IGNORECASE):
             return 1e3
+        if tok == "TW" or re.fullmatch(r"(?:terawatt|terawatts)", tok, flags=re.IGNORECASE):
+            return 1e12
+        if tok == "GW" or re.fullmatch(r"(?:gigawatt|gigawatts)", tok, flags=re.IGNORECASE):
+            return 1e9
         if tok == "MW" or re.fullmatch(r"(?:megawatt|megawatts)", tok, flags=re.IGNORECASE):
             return 1e6
         if tok in ("mW", "mw") or re.fullmatch(r"(?:milliwatt|milliwatts)", tok, flags=re.IGNORECASE):
@@ -577,12 +582,55 @@ def _detect_power_scale_w(col_name: str) -> tuple[float, str | None]:
         tok = br.group(1).strip()
         sc = _parse_pow(tok)
         return (sc, None) if sc is not None else (1.0, tok)
-    sfx = re.search(r"(?:^|[_\s])(kW|MW|mW|uW|µW|μW|W)$", raw)
+    # Explicit unit suffixes must be parsed or rejected; P_in_hp must not
+    # silently become watts. Preserve SI case distinction: MW != mw.
+    sfx = re.search(r"(?:^|[_\s])([A-Za-zµμ]+)$", raw)
     if sfx:
-        sc = _parse_pow(sfx.group(1))
-        if sc is not None:
-            return sc, None
+        tok = sfx.group(1)
+        suffix_key = tok.lower()
+        explicit_power_suffixes = {
+            "w", "kw", "mw", "gw", "tw", "uw", "µw", "μw",
+            "watt", "watts", "kilowatt", "kilowatts", "megawatt", "megawatts", "gigawatt", "gigawatts",
+            "milliwatt", "milliwatts", "microwatt", "microwatts",
+            "hp", "horsepower", "ps", "va", "kva", "mva", "dbm",
+            "wh", "kwh", "mwh", "gwh", "j", "kj", "mj", "gj",
+        }
+        if suffix_key in explicit_power_suffixes:
+            sc = _parse_pow(tok)
+            return (sc, None) if sc is not None else (1.0, tok)
     return 1.0, None
+
+
+def _fit_nonnegative_linear_p0(samples: list[tuple[float, float]]) -> tuple[float, float]:
+    """Exact non-negative LS counterpart of TS fitNonNegLinearP0."""
+    if not samples:
+        return 0.0, 0.0
+    s11 = s12 = s22 = r1 = r2 = 0.0
+    for n, p0 in samples:
+        x1 = abs(float(n))
+        x2 = float(n) * float(n)
+        y = float(p0)
+        s11 += x1 * x1
+        s12 += x1 * x2
+        s22 += x2 * x2
+        r1 += x1 * y
+        r2 += x2 * y
+
+    det = s11 * s22 - s12 * s12
+    if abs(det) > 1e-18:
+        a = (r1 * s22 - r2 * s12) / det
+        b = (s11 * r2 - s12 * r1) / det
+        if a >= 0.0 and b >= 0.0:
+            return float(a), float(b)
+
+    def _loss(a: float, b: float) -> float:
+        return sum((a * abs(float(n)) + b * float(n) * float(n) - float(p0)) ** 2 for n, p0 in samples)
+
+    a_only = max(0.0, r1 / s11) if s11 > 1e-18 else 0.0
+    b_only = max(0.0, r2 / s22) if s22 > 1e-18 else 0.0
+    candidates = [(a_only, 0.0), (0.0, b_only), (0.0, 0.0)]
+    best_a, best_b = min(candidates, key=lambda ab: _loss(ab[0], ab[1]))
+    return float(best_a), float(best_b)
 
 
 def _parse_power_series_w(series: pd.Series, default_scale_w: float) -> pd.Series:
@@ -592,11 +640,11 @@ def _parse_power_series_w(series: pd.Series, default_scale_w: float) -> pd.Serie
         unit_scales = {"kw": 1e3, "mw": 1e-3, "uw": 1e-6, "µw": 1e-6, "μw": 1e-6, "w": 1.0}
         for idx, raw in series.loc[need_str].items():
             s = str(raw).strip()
-            m = re.match(r"^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(kW|MW|mW|uW|µW|μW|W)$", s, flags=re.IGNORECASE)
+            m = re.match(r"^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(TW|GW|kW|MW|mW|uW|µW|μW|W)$", s, flags=re.IGNORECASE)
             if m:
                 val = float(m.group(1))
                 u = m.group(2)
-                sc = 1e6 if u == "MW" else unit_scales.get(u.lower(), 1.0)
+                sc = 1e12 if u.upper() == "TW" else (1e9 if u.upper() == "GW" else (1e6 if u == "MW" else unit_scales.get(u.lower(), 1.0)))
                 num.loc[idx] = val * sc
     return num
 
@@ -627,20 +675,28 @@ def normalize_dyno_df(
     else:
         out["T_Nm"] = np.nan
 
+    pin_scale, pin_bad = _detect_power_scale_w(col_map.get("P_in", "")) if col_map.get("P_in") else (1.0, None)
+    pout_mapped = bool(col_map.get("P_out"))
+    pout_scale, pout_bad = _detect_power_scale_w(col_map.get("P_out", "")) if pout_mapped else (1.0, None)
+    if pin_bad:
+        warnings.append(f"P_in 列 \"{col_map['P_in']}\" 显式单位 \"{pin_bad}\" 属于非标准功率单位，不在安全换算表 (W/kW/mW/MW/GW/TW) 中。")
+    if pout_bad:
+        warnings.append(f"P_out 列 \"{col_map['P_out']}\" 显式单位 \"{pout_bad}\" 属于非标准功率单位，不在安全换算表 (W/kW/mW/MW/GW/TW) 中。")
+    if pin_bad or pout_bad:
+        # Match the browser calibrator: never reinterpret an unknown explicit
+        # power unit as W, and never hide it by falling back to V_bus * I_bus.
+        empty = pd.DataFrame(columns=cols)
+        warnings.append("功率列单位不明确，已停止标定点生成；请修正列单位或取消该功率列映射，不能默认按 W 解释。")
+        empty.attrs["warnings"] = warnings
+        return empty
+
     if col_map.get("P_in"):
-        pin_scale, pin_bad = _detect_power_scale_w(col_map["P_in"])
-        if pin_bad:
-            warnings.append(f"P_in 列 \"{col_map['P_in']}\" 括号单位 \"{pin_bad}\" 非标准功率单位 (W/kW/mW/MW)，已按 W 处理。")
         out["P_in"] = _parse_power_series_w(df[col_map["P_in"]], pin_scale)
     else:
         out["P_in"] = out["V_bus"] * out["I_bus"]
     out["P_in"] = out["P_in"].fillna(out["V_bus"] * out["I_bus"])
 
-    pout_mapped = bool(col_map.get("P_out"))
     if pout_mapped:
-        pout_scale, pout_bad = _detect_power_scale_w(col_map["P_out"])
-        if pout_bad:
-            warnings.append(f"P_out 列 \"{col_map['P_out']}\" 括号单位 \"{pout_bad}\" 非标准功率单位 (W/kW/mW/MW)，已按 W 处理。")
         out["P_out"] = _parse_power_series_w(df[col_map["P_out"]], pout_scale)
     else:
         out["P_out"] = np.nan
@@ -731,7 +787,15 @@ def run_stepwise_calibration(
 
     # Step 1: Ke' & n0_rpm
     calibrated_n0 = base_params.n0_rpm
-    mod_scale = min(1.1547, max(0.1, float(open_loop_mod_depth))) if math.isfinite(open_loop_mod_depth) else 1.0
+    requested_mod_scale = float(open_loop_mod_depth) if math.isfinite(open_loop_mod_depth) else 1.0
+    mod_scale = min(1.0, max(0.1, requested_mod_scale))
+    if ke_source == "open_loop_auto" and requested_mod_scale > 1.0 + 1e-6:
+        _elevate("warn")
+        calib_warnings.append(f"输入 m_norm={requested_mod_scale:.4f} 超过线性 SVPWM 定义上限 1.0，已限制为 1.0；请确认是否把调制深度 m 与归一化 m_norm 混淆。")
+    elif ke_source == "open_loop_auto" and requested_mod_scale < 0.1 - 1e-6:
+        _elevate("warn")
+        calib_warnings.append(f"输入 m_norm={requested_mod_scale:.4f} 低于可用下限 0.1，自动 Ke 已按 0.1 计算；请检查输入。")
+
     if ke_source == "manual_n0_vtest":
         ke_prime = calc_ke_from_no_load(manual_vtest, manual_n0)
         calibrated_n0 = float(manual_n0)
@@ -740,21 +804,37 @@ def run_stepwise_calibration(
     elif df_open is not None and len(df_open) > 0:
         valid_ol = df_open[(df_open["n_rpm"] > 50) & (df_open["V_bus"] > 0.5)]
         if len(valid_ol) > 0:
-            top = valid_ol.sort_values("n_rpm", ascending=False).iloc[0]
-            ke_prime = calc_ke_from_no_load(float(top["V_bus"]) * mod_scale, float(top["n_rpm"]))
-            calibrated_n0 = float(top["n_rpm"])
-            if len(valid_ol) >= 2:
-                ratios = (valid_ol["V_bus"] * mod_scale) / valid_ol["n_rpm"]
-                r_min, r_max, r_mean = float(ratios.min()), float(ratios.max()), float(ratios.mean())
-                if r_mean > 1e-9 and (r_max - r_min) / r_mean > 0.12:
+            max_open_torque = float(pd.to_numeric(valid_ol["T_Nm"], errors="coerce").abs().max())
+            if not math.isfinite(max_open_torque):
+                max_open_torque = 0.0
+            no_load_pts = valid_ol[(max_open_torque <= 0.02) | (pd.to_numeric(valid_ol["T_Nm"], errors="coerce").abs() <= max(0.02, max_open_torque * 0.05))]
+            ke_candidates = [
+                calc_ke_from_no_load(float(row["V_bus"]) * mod_scale, float(row["n_rpm"]))
+                for _, row in no_load_pts.iterrows()
+            ]
+            ke_candidates = sorted(v for v in ke_candidates if math.isfinite(v) and v > 0.0)
+            # Loaded measurements include Rs*I and omega*L*I voltage drops;
+            # never use them as a fallback back-EMF / Ke proxy.
+            if len(ke_candidates) >= 2:
+                mid = len(ke_candidates) // 2
+                ke_prime = (0.5 * (ke_candidates[mid - 1] + ke_candidates[mid])
+                            if len(ke_candidates) % 2 == 0 else ke_candidates[mid])
+                calibrated_n0 = float(no_load_pts["n_rpm"].max())
+                relative_spread = (max(ke_candidates) - min(ke_candidates)) / max(1e-12, ke_prime)
+                if relative_spread > 0.12:
                     _elevate("warn")
                     calib_warnings.append(
-                        f"开环多点 V_bus/n 线性离散度达 {((r_max - r_min) / r_mean) * 100:.1f}% (>12%)，说明部分测点非同油门/满调制，建议检查开环占空比或改用手动 KV。"
+                        f"多点 Ke 候选值极差/中位数为 {relative_spread * 100:.1f}% (>12%)，测点可能不在同一调制深度/负载条件；自动 Ke 仅作为估计，建议核对相电压基波或使用独立空载反电势测量。"
                     )
+            else:
+                ke_prime = base_params.ke_prime
+                calibrated_n0 = base_params.n0_rpm
+                _elevate("warn")
+                calib_warnings.append(f"仅识别到 {len(ke_candidates)} 个有效空载 Ke 候选点（至少需要 2 个）；没有使用带载点替代空载反电势，Ke'/n0 沿用基准参数。请补充不同转速下的空载数据，或改用手动 KV/(n0,V_test)。")
         else:
             ke_prime = base_params.ke_prime
             _elevate("warn")
-            calib_warnings.append("开环数据缺少 n > 50 RPM 且 V_bus > 0.5V 的有效空载点，已沿用当前设定 Ke'。")
+            calib_warnings.append("开环数据缺少 n > 50 RPM 且 V_bus > 0.5V 的有效空载点，无法自动提取 Ke'，已沿用设定值。")
     else:
         ke_prime = base_params.ke_prime
 
@@ -778,36 +858,63 @@ def run_stepwise_calibration(
     p0_n, p0_obs = [], []
 
     if df_open is not None and len(df_open) >= 2:
-        max_open_t = float(df_open["T_Nm"].abs().max())
-        if max_open_t <= 0.015:
-            src_for_p0 = df_open
-        else:
-            src_for_p0 = df_open[df_open["T_Nm"].abs() <= max(0.015, 0.2 * max_open_t)]
+        max_open_t = float(pd.to_numeric(df_open["T_Nm"], errors="coerce").abs().max())
+        if not math.isfinite(max_open_t):
+            max_open_t = 0.0
+        ol_no_load = df_open[((max_open_t <= 0.02) | (pd.to_numeric(df_open["T_Nm"], errors="coerce").abs() <= 0.02)) & (df_open["n_rpm"] > 30)]
+        # Match the browser-side source selection: use true near-zero torque
+        # points when at least two exist; otherwise use the open-loop speed
+        # points as a low-confidence fallback and let the identifiability gate
+        # decide whether P0 can actually be fitted.
+        src_for_p0 = ol_no_load if len(ol_no_load) >= 2 else df_open[df_open["n_rpm"] > 30]
     else:
         src_for_p0 = pd.DataFrame()
 
-    if len(src_for_p0) < 2 and df_closed is not None and len(df_closed) > 0:
-        src_for_p0 = df_closed[df_closed["T_Nm"].abs() <= 0.38 * max(1e-4, float(df_closed["T_Nm"].abs().max()))]
-
     for _, row in src_for_p0.iterrows():
-        if row["n_rpm"] <= 10:
+        if abs(float(row["n_rpm"])) <= 10:
             continue
         res = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), temp_params)
         if math.isfinite(res["iq"]):
             p_airgap = 1.5 * res["eq"] * res["iq"]
-            p0_n.append(float(row["n_rpm"]))
+            p0_n.append(abs(float(row["n_rpm"])))
             p0_obs.append(max(0.0, p_airgap - float(row["P_out"])))
 
-    if len(p0_n) >= 2:
-        n_arr = np.array(p0_n)
-        y_arr = np.array(p0_obs)
-        res_p0 = least_squares(lambda c: c[0] * n_arr + c[1] * (n_arr ** 2) - y_arr, x0=[5e-4, 5e-7], bounds=([0.0, 0.0], [1.0, 1e-2]))
-        if not bool(res_p0.success):
-            _elevate("warn")
-            calib_warnings.append(f"Step 2 P0(n) 最小二乘拟合未完全收敛: {res_p0.message}")
-        p0_a, p0_b = float(res_p0.x[0]), float(res_p0.x[1])
+    if len(p0_n) < 3 and df_closed is not None and len(df_closed) > 0:
+        max_closed_t = max(1e-4, float(pd.to_numeric(df_closed["T_Nm"], errors="coerce").abs().max()))
+        light_points = df_closed[(pd.to_numeric(df_closed["T_Nm"], errors="coerce").abs() <= 0.38 * max_closed_t) & (df_closed["n_rpm"] > 50)]
+        src_closed_for_p0 = light_points if len(light_points) >= 3 else df_closed.head(min(8, len(df_closed)))
+        for _, row in src_closed_for_p0.iterrows():
+            if abs(float(row["n_rpm"])) <= 10:
+                continue
+            res = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), temp_params)
+            if math.isfinite(res["iq"]):
+                p_airgap = 1.5 * res["eq"] * res["iq"]
+                p0_n.append(abs(float(row["n_rpm"])))
+                p0_obs.append(max(0.0, p_airgap - float(row["P_out"])))
+
+    p0_pairs = [(abs(float(n)), float(p0)) for n, p0 in zip(p0_n, p0_obs)
+                if math.isfinite(float(n)) and abs(float(n)) > 30 and math.isfinite(float(p0)) and float(p0) >= 0.0]
+    p0_speed_levels = sorted({int(round(n)) for n, _ in p0_pairs})
+    p0_speed_span = (p0_speed_levels[-1] - p0_speed_levels[0]) if len(p0_speed_levels) >= 2 else 0
+    p0_speed_reference = p0_speed_levels[-1] if p0_speed_levels else 0
+    # Dimensionless condition number of normalized design columns |n| and n^2.
+    # Large values mean a and b can trade off strongly without changing the fit.
+    p0_sum_n2 = sum(n * n for n in p0_speed_levels)
+    p0_sum_n3 = sum(n * n * n for n in p0_speed_levels)
+    p0_sum_n4 = sum(n * n * n * n for n in p0_speed_levels)
+    p0_column_correlation = min(1.0, max(0.0, p0_sum_n3 / math.sqrt(p0_sum_n2 * p0_sum_n4))) if p0_sum_n2 > 0 and p0_sum_n4 > 0 else 1.0
+    p0_design_condition_number = math.inf if p0_column_correlation >= 1.0 - 1e-12 else math.sqrt((1.0 + p0_column_correlation) / (1.0 - p0_column_correlation))
+    p0_identifiable = (len(p0_pairs) >= 3 and len(p0_speed_levels) >= 3 and
+                       p0_speed_span >= max(20.0, 0.08 * p0_speed_reference) and
+                       p0_design_condition_number <= 40.0)
+
+    if p0_identifiable:
+        p0_a, p0_b = _fit_nonnegative_linear_p0(p0_pairs)
     else:
-        p0_a, p0_b = base_params.p0_a, base_params.p0_b
+        p0_a, p0_b = max(0.0, base_params.p0_a), max(0.0, base_params.p0_b)
+        _elevate("warn")
+        condition_text = f"{p0_design_condition_number:.1f}" if math.isfinite(p0_design_condition_number) else "∞"
+        calib_warnings.append(f"P0(n)=a·|n|+b·n² 的参数不可充分辨识：有效样本 {len(p0_pairs)} 个、不同转速 {len(p0_speed_levels)} 档、转速跨度 {p0_speed_span:.1f} RPM、归一化设计矩阵条件数 {condition_text}；至少需要 3 个不同转速、跨度达到最高转速的 8%（或 20 RPM），且条件数 ≤40。已保留基准 P0 参数。")
 
     # Step 3: Fit beta (>=0) with locked or +/-15% bounded Rs_eff
     step3_base = MotorParams(**{**base_params.__dict__, "ke_prime": ke_prime, "n0_rpm": calibrated_n0, "p0_a": p0_a, "p0_b": p0_b})
@@ -818,22 +925,24 @@ def run_stepwise_calibration(
         final_params = MotorParams(**{
             **step3_base.__dict__,
             "beta_sat": best_beta,
-            "rs_eff_override": None if rs_fit_mode == "locked" else best_rs,
+            "rs_eff_override": best_rs,
         })
         return {
-            "status": "empty_data",
-            "warnings": calib_warnings + ["闭环有效测功点为空，无法执行 Step 3 标定。"],
+            # Match the browser calibration status gate: empty closed-loop data is a failed calibration.
+            "status": "failed",
+            "warnings": calib_warnings + ["闭环测功有效测点为空，无法完成 Step 3 磁饱和与效率 Map 标定（请核对闭环数据及扭矩列映射）。"],
             "params": final_params,
             "rs_anchor": rs_anchor,
             "rs_eff": best_rs,
             "eval_df": pd.DataFrame(columns=EVAL_COLUMNS),
             "metrics": {
-                "MAE_T": 0.0,
-                "RMSE_T": 0.0,
-                "MAPE_T_pct": 0.0,
-                "MAE_eta_pct": 0.0,
-                "RMSE_eta_pct": 0.0,
-                "MAPE_eta_pct": 0.0,
+                # No closed-loop data means no validation evidence; never report zero error.
+                "MAE_T": float("nan"),
+                "RMSE_T": float("nan"),
+                "MAPE_T_pct": float("nan"),
+                "MAE_eta_pct": float("nan"),
+                "RMSE_eta_pct": float("nan"),
+                "MAPE_eta_pct": float("nan"),
             },
             "validation_metrics": None,
             "operating_envelope": None,
@@ -844,79 +953,103 @@ def run_stepwise_calibration(
             "z_pred": None,
         }
 
-    def residuals(x: np.ndarray) -> np.ndarray:
-        beta_cand = float(x[0])
-        rs_cand = rs_anchor if rs_fit_mode == "locked" else float(x[1])
-        p_cand = MotorParams(**{**step3_base.__dict__, "beta_sat": beta_cand, "rs_eff_override": rs_cand})
-        errs = []
-        for _, row in df_closed.iterrows():
-            r = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), p_cand)
-            if math.isfinite(r["t_est"]):
-                row_eta = float(row["eta"])
-                eta_err = (r["eta_est"] - row_eta) if (math.isfinite(r["eta_est"]) and math.isfinite(row_eta)) else 0.0
-                errs.append(r["t_est"] - float(row["T_Nm"]))
-                errs.append(0.1 * eta_err)
-            else:
-                errs.append(1e3)
-                errs.append(1e2)
-        return np.array(errs, dtype=float)
+    def _step3_objective(points: pd.DataFrame, beta: float, rs: float) -> float:
+        p_cand = MotorParams(**{**step3_base.__dict__, "beta_sat": float(beta), "rs_eff_override": float(rs)})
+        loss = 0.0
+        count = 0
+        for _, row in points.iterrows():
+            rr = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), p_cand)
+            if not math.isfinite(rr["t_est"]):
+                loss += 1e6
+                count += 1
+                continue
+            t_err = rr["t_est"] - float(row["T_Nm"])
+            eta_row = float(row["eta"])
+            if math.isfinite(rr["eta_est"]) and math.isfinite(eta_row):
+                eta_err = rr["eta_est"] - eta_row
+                loss += 0.01 * eta_err * eta_err
+            loss += t_err * t_err
+            count += 1
+        return loss / count if count > 0 else math.inf
 
-    if rs_fit_mode == "locked":
-        opt = least_squares(residuals, x0=[0.005], bounds=([0.0], [0.5]))
-        best_beta = float(opt.x[0])
-        best_rs = rs_anchor
-    else:
-        opt = least_squares(residuals, x0=[0.005, rs_anchor], bounds=([0.0, rs_anchor * 0.85], [0.5, rs_anchor * 1.15]))
-        best_beta = float(opt.x[0])
-        best_rs = float(opt.x[1])
+    rs_min = rs_anchor if rs_fit_mode == "locked" else rs_anchor * 0.85
+    rs_max = rs_anchor if rs_fit_mode == "locked" else rs_anchor * 1.15
+    rs_steps = [rs_anchor] if rs_fit_mode == "locked" else [rs_min + (rs_max - rs_min) * i / 12.0 for i in range(13)]
+    best_beta = 0.0
+    best_rs = rs_anchor
+    best_loss = math.inf
+    for rs_candidate in rs_steps:
+        for bi in range(51):
+            beta_candidate = bi * 0.002
+            objective = _step3_objective(df_closed, beta_candidate, rs_candidate)
+            if objective < best_loss:
+                best_loss, best_beta, best_rs = objective, beta_candidate, rs_candidate
 
-    if not bool(opt.success):
-        _elevate("warn")
-        calib_warnings.append(f"Step 3 优化器未完全收敛: {opt.message}")
+    d_beta = 0.001
+    d_rs = 0.0 if rs_fit_mode == "locked" else (rs_max - rs_min) * 0.04
+    for _ in range(18):
+        candidates = [(max(0.0, best_beta - d_beta), best_rs), (min(0.5, best_beta + d_beta), best_rs)]
+        if rs_fit_mode == "bounded_15pct":
+            candidates.extend([(best_beta, max(rs_min, best_rs - d_rs)), (best_beta, min(rs_max, best_rs + d_rs))])
+        improved = False
+        for beta_candidate, rs_candidate in candidates:
+            objective = _step3_objective(df_closed, beta_candidate, rs_candidate)
+            if objective < best_loss:
+                best_loss, best_beta, best_rs = objective, beta_candidate, rs_candidate
+                improved = True
+        if not improved:
+            d_beta *= 0.5
+            d_rs *= 0.5
 
     final_params = MotorParams(**{
         **step3_base.__dict__,
         "beta_sat": best_beta,
-        "rs_eff_override": None if rs_fit_mode == "locked" else best_rs,
+        # Match browser finalParams: the effective Rs selected by Step 3 is explicit
+        # even in locked mode, so downstream consumers see the same fitted value.
+        "rs_eff_override": best_rs,
     })
 
     eval_rows = []
     unsolved_count = 0
     for _, row in df_closed.iterrows():
-        r = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), final_params)
-        if not math.isfinite(r["t_est"]):
+        rr = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), final_params)
+        solved = (math.isfinite(rr["t_est"]) and math.isfinite(rr["p_elec"]) and math.isfinite(rr["iq"]))
+        if not solved:
             unsolved_count += 1
-        p_inv = max(0.0, float(row["P_in"]) - r["p_elec"]) if math.isfinite(r["p_elec"]) else 0.0
-        p_cu = r["p_cu"] if math.isfinite(r["p_cu"]) else 0.0
-        t_est = r["t_est"] if math.isfinite(r["t_est"]) else 0.0
-        eta_est = r["eta_est"] if math.isfinite(r["eta_est"]) else 0.0
+        p_inv = max(0.0, float(row["P_in"]) - rr["p_elec"]) if solved else float("nan")
+        p_cu = rr["p_cu"] if solved and math.isfinite(rr["p_cu"]) else float("nan")
+        p0_loss = rr["p0"] if solved and math.isfinite(rr["p0"]) else float("nan")
+        t_est = rr["t_est"] if solved else float("nan")
+        eta_est = rr["eta_est"] if solved and math.isfinite(rr["eta_est"]) else float("nan")
+        iq_est = rr["iq"] if solved else float("nan")
         eta_meas_val = float(row["eta"])
-        err_eta_val = (eta_est - eta_meas_val) if math.isfinite(eta_meas_val) else float("nan")
+        err_eta_val = (eta_est - eta_meas_val) if math.isfinite(eta_est) and math.isfinite(eta_meas_val) else float("nan")
         eval_rows.append({
             **row.to_dict(),
-            "iq_est": r["iq"],
+            "iq_est": iq_est,
             "T_est": t_est,
             "eta_est": eta_est,
             "P_inv_loss": p_inv,
             "P_cu_loss": p_cu,
-            "P_iron_wind_loss": r["p0"],
-            "err_T": t_est - float(row["T_Nm"]),
+            "P_iron_wind_loss": p0_loss,
+            "err_T": t_est - float(row["T_Nm"]) if math.isfinite(t_est) else float("nan"),
             "err_eta": err_eta_val,
         })
     df_eval = pd.DataFrame(eval_rows, columns=EVAL_COLUMNS)
+    solved_eval = df_eval.loc[np.isfinite(pd.to_numeric(df_eval["err_T"], errors="coerce"))] if len(df_eval) else df_eval
+    mae_t = float(solved_eval["err_T"].abs().mean()) if len(solved_eval) else float("nan")
+    rmse_t = float(np.sqrt((solved_eval["err_T"] ** 2).mean())) if len(solved_eval) else float("nan")
+    mask_t = solved_eval["T_Nm"].abs() > 0.015 if len(solved_eval) else pd.Series(dtype=bool)
+    mape_t = float(((solved_eval.loc[mask_t, "err_T"].abs() / solved_eval.loc[mask_t, "T_Nm"].abs()) * 100.0).mean()) if len(solved_eval) and mask_t.any() else float("nan")
+    valid_err_eta = solved_eval["err_eta"].dropna() if len(solved_eval) else pd.Series(dtype=float)
+    mae_eta = float((valid_err_eta.abs() * 100.0).mean()) if len(valid_err_eta) else float("nan")
+    rmse_eta = float(np.sqrt(((valid_err_eta * 100.0) ** 2).mean())) if len(valid_err_eta) else float("nan")
+    mask_eta = solved_eval["eta"].notna() & (solved_eval["eta"] > 0.1) & solved_eval["err_eta"].notna() if len(solved_eval) else pd.Series(dtype=bool)
+    mape_eta = float(((solved_eval.loc[mask_eta, "err_eta"].abs() / solved_eval.loc[mask_eta, "eta"]) * 100.0).mean()) if len(solved_eval) and mask_eta.any() else float("nan")
 
-    mae_t = float(df_eval["err_T"].abs().mean())
-    rmse_t = float(np.sqrt((df_eval["err_T"] ** 2).mean()))
-    mask_t = df_eval["T_Nm"].abs() > 0.015
-    mape_t = float(((df_eval.loc[mask_t, "err_T"].abs() / df_eval.loc[mask_t, "T_Nm"].abs()) * 100.0).mean()) if mask_t.any() else 0.0
-
-    valid_err_eta = df_eval["err_eta"].dropna()
-    mae_eta = float((valid_err_eta.abs() * 100.0).mean()) if len(valid_err_eta) > 0 else 0.0
-    rmse_eta = float(np.sqrt(((valid_err_eta * 100.0) ** 2).mean())) if len(valid_err_eta) > 0 else 0.0
-    mask_eta = df_eval["eta"].notna() & (df_eval["eta"] > 0.1)
-    mape_eta = float(((df_eval.loc[mask_eta, "err_eta"].abs() / df_eval.loc[mask_eta, "eta"]) * 100.0).mean()) if mask_eta.any() else 0.0
-
-    # 20% Holdout Cross-Validation, Operating Envelope & Parameter Sensitivity
+    # Independent holdout validation: refit beta/Rs on train points only.
+    # P0 is sourced only from independent open-loop data; closed-loop holdout rows
+    # must not leak into any parameter used for validation.
     validation_metrics = None
     if len(df_closed) >= 10:
         sorted_cl = df_closed.sort_values(["n_rpm", "T_Nm"]).reset_index(drop=True)
@@ -924,32 +1057,105 @@ def run_stepwise_calibration(
         val_df = sorted_cl.loc[val_mask]
         train_df = sorted_cl.loc[~val_mask]
         if len(val_df) >= 2 and len(train_df) >= 6:
-            def _train_res(x: np.ndarray) -> np.ndarray:
-                p_tr = MotorParams(**{**step3_base.__dict__, "beta_sat": float(x[0]), "rs_eff_override": best_rs})
-                out_e = []
-                for _, rw in train_df.iterrows():
-                    rr = solve_single_point(float(rw["V_bus"]), float(rw["I_bus"]), float(rw["n_rpm"]), p_tr)
-                    out_e.append((rr["t_est"] - float(rw["T_Nm"])) if math.isfinite(rr["t_est"]) else 1e3)
-                return np.array(out_e, dtype=float)
-            opt_val = least_squares(_train_res, x0=[0.005], bounds=([0.0], [0.5]))
-            val_params = MotorParams(**{**step3_base.__dict__, "beta_sat": float(opt_val.x[0]), "rs_eff_override": best_rs})
+            cv_p0_samples: list[tuple[float, float]] = []
+            if df_open is not None and len(df_open) >= 2:
+                open_torque = pd.to_numeric(df_open["T_Nm"], errors="coerce").abs()
+                max_open_t = float(open_torque.max()) if open_torque.notna().any() else 0.0
+                open_abs_t = pd.to_numeric(df_open["T_Nm"], errors="coerce").abs()
+                no_load = df_open[((max_open_t <= 0.02) | (open_abs_t <= max(0.02, max_open_t * 0.05))) & (df_open["n_rpm"] > 30)]
+                p0_source = no_load if len(no_load) >= 2 else df_open[df_open["n_rpm"] > 30]
+                cv_p0_params = MotorParams(**{
+                    **base_params.__dict__, "ke_prime": ke_prime, "n0_rpm": calibrated_n0,
+                    "p0_a": 0.0, "p0_b": 0.0, "beta_sat": 0.0, "rs_eff_override": rs_anchor,
+                })
+                for _, point in p0_source.iterrows():
+                    rr = solve_single_point(float(point["V_bus"]), float(point["I_bus"]), float(point["n_rpm"]), cv_p0_params)
+                    if math.isfinite(rr["iq"]):
+                        cv_p0_samples.append((float(point["n_rpm"]), max(0.0, 1.5 * rr["eq"] * rr["iq"] - float(point["P_out"]))))
+            if len(cv_p0_samples) >= 2:
+                cv_p0_a, cv_p0_b = _fit_nonnegative_linear_p0(cv_p0_samples)
+            else:
+                cv_p0_a, cv_p0_b = max(0.0, base_params.p0_a), max(0.0, base_params.p0_b)
+            cv_base = MotorParams(**{
+                **base_params.__dict__, "ke_prime": ke_prime, "n0_rpm": calibrated_n0,
+                "p0_a": cv_p0_a, "p0_b": cv_p0_b, "beta_sat": 0.0, "rs_eff_override": rs_anchor,
+            })
+
+            def _cv_objective(beta: float, rs: float) -> float:
+                p_cv = MotorParams(**{**cv_base.__dict__, "beta_sat": float(beta), "rs_eff_override": float(rs)})
+                loss = 0.0
+                count = 0
+                for _, row in train_df.iterrows():
+                    rr = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), p_cv)
+                    if not math.isfinite(rr["t_est"]):
+                        loss += 1e6
+                        count += 1
+                        continue
+                    t_err = rr["t_est"] - float(row["T_Nm"])
+                    eta_row = float(row["eta"])
+                    if math.isfinite(rr["eta_est"]) and math.isfinite(eta_row):
+                        eta_err = rr["eta_est"] - eta_row
+                        loss += 0.01 * eta_err * eta_err
+                    loss += t_err * t_err
+                    count += 1
+                return loss / count if count > 0 else math.inf
+
+            rs_min_cv = rs_anchor if rs_fit_mode == "locked" else rs_anchor * 0.85
+            rs_max_cv = rs_anchor if rs_fit_mode == "locked" else rs_anchor * 1.15
+            rs_steps_cv = [rs_anchor] if rs_fit_mode == "locked" else [rs_min_cv + (rs_max_cv - rs_min_cv) * i / 12.0 for i in range(13)]
+            cv_beta, cv_rs, cv_loss = 0.0, rs_anchor, math.inf
+            for rs_candidate in rs_steps_cv:
+                for bi in range(51):
+                    beta_candidate = bi * 0.002
+                    objective = _cv_objective(beta_candidate, rs_candidate)
+                    if objective < cv_loss:
+                        cv_loss, cv_beta, cv_rs = objective, beta_candidate, rs_candidate
+            d_beta_cv = 0.001
+            d_rs_cv = 0.0 if rs_fit_mode == "locked" else (rs_max_cv - rs_min_cv) * 0.04
+            for _ in range(18):
+                candidates = [(max(0.0, cv_beta - d_beta_cv), cv_rs), (min(0.5, cv_beta + d_beta_cv), cv_rs)]
+                if rs_fit_mode == "bounded_15pct":
+                    candidates.extend([(cv_beta, max(rs_min_cv, cv_rs - d_rs_cv)), (cv_beta, min(rs_max_cv, cv_rs + d_rs_cv))])
+                improved = False
+                for beta_candidate, rs_candidate in candidates:
+                    objective = _cv_objective(beta_candidate, rs_candidate)
+                    if objective < cv_loss:
+                        cv_loss, cv_beta, cv_rs = objective, beta_candidate, rs_candidate
+                        improved = True
+                if not improved:
+                    d_beta_cv *= 0.5
+                    d_rs_cv *= 0.5
+
+            val_params = MotorParams(**{**cv_base.__dict__, "beta_sat": cv_beta, "rs_eff_override": cv_rs})
             v_abs_t, v_pct_t, v_abs_eta = [], [], []
-            for _, rw in val_df.iterrows():
-                rr = solve_single_point(float(rw["V_bus"]), float(rw["I_bus"]), float(rw["n_rpm"]), val_params)
-                te = rr["t_est"] if math.isfinite(rr["t_est"]) else 0.0
-                ee = rr["eta_est"] if math.isfinite(rr["eta_est"]) else 0.0
-                tnm = float(rw["T_Nm"])
+            for _, row in val_df.iterrows():
+                rr = solve_single_point(float(row["V_bus"]), float(row["I_bus"]), float(row["n_rpm"]), val_params)
+                te = rr["t_est"] if math.isfinite(rr["t_est"]) else float("nan")
+                if not math.isfinite(te):
+                    continue
+                tnm = float(row["T_Nm"])
                 v_abs_t.append(abs(te - tnm))
                 if abs(tnm) > 0.015:
-                    v_pct_t.append((abs(te - tnm) / abs(tnm)) * 100.0)
-                if math.isfinite(float(rw["eta"])):
-                    v_abs_eta.append(abs((ee - float(rw["eta"])) * 100.0))
+                    v_pct_t.append(abs(te - tnm) / abs(tnm) * 100.0)
+                eta_row = float(row["eta"])
+                if math.isfinite(eta_row) and math.isfinite(rr["eta_est"]):
+                    v_abs_eta.append(abs((rr["eta_est"] - eta_row) * 100.0))
             validation_metrics = {
                 "holdout_count": int(len(val_df)),
-                "val_mae_T": float(np.mean(v_abs_t)) if v_abs_t else 0.0,
-                "val_mape_T_pct": float(np.mean(v_pct_t)) if v_pct_t else 0.0,
-                "val_mae_eta_pct": float(np.mean(v_abs_eta)) if v_abs_eta else 0.0,
+                "train_count": int(len(train_df)),
+                "fit_source": "train_only",
+                "valid_holdout_count": int(len(v_abs_t)),
+                "valid_holdout_eta_count": int(len(v_abs_eta)),
+                "val_mae_T": float(np.mean(v_abs_t)) if v_abs_t else float("nan"),
+                "val_mape_T_pct": float(np.mean(v_pct_t)) if v_pct_t else float("nan"),
+                "val_mae_eta_pct": float(np.mean(v_abs_eta)) if v_abs_eta else float("nan"),
             }
+            if not v_abs_t:
+                _elevate("warn")
+                calib_warnings.append("独立留出集没有任何可物理解算的验证点，验证 MAE 已标记为 NaN，不能据此宣称标定通过。")
+            elif len(v_abs_t) < len(val_df):
+                _elevate("warn")
+                calib_warnings.append(f"独立留出验证中 {len(val_df) - len(v_abs_t)} 个点无法物理解算，验证 MAE 仅基于 {len(v_abs_t)}/{len(val_df)} 个有效点。")
 
     operating_envelope = {
         "min_rpm": float(df_closed["n_rpm"].min()),
@@ -964,9 +1170,9 @@ def run_stepwise_calibration(
         errs_t = []
         for _, rw in df_closed.iterrows():
             rr = solve_single_point(float(rw["V_bus"]), float(rw["I_bus"]), float(rw["n_rpm"]), p_test)
-            te = rr["t_est"] if math.isfinite(rr["t_est"]) else 0.0
-            errs_t.append(abs(te - float(rw["T_Nm"])))
-        return float(np.mean(errs_t)) if errs_t else 0.0
+            if math.isfinite(rr["t_est"]):
+                errs_t.append(abs(rr["t_est"] - float(rw["T_Nm"])))
+        return float(np.mean(errs_t)) if errs_t else float("nan")
     param_sensitivity = {
         "rs_plus_10pct_delta_mae": _eval_mae_with(rs_eff_override=best_rs * 1.1) - mae_t,
         "ke_plus_5pct_delta_mae": _eval_mae_with(ke_prime=ke_prime * 1.05) - mae_t,
@@ -1431,7 +1637,7 @@ with tab1:
         ke_source = st.selectbox("Ke' 初值来源", ["open_loop_auto", "manual_n0_vtest", "manual_kv"], key="ke_src")
         man_n0, man_vtest, man_kv, ol_mod_depth = 1450.0, 13.5, 107.4, 1.0
         if ke_source == "open_loop_auto":
-            ol_mod_depth = float(st.number_input("开环调制比 m_norm (若非满调制可修正)", 0.1, 1.1547, 1.0, format="%.3f", key="ol_mod"))
+            ol_mod_depth = float(st.number_input("开环调制比 m_norm (若非满调制可修正；线性 SVPWM 上限 1.0)", 0.1, 1.0, 1.0, format="%.3f", key="ol_mod"))
         elif ke_source == "manual_n0_vtest":
             kc1, kc2 = st.columns(2)
             man_n0 = kc1.number_input("空载转速 n0 (RPM)", 10.0, 30000.0, 1450.0)

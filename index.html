@@ -1987,9 +1987,9 @@
               </div>
 
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1b222c]">
-                <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer" title="当 Vds 波形在 25°C 冷态测得时勾选此项以按 ΔTj 放大导通压降；若 Vds 已在高温稳态采集，请取消勾选以免重复放大。">
-                  <input id="thermLossRdsFeedbackChk" type="checkbox" class="accent-cyan-400 cursor-pointer" checked />
-                  <span>计入 Rds(on)(Tj) 温升增阻（高温实测 Vds 请取消以免重复计入）</span>
+                <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer" title="默认关闭：Vds×Ids 已直接计入实测导通损耗。只有当 Vds 是 25°C 参考态/模型波形且未包含当前结温增阻时，才勾选叠加 Rds(on)(Tj)。">
+                  <input id="thermLossRdsFeedbackChk" type="checkbox" class="accent-cyan-400 cursor-pointer" />
+                  <span>叠加 Rds(on)(Tj) 温升修正（默认关闭；仅适用于 25°C 参考态/模型 Vds）</span>
                 </label>
                 <button id="thermRunLossBtn" type="button" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer shrink-0">Run Loss &amp; Tj(t)</button>
               </div>
@@ -2306,9 +2306,10 @@
                   </label>
                   <label class="flex items-center gap-1 text-slate-400">
                     <span>R_s</span>
-                    <input id="focStallRsInput" type="number" step="0.01" min="0.001" value="0.25" class="w-16 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200 font-mono" title="电机单相定子绕组电阻 R_s (Ω)，用于计算堵转电压调制比 m ≈ 2·I_pk·(R_s+Rds)/Vbus" />
+                    <input id="focStallRsInput" type="number" step="0.01" min="0.001" value="0.25" class="w-16 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200 font-mono" title="0.25Ω 为占位假设。输入应为已按星形/三角形换算的单相等效绕组电阻，并按堵转绕组温度修正；用于计算 m ≈ 2·I_pk·(R_phase+Rds)/Vbus" />
                     <span>Ω</span>
                   </label>
+                  <span class="text-[10px] text-amber-400/90" title="需要先将线间电阻换算成单相等效值，并修正到堵转绕组温度">0.25Ω 为默认假设；请用实测相电阻替换</span>
                   <select id="focStallDutyModeSelect" class="bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200 font-mono text-[10px]">
                     <option value="resistive" selected>零速堵转 SVPWM (压降 m≈2·I·(R_s+Rds)/Vbus)</option>
                     <option value="user_m">强制使用设定 m 与调制方式</option>

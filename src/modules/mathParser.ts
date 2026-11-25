@@ -641,7 +641,9 @@ export function evaluateRPN(
     arr.fill(finalResult.val);
     return arr;
   }
-  return finalResult.val;
+  // The scalar branch returns above; retain an explicit array assertion so
+  // TypeScript configurations without strictNullChecks also narrow this union.
+  return finalResult.val as Float32Array;
 }
 
 /**

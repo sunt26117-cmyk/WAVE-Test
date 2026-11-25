@@ -12,6 +12,7 @@ import {
 } from '../types/models';
 import { analyzeSamplingQuality, getTimeUnitMultiplier } from '../modules/qualityCheck';
 import { resampleUniform } from '../modules/resampler';
+import { selectTimeDecimationIndices, selectArrayByIndices } from '../modules/timeDecimator';
 
 const TIME_HEADER_REGEX = /^(time|t|timestamp|date|datetime|time_s|time_ms|time_us|time_ns|time_ps|seconds|sec|t_sec|t_s|x)($|[\s_(\[])/i;
 
@@ -300,7 +301,13 @@ export function computeCsvPreviewQuality(
   timeUnitOverride?: 's' | 'ms' | 'us' | 'ns' | 'ps',
   sampleRateOverrideHz?: number | null
 ): SamplingMetadata | null {
-  const effectiveFs = sampleRateOverrideHz !== undefined ? sampleRateOverrideHz : preview.sampleRateOverrideHz;
+  // With a measured Time column, a manual rate means time-domain thinning:
+  // keep original rows at the requested minimum interval. Without Time, it
+  // remains an index-based clock reconstruction rate.
+  const hasExplicitTime = preview.timeColIndex >= 0;
+  const requestedFs = sampleRateOverrideHz !== undefined ? sampleRateOverrideHz : preview.sampleRateOverrideHz;
+  const validRequestedFs = Number.isFinite(requestedFs) && Number(requestedFs) > 0 ? Number(requestedFs) : null;
+  const effectiveFs = !hasExplicitTime ? validRequestedFs : null;
   const clean = stripBom(text);
   const lines = clean.split(/\r?\n/).filter((l) => l.trim().length > 0);
   const startLine = (preview.skipLines || 0) + (preview.hasHeader ? 1 : 0);
@@ -324,7 +331,7 @@ export function computeCsvPreviewQuality(
     return meta;
   }
 
-  if (preview.timeColIndex < 0) return null;
+  if (!hasExplicitTime) return null;
   if (totalData < 2) return null;
 
   const maxScan = Math.min(lines.length, startLine + 50000);
@@ -353,8 +360,27 @@ export function computeCsvPreviewQuality(
   }
 
   if (times.length < 2) return null;
-  times.sort((a, b) => a - b);
-  return analyzeSamplingQuality(Float64Array.from(times), invalidCount);
+
+  // Full import sorts timestamps together with channel values. Apply the same
+  // chronological ordering in preview, then thin by selecting existing rows.
+  const orderedTimes = times.slice().sort((a, b) => a - b);
+  const rawTime = Float64Array.from(orderedTimes);
+  const rawMeta = analyzeSamplingQuality(rawTime, invalidCount);
+  if (!validRequestedFs) return rawMeta;
+
+  const keptIndices = selectTimeDecimationIndices(rawTime, validRequestedFs);
+  const keptTime = selectArrayByIndices(rawTime, keptIndices);
+  const meta = analyzeSamplingQuality(keptTime, invalidCount);
+  meta.originalSampleCount = rawTime.length;
+  meta.originalTimeStart = rawTime[0];
+  meta.originalTimeEnd = rawTime[rawTime.length - 1];
+  meta.droppedSamples += rawTime.length - keptTime.length;
+  meta.requestedSampleRateHz = validRequestedFs;
+  meta.decimatedSampleCount = rawTime.length - keptTime.length;
+  meta.sourceRowsDecimated = true;
+  meta.decimationCountEstimated = maxScan < lines.length;
+  meta.rawGapCount = rawMeta.gapCount;
+  return meta;
 }
 
 /**
@@ -504,12 +530,16 @@ export function parseFullCsv(
   if (numDataRows <= 0) throw new Error('No data rows found in CSV.');
 
   const timeMultiplier = getTimeUnitMultiplier(options.timeUnit);
-  const overrideFs = options.sampleRateOverrideHz && options.sampleRateOverrideHz > 0 && isFinite(options.sampleRateOverrideHz)
+  const hasExplicitTime = options.timeColIndex >= 0;
+  const requestedOverrideFs = options.sampleRateOverrideHz && options.sampleRateOverrideHz > 0 && isFinite(options.sampleRateOverrideHz)
     ? options.sampleRateOverrideHz
     : null;
+  // No-Time files use Fs to reconstruct t=index/Fs. With an explicit Time
+  // column, Fs instead selects a subset of measured source rows (no resampling).
+  const overrideFs = hasExplicitTime ? null : requestedOverrideFs;
+  const timeDecimationRequested = hasExplicitTime && requestedOverrideFs !== null;
 
   const rawTime = new Float64Array(numDataRows);
-  const hasExplicitTime = options.timeColIndex >= 0 && overrideFs === null;
   let invalidRows = 0;
   let baseClockTime: number | null = null;
 
@@ -524,7 +554,7 @@ export function parseFullCsv(
   let needsSort = false;
   let nonMonotonicRawCount = 0;
   let prevTime = -Infinity;
-  const syntheticClockUsed = overrideFs === null && !hasExplicitTime;
+  const syntheticClockUsed = !hasExplicitTime;
   const perChannelNanCounts = new Int32Array(activeChannels.length);
 
   for (let lineIdx = startIndex; lineIdx < lines.length; lineIdx++) {
@@ -604,31 +634,59 @@ export function parseFullCsv(
     }
   }
 
-  const totalSignalNanCount = perChannelNanCounts.reduce((a, b) => a + b, 0);
+  const rawSampleCount = validCount;
+  const rawTimeStart = finalTime.length ? finalTime[0] : 0;
+  const rawTimeEnd = finalTime.length ? finalTime[finalTime.length - 1] : 0;
+  const rawQuality = analyzeSamplingQuality(finalTime, invalidRows);
 
-  // Quality check
-  const quality = analyzeSamplingQuality(finalTime, invalidRows, totalSignalNanCount);
-  quality.nonMonotonicCount = (quality.nonMonotonicCount || 0) + nonMonotonicRawCount;
-  quality.syntheticClockUsed = syntheticClockUsed;
-  quality.rawGapCount = quality.gapCount;
-  if (overrideFs !== null && validCount >= 2) {
-    quality.isUniformSampling = true;
-    quality.qualityStatus = 'uniform';
-    quality.sampleRate = overrideFs;
-    quality.nominalDt = 1 / overrideFs;
-    quality.medianDt = 1 / overrideFs;
-    quality.meanDt = 1 / overrideFs;
-    quality.gapCount = 0;
-    quality.gapIndices = [];
+  let keptIndices: number[] | null = null;
+  let decimatedSampleCount = 0;
+  if (timeDecimationRequested && finalTime.length >= 2) {
+    keptIndices = selectTimeDecimationIndices(finalTime, requestedOverrideFs);
+    if (keptIndices.length !== finalTime.length) {
+      decimatedSampleCount = finalTime.length - keptIndices.length;
+      finalTime = selectArrayByIndices(finalTime, keptIndices);
+      for (let c = 0; c < orderedValues.length; c++) {
+        orderedValues[c] = selectArrayByIndices(orderedValues[c], keptIndices);
+      }
+    }
   }
 
+  const totalSignalNanCount = orderedValues.reduce((sum, arr) => {
+    let n = 0;
+    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) n++;
+    return sum + n;
+  }, 0);
+
+  // Quality is calculated from the timestamps that will actually be imported.
+  // Keep source extent/count separately so the deliberate thinning is auditable.
+  const quality = analyzeSamplingQuality(finalTime, invalidRows, totalSignalNanCount);
+  quality.originalSampleCount = rawSampleCount;
+  quality.originalTimeStart = rawTimeStart;
+  quality.originalTimeEnd = rawTimeEnd;
+  quality.droppedSamples += decimatedSampleCount;
+  if (timeDecimationRequested) {
+    quality.requestedSampleRateHz = requestedOverrideFs!;
+    quality.decimatedSampleCount = decimatedSampleCount;
+    quality.sourceRowsDecimated = true;
+    quality.decimationCountEstimated = false;
+    quality.rawGapCount = rawQuality.gapCount;
+  }
+  if (/^\s*#\s*WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_STEADY_STATE\s*$/im.test(clean)) {
+    quality.dataProvenance = 'synthetic_steady_state';
+    quality.sourceModel = 'ideal_sinusoidal_current_average_duty';
+  }
+  quality.nonMonotonicCount = (quality.nonMonotonicCount || 0) + nonMonotonicRawCount;
+  quality.syntheticClockUsed = syntheticClockUsed;
+  if (!timeDecimationRequested) quality.rawGapCount = quality.gapCount;
   const channels: Record<string, WaveformChannel> = {};
   const drawOrder: string[] = [];
 
   for (let c = 0; c < activeChannels.length; c++) {
     const chMap = activeChannels[c];
     const chRawV = orderedValues[c];
-    const chNanCount = perChannelNanCounts[c];
+    let chNanCount = 0;
+    for (let i = 0; i < chRawV.length; i++) if (!Number.isFinite(chRawV[i])) chNanCount++;
 
     let finalT: Float64Array = finalTime;
     let finalV: Float32Array = chRawV;
@@ -641,7 +699,7 @@ export function parseFullCsv(
       signalNanCount: chNanCount,
     };
 
-    if (options.resample && overrideFs === null && (!quality.isUniformSampling || quality.qualityStatus !== 'uniform')) {
+    if (options.resample && !timeDecimationRequested && overrideFs === null && (!quality.isUniformSampling || quality.qualityStatus !== 'uniform')) {
       // allowGapInterpolation: true guarantees Load + Resample never punches NaN holes into user captures
       const res = resampleUniform(finalTime, chRawV, { allowGapInterpolation: true });
       finalT = res.t;

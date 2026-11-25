@@ -535,10 +535,13 @@ class ExcelImportModalController {
           : sh.timeSourceKind === 'clock-string'
           ? '<span class="text-amber-300">Time: Clock String → Relative s (t₀=0)</span>'
           : sh.timeColIndex >= 0
-          ? `<span class="text-cyan-300">Time: Col ${sh.columnMappings[sh.timeColIndex]?.colLetter || ''} (${sh.timeUnit})</span>`
+          ? `<span class="text-cyan-300">Time: Col ${sh.columnMappings[sh.timeColIndex]?.colLetter || ''} (${sh.timeUnit})${sh.sampleRateOverrideHz ? ` · 按目标间隔抽取原始行 ${formatEng(sh.sampleRateOverrideHz, 'Sa/s', 2)}` : ' · 全量原始时间'}</span>`
           : '<span class="text-slate-400">Time: Index / Forced Sample Rate</span>';
 
-      const rateStr = sh.quality?.sampleRate ? formatEng(sh.quality.sampleRate, 'Sa/s', 2) : 'N/A';
+      const measuredRateStr = sh.quality?.sampleRate ? formatEng(sh.quality.sampleRate, 'Sa/s', 2) : 'N/A';
+      const rateStr = sh.sampleRateOverrideHz && sh.timeColIndex >= 0
+        ? `${measuredRateStr} (target ${formatEng(sh.sampleRateOverrideHz, 'Sa/s', 2)}${sh.quality?.decimationCountEstimated ? ', preview estimate' : ''})`
+        : measuredRateStr;
       const durStr =
         sh.quality && isFinite(sh.quality.originalTimeEnd - sh.quality.originalTimeStart)
           ? formatEng(sh.quality.originalTimeEnd - sh.quality.originalTimeStart, 's', 3)

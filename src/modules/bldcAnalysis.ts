@@ -281,9 +281,9 @@ export function analyzeBldcHallCommutation(
   tEndArg?: number
 ): HallCommutationResult {
   const opts: HallCommutationOptions =
-    typeof tStartOrOpts === 'object' && tStartOrOpts !== null
+    tStartOrOpts !== null && typeof tStartOrOpts === 'object'
       ? tStartOrOpts
-      : { tStart: tStartOrOpts, tEnd: tEndArg };
+      : { tStart: typeof tStartOrOpts === 'number' ? tStartOrOpts : undefined, tEnd: tEndArg };
 
   const activeRing =
     opts.customSequence && opts.customSequence.length === 6 && new Set(opts.customSequence).size === 6
@@ -509,7 +509,7 @@ export function analyzeBldcHallCommutation(
   }
 
   if (hallOffsetDeg !== 0) {
-    warnings.push(`已记录 Hall 安装电角度偏移 ${hallOffsetDeg.toFixed(1)}°（用于相对反电势过零点相位标定参考）。`);
+    warnings.push(`已记录 Hall 安装电角度偏移 ${hallOffsetDeg.toFixed(1)}°；当前 Hall-only 分析没有反电势/编码器相位参考输入，因此该偏移未参与扇区、转速或相位误差计算。`);
   }
 
   return {
@@ -570,9 +570,9 @@ export function analyzePwmSwitchingAndDeadTime(
   tEndArg?: number
 ): PwmDeadTimeResult {
   const opts: PwmAnalyzeOptions =
-    typeof tStartOrOpts === 'object' && tStartOrOpts !== null
+    tStartOrOpts !== null && typeof tStartOrOpts === 'object'
       ? tStartOrOpts
-      : { tStart: tStartOrOpts, tEnd: tEndArg };
+      : { tStart: typeof tStartOrOpts === 'number' ? tStartOrOpts : undefined, tEnd: tEndArg };
 
   const guessedSw =
     /(?:^|[^a-z0-9])(sw|phase|node|vds|[uvw]_?(?:ph|phase)?)(?:$|[^a-z0-9])/i.test(chHigh.name) &&
@@ -857,6 +857,8 @@ export function analyzePwmSwitchingAndDeadTime(
 export type RippleSignalKind = 'torque' | 'current' | 'power' | 'other';
 
 export interface TorqueRippleResult {
+  valid: boolean;
+  invalidReason: string | null;
   signalKind: RippleSignalKind;
   isTrueMechanicalTorque: boolean;
   warning: string | null;
@@ -897,22 +899,39 @@ export function analyzeTorqueAndCurrentRipple(
   tEnd?: number
 ): TorqueRippleResult {
   const signalKind = classifyRippleChannel(ch);
-  const isTrueMechanicalTorque = signalKind === 'torque';
-  const warning = isTrueMechanicalTorque
-    ? null
+  // A torque label/unit identifies the quantity, not whether it came from a shaft torque sensor.
+  const isTrueMechanicalTorque = signalKind === 'torque' && ch.metadata?.dataProvenance === 'measured';
+  const warning = signalKind === 'torque'
+    ? (isTrueMechanicalTorque
+        ? null
+        : '已识别为转矩量（单位/通道名），但文件未携带已验证的实测传感器来源标记；请确认来自轴端转矩传感器，而不是模型估算/仿真通道。')
     : signalKind === 'current'
     ? '当前通道为电流信号，本结果仅反映电流脉动及 6× 换相谐波；由于存在磁饱和、齿槽转矩与铁损，电流纹波不能直接等同于机械轴转矩脉动。'
     : signalKind === 'power'
     ? '当前通道为电功率信号，反映瞬时功率脉动，不能直接等同于机械转矩脉动。'
     : '未识别到机械扭矩单位 (N·m/mN·m)，结果仅代表所选通道自身的波形脉动与频谱分量。';
 
-  const n = Math.min(ch.t.length, ch.v.length);
+  const invalid = (reason: string): TorqueRippleResult => ({
+    valid: false, invalidReason: reason, signalKind, isTrueMechanicalTorque, warning: reason,
+    mean: 0, rms: 0, peakToPeakRipple: 0, rippleFactorPct: 0, rmsRipplePct: 0,
+    fundamentalElecHz: null, harm1xAmp: null, harm2xAmp: null, harm6xAmp: null, harm12xAmp: null,
+    sixthHarmonicPctOfMean: null, dominantRippleFreqHz: null, dominantRippleAmp: null,
+  });
+  if (ch.t.length !== ch.v.length) return invalid(`通道时间轴与幅值长度不一致 (t=${ch.t.length}, v=${ch.v.length})，拒绝截断后计算纹波。`);
+  const n = ch.t.length;
+  if (n < 2) return invalid('有效样本不足，无法分析转矩/电流纹波。');
+  for (let i = 0; i < n; i++) {
+    if (!Number.isFinite(ch.t[i]) || !Number.isFinite(ch.v[i])) return invalid(`波形在索引 ${i} 处包含 NaN/Inf 时间戳或幅值，拒绝跳过无效点后输出纹波指标。`);
+    if (i > 0 && !(ch.t[i] > ch.t[i - 1])) return invalid(`时间轴在索引 ${i} 处重复或倒退，纹波与谐波频率计算已拒绝。`);
+  }
   const { i0, i1 } = sliceIndexRange(ch.t, n, tStart, tEnd);
   if (i1 - i0 < 8) {
     return {
+      valid: false,
+      invalidReason: '当前门控窗口内有效样本不足 8 点，无法可靠估算纹波及谐波。',
       signalKind,
       isTrueMechanicalTorque,
-      warning,
+      warning: '当前门控窗口内有效样本不足 8 点，无法可靠估算纹波及谐波。',
       mean: 0,
       rms: 0,
       peakToPeakRipple: 0,
@@ -1016,6 +1035,8 @@ export function analyzeTorqueAndCurrentRipple(
     h6 !== null && denomMean > 1e-9 ? (h6 / denomMean) * 100 : null;
 
   return {
+    valid: true,
+    invalidReason: null,
     signalKind,
     isTrueMechanicalTorque,
     warning,

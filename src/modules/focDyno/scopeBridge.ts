@@ -8,7 +8,7 @@ import { TabState, WaveformChannel } from '../../types/models';
 import { analyzeSamplingQuality } from '../qualityCheck';
 import { getChannelDisplayValue, computeChannelMean } from '../oscilloscopeScale';
 import { parseSiUnitScale } from '../thermalEngine';
-import { inspectTimebase, areTimebasesSynchronized } from '../timeSync';
+import { inspectTimebase, areTimebasesSynchronized, inspectChannelSamplingGaps } from '../timeSync';
 import { MotorParams, RuntimeLogRow } from './motorPhysics';
 import { SynthesizedWaveform } from './thermalExporter';
 import { RawRuntimeLogEntry } from './demoData';
@@ -38,6 +38,25 @@ export interface FocThermalHandoffPayload {
   handoffNote?: string;
 }
 
+/** Scope channels share the same time vector. Reject ambiguous clocks rather than
+ * assigning a nominal fs to data with duplicate, descending, or non-finite times. */
+function hasStrictlyIncreasingFiniteTime(t: Float64Array): boolean {
+  if (t.length < 2) return false;
+  for (let i = 0; i < t.length; i++) {
+    if (!Number.isFinite(t[i])) return false;
+    if (i > 0 && !(t[i] > t[i - 1])) return false;
+  }
+  return true;
+}
+
+function getRobustTimebase(t: Float64Array) {
+  const meta = analyzeSamplingQuality(t);
+  const dt = meta.medianDt ?? meta.nominalDt;
+  if (!Number.isFinite(dt) || (dt as number) <= 0) return null;
+  const safeDt = dt as number;
+  return { meta, dt: safeDt, fs: 1 / safeDt };
+}
+
 function makeChannel(
   id: string,
   name: string,
@@ -48,13 +67,23 @@ function makeChannel(
   fs: number,
   dt: number,
   meta: ReturnType<typeof analyzeSamplingQuality>,
-  options?: { isMath?: boolean; badgeText?: string; expr?: string }
+  options?: {
+    isMath?: boolean;
+    badgeText?: string;
+    expr?: string;
+    dataProvenance?: NonNullable<WaveformChannel['metadata']>['dataProvenance'];
+    sourceModel?: string;
+  }
 ): WaveformChannel {
   let mn = Infinity;
   let mx = -Infinity;
+  let signalNanCount = 0;
   for (let i = 0; i < v.length; i++) {
     const val = v[i];
-    if (!Number.isFinite(val)) continue;
+    if (!Number.isFinite(val)) {
+      signalNanCount++;
+      continue;
+    }
     if (val < mn) mn = val;
     if (val > mx) mx = val;
   }
@@ -90,7 +119,15 @@ function makeChannel(
     sourceChannelIds: [],
     fs,
     dt,
-    metadata: meta,
+    // Each signal has its own invalid-value count. Sharing the timebase object
+    // must not make one channel's NaNs appear on every other channel.
+    metadata: {
+      ...meta,
+      gapIndices: [...meta.gapIndices],
+      signalNanCount,
+      dataProvenance: options?.dataProvenance ?? meta.dataProvenance,
+      sourceModel: options?.sourceModel ?? meta.sourceModel,
+    },
   };
 }
 
@@ -107,28 +144,46 @@ export function buildOscilloscopeTabFromSixMos(
   const ic = new Float32Array(n);
   const vbus = new Float32Array(n);
 
-  const hasDuty = Boolean(synth.summary.includeDuty && synth.samples[0].da !== undefined);
+  const hasDuty = Boolean(synth.summary.includeDuty);
   const da = hasDuty ? new Float32Array(n) : null;
   const db = hasDuty ? new Float32Array(n) : null;
   const dc = hasDuty ? new Float32Array(n) : null;
 
   for (let i = 0; i < n; i++) {
     const s = synth.samples[i];
+    if (
+      !Number.isFinite(s.timeS) ||
+      !Number.isFinite(s.iaA) ||
+      !Number.isFinite(s.ibA) ||
+      !Number.isFinite(s.icA) ||
+      !Number.isFinite(s.vBusV)
+    ) return null;
+    if (hasDuty && (
+      !Number.isFinite(s.da) || !Number.isFinite(s.db) || !Number.isFinite(s.dc) ||
+      (s.da as number) < 0 || (s.da as number) > 1 ||
+      (s.db as number) < 0 || (s.db as number) > 1 ||
+      (s.dc as number) < 0 || (s.dc as number) > 1
+    )) return null;
+
     t[i] = s.timeS;
     ia[i] = s.iaA;
     ib[i] = s.ibA;
     ic[i] = s.icA;
     vbus[i] = s.vBusV;
     if (da && db && dc) {
-      da[i] = s.da ?? 0.5;
-      db[i] = s.db ?? 0.5;
-      dc[i] = s.dc ?? 0.5;
+      da[i] = s.da as number;
+      db[i] = s.db as number;
+      dc[i] = s.dc as number;
     }
   }
 
-  const dt = n >= 2 ? Math.max(1e-9, t[1] - t[0]) : 1 / 20000;
-  const fs = 1 / dt;
-  const meta = analyzeSamplingQuality(t);
+  if (!hasStrictlyIncreasingFiniteTime(t)) return null;
+  const timebase = getRobustTimebase(t);
+  if (!timebase) return null;
+  const { dt, fs } = timebase;
+  const meta = timebase.meta;
+  meta.dataProvenance = synth.summary.dataProvenance;
+  meta.sourceModel = synth.summary.waveformModel;
 
   const chIa = makeChannel('ch_ia', 'Ia', 'A', '#facc15', t, ia, fs, dt, meta);
   const chIb = makeChannel('ch_ib', 'Ib', 'A', '#22d3ee', t, ib, fs, dt, meta);
@@ -198,32 +253,47 @@ export function buildOscilloscopeTabFromBatchLog(
     vMeas[i] = r.vMeasV;
   }
 
-  const dt = n >= 2 ? Math.max(1e-9, (t[n - 1] - t[0]) / (n - 1)) : 0.002;
-  const fs = 1 / dt;
-  const meta = analyzeSamplingQuality(t);
+  if (!hasStrictlyIncreasingFiniteTime(t)) return null;
+  const timebase = getRobustTimebase(t);
+  if (!timebase) return null;
+  const { dt, fs, meta } = timebase;
 
   const chIq = makeChannel('ch_iq', 'Iq_est', 'A', '#38bdf8', t, iq, fs, dt, meta, {
     isMath: true,
     badgeText: 'fx',
     expr: 'Inverse FOC Iq(Vbus, Ibus, n)',
+    dataProvenance: 'derived_estimate',
+    sourceModel: 'foc_inverse_steady_state_model',
   });
-  const chIbus = makeChannel('ch_ibus', 'Ibus_filt', 'A', '#f59e0b', t, iBusFilt, fs, dt, meta);
+  const chIbus = makeChannel('ch_ibus', 'Ibus_filt', 'A', '#f59e0b', t, iBusFilt, fs, dt, meta, {
+    dataProvenance: 'measured',
+    sourceModel: 'dynolab_runtime_log_input',
+  });
   const chVqM = makeChannel('ch_vq_motor', 'Vq_motor', 'V', '#4ade80', t, vqMotor, fs, dt, meta, {
     isMath: true,
     badgeText: 'fx',
     expr: 'Eq + Rs*Iq',
+    dataProvenance: 'derived_estimate',
+    sourceModel: 'foc_inverse_steady_state_model',
   });
   const chVqC = makeChannel('ch_vq_cmd', 'Vq_cmd', 'V', '#f472b6', t, vqCmd, fs, dt, meta, {
     isMath: true,
     badgeText: 'fx',
     expr: 'Vq_motor + Rds*Iq + Vdead',
+    dataProvenance: 'derived_estimate',
+    sourceModel: 'foc_inverse_steady_state_model',
   });
   const chM = makeChannel('ch_m_cmd', 'm_cmd', '', '#a78bfa', t, mCmd, fs, dt, meta, {
     isMath: true,
     badgeText: 'fx',
     expr: 'Vph_cmd / (Vbus_cap/2)',
+    dataProvenance: 'derived_estimate',
+    sourceModel: 'foc_inverse_steady_state_model',
   });
-  const chVbus = makeChannel('ch_vbus', 'Vbus_meas', 'V', '#fb923c', t, vMeas, fs, dt, meta);
+  const chVbus = makeChannel('ch_vbus', 'Vbus_meas', 'V', '#fb923c', t, vMeas, fs, dt, meta, {
+    dataProvenance: 'measured',
+    sourceModel: 'dynolab_runtime_log_input',
+  });
 
   const baseName = sourceFileName.replace(/\.[^.]+$/, '');
   return {
@@ -285,8 +355,9 @@ export function buildThermalHandoffFromSixMos(
     rdsRefC !== 25
       ? `（已将 ${rdsRefC.toFixed(0)}°C 热态 Rds=${params.rdsOnMOhm.toFixed(2)}mΩ 折算为 Rds25=${rds25MOhm.toFixed(2)}mΩ 以避免闭环温升重复放大）`
       : '';
+  const provenanceNote = '【模型合成数据】理想正弦相电流与周期平均 Duty；无 PWM 载波、开关纹波、死区畸变、ADC 采样窗口及实测控制环动态，禁止作为实测开关损耗输入。';
   const baseNote =
-    `DynoLab 标定电机参数 (Ke', P0, β) 并结合人工设定 I_idle/η_inv 同步 Vbus_cap, m_cmd, φ_cmd, f_sw, t_dead, Rds25${rdsConvNote}, V_SD, R_s(堵转)；开关损耗/热系数 (α, Esw, Eoss, Qrr, Vref, Iref) 仍沿用 MOS Thermal 面板设定。`;
+    `${provenanceNote} DynoLab 标定电机参数 (Ke', P0, β) 并结合人工设定 I_idle/η_inv 同步 Vbus_cap, m_cmd, φ_cmd, f_sw, t_dead, Rds25${rdsConvNote}, V_SD, R_s(堵转)；开关损耗/热系数 (α, Esw, Eoss, Qrr, Vref, Iref) 仍沿用 MOS Thermal 面板设定。`;
 
   return {
     tab,
@@ -311,55 +382,50 @@ export function buildThermalHandoffFromSixMos(
   };
 }
 
+function validateScopeSourceChannel(
+  ch: WaveformChannel,
+  label: string,
+  acOffset: number
+): string | null {
+  if (ch.t.length !== ch.v.length) {
+    return `${label} 通道时间数组与数值数组长度不一致（${ch.t.length} vs ${ch.v.length}），拒绝截断对齐。`;
+  }
+  if (ch.t.length < 2) return `${label} 通道样本不足 2 点。`;
+  for (let i = 0; i < ch.t.length; i++) {
+    if (!Number.isFinite(ch.t[i])) return `${label} 通道第 ${i + 1} 个时间戳非有限。`;
+    if (i > 0 && ch.t[i] <= ch.t[i - 1]) {
+      return `${label} 通道时间戳必须严格递增；第 ${i + 1} 点重复或倒退。`;
+    }
+    if (!Number.isFinite(getChannelDisplayValue(ch, i, acOffset))) {
+      return `${label} 通道第 ${i + 1} 个采样值无效；拒绝跨越 NaN/缺失段插值。`;
+    }
+  }
+  return null;
+}
+
 function sampleChannelAtTime(ch: WaveformChannel, tQuery: number, acOffset: number): number {
-  const len = Math.min(ch.t.length, ch.v.length);
-  if (len === 0 || !Number.isFinite(tQuery)) return Number.NaN;
-  if (len === 1) return getChannelDisplayValue(ch, 0, acOffset);
+  const len = ch.t.length;
+  if (len !== ch.v.length || len < 2 || !Number.isFinite(tQuery)) return Number.NaN;
+  // No endpoint extrapolation: a query outside the acquired interval is invalid.
+  if (tQuery < ch.t[0] || tQuery > ch.t[len - 1]) return Number.NaN;
 
-  if (tQuery <= ch.t[0]) {
-    for (let i = 0; i < Math.min(len, 16); i++) {
-      const val = getChannelDisplayValue(ch, i, acOffset);
-      if (Number.isFinite(val)) return val;
-    }
-    return Number.NaN;
-  }
-  if (tQuery >= ch.t[len - 1]) {
-    for (let i = len - 1; i >= Math.max(0, len - 16); i--) {
-      const val = getChannelDisplayValue(ch, i, acOffset);
-      if (Number.isFinite(val)) return val;
-    }
-    return Number.NaN;
-  }
-
-  // Binary search for bracketing interval [lo, hi] where ch.t[lo] <= tQuery <= ch.t[hi]
   let lo = 0;
   let hi = len - 1;
-  while (hi - lo > 1) {
+  while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (ch.t[mid] <= tQuery) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
+    if (ch.t[mid] < tQuery) lo = mid + 1;
+    else hi = mid;
   }
+  if (ch.t[lo] === tQuery) return getChannelDisplayValue(ch, lo, acOffset);
+  if (lo === 0) return Number.NaN;
 
-  let iL = lo;
-  let v0 = getChannelDisplayValue(ch, iL, acOffset);
-  while (!Number.isFinite(v0) && iL > 0) {
-    iL--;
-    v0 = getChannelDisplayValue(ch, iL, acOffset);
-  }
-  let iR = hi;
-  let v1 = getChannelDisplayValue(ch, iR, acOffset);
-  while (!Number.isFinite(v1) && iR < len - 1) {
-    iR++;
-    v1 = getChannelDisplayValue(ch, iR, acOffset);
-  }
-  if (!Number.isFinite(v0)) return v1;
-  if (!Number.isFinite(v1)) return v0;
-  const span = ch.t[iR] - ch.t[iL];
-  if (span <= 1e-15) return v0;
-  const alpha = (tQuery - ch.t[iL]) / span;
+  const left = lo - 1;
+  const t0 = ch.t[left];
+  const t1 = ch.t[lo];
+  const v0 = getChannelDisplayValue(ch, left, acOffset);
+  const v1 = getChannelDisplayValue(ch, lo, acOffset);
+  if (!(t1 > t0) || !Number.isFinite(v0) || !Number.isFinite(v1)) return Number.NaN;
+  const alpha = (tQuery - t0) / (t1 - t0);
   return v0 + alpha * (v1 - v0);
 }
 
@@ -395,77 +461,171 @@ export function extractRuntimeLogWithAudit(options: {
   } = options;
 
   const warnings: string[] = [];
-  const n = Math.min(ibusCh.t.length, ibusCh.v.length);
-  if (n < 2) {
-    return { rows: [], warnings: ['Ibus 通道样本不足 2 点。'], vbusScaleV: 1, ibusScaleA: 1, isMonotonic: true };
+  const n = ibusCh.t.length;
+  const needsPolePairs = Boolean(speedCh && speedUnit === 'elec_hz');
+  if (!Number.isInteger(maxPoints) || maxPoints < 2 || (needsPolePairs && (!Number.isInteger(polePairs) || polePairs < 1))) {
+    return { rows: [], warnings: [needsPolePairs ? 'maxPoints 必须为不小于 2 的整数，电频率换算所需 polePairs 必须为正整数。' : 'maxPoints 必须为不小于 2 的整数。'], vbusScaleV: 1, ibusScaleA: 1, isMonotonic: false };
   }
-
-  const tbI = inspectTimebase(ibusCh.t);
-  if (!tbI.monotonic) {
-    warnings.push('Ibus 通道时间戳非严格递增，时间对齐与窗口滤波精度可能受影响。');
+  const pointLimit = Math.floor(maxPoints);
+  if (!vbusCh && (!Number.isFinite(vbusConstV) || vbusConstV <= 0)) {
+    return { rows: [], warnings: ['固定母线电压必须为有限正数。'], vbusScaleV: 1, ibusScaleA: currentUnit === 'mA' ? 1e-3 : 1, isMonotonic: false };
+  }
+  if (!speedCh && !Number.isFinite(speedConstRpm)) {
+    return { rows: [], warnings: ['固定转速必须为有限数值。'], vbusScaleV: 1, ibusScaleA: currentUnit === 'mA' ? 1e-3 : 1, isMonotonic: false };
   }
 
   const acI = ibusCh.coupling === 'AC' ? computeChannelMean(ibusCh) : 0;
   const acV = vbusCh && vbusCh.coupling === 'AC' ? computeChannelMean(vbusCh) : 0;
   const acSpd = speedCh && speedCh.coupling === 'AC' ? computeChannelMean(speedCh) : 0;
+  const iScale = currentUnit === 'mA' ? 1e-3 : 1;
+  const p = needsPolePairs ? polePairs : 1;
+
+  const ibusError = validateScopeSourceChannel(ibusCh, 'Ibus', acI);
+  if (ibusError) {
+    return { rows: [], warnings: [ibusError], vbusScaleV: 1, ibusScaleA: iScale, isMonotonic: false };
+  }
+  if (vbusCh) {
+    const vbusError = validateScopeSourceChannel(vbusCh, 'Vbus', acV);
+    if (vbusError) return { rows: [], warnings: [vbusError], vbusScaleV: 1, ibusScaleA: iScale, isMonotonic: false };
+  }
+  if (speedCh) {
+    const speedError = validateScopeSourceChannel(speedCh, 'Speed', acSpd);
+    if (speedError) return { rows: [], warnings: [speedError], vbusScaleV: 1, ibusScaleA: iScale, isMonotonic: false };
+  }
+
+  // Reject irregular internal acquisition gaps before interpolating Vbus/Speed
+  // onto the Ibus master timebase. Regular channels may have different nominal
+  // sampling rates; only anomalously large gaps relative to their own median dt
+  // are blocked.
+  const gapChecks: Array<[WaveformChannel, string]> = [[ibusCh, 'Ibus']];
+  if (vbusCh) gapChecks.push([vbusCh, 'Vbus']);
+  if (speedCh) gapChecks.push([speedCh, 'Speed']);
+  for (const [channel, label] of gapChecks) {
+    const gaps = inspectChannelSamplingGaps(channel.t, 0, channel.t.length - 1, 3.5);
+    if (gaps.gapCount > 0) {
+      return {
+        rows: [],
+        warnings: [`${label} 时间轴检测到 ${gaps.gapCount} 个内部采样缺口，最大间隔为 ${(gaps.maxGapSec * 1e3).toFixed(3)}ms（本通道中位采样间隔的 ${gaps.maxGapRatio.toFixed(1)} 倍）；DynoLab 不跨缺口插值或生成运行日志，请裁剪缺口或重新采集。`],
+        vbusScaleV: 1,
+        ibusScaleA: iScale,
+        isMonotonic: true,
+      };
+    }
+  }
 
   let vbusScaleV = 1;
   if (vbusCh) {
     try {
       vbusScaleV = parseSiUnitScale(vbusCh.unit, 'V', vbusCh.name);
     } catch (err: any) {
-      warnings.push(err?.message || `Vbus 通道单位 "${vbusCh.unit}" 非标准电压单位。`);
+      return { rows: [], warnings: [err?.message || `Vbus 通道单位 "${vbusCh.unit}" 非标准电压单位。`], vbusScaleV: 1, ibusScaleA: iScale, isMonotonic: false };
     }
   }
-  const iScale = currentUnit === 'mA' ? 1e-3 : 1;
-  const p = Math.max(1, Math.round(polePairs));
+
+  const tbI = inspectTimebase(ibusCh.t);
+  const ibusStart = ibusCh.t[0];
+  const ibusEnd = ibusCh.t[n - 1];
+  if (vbusCh && (vbusCh.t[0] > ibusStart || vbusCh.t[vbusCh.t.length - 1] < ibusEnd)) {
+    return { rows: [], warnings: ['Vbus 时间范围未完整覆盖 Ibus，不能进行端点外推；请裁剪到共同时间窗或重新导入。'], vbusScaleV, ibusScaleA: iScale, isMonotonic: tbI.monotonic };
+  }
+  if (speedCh && (speedCh.t[0] > ibusStart || speedCh.t[speedCh.t.length - 1] < ibusEnd)) {
+    return { rows: [], warnings: ['Speed 时间范围未完整覆盖 Ibus，不能进行端点外推；请裁剪到共同时间窗或重新导入。'], vbusScaleV, ibusScaleA: iScale, isMonotonic: tbI.monotonic };
+  }
 
   const convertSpeedToRpm = (val: number): number => {
     if (speedUnit === 'rad_s') return (val * 60) / (2 * Math.PI);
     if (speedUnit === 'elec_hz') return (val * 60) / p;
     return val;
   };
-
   const indices: number[] = [];
-  if (n <= maxPoints) {
+  if (n <= pointLimit) {
     for (let i = 0; i < n; i++) indices.push(i);
   } else {
-    const buckets = Math.max(1, Math.floor(maxPoints / 2));
+    // Downsample against every signal that will be consumed downstream. Using
+    // Ibus-only extrema can erase a Vbus sag or RPM transient even though the
+    // retained row is later treated as a complete synchronized operating point.
+    const signals: Array<{ channel: WaveformChannel; acOffset: number }> = [
+      { channel: ibusCh, acOffset: acI },
+    ];
+    if (vbusCh) signals.push({ channel: vbusCh, acOffset: acV });
+    if (speedCh) signals.push({ channel: speedCh, acOffset: acSpd });
+    const minRequiredPoints = Math.max(2, signals.length * 2);
+    if (pointLimit < minRequiredPoints) {
+      return {
+        rows: [],
+        warnings: [`maxPoints=${pointLimit} 不足以保留 ${signals.length} 个运行信号的峰/谷特征；请至少设置为 ${minRequiredPoints}。`],
+        vbusScaleV: 1,
+        ibusScaleA: iScale,
+        isMonotonic: tbI.monotonic,
+      };
+    }
+    const buckets = Math.max(1, Math.floor(pointLimit / (2 * signals.length)));
+    const selected = new Set<number>();
+    let nonCoincidentExtremaCount = 0;
+    const nearestIbusIndex = (queryTime: number): number => {
+      let lo = 0;
+      let hi = n - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ibusCh.t[mid] < queryTime) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo > 0 && Math.abs(ibusCh.t[lo - 1] - queryTime) <= Math.abs(ibusCh.t[lo] - queryTime)) return lo - 1;
+      return lo;
+    };
     for (let b = 0; b < buckets; b++) {
       const start = Math.floor((b * n) / buckets);
       const end = Math.min(n, Math.floor(((b + 1) * n) / buckets));
       if (start >= end) continue;
-      let minIdx = -1;
-      let maxIdx = -1;
-      let minVal = Infinity;
-      let maxVal = -Infinity;
-      for (let j = start; j < end; j++) {
-        const val = getChannelDisplayValue(ibusCh, j, acI);
-        if (!Number.isFinite(val)) continue;
-        if (val < minVal) {
-          minVal = val;
-          minIdx = j;
+      const bucketStartTime = ibusCh.t[start];
+      const bucketEndTime = ibusCh.t[end - 1];
+      for (const signal of signals) {
+        let minIdx = -1;
+        let maxIdx = -1;
+        let minVal = Infinity;
+        let maxVal = -Infinity;
+        // Search the signal's own time/value arrays. Different channels are
+        // allowed to have different lengths and sampling intervals.
+        for (let j = 0; j < signal.channel.t.length; j++) {
+          const signalTime = signal.channel.t[j];
+          if (signalTime < bucketStartTime || signalTime > bucketEndTime) continue;
+          const val = getChannelDisplayValue(signal.channel, j, signal.acOffset);
+          if (!Number.isFinite(val)) continue;
+          if (val < minVal) { minVal = val; minIdx = j; }
+          if (val > maxVal) { maxVal = val; maxIdx = j; }
         }
-        if (val > maxVal) {
-          maxVal = val;
-          maxIdx = j;
+        for (const sourceIdx of [minIdx, maxIdx]) {
+          if (sourceIdx < 0) continue;
+          const sourceTime = signal.channel.t[sourceIdx];
+          const targetIdx = nearestIbusIndex(sourceTime);
+          if (ibusCh.t[targetIdx] !== sourceTime) nonCoincidentExtremaCount++;
+          selected.add(targetIdx);
         }
-      }
-      if (minIdx >= 0 && maxIdx >= 0) {
-        if (minIdx === maxIdx) indices.push(minIdx);
-        else if (minIdx < maxIdx) indices.push(minIdx, maxIdx);
-        else indices.push(maxIdx, minIdx);
       }
     }
+    indices.push(...Array.from(selected).sort((a, b) => a - b));
+    if (indices.length > pointLimit) {
+      // Bucket arithmetic should keep this bounded; fail closed if future
+      // changes violate the public maxPoints contract.
+      return {
+        rows: [],
+        warnings: [`多通道峰谷抽样产生 ${indices.length} 点，超过 maxPoints=${pointLimit}；已拒绝生成截断运行日志。`],
+        vbusScaleV: 1,
+        ibusScaleA: iScale,
+        isMonotonic: tbI.monotonic,
+      };
+    }
+    warnings.push(`运行日志已按 Ibus${vbusCh ? '、Vbus' : ''}${speedCh ? '、Speed' : ''} 各通道峰/谷联合降采样；保留 ${indices.length}/${n} 个 Ibus 时间点。`);
+    if (nonCoincidentExtremaCount > 0) warnings.push(`有 ${nonCoincidentExtremaCount} 个 Vbus/Speed 峰谷发生在 Ibus 采样时刻之间，已映射到最近 Ibus 时间点并按时间戳插值取值；窄脉冲可能被低估，请提高 Ibus 采样率或在共同采集时钟下同步采样。`);
   }
 
   const sameVbusTimebase = Boolean(vbusCh && areTimebasesSynchronized(ibusCh.t, vbusCh.t));
   const sameSpeedTimebase = Boolean(speedCh && areTimebasesSynchronized(ibusCh.t, speedCh.t));
   if (vbusCh && !sameVbusTimebase) {
-    warnings.push(`Vbus (${vbusCh.name}) 与 Ibus 时间轴不完全一致，已按时间戳线性重采样对齐。`);
+    warnings.push(`Vbus (${vbusCh.name}) 与 Ibus 时间轴不完全一致，已在共同覆盖区间内按相邻原始点线性插值对齐。`);
   }
   if (speedCh && !sameSpeedTimebase) {
-    warnings.push(`Speed (${speedCh.name}) 与 Ibus 时间轴不完全一致，已按时间戳线性重采样对齐。`);
+    warnings.push(`Speed (${speedCh.name}) 与 Ibus 时间轴不完全一致，已在共同覆盖区间内按相邻原始点线性插值对齐。`);
   }
 
   const rows: RawRuntimeLogEntry[] = [];
@@ -507,7 +667,8 @@ export function extractRuntimeLogWithAudit(options: {
 
 /**
  * Extracts runtime log rows directly from active Oscilloscope channels with explicit unit conversions
- * and timestamp-aligned interpolation across channels + peak-preserving MinMax bucket downsampling.
+ * and timestamp-aligned interpolation across channels + multi-signal peak/valley bucket downsampling
+ * (Ibus, Vbus and Speed all contribute extrema; retained runtime rows stay on the Ibus master clock).
  */
 export function extractRuntimeLogFromScopeChannels(options: {
   vbusCh: WaveformChannel | null;

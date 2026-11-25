@@ -319,17 +319,17 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
 
                 {keSource === 'open_loop_auto' && (
                   <div className="flex items-center gap-2 font-mono text-xs">
-                    <span className="dyno-text-muted" title="若开环空载并非满调制 (1.0)，请填入实际油门/调制系数">
-                      开环调制系数 m_norm:
+                    <span className="dyno-text-muted" title="必须填入实际开环调制系数；默认 1.0 只是满调制假设，未经实测确认时 Ke 仅为估计">
+                      开环调制系数 m_norm（实测/确认值）:
                     </span>
                     <SmoothNumberInput
                       value={openLoopModDepth}
                       min={0.1}
-                      max={1.1547}
+                      max={1.0}
                       step={0.05}
                       precision={3}
                       ariaLabel="开环调制系数 m_norm"
-                      onChange={(v) => onChangeOpenLoopModDepth(Math.max(0.1, Math.min(1.1547, v)))}
+                      onChange={(v) => onChangeOpenLoopModDepth(Math.max(0.1, Math.min(1.0, v)))}
                       className="dyno-input w-20 rounded-sm border px-2 py-1 text-right tabular-nums"
                     />
                   </div>
@@ -502,9 +502,11 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
           <div className="grid grid-cols-1 gap-2 border-t dyno-border pt-2 font-mono text-[11px] md:grid-cols-3">
             {report.validationMetrics && (
               <div>
-                <span className="dyno-text-muted">20% Holdout 样本外验证 ({report.validationMetrics.holdoutCount}点): </span>
+                <span className="dyno-text-muted">
+                  20% Holdout 样本外验证（扭矩有效 {report.validationMetrics.validHoldoutCount}/{report.validationMetrics.holdoutCount} 点，效率有效 {report.validationMetrics.validHoldoutEtaCount} 点）：
+                </span>
                 <span className="dyno-text-primary font-semibold">
-                  MAE={report.validationMetrics.valMaeTorqueNm.toFixed(4)} N·m ({report.validationMetrics.valMapeTorquePct.toFixed(2)}%), η MAE={report.validationMetrics.valMaeEtaPct.toFixed(2)}pp
+                  MAE={Number.isFinite(report.validationMetrics.valMaeTorqueNm) ? report.validationMetrics.valMaeTorqueNm.toFixed(4) : 'N/A'} N·m ({Number.isFinite(report.validationMetrics.valMapeTorquePct) ? `${report.validationMetrics.valMapeTorquePct.toFixed(2)}%` : 'MAPE N/A'}), η MAE={Number.isFinite(report.validationMetrics.valMaeEtaPct) ? `${report.validationMetrics.valMaeEtaPct.toFixed(2)}pp` : 'N/A'}
                 </span>
               </div>
             )}

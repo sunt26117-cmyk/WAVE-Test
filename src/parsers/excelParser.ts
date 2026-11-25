@@ -15,6 +15,7 @@ import {
 import { parseNumericCell, parseTimeCell } from './csvParser';
 import { analyzeSamplingQuality, getTimeUnitMultiplier } from '../modules/qualityCheck';
 import { resampleUniform } from '../modules/resampler';
+import { selectTimeDecimationIndices, selectArrayByIndices } from '../modules/timeDecimator';
 import { computeBufferFingerprint } from '../modules/waveformCompare';
 
 const PREVIEW_ROW_LIMIT = 100;
@@ -497,21 +498,24 @@ function computePreviewQualityFromMeta(
   const totalData = Math.max(0, sheet.totalRows - sheet.firstDataRow);
   if (totalData < 2) return null;
 
-  if (sheet.sampleRateOverrideHz && sheet.sampleRateOverrideHz > 0 && isFinite(sheet.sampleRateOverrideHz)) {
-    const dt = 1 / sheet.sampleRateOverrideHz;
+  const requestedFs = Number.isFinite(sheet.sampleRateOverrideHz) && Number(sheet.sampleRateOverrideHz) > 0
+    ? Number(sheet.sampleRateOverrideHz)
+    : null;
+
+  if (sheet.timeColIndex < 0 && requestedFs !== null) {
+    const dt = 1 / requestedFs;
     const count = Math.min(totalData, 5000);
     const syn = new Float64Array(count);
     for (let i = 0; i < count; i++) syn[i] = i * dt;
     const meta = analyzeSamplingQuality(syn, 0);
     meta.originalSampleCount = totalData;
     meta.originalTimeEnd = (totalData - 1) * dt;
-    meta.sampleRate = sheet.sampleRateOverrideHz;
+    meta.sampleRate = requestedFs;
     meta.nominalDt = dt;
     meta.medianDt = dt;
     meta.meanDt = dt;
     return meta;
   }
-
   if (sheet.timeColIndex < 0) return null;
 
   const mult = getTimeUnitMultiplier(sheet.timeUnit);
@@ -535,8 +539,26 @@ function computePreviewQualityFromMeta(
 
   if (times.length < 2) return null;
   times.sort((a, b) => a - b);
-  const meta = analyzeSamplingQuality(Float64Array.from(times), invalid);
+  const rawTime = Float64Array.from(times);
+  const rawMeta = analyzeSamplingQuality(rawTime, invalid);
+  if (requestedFs === null) {
+    rawMeta.originalSampleCount = totalData;
+    return rawMeta;
+  }
+
+  const keptIndices = selectTimeDecimationIndices(rawTime, requestedFs);
+  const keptTime = selectArrayByIndices(rawTime, keptIndices);
+  const meta = analyzeSamplingQuality(keptTime, invalid);
+  const estimatedDropped = Math.round(((rawTime.length - keptTime.length) / rawTime.length) * totalData);
   meta.originalSampleCount = totalData;
+  meta.originalTimeStart = rawTime[0];
+  meta.originalTimeEnd = rawTime[rawTime.length - 1];
+  meta.droppedSamples += estimatedDropped;
+  meta.requestedSampleRateHz = requestedFs;
+  meta.decimatedSampleCount = estimatedDropped;
+  meta.sourceRowsDecimated = true;
+  meta.decimationCountEstimated = metaRows.length < sheet.totalRows;
+  meta.rawGapCount = rawMeta.gapCount;
   return meta;
 }
 
@@ -666,10 +688,12 @@ export function createExcelWorkbookSessionFromBuffer(
     cellStyles: false,
   });
 
-  const sheets = workbook.SheetNames.map((name, idx) =>
+  // Explicit parameter types keep this file type-clean even when the `xlsx`
+  // module's own declarations are unavailable (e.g. dependency not installed yet).
+  const sheets = workbook.SheetNames.map((name: string, idx: number) =>
     buildSheetPreview(workbook.Sheets[name], name, idx)
   );
-  const firstNumericSheet = sheets.findIndex((s) => s.selected);
+  const firstNumericSheet = sheets.findIndex((s: { selected: boolean }) => s.selected);
   const activeSheetIndex = firstNumericSheet >= 0 ? firstNumericSheet : 0;
 
   return {
@@ -972,7 +996,8 @@ export function parseExcelSheetToChannels(
     sheet.sampleRateOverrideHz && sheet.sampleRateOverrideHz > 0 && isFinite(sheet.sampleRateOverrideHz)
       ? sheet.sampleRateOverrideHz
       : null;
-  const hasExplicitTime = sheet.timeColIndex >= 0 && overrideFs === null;
+  const hasExplicitTime = sheet.timeColIndex >= 0;
+  const timeDecimationRequested = hasExplicitTime && overrideFs !== null;
 
   const rawTime = new Float64Array(rowCap);
   const rawValues: Float32Array[] = activeCols.map(() => new Float32Array(rowCap));
@@ -984,8 +1009,7 @@ export function parseExcelSheetToChannels(
   let prevTime = -Infinity;
 
   let nonMonotonicRawCount = 0;
-  const syntheticClockUsed = overrideFs === null && !hasExplicitTime;
-  const perChannelNanCounts = new Int32Array(activeCols.length);
+  const syntheticClockUsed = !hasExplicitTime;
 
   for (let r = startR; r <= endR; r++) {
     let rowHasAnyValue = false;
@@ -1010,7 +1034,7 @@ export function parseExcelSheetToChannels(
     }
 
     let rowT = 0;
-    if (overrideFs !== null) {
+    if (!hasExplicitTime && overrideFs !== null) {
       if (!rowHasAnyValue) continue;
       rowT = validCount / overrideFs;
     } else if (hasExplicitTime) {
@@ -1064,7 +1088,6 @@ export function parseExcelSheetToChannels(
     for (let c = 0; c < activeCols.length; c++) {
       const rv = rowVals[c];
       rawValues[c][validCount] = rv;
-      if (!Number.isFinite(rv)) perChannelNanCounts[c]++;
     }
     validCount++;
   }
@@ -1090,12 +1113,45 @@ export function parseExcelSheetToChannels(
     }
   }
 
-  const totalSignalNanCount = perChannelNanCounts.reduce((a, b) => a + b, 0);
+  const rawSampleCount = validCount;
+  const rawTimeStart = validCount ? finalTime[0] : 0;
+  const rawTimeEnd = validCount ? finalTime[validCount - 1] : 0;
+  const rawQuality = analyzeSamplingQuality(finalTime, invalidRows);
+
+  let decimatedSampleCount = 0;
+  if (timeDecimationRequested && finalTime.length >= 2) {
+    const keptIndices = selectTimeDecimationIndices(finalTime, overrideFs);
+    if (keptIndices.length !== finalTime.length) {
+      decimatedSampleCount = finalTime.length - keptIndices.length;
+      finalTime = selectArrayByIndices(finalTime, keptIndices);
+      for (let c = 0; c < orderedValues.length; c++) {
+        orderedValues[c] = selectArrayByIndices(orderedValues[c], keptIndices);
+      }
+    }
+  }
+
+  const totalSignalNanCount = orderedValues.reduce((sum, arr) => {
+    let n = 0;
+    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) n++;
+    return sum + n;
+  }, 0);
   const quality = analyzeSamplingQuality(finalTime, invalidRows, totalSignalNanCount);
+  quality.originalSampleCount = rawSampleCount;
+  quality.originalTimeStart = rawTimeStart;
+  quality.originalTimeEnd = rawTimeEnd;
+  quality.droppedSamples += decimatedSampleCount;
   quality.nonMonotonicCount = (quality.nonMonotonicCount || 0) + nonMonotonicRawCount;
   quality.syntheticClockUsed = syntheticClockUsed;
-  quality.rawGapCount = quality.gapCount;
-  if (overrideFs !== null && validCount >= 2) {
+  if (timeDecimationRequested) {
+    quality.requestedSampleRateHz = overrideFs!;
+    quality.decimatedSampleCount = decimatedSampleCount;
+    quality.sourceRowsDecimated = true;
+    quality.decimationCountEstimated = false;
+    quality.rawGapCount = rawQuality.gapCount;
+  } else {
+    quality.rawGapCount = quality.gapCount;
+  }
+  if (overrideFs !== null && !hasExplicitTime && validCount >= 2) {
     quality.isUniformSampling = true;
     quality.qualityStatus = 'uniform';
     quality.sampleRate = overrideFs;
@@ -1105,7 +1161,6 @@ export function parseExcelSheetToChannels(
     quality.gapCount = 0;
     quality.gapIndices = [];
   }
-
   const channels: Record<string, WaveformChannel> = {};
   const drawOrder: string[] = [];
   const skippedEmptyColumns: string[] = [];
@@ -1114,11 +1169,11 @@ export function parseExcelSheetToChannels(
   for (let c = 0; c < activeCols.length; c++) {
     const chMap = activeCols[c];
     const chRawV = orderedValues[c];
-    const chNanCount = perChannelNanCounts[c];
-
+    let chNanCount = 0;
     let finiteCount = 0;
     for (let i = 0; i < chRawV.length; i++) {
       if (!isNaN(chRawV[i]) && isFinite(chRawV[i])) finiteCount++;
+      else chNanCount++;
     }
     if (finiteCount === 0) {
       skippedEmptyColumns.push(chMap.channelName || chMap.header);
@@ -1138,6 +1193,7 @@ export function parseExcelSheetToChannels(
 
     if (
       options.resample &&
+      !timeDecimationRequested &&
       overrideFs === null &&
       (!quality.isUniformSampling || quality.qualityStatus !== 'uniform') &&
       finalTime.length >= 2

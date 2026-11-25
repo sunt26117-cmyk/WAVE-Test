@@ -326,12 +326,9 @@ export function validateTemperatureChannel(ch: WaveformChannel): TemperatureVali
     );
   }
 
-  return {
-    unitLabel: '°C (未标注)',
-    scale: 1,
-    offsetC: 0,
-    warning: `温度通道 "${ch.name}" 未显式标注 °C 单位，已假设数据已完成标定为 °C。`,
-  };
+  throw new Error(
+    `温度通道 "${ch.name}" 未标注温度单位。热阻反演不允许自动假设为 °C；请先确认传感器已完成温度标定，并将通道单位明确设置为 °C 或 K。`
+  );
 }
 
 export function classifyThermalLayer(tauSec: number, pathMode: ThermalPathMode = 'junction_ambient'): string {
@@ -1366,23 +1363,38 @@ export function deconvolveThermalImpedance(
       ? Math.max(0, options.padSpreadRthCPerW)
       : 0;
 
-  // 1. Slice window, enforce strict monotonic increasing timestamps & sanitize finite points
-  const slicedT: number[] = [];
-  const slicedY: number[] = [];
-  const nRaw = Math.min(rawTime.length, rawTemp.length);
-  let prevFiniteT = -Infinity;
-  for (let i = 0; i < nRaw; i++) {
+  // 1. Validate the raw acquisition before slicing. Silently deleting NaN samples
+  // or truncating mismatched arrays can hide missing thermal transients and
+  // produce a deceptively smooth, but physically unsupported, fitted Zth curve.
+  if (rawTime.length !== rawTemp.length) {
+    throw new Error(
+      `热反演输入长度不一致：时间戳 ${rawTime.length} 点、温度 ${rawTemp.length} 点。禁止按较短数组静默截断。`
+    );
+  }
+  for (let i = 0; i < rawTime.length; i++) {
     const ti = rawTime[i];
-    const yi = rawTemp[i];
-    if (!isFinite(ti) || !isFinite(yi)) continue;
-    if (slicedT.length > 0 && ti <= prevFiniteT) {
+    if (!Number.isFinite(ti)) {
+      throw new Error(`热反演时间轴在索引 ${i} 处存在 NaN/Inf 时间戳，已拒绝删除异常点后继续拟合。`);
+    }
+    if (i > 0 && !(ti > rawTime[i - 1])) {
       throw new Error(
-        `时间轴在样本索引 ${i} 处非严格递增 (${ti.toFixed(6)}s <= ${prevFiniteT.toFixed(6)}s)，请先清洗或重采样后再执行热阻反演。`
+        `时间轴在样本索引 ${i} 处非严格递增 (${ti.toFixed(6)}s <= ${rawTime[i - 1].toFixed(6)}s)，请先清洗或重采样后再执行热阻反演。`
       );
     }
-    prevFiniteT = ti;
+  }
+
+  // 2. Slice the requested window. Temperature samples outside the gate are
+  // irrelevant; any invalid sample inside the gate makes the response incomplete.
+  const slicedT: number[] = [];
+  const slicedY: number[] = [];
+  for (let i = 0; i < rawTime.length; i++) {
+    const ti = rawTime[i];
+    const yi = rawTemp[i];
     if (options.tStart !== undefined && ti < options.tStart) continue;
     if (options.tEnd !== undefined && ti > options.tEnd) continue;
+    if (!Number.isFinite(yi)) {
+      throw new Error(`温度通道在索引 ${i}、t=${ti.toFixed(6)}s 处存在 NaN/Inf，不能通过删除样本掩盖热响应缺失。`);
+    }
     slicedT.push(ti);
     slicedY.push(yi);
   }
@@ -2199,11 +2211,41 @@ export function computeLossWithDeskewAndEoss(
   cauerStages: CauerStage[],
   opts: LossSimulationOptions
 ): LossSimulationResult {
-  const nVFull = Math.min(vdsCh.t.length, vdsCh.v.length);
-  const nIFull = Math.min(idsCh.t.length, idsCh.v.length);
+  if (vdsCh.t.length !== vdsCh.v.length) {
+    throw new Error(`Vds 时间戳数量 (${vdsCh.t.length}) 与幅值数量 (${vdsCh.v.length}) 不一致，已拒绝静默截断。`);
+  }
+  if (idsCh.t.length !== idsCh.v.length) {
+    throw new Error(`Ids 时间戳数量 (${idsCh.t.length}) 与幅值数量 (${idsCh.v.length}) 不一致，已拒绝静默截断。`);
+  }
+  const nVFull = vdsCh.t.length;
+  const nIFull = idsCh.t.length;
   if (nVFull < 4 || nIFull < 2) {
     throw new Error('At least 4 Vds samples and 2 Ids samples are required for loss stripping simulation.');
   }
+  if (cauerStages.length === 0) throw new Error('MOS 结温计算缺少 Cauer 热网络；拒绝用 Tamb 伪装成结温曲线。');
+  cauerStages.forEach((stage, idx) => {
+    if (!Number.isFinite(stage.r) || stage.r <= 0 || !Number.isFinite(stage.c) || stage.c <= 0) {
+      throw new Error(`Cauer 第 ${idx + 1} 阶 R/C 必须为有限正数。`);
+    }
+  });
+  const deskewNs = opts.deskewNs ?? 0;
+  const eossUj = opts.eossUj ?? 0;
+  const rdsOn25Mohm = opts.rdsOn25Mohm ?? 0;
+  const tempCoeffAlphaPerC = opts.tempCoeffAlphaPerC ?? 0;
+  if (!Number.isFinite(deskewNs)) throw new Error('Deskew 必须为有限数值（ns）。');
+  if (!Number.isFinite(eossUj) || eossUj < 0) throw new Error('Eoss 必须为非负有限值（µJ）。');
+  if (!Number.isFinite(rdsOn25Mohm) || rdsOn25Mohm < 0) throw new Error('Rds(on)@25°C 必须为非负有限值（mΩ）。');
+  if (!Number.isFinite(tempCoeffAlphaPerC) || tempCoeffAlphaPerC < 0 || tempCoeffAlphaPerC > 0.05) {
+    throw new Error('Rds(on) 温度系数必须为 0～0.05 /°C 的有限值。');
+  }
+  if (!Number.isFinite(opts.tAmbC) || opts.tAmbC <= -273.15 || opts.tAmbC > 1000) throw new Error('环境温度必须高于绝对零度且不超过 1000°C。');
+  if (opts.tStart !== undefined && !Number.isFinite(opts.tStart)) throw new Error('损耗仿真起始时间必须为有限值。');
+  if (opts.tEnd !== undefined && !Number.isFinite(opts.tEnd)) throw new Error('损耗仿真结束时间必须为有限值。');
+  if (opts.vOnThreshV !== undefined && (!Number.isFinite(opts.vOnThreshV) || opts.vOnThreshV < 0)) throw new Error('MOS 导通电压阈值必须为非负有限值。');
+  if (opts.initialNodeT !== undefined && (opts.initialNodeT.length !== cauerStages.length || !opts.initialNodeT.every(Number.isFinite))) {
+    throw new Error('initialNodeT 必须与 Cauer 阶梯数量一致，且所有节点温度均为有限值。');
+  }
+  if (opts.initialTjC !== undefined && !Number.isFinite(opts.initialTjC)) throw new Error('初始结温 initialTjC 必须为有限值。');
 
   let i0 = 0;
   let i1 = nVFull - 1;
@@ -2229,9 +2271,13 @@ export function computeLossWithDeskewAndEoss(
   if (!tbI.monotonic) {
     throw new Error(`Ids 通道时间轴在索引 ${tbI.nonMonotonicIndex} 处非严格递增，无法进行时间对齐与 Deskew 插值。`);
   }
+  // Non-finite samples inside the evaluated gate are marked invalid by the
+  // point-wise mask below. The result is INCOMPLETE with NaN energy/Tj, rather
+  // than throwing or silently repairing the waveform. This preserves a useful
+  // diagnostic while preventing a partial capture from yielding a valid loss.
 
   const thermalPathMode: ThermalPathMode = opts.pathMode === 'pad_ambient' ? 'pad_ambient' : 'junction_ambient';
-  const deskewSec = (opts.deskewNs || 0) * 1e-9;
+  const deskewSec = deskewNs * 1e-9;
   const sameTimebase = areTimebasesSynchronized(vdsCh.t, idsCh.t);
   const warnings: string[] = [];
   const incompleteReasons: string[] = [];
@@ -2300,9 +2346,9 @@ export function computeLossWithDeskewAndEoss(
   const vLowThresh = vMin + vSpan * 0.2;
   const vHighThresh = vMin + vSpan * 0.8;
 
-  const eossJ = Math.max(0, opts.eossUj || 0) * 1e-6;
-  const r25Ohm = Math.max(0, opts.rdsOn25Mohm || 0) * 1e-3;
-  const alpha = opts.tempCoeffAlphaPerC || 0;
+  const eossJ = eossUj * 1e-6;
+  const r25Ohm = rdsOn25Mohm * 1e-3;
+  const alpha = tempCoeffAlphaPerC;
   const vOnThresh = opts.vOnThreshV ?? Math.max(0.5, vMin + vSpan * 0.15);
   const rdsFeedbackEnabled = opts.rdsFeedbackEnabled !== false;
 
@@ -2431,6 +2477,7 @@ export function computeLossWithDeskewAndEoss(
   let energyStrippedJ = 0;
   let switchingEvents = 0;
   let zvsTurnOnCount = 0;
+  let underResolvedEdgeCount = 0;
 
   const mStages = cauerStages.length;
   const nodeT = new Float64Array(Math.max(1, mStages)).fill(opts.tAmbC);
@@ -2552,6 +2599,7 @@ export function computeLossWithDeskewAndEoss(
       transStartIdx = k;
     } else if (swState === 'trans_off') {
       if (vds >= vHighThresh) {
+        if (k - transStartIdx + 1 < 4) underResolvedEdgeCount++;
         applyExactEdgeEnergy(transStartIdx, k, -eossJ);
         switchingEvents++;
         swState = 'off';
@@ -2563,6 +2611,7 @@ export function computeLossWithDeskewAndEoss(
       transStartIdx = k;
     } else if (swState === 'trans_on') {
       if (vds <= vLowThresh) {
+        if (k - transStartIdx + 1 < 4) underResolvedEdgeCount++;
         let maxForwardIds = -Infinity;
         for (let j = Math.max(0, transStartIdx); j <= k; j++) {
           if (iAlignedArr[j] > maxForwardIds) maxForwardIds = iAlignedArr[j];
@@ -2579,6 +2628,34 @@ export function computeLossWithDeskewAndEoss(
         swState = 'off';
       }
     }
+  }
+
+  const truncatedEdgeCount = swState === 'trans_off' || swState === 'trans_on' ? 1 : 0;
+  if (underResolvedEdgeCount > 0 || truncatedEdgeCount > 0) {
+    const reason = `Vds 开关边沿分辨率不足：${underResolvedEdgeCount} 个边沿仅包含少于 4 个采样点，${truncatedEdgeCount} 个边沿在门控结束时未完成；开关瞬态能量无法可靠积分。请提高示波器采样率/缩短时间跨度后重测。`;
+    warnings.push(reason);
+    tjC.fill(Number.NaN);
+    pLossW.fill(Number.NaN);
+    return {
+      time,
+      pLossW,
+      tjC,
+      pLossMeanW: Number.NaN,
+      tjMaxC: Number.NaN,
+      tjMinC: Number.NaN,
+      tjMeanC: Number.NaN,
+      energyRawMj: Number.NaN,
+      energyDeskewedMj: Number.NaN,
+      energyStrippedMj: Number.NaN,
+      switchingEvents,
+      zvsTurnOnCount,
+      incomplete: true,
+      incompleteReasons: [reason],
+      nonFiniteMasked: 0,
+      outOfCoverageCount: 0,
+      thermalPathMode,
+      warnings,
+    };
   }
 
   if (zvsTurnOnCount > 0 && eossJ > 0) {
@@ -2711,11 +2788,23 @@ export function computePowerFromVISources(
     };
   }
 
-  // Pick master channel for timebase (denser channel if both exist, or the sole waveform channel)
-  const nV = vCh ? Math.min(vCh.t.length, vCh.v.length) : 0;
-  const nI = iCh ? Math.min(iCh.t.length, iCh.v.length) : 0;
-  if (vCh && nV < 2) throw new Error('Voltage waveform must have at least 2 samples.');
-  if (iCh && nI < 2) throw new Error('Current waveform must have at least 2 samples.');
+  // A waveform channel is a paired acquisition. Never truncate mismatched
+  // timestamps/values or sort a corrupted axis: both can manufacture false power.
+  const validatePowerChannel = (ch: WaveformChannel | null, label: string): number => {
+    if (!ch) return 0;
+    if (ch.t.length !== ch.v.length) {
+      throw new Error(`${label} 时间戳数量 (${ch.t.length}) 与幅值数量 (${ch.v.length}) 不一致，已拒绝静默截断。`);
+    }
+    if (ch.t.length < 2) throw new Error(`${label} waveform must have at least 2 samples.`);
+    for (let i = 0; i < ch.t.length; i++) {
+      if (!Number.isFinite(ch.t[i])) throw new Error(`${label} 时间轴在索引 ${i} 处含 NaN/Inf。`);
+      if (i > 0 && !(ch.t[i] > ch.t[i - 1])) throw new Error(`${label} 时间轴在索引 ${i} 处非严格递增。`);
+      if (!Number.isFinite(ch.v[i])) throw new Error(`${label} 在索引 ${i} 处含 NaN/Inf 幅值，已拒绝将无效功率样本替换为 0。`);
+    }
+    return ch.t.length;
+  };
+  const nV = validatePowerChannel(vCh, 'Voltage');
+  const nI = validatePowerChannel(iCh, 'Current');
 
   const vScale = vCh ? parseSiUnitScale(vCh.unit, 'V', vCh.name) : 1;
   const iScale = iCh ? parseSiUnitScale(iCh.unit, 'A', iCh.name) : 1;
@@ -2725,13 +2814,18 @@ export function computePowerFromVISources(
   const masterIsV = Boolean(vCh && (!iCh || nV >= nI));
   const masterCh = (masterIsV ? vCh : iCh)!;
   const nMaster = masterIsV ? nV : nI;
-  const sameTimebase = Boolean(vCh && iCh && nV === nI && vCh.t === iCh.t);
+  const sameTimebase = Boolean(
+    vCh && iCh && nV === nI && vCh.t.every((t, idx) => t === iCh.t[idx])
+  );
 
   const sampleChannelAt = (ch: WaveformChannel, nCh: number, scale: number, meanAc: number, targetT: number, fallbackIdx: number): number => {
     if (sameTimebase) return getChannelDisplayValue(ch, fallbackIdx, meanAc) * scale;
     const tArr = ch.t;
-    if (targetT <= tArr[0]) return getChannelDisplayValue(ch, 0, meanAc) * scale;
-    if (targetT >= tArr[nCh - 1]) return getChannelDisplayValue(ch, nCh - 1, meanAc) * scale;
+    if (targetT < tArr[0] || targetT > tArr[nCh - 1]) {
+      throw new Error(`V×I 时间对齐点 ${targetT.toExponential(6)}s 超出 ${ch.name} 时间覆盖范围，禁止端点保持外推。`);
+    }
+    if (targetT === tArr[0]) return getChannelDisplayValue(ch, 0, meanAc) * scale;
+    if (targetT === tArr[nCh - 1]) return getChannelDisplayValue(ch, nCh - 1, meanAc) * scale;
     let lo = 0;
     let hi = nCh - 1;
     while (hi - lo > 1) {
@@ -2746,14 +2840,23 @@ export function computePowerFromVISources(
     return val0 + frac * (val1 - val0);
   };
 
+  const overlapStart = Math.max(
+    vCh ? vCh.t[0] : -Infinity,
+    iCh ? iCh.t[0] : -Infinity,
+    opts.tStart ?? -Infinity
+  );
+  const overlapEnd = Math.min(
+    vCh ? vCh.t[nV - 1] : Infinity,
+    iCh ? iCh.t[nI - 1] : Infinity,
+    opts.tEnd ?? Infinity
+  );
+  if (!(overlapEnd > overlapStart)) {
+    throw new Error('V 与 I 通道在所选分析门控内没有正长度的共同时间覆盖，拒绝端点外推计算功率。');
+  }
   let iStart = 0;
   let iEnd = nMaster - 1;
-  if (opts.tStart !== undefined) {
-    while (iStart < nMaster && masterCh.t[iStart] < opts.tStart) iStart++;
-  }
-  if (opts.tEnd !== undefined) {
-    while (iEnd > iStart && masterCh.t[iEnd] > opts.tEnd) iEnd--;
-  }
+  while (iStart < nMaster && masterCh.t[iStart] < overlapStart) iStart++;
+  while (iEnd > iStart && masterCh.t[iEnd] > overlapEnd) iEnd--;
   const len = Math.max(0, iEnd - iStart + 1);
   if (len < 2) {
     throw new Error('At least 2 samples are required inside the analysis gate to compute V × I power.');
@@ -2781,10 +2884,14 @@ export function computePowerFromVISources(
         ? getChannelDisplayValue(iCh, idx, mI) * iScale
         : sampleChannelAt(iCh, nI, iScale, mI, ti, idx)
       : iConst;
+    if (!Number.isFinite(ti) || !Number.isFinite(vVal) || !Number.isFinite(iVal)) {
+      throw new Error(`V×I 在 t=${ti} 处存在无效时间/电压/电流样本，禁止用 0 替代后继续积分。`);
+    }
     const pRaw = vVal * iVal;
     const pVal = useAbs ? Math.abs(pRaw) : pRaw;
+    if (!Number.isFinite(pVal)) throw new Error(`V×I 在 t=${ti.toExponential(6)}s 处功率溢出或无效。`);
     time[k] = ti;
-    powerW[k] = isFinite(pVal) ? pVal : 0;
+    powerW[k] = pVal;
     absPowers[k] = Math.abs(powerW[k]);
     if (isFinite(vVal)) sumV += vVal;
     if (isFinite(iVal)) sumI += iVal;
@@ -2793,7 +2900,8 @@ export function computePowerFromVISources(
 
   let energyJ = 0;
   for (let k = 1; k < len; k++) {
-    const dt = Math.max(0, time[k] - time[k - 1]);
+    const dt = time[k] - time[k - 1];
+    if (!(dt > 0)) throw new Error(`V×I 积分时间轴在索引 ${k} 处非严格递增。`);
     energyJ += 0.5 * (powerW[k - 1] + powerW[k]) * dt;
   }
   const totalSpan = Math.max(0, time[len - 1] - time[0]);

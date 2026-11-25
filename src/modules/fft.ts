@@ -327,8 +327,11 @@ export function computeFFT(
   channelName: string,
   extra?: { sourceUnit?: string; isUniformSampling?: boolean }
 ): SpectrumResult {
-  if (v.length < 4 || sampleRate <= 0) {
-    throw new Error('Insufficient points or invalid sample rate for FFT.');
+  if (t.length !== v.length) {
+    throw new Error(`FFT 输入长度不一致：时间戳 ${t.length} 点、幅值 ${v.length} 点，已阻止静默截断。`);
+  }
+  if (v.length < 4 || !Number.isFinite(sampleRate) || sampleRate <= 0) {
+    throw new Error('FFT 至少需要 4 组一一对应样本，且名义采样率必须为有限正数。');
   }
 
   let workT = t;
@@ -336,21 +339,19 @@ export function computeFFT(
   let effectiveFs = sampleRate;
   const warnings: string[] = [];
 
-  if (t.length === v.length || t.length >= 4) {
-    const sync = ensureUniformForSpectral(t, v, sampleRate);
-    if (sync.wasResampled || extra?.isUniformSampling === false) {
-      workT = sync.t;
-      workV = sync.v;
-      effectiveFs = sync.sampleRate;
-      if (sync.gapCount > 0) {
-        warnings.push(
-          `Non-uniform sampling detected (${sync.gapCount} gap points); uniformly resampled to ${formatFreq(effectiveFs)} for FFT`
-        );
-      } else {
-        warnings.push(
-          `Non-uniform sampling detected; uniformly resampled to ${formatFreq(effectiveFs)} before FFT`
-        );
-      }
+  const sync = ensureUniformForSpectral(t, v, sampleRate);
+  if (sync.wasResampled || extra?.isUniformSampling === false) {
+    workT = sync.t;
+    workV = sync.v;
+    effectiveFs = sync.sampleRate;
+    if (sync.gapCount > 0) {
+      warnings.push(
+        `Non-uniform sampling detected (${sync.gapCount} gap points); uniformly resampled to ${formatFreq(effectiveFs)} for FFT`
+      );
+    } else {
+      warnings.push(
+        `Non-uniform sampling detected; uniformly resampled to ${formatFreq(effectiveFs)} before FFT`
+      );
     }
   }
 
@@ -368,52 +369,22 @@ export function computeFFT(
   const nonUniformWarning = warnings.find((w) => w.startsWith('Non-uniform sampling'));
   const cappedWarning = warnings.length > 0 ? warnings.join(' · ') : undefined;
 
-  // Sanitize NaN/Inf via linear interpolation between valid neighbors
+  // Invalid samples are rejected at ensureUniformForSpectral(). Do not repair them here:
+  // interpolation/zero-fill can erase switching peaks and create a plausible but false spectrum.
   const cleanSlice = new Float64Array(baseN);
-  let firstValidIdx = -1;
   let validSum = 0;
-  let validCount = 0;
-
   for (let i = 0; i < baseN; i++) {
     const val = workV[i];
-    if (isFinite(val)) {
-      cleanSlice[i] = val;
-      if (firstValidIdx === -1) {
-        firstValidIdx = i;
-        for (let k = 0; k < i; k++) cleanSlice[k] = val;
-      }
-      validSum += val;
-      validCount++;
-    } else {
-      cleanSlice[i] = NaN;
+    if (!Number.isFinite(val)) {
+      throw new Error(`FFT 幅值在重采样后索引 ${i} 处出现 NaN/Inf；已拒绝输出频谱。`);
     }
-  }
-
-  if (validCount === 0) {
-    cleanSlice.fill(0);
-  } else {
-    let prevValid = firstValidIdx;
-    for (let i = firstValidIdx + 1; i < baseN; i++) {
-      if (isFinite(cleanSlice[i])) {
-        const gap = i - prevValid;
-        if (gap > 1) {
-          const y0 = cleanSlice[prevValid];
-          const y1 = cleanSlice[i];
-          for (let k = 1; k < gap; k++) {
-            cleanSlice[prevValid + k] = y0 + ((y1 - y0) * k) / gap;
-          }
-        }
-        prevValid = i;
-      }
-    }
-    for (let i = prevValid + 1; i < baseN; i++) {
-      cleanSlice[i] = cleanSlice[prevValid];
-    }
+    cleanSlice[i] = val;
+    validSum += val;
   }
 
   let sliceMean = 0;
-  if (options.removeDC && validCount > 0) {
-    sliceMean = validSum / validCount;
+  if (options.removeDC) {
+    sliceMean = validSum / baseN;
   }
 
   // Compute or fetch cached Window

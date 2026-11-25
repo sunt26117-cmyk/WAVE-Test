@@ -3730,10 +3730,16 @@ function renderBldcRipple(tab: TabState) {
   const feOverride = isFinite(feRaw) && feRaw > 0 ? feRaw : null;
   const { tStart, tEnd } = getBldcGateBounds(tab, ch);
   const res = analyzeTorqueAndCurrentRipple(ch, feOverride, tStart, tEnd);
+  if (!res.valid) {
+    card.innerHTML = `<div class="text-rose-300 text-xs">${escapeHtml(res.invalidReason || '输入波形无效，已拒绝计算。')}</div>`;
+    return;
+  }
   const unit = ch.unit || 'A';
   const kindBadge =
     res.isTrueMechanicalTorque
-      ? '<span class="px-1.5 py-0.5 bg-emerald-950/70 border border-emerald-500/50 text-emerald-300 rounded-xs text-[10px]">机械轴转矩 (Torque)</span>'
+      ? '<span class="px-1.5 py-0.5 bg-emerald-950/70 border border-emerald-500/50 text-emerald-300 rounded-xs text-[10px]">已标记实测轴转矩</span>'
+      : res.signalKind === 'torque'
+      ? '<span class="px-1.5 py-0.5 bg-amber-950/70 border border-amber-500/50 text-amber-200 rounded-xs text-[10px]">转矩量（实测来源待核实）</span>'
       : res.signalKind === 'current'
       ? '<span class="px-1.5 py-0.5 bg-amber-950/70 border border-amber-500/50 text-amber-200 rounded-xs text-[10px]">电流纹波 (非机械转矩)</span>'
       : res.signalKind === 'power'

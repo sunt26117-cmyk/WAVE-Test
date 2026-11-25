@@ -1794,7 +1794,7 @@ export class ThermalWorkbenchController {
     const eossUj = parseFloat((document.getElementById('thermLossEossInput') as HTMLInputElement)?.value || '12');
     const rdsOn25Mohm = parseFloat((document.getElementById('thermLossRdsInput') as HTMLInputElement)?.value || '4.5');
     const alphaPct = parseFloat((document.getElementById('thermLossAlphaInput') as HTMLInputElement)?.value || '0.45');
-    const rdsFeedbackEnabled = (document.getElementById('thermLossRdsFeedbackChk') as HTMLInputElement)?.checked ?? true;
+    const rdsFeedbackEnabled = (document.getElementById('thermLossRdsFeedbackChk') as HTMLInputElement)?.checked ?? false;
 
     const rng = getChannelGateRange(tab, vdsCh, gate);
     try {
@@ -2954,8 +2954,8 @@ export class ThermalWorkbenchController {
       const pwrEl = document.getElementById('focKpiPower');
       if (pwrEl) {
         pwrEl.innerText = `${res.pInvMeanW.toFixed(2)} W / ${res.tBoardFinalC.toFixed(1)}°C (${
-          res.steadyThermalRunaway ? '不收敛' : `稳态~${res.tBoardSteadyEstC.toFixed(1)}°C`
-        }, ${res.thermalConvergencePct.toFixed(0)}%)`;
+          res.steadyThermalRunaway ? '热失控' : `稳态~${res.tBoardSteadyEstC.toFixed(1)}°C`
+        }, 保守收敛 ${res.thermalConvergencePct.toFixed(0)}% / 六结 ${res.junctionConvergencePct.toFixed(0)}%)`;
       }
 
       const tbody = document.getElementById('focSwitchTableBody');
@@ -3072,11 +3072,19 @@ export class ThermalWorkbenchController {
       this.syncFocViewButtons();
 
       const stallWarnings: string[] = [
+        ...res.warnings,
         `堵转扫描条件: ${res.effectiveStallModulation} (m_eff=${res.effectiveStallModDepthM.toFixed(3)}, PF φ=${res.effectiveStallPfAngleDeg.toFixed(1)}°, R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω), t_safe/I²t 基于宏观 Cauer Tj_limit=${tjLimitC}°C 热稳态/瞬态越限（非数据手册绝热短路 SOA 极限）。`,
       ];
-      if (res.inheritedHotState) {
+      // inheritedMaxTjC is non-null exactly when inheritedFullThermalState is true
+      // (both derive from hasValidInitialState in focThermal.ts), so this extra
+      // check is a no-op at runtime but lets TypeScript narrow the nullable field.
+      if (res.inheritedFullThermalState && res.inheritedMaxTjC !== null) {
         stallWarnings.push(
           `热态初温继承: 已加载最近一次 6-MOS 瞬态完整热网络节点状态 (T_board_init=${res.inheritedBoardTempC.toFixed(1)}°C, Tj_max_init=${res.inheritedMaxTjC.toFixed(1)}°C)。`
+        );
+      } else if (res.inheritedHotState) {
+        stallWarnings.push(
+          `热态初温继承: 仅使用标量 Board 初温 ${res.inheritedBoardTempC.toFixed(1)}°C 初始化所有热网络节点；没有完整 6-MOS 热历史，初始结温 Tj_max 未知，不能代表真实结温梯度。`
         );
       } else {
         stallWarnings.push(
@@ -3103,18 +3111,25 @@ export class ThermalWorkbenchController {
       }
       const safeEl = document.getElementById('focKpiStallSafe');
       if (safeEl) {
-        safeEl.innerText = res.steadySafe
-          ? `SAFE (Steady ≤ ${tjLimitC}°C)`
-          : res.tSafeSec !== null
-          ? `t=${res.tSafeSec.toFixed(2)}s · RMS:${res.i2tRmsA2s?.toFixed(0)} / 臂:${res.i2tWorstLegA2s?.toFixed(0)} A²s`
-          : `EXCEEDS >120s`;
-        safeEl.className = res.steadySafe ? 'text-emerald-300 font-semibold' : 'text-rose-300 font-semibold';
+        safeEl.innerText = res.tSafeSec !== null
+          ? `t_safe=${res.tSafeSec.toFixed(2)}s @ θ=${res.tSafeAngleDeg}°/${res.transientWorstSwitch} · 正弦等效 I²t:${res.i2tRmsA2s?.toFixed(0)} / 最不利相 I²t:${res.i2tWorstLegA2s?.toFixed(0)} A²s${res.stallVoltageLimited ? ' · 请求电流超出线性调制电压能力（条件估算）' : ''}`
+          : !res.stallSteadyConverged
+          ? '稳态求解未收敛（不可判 SAFE）'
+          : res.stallThermalRunaway
+          ? '热失控（不可判 SAFE）'
+          : res.stallVoltageLimited
+          ? '请求电流超出线性调制电压能力；热结果仅为强制电流假设，不可判 SAFE'
+          : res.steadySafe
+          ? `稳态安全；本时域 ${res.transientTime[res.transientTime.length - 1].toFixed(0)}s 未越限`
+          : `稳态超限；本时域未越限`;
+        const transientThermalLimitCrossed = res.tSafeSec !== null;
+        safeEl.className = res.steadySafe && !transientThermalLimitCrossed ? 'text-emerald-300 font-semibold' : 'text-rose-300 font-semibold';
       }
 
       this.drawFocCanvas();
       this.app.showToast(
         `Stall Sweep (${res.effectiveStallModulation}, m=${res.effectiveStallModDepthM.toFixed(3)}, R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω, init=${res.inheritedBoardTempC.toFixed(1)}°C): Worst ${res.worstSwitch} @ θ=${res.worstAngleDeg}° (${res.stallThermalRunaway ? '热失控' : `${res.worstSteadyTjC.toFixed(1)}°C steady`})`,
-        res.steadySafe && !res.stallVoltageLimited ? 'info' : 'warn'
+        res.steadySafe && res.tSafeSec === null && !res.stallVoltageLimited ? 'info' : 'warn'
       );
     } catch (err: any) {
       this.app.showToast(`Stall sweep failed: ${err?.message || err}`, 'error');
@@ -3339,7 +3354,7 @@ export class ThermalWorkbenchController {
       }
       ctx.textAlign = 'left';
       ctx.fillStyle = th.titleText;
-      ctx.fillText(`Worst: ${st.worstSwitch} @ θ=${st.worstAngleDeg}° (${st.worstSteadyTjC.toFixed(1)}°C steady, ${st.phaseSquaredRatioAtWorst.toFixed(2)}× Irms²)`, pad.l + 6, pad.t - 6);
+      ctx.fillText(`Steady worst: ${st.worstSwitch} @ ${st.worstAngleDeg}° · t_safe: ${st.tSafeSec === null ? `not crossed within ${st.transientTime[st.transientTime.length - 1].toFixed(2)}s` : `${st.tSafeSec.toFixed(2)}s @ ${st.tSafeAngleDeg}° / ${st.transientWorstSwitch}`} · I² ratio ${st.phaseSquaredRatioAtWorst.toFixed(2)}×`, pad.l + 6, pad.t - 6);
     } else {
       if (titleEl) titleEl.innerText = 'Carrier Frequency Trade-off: SVPWM vs DPWM1 Total Loss (W)';
       const sw = this.lastFocSweep;

@@ -70,6 +70,34 @@ export function stepScale125(current: number, direction: 1 | -1): number {
 export function computeChannelMean(ch: WaveformChannel): number {
   const v = ch.v;
   if (!v || v.length === 0) return 0;
+
+  // For a non-uniform acquisition, a sample-count mean overweights regions
+  // where the logger happened to sample densely. AC coupling is a DC-offset
+  // removal operation, so its offset must be estimated in the time domain.
+  // Use trapezoidal time weighting over adjacent valid samples.
+  if (ch.metadata?.isUniformSampling === false && ch.t.length === v.length && v.length >= 2) {
+    let area = 0;
+    let duration = 0;
+    let timebaseValid = true;
+    for (let i = 1; i < v.length; i++) {
+      const t0 = ch.t[i - 1];
+      const t1 = ch.t[i];
+      if (!isFinite(t0) || !isFinite(t1) || !(t1 > t0)) {
+        timebaseValid = false;
+        break;
+      }
+      const v0 = v[i - 1];
+      const v1 = v[i];
+      if (!isFinite(v0) || !isFinite(v1)) continue;
+      const dt = t1 - t0;
+      area += 0.5 * (v0 + v1) * dt;
+      duration += dt;
+    }
+    if (timebaseValid && duration > 0) return area / duration;
+  }
+
+  // Uniform captures retain the bounded O(20k) estimate for rendering speed.
+  // Fall back to the sample mean for legacy channels without valid time metadata.
   let sum = 0;
   let count = 0;
   const step = v.length > 50000 ? Math.floor(v.length / 20000) : 1;

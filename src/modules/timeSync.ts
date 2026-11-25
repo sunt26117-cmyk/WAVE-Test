@@ -88,7 +88,8 @@ export function sampleSeriesAtTime(
   targetT: number,
   acMean: number
 ): number {
-  const n = Math.min(tArr.length, ch.v.length);
+  if (tArr.length !== ch.v.length) return Number.NaN;
+  const n = tArr.length;
   if (n === 0) return Number.NaN;
   if (targetT < tArr[0] || targetT > tArr[n - 1]) return Number.NaN;
   if (targetT === tArr[0]) return getChannelDisplayValue(ch, 0, acMean);
@@ -264,7 +265,20 @@ export function alignChannelsToCommonTimebase(
   let overlapEnd = tEnd !== undefined && Number.isFinite(tEnd) ? tEnd : Infinity;
 
   for (const ch of channels) {
-    const n = Math.min(ch.t.length, ch.v.length);
+    if (ch.t.length !== ch.v.length) {
+      const msg = `通道 "${ch.name}" 时间戳 ${ch.t.length} 点、幅值 ${ch.v.length} 点，数据一一对应关系已破坏，拒绝静默截断后继续多通道计算。`;
+      return {
+        valid: false,
+        invalidReason: msg,
+        time: new Float64Array(0),
+        values: channels.map(() => new Float32Array(0)),
+        resampled: false,
+        overlapStart: 0,
+        overlapEnd: 0,
+        warnings: [msg],
+      };
+    }
+    const n = ch.t.length;
     if (n < 2) {
       const msg = `通道 "${ch.name}" 有效样本不足 (<2 点)，无法进行多通道物理运算。`;
       return {
@@ -290,6 +304,15 @@ export function alignChannelsToCommonTimebase(
         overlapStart: 0,
         overlapEnd: 0,
         warnings: [msg],
+      };
+    }
+    const invalidSampleIndex = ch.v.findIndex((value) => !Number.isFinite(value));
+    if (invalidSampleIndex >= 0) {
+      const msg = `通道 "${ch.name}" 的原始幅值在索引 ${invalidSampleIndex} 处包含 NaN/Inf；拒绝在重采样时跳过或插值修补无效样本。`;
+      return {
+        valid: false, invalidReason: msg, time: new Float64Array(0),
+        values: channels.map(() => new Float32Array(0)), resampled: false,
+        overlapStart: 0, overlapEnd: 0, warnings: [msg],
       };
     }
     if (ch.t[0] > overlapStart) overlapStart = ch.t[0];
@@ -322,7 +345,7 @@ export function alignChannelsToCommonTimebase(
   const acMeans = channels.map((ch) => (ch.coupling === 'AC' ? computeChannelMean(ch) : 0));
 
   if (allSynced) {
-    const nRef = Math.min(ref.t.length, ref.v.length);
+    const nRef = ref.t.length;
     let i0 = 0;
     let i1 = nRef - 1;
     while (i0 < nRef && ref.t[i0] < overlapStart) i0++;
@@ -349,12 +372,26 @@ export function alignChannelsToCommonTimebase(
       for (let k = 0; k < len; k++) arr[k] = getChannelDisplayValue(ch, i0 + k, mean);
       return arr;
     });
+    const invalidChannelIndex = values.findIndex((arr) => arr.some((value) => !Number.isFinite(value)));
+    if (invalidChannelIndex >= 0) {
+      const msg = `通道 "${channels[invalidChannelIndex].name}" 在同步门控区间内含 NaN/Inf 幅值样本；缺失数据可能包含瞬态峰值，已阻止生成有效多通道分析结果。`;
+      return {
+        valid: false,
+        invalidReason: msg,
+        time: new Float64Array(0),
+        values: channels.map(() => new Float32Array(0)),
+        resampled: false,
+        overlapStart,
+        overlapEnd,
+        warnings: [...warnings, msg],
+      };
+    }
     return { valid: true, invalidReason: null, time, values, resampled: false, overlapStart, overlapEnd, warnings };
   }
 
   // Build synchronized reference grid from densest channel median dt inside [overlapStart, overlapEnd]
   const dtList = channels.map((ch) => {
-    const n = Math.min(ch.t.length, ch.v.length);
+    const n = ch.t.length;
     const tb = inspectTimebase(ch.t, 0, n - 1);
     return tb.dtMedian > 0 ? tb.dtMedian : (ch.t[n - 1] - ch.t[0]) / Math.max(1, n - 1);
   });
@@ -380,6 +417,21 @@ export function alignChannelsToCommonTimebase(
     return arr;
   });
 
+  const invalidChannelIndex = values.findIndex((arr) => arr.some((value) => !Number.isFinite(value)));
+  if (invalidChannelIndex >= 0) {
+    const msg = `通道 "${channels[invalidChannelIndex].name}" 在公共时间轴对齐后含 NaN/Inf 样本（可能存在采样缺口或无效测量值），已阻止基于不完整波形输出确定性诊断。`;
+    return {
+      valid: false,
+      invalidReason: msg,
+      time: new Float64Array(0),
+      values: channels.map(() => new Float32Array(0)),
+      resampled: true,
+      overlapStart,
+      overlapEnd,
+      warnings: [...warnings, msg],
+    };
+  }
+
   warnings.push(
     `检测到多通道采样率/时间轴不一致，已线性插值对齐至公共时间窗 [${overlapStart.toExponential(3)}s, ${overlapEnd.toExponential(3)}s] (${targetLen} pts)。`
   );
@@ -400,15 +452,27 @@ export function ensureUniformForSpectral(
   v: Float32Array,
   fallbackFs: number
 ): { t: Float64Array; v: Float32Array; sampleRate: number; wasResampled: boolean; gapCount: number } {
-  const n = Math.min(t.length, v.length);
-  if (n < 4) {
-    return { t, v, sampleRate: fallbackFs, wasResampled: false, gapCount: 0 };
+  if (t.length !== v.length) {
+    throw new Error(`FFT 时间轴与幅值数组长度不一致：t=${t.length}, v=${v.length}。禁止静默截断后继续计算频谱。`);
   }
-  const tb = inspectTimebase(t, 0, n - 1);
+  if (t.length < 4) {
+    throw new Error('FFT 至少需要 4 组一一对应的时间戳和幅值样本。');
+  }
+  for (let i = 0; i < v.length; i++) {
+    if (!Number.isFinite(v[i])) {
+      throw new Error(`FFT 幅值在索引 ${i} 处包含 NaN/Inf；频谱分析不得插值修补或将无效样本替换为零。`);
+    }
+  }
+  const tb = inspectTimebase(t, 0, t.length - 1);
+  if (!tb.monotonic) {
+    throw new Error(
+      `FFT 时间轴在索引 ${tb.nonMonotonicIndex ?? '未知'} 处存在 NaN/Inf、重复或倒退时间戳；非单调数据不能直接重采样或计算频谱。`
+    );
+  }
   if (tb.monotonic && tb.isUniform && tb.dtMedian > 0) {
     return { t, v, sampleRate: 1 / tb.dtMedian, wasResampled: false, gapCount: 0 };
   }
-  const resampled = resampleUniform(t.subarray(0, n), v.subarray(0, n), { allowGapInterpolation: false });
+  const resampled = resampleUniform(t, v, { allowGapInterpolation: false });
   return {
     t: resampled.t,
     v: resampled.v,

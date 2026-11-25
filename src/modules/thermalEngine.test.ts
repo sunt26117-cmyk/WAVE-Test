@@ -9,10 +9,11 @@ import {
   parseSiUnitScale,
   validateCauerSpiceNetlist,
 } from './thermalEngine';
-import { evaluateDynamicSoa, SOA_PRESETS } from './dynamicSoa';
+import { evaluateDynamicSoa, interpolateSoaCurveAtVds, SOA_PRESETS } from './dynamicSoa';
 import {
   DEFAULT_FOC_MODEL,
   computePhaseMosLosses,
+  buildPerSwitchJcChains,
   focModelToSpice,
   getModulationLinearCeiling,
   reconstructSensorlessDutySample,
@@ -23,10 +24,11 @@ import {
 } from './focThermal';
 
 import { analyzeSamplingQuality } from './qualityCheck';
-import { inferCsvChannelUnit, previewCsv } from '../parsers/csvParser';
+import { computeChannelMean } from './oscilloscopeScale';
+import { inferCsvChannelUnit, previewCsv, parseFullCsv, computeCsvPreviewQuality } from '../parsers/csvParser';
 import { inferUnitFromHeader } from '../parsers/excelParser';
 import { computeFFT } from './fft';
-import { analyzeThreePhaseBalance, analyzePwmSwitchingAndDeadTime } from './bldcAnalysis';
+import { analyzeThreePhaseBalance, analyzePwmSwitchingAndDeadTime, analyzeTorqueAndCurrentRipple } from './bldcAnalysis';
 import { analyzeDoublePulseTest, generateDptDemoChannels } from './dptAnalyzer';
 import { validateTemperatureChannel } from './thermalEngine';
 
@@ -57,6 +59,41 @@ function makeChannel(
     metadata: analyzeSamplingQuality(t),
   };
 }
+
+test('MOS conduction exposes an exact 25C reference independent of instantaneous Tj', () => {
+  const mos = {
+    rdsOn25Mohm: 5,
+    tempCoeffAlphaPerC: 0.0045,
+    vsdV: 0.8,
+    eonPlusEoffUj: 0,
+    vRefV: 48,
+    iRefA: 20,
+    qrrNc: 0,
+    eossUj: 0,
+  };
+  const cold = computePhaseMosLosses(12, 0.37, 48, 25, 25, 'SVPWM', 20000, 0, mos);
+  const hot = computePhaseMosLosses(12, 0.37, 48, 125, 125, 'SVPWM', 20000, 0, mos);
+  assert.ok(hot.pHighCond > cold.pHighCond);
+  assert.ok(hot.pLowCond > cold.pLowCond);
+  assert.equal(hot.pHighCond25W, cold.pHighCond25W);
+  assert.equal(hot.pLowCond25W, cold.pLowCond25W);
+});
+
+test('AC-coupling offset uses time-weighted mean for non-uniform sampling', () => {
+  // Dense acquisition around 10 V must not outweigh a long 10 V plateau simply
+  // because the logger used fewer samples at the beginning/end of the record.
+  const t = new Float64Array([0, 1, 9, 10]);
+  const v = new Float32Array([0, 10, 10, 0]);
+  const ch = makeChannel('ac_irregular', 'Irregular AC', 'V', t, v);
+  ch.coupling = 'AC';
+  assert.equal(ch.metadata.isUniformSampling, false);
+  // Trapezoidal area = 5 + 80 + 5 = 90 V·s across 10 s.
+  assert.ok(Math.abs(computeChannelMean(ch) - 9) < 1e-6);
+
+  const uniform = makeChannel('ac_uniform', 'Uniform AC', 'V', new Float64Array([0, 1, 2]), new Float32Array([0, 10, 0]));
+  uniform.coupling = 'AC';
+  assert.ok(Math.abs(computeChannelMean(uniform) - 10 / 3) < 1e-6);
+});
 
 test('parseSiUnitScale converts V/A/W SI prefixes accurately', () => {
   assert.equal(parseSiUnitScale('V', 'V'), 1);
@@ -478,7 +515,7 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   const tShort = Float64Array.from({ length: 11 }, (_, i) => 0.05 + i * 0.01);
   const ibShort = Float32Array.from({ length: 11 }, () => -10);
   const rCov = simulateFoc6Mos(makeChannel('ia2', 'Ia', 'A', tA, iaShift), makeChannel('ib2', 'Ib', 'A', tShort, ibShort), DEFAULT_FOC_MODEL, mos, ctrl);
-  assert.ok(rCov.alignmentWarnings.some((w) => w.includes('未完整覆盖仿真区间')));
+  assert.ok(rCov.alignmentWarnings.some((w) => w.includes('裁剪到共同覆盖区间')));
 
   // 2. Non-uniform time-weighted mean (100 pts @ 1ms at 5A + 1 final pt at 1.0s at 40A -> step holds ~0.6W over 0.901s tail)
   const tNu = new Float64Array(101);
@@ -491,7 +528,7 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
     ibNu[i] = -2.5;
     icNu[i] = -2.5;
   }
-  tNu[100] = 1.0;
+  tNu[100] = 0.102; // 3x median interval: irregular, but not a missing acquisition gap
   iaNu[100] = 40;
   ibNu[100] = -20;
   icNu[100] = -20;
@@ -505,6 +542,15 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   );
   // True step-energy average should stay near 0.60W (not inflated by the final 40A point!)
   assert.ok(Math.abs(rNu.pInvMeanW - rNu.pInvTotal[0]) < 0.05, `Expected ~0.6W, got ${rNu.pInvMeanW}`);
+
+  // A large internal gap must not be silently bridged by linear interpolation.
+  const tNuGap = Float64Array.from(tNu, (t, idx) => idx >= 60 ? t + 0.05 : t);
+  assert.throws(() => simulateFoc6Mos(
+    makeChannel('ia_gap', 'Ia', 'A', tNuGap, iaNu),
+    makeChannel('ib_gap', 'Ib', 'A', tNuGap, ibNu),
+    DEFAULT_FOC_MODEL, mos, ctrl,
+    { icCh: makeChannel('ic_gap', 'Ic', 'A', tNuGap, icNu) }
+  ), /内部采样缺口/);
 
   // 3. Time-gate continuous preheat vs explicit cold reset
   const tGate = Float64Array.from({ length: 2000 }, (_, i) => i * 0.001);
@@ -528,6 +574,23 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   assert.ok(preheatGate.tjSteadyMaxEstC > preheatGate.tjMaxGlobalC);
   assert.ok(preheatGate.thermalConvergencePct > 0 && preheatGate.thermalConvergencePct < 100);
 
+  // Preheat begins at the first acquired sample, so Vbus must cover the pre-gate history too.
+  const tVbusGateOnly = Float64Array.from({ length: 501 }, (_, i) => 1.5 + i * 0.001);
+  const vbusGateOnly = makeChannel('vbus_gate_only', 'Vbus', 'V', tVbusGateOnly, new Float32Array(501).fill(48));
+  assert.throws(() => simulateFoc6Mos(
+    makeChannel('iag_vbus', 'Ia', 'A', tGate, iaGate),
+    makeChannel('ibg_vbus', 'Ib', 'A', tGate, ibGate),
+    DEFAULT_FOC_MODEL, mos, ctrl,
+    { tStart: 1.5, tEnd: 2.0, gateThermalMode: 'preheat', vbusCh: vbusGateOnly }
+  ), /Vbus.*未完整覆盖/);
+
+  // Per-switch JC scale values down to 0.05 are valid and must not silently revert to 1.0.
+  const scaledJc = buildPerSwitchJcChains({
+    ...DEFAULT_FOC_MODEL,
+    perSwitchRjcScale: [0.05, 1, 1, 1, 1, 1],
+  });
+  assert.ok(Math.abs(scaledJc[0][0].r - DEFAULT_FOC_MODEL.zthJC[0].r * 0.05) < 1e-12);
+
   // 4. Modulation ceiling & overmodulation reporting + m=0 DPWM1 safety
   assert.equal(getModulationLinearCeiling('SPWM'), 1.0);
   assert.ok(Math.abs(getModulationLinearCeiling('SVPWM') - 2 / Math.sqrt(3)) < 1e-12);
@@ -543,9 +606,11 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
     { r: 0.5, c: 2.0, tauEst: 1.0, layerLabel: 'L3' },
   ];
   const sp = splitCauerToFocModel(unordered, 0.05);
-  assert.deepEqual(sp.zthJC.map((s) => s.layerLabel), ['L1']);
-  assert.deepEqual(sp.zthBoard.map((s) => s.layerLabel), ['L2', 'L3']);
-  assert.equal(sp.splitMeta?.nonMonotonicTau, true);
+  assert.equal(sp.splitFeasible, false);
+  assert.match(sp.splitMeta?.warning || '', /缺少器件手册 RθJC/);
+  const spAnchored = splitCauerToFocModel(unordered, 0.05, { pathMode: 'junction_ambient', rJcDatasheetOhm: 0.2 });
+  assert.equal(spAnchored.splitFeasible, true);
+  assert.ok(spAnchored.zthJC.length > 0 && spAnchored.zthBoard.length > 0);
 
   const spiceZeroAmb = focModelToSpice(DEFAULT_FOC_MODEL, 0);
   assert.match(spiceZeroAmb, /T_amb=0\.00/);
@@ -576,12 +641,23 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   assert.ok(stall.effectiveStallModDepthM > 0.12 && stall.effectiveStallModDepthM < 0.25);
   assert.equal(stall.stallVoltageLimited, false);
   assert.ok(stall.i2tRmsA2s !== null && stall.i2tWorstLegA2s !== null);
+  assert.ok(stall.anglesDeg.includes(stall.tSafeAngleDeg), 't_safe angle must be one of the swept electrical angles');
+  const tSafeRad = (stall.tSafeAngleDeg * Math.PI) / 180;
+  const tSafePhasePeaks = [
+    135 * Math.cos(tSafeRad),
+    135 * Math.cos(tSafeRad - (2 * Math.PI) / 3),
+    135 * Math.cos(tSafeRad + (2 * Math.PI) / 3),
+  ];
+  const expectedTsafeRatio = Math.max(...tSafePhasePeaks.map((v) => v * v)) / (135 * 135 / 2);
+  assert.ok(Math.abs(stall.phaseSquaredRatioAtWorst - expectedTsafeRatio) < 1e-9);
   assert.ok(Math.abs(stall.i2tWorstLegA2s! - stall.phaseSquaredRatioAtWorst * stall.i2tRmsA2s!) < 1e-6);
+  assert.ok(stall.warnings.some((warning) => warning.includes('全部 72 个')));
+  assert.ok(stall.warnings.some((warning) => warning.includes('星形/三角形接法')));
 
   // High Rs stall hits SVPWM ceiling and raises stallVoltageLimited without falling back to 2*Rds(on)
   const stallDefaultRs = runFocStallSweep({
     iPeakA: 135,
-    tjLimitC: 120,
+    tjLimitC: 2000,
     tAmbC: 25,
     modulation: 'SVPWM',
     modDepthM: 0.85,
@@ -595,7 +671,87 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   });
   assert.equal(stallDefaultRs.rPhaseUsedOhm, 0.25);
   assert.equal(stallDefaultRs.stallVoltageLimited, true);
+  assert.equal(stallDefaultRs.thermalSafeAtRequestedCurrent, true, 'thermal-only result may be safe under the forced-current assumption');
+  assert.equal(stallDefaultRs.steadySafe, false, 'an infeasible voltage-limited operating point must never be presented as SAFE');
   assert.ok(Math.abs(stallDefaultRs.effectiveStallModDepthM - getModulationLinearCeiling('SVPWM')) < 1e-6);
+});
+
+
+test('FOC stall sweep honors a requested sub-5-second horizon without extending the result window', () => {
+  const short = runFocStallSweep({
+    iPeakA: 1,
+    tjLimitC: 1000,
+    tAmbC: 25,
+    modulation: 'SVPWM',
+    modDepthM: 0.1,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: {
+      rdsOn25Mohm: 4.5,
+      tempCoeffAlphaPerC: 0.0045,
+      vsdV: 0.9,
+      eonPlusEoffUj: 35,
+      vRefV: 48,
+      iRefA: 30,
+      qrrNc: 60,
+    },
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 0.05,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.025,
+  });
+  assert.equal(short.transientTime.length, 280);
+  assert.ok(Math.abs(short.transientTime[short.transientTime.length - 1] - 0.05) < 1e-12);
+  assert.equal(short.tSafeSec, null);
+});
+
+test('FOC stall inherited maximum Tj reads the junction node, not hotter internal Cauer nodes', () => {
+  const chains = buildPerSwitchJcChains(DEFAULT_FOC_MODEL);
+  const initialThermalState = {
+    armT: chains.map((chain, index) => chain.map((_, stage) => stage === 0 ? 80 + index : 160 + index)),
+    brdT: DEFAULT_FOC_MODEL.zthBoard.map(() => 70),
+    tBoardC: 70,
+    tjMaxC: 85,
+  };
+  const result = runFocStallSweep({
+    iPeakA: 10, tjLimitC: 500, tAmbC: 25, modulation: 'SVPWM', modDepthM: 0.5,
+    fswHz: 20000, tDeadNs: 100, mos: {
+      rdsOn25Mohm: 5, tempCoeffAlphaPerC: 0.0045, vsdV: 0.8,
+      eonPlusEoffUj: 30, vRefV: 48, iRefA: 20, qrrNc: 25,
+    },
+    model: DEFAULT_FOC_MODEL, vBusV: 48, horizonSec: 5,
+    stallDutyMode: 'resistive', rPhaseOhm: 0.04, initialThermalState,
+  });
+  assert.equal(result.inheritedFullThermalState, true);
+  assert.equal(result.inheritedMaxTjC, 85, 'Tj max must use first node of each MOS Cauer arm');
+  assert.equal(result.inheritedBoardTempC, 70);
+});
+
+test('FOC stall scalar Board initialization does not fabricate an initial junction temperature', () => {
+  const result = runFocStallSweep({
+    iPeakA: 10,
+    tjLimitC: 500,
+    tAmbC: 25,
+    tInitialBoardC: 82,
+    modulation: 'SVPWM',
+    modDepthM: 0.5,
+    fswHz: 20000,
+    tDeadNs: 100,
+    mos: {
+      rdsOn25Mohm: 5, tempCoeffAlphaPerC: 0.0045, vsdV: 0.8,
+      eonPlusEoffUj: 30, vRefV: 48, iRefA: 20, qrrNc: 25,
+    },
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 0.01,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.04,
+  });
+  assert.equal(result.inheritedHotState, true);
+  assert.equal(result.inheritedFullThermalState, false);
+  assert.equal(result.inheritedBoardTempC, 82);
+  assert.equal(result.inheritedMaxTjC, null, 'Board temperature alone cannot identify Tj_max');
 });
 
 test('Round-3: External Duty % resolution handles <=1.5% cleanly, NaN/non-monotonic robustness, runaway detection & CSV/Excel Duty unit inference', () => {
@@ -642,6 +798,14 @@ test('Round-3: External Duty % resolution handles <=1.5% cleanly, NaN/non-monoto
     vBusConstV: 48,
   };
 
+  assert.throws(() => runFocStallSweep({
+    iPeakA: 35, tjLimitC: 150, tAmbC: 25, modulation: 'SVPWM', modDepthM: 0.8,
+    fswHz: 20000, tDeadNs: 200, mos, model: { ...DEFAULT_FOC_MODEL, splitFeasible: false, splitMeta: {
+      tauSplitSec: 0, boundaryIndex: -1, boundaryAdjusted: false, nonMonotonicTau: false, shuntCapRatioPct: 0,
+      warning: 'Cauer split infeasible test',
+    } }, vBusV: 48,
+  }), /Cauer split infeasible/);
+
   const rFrac = simulateFoc6Mos(makeChannel('iaf', 'Ia', 'A', t, ia), makeChannel('ibf', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
     icCh: makeChannel('icf', 'Ic', 'A', t, ic),
     dutyChs: {
@@ -674,6 +838,37 @@ test('Round-3: External Duty % resolution handles <=1.5% cleanly, NaN/non-monoto
   assert.ok(Math.abs(rPctExplicit.pInvMeanW - rFrac.pInvMeanW) < 1e-5);
   assert.ok(rPctUnitless.warnings.some((w) => w.includes('按百分比')));
 
+  // Mixed engineering-unit channels must each use their own scale. A global
+  // percentage scale would incorrectly shrink the fractional B phase by 100x.
+  const rMixedDuty = simulateFoc6Mos(makeChannel('iam', 'Ia', 'A', t, ia), makeChannel('ibm', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    icCh: makeChannel('icm', 'Ic', 'A', t, ic),
+    dutyChs: {
+      da: makeChannel('dam', 'Duty_A', '%', t, daPctArr),
+      db: makeChannel('dbm', 'Duty_B', 'pu', t, dbFracArr),
+      dc: makeChannel('dcm', 'Duty_C', '%', t, dcPctArr),
+    },
+  });
+  assert.ok(Math.abs(rMixedDuty.duty.a[10] - 0.012) < 1e-6);
+  assert.ok(Math.abs(rMixedDuty.duty.b[10] - 0.008) < 1e-6);
+  assert.ok(Math.abs(rMixedDuty.duty.c[10] - 0.5) < 1e-6);
+  assert.ok(Math.abs(rMixedDuty.pInvMeanW - rFrac.pInvMeanW) < 1e-5);
+  const badDutyRange = Float32Array.from({ length: n }, () => 120);
+  assert.throws(() => simulateFoc6Mos(makeChannel('iad', 'Ia', 'A', t, ia), makeChannel('ibd', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    dutyChs: {
+      da: makeChannel('dad', 'Duty_A', '%', t, badDutyRange),
+      db: makeChannel('dbd', 'Duty_B', '%', t, dcPctArr),
+      dc: makeChannel('dcd', 'Duty_C', '%', t, dcPctArr),
+    },
+  }), /超过 100.5%/);
+
+  const unbalancedIc = Float32Array.from({ length: n }, () => 2);
+  const kclWarnResult = simulateFoc6Mos(makeChannel('iak', 'Ia', 'A', t, ia), makeChannel('ibk', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+    icCh: makeChannel('ick', 'Ic', 'A', t, unbalancedIc),
+  });
+  assert.ok((kclWarnResult.phaseCurrentKclRelativePct || 0) > 5);
+  assert.ok(kclWarnResult.warnings.some((w) => w.includes('KCL')));
+  assert.ok(kclWarnResult.thermalConvergencePct <= kclWarnResult.junctionConvergencePct + 1e-9);
+
   // 3. Partial Duty selection triggers explicit fallback warning
   const rPartial = simulateFoc6Mos(makeChannel('iaP', 'Ia', 'A', t, ia), makeChannel('ibP', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
     dutyChs: { da: makeChannel('daP', 'Duty_A', '', t, daFracArr), db: null, dc: null },
@@ -681,13 +876,14 @@ test('Round-3: External Duty % resolution handles <=1.5% cleanly, NaN/non-monoto
   assert.equal(rPartial.dutySource, 'reconstructed');
   assert.ok(rPartial.warnings.some((w) => w.includes('部分外部 Duty')));
 
-  // 4. Consecutive NaNs in aux channel interpolate safely instead of zeroing; backward/NaN Ia timestamps throw
+  // 4. Invalid Vbus samples must block thermal loss output; never interpolate across unknown intervals.
   const vbusGap = Float32Array.from({ length: n }, (_, i) => (i >= 40 && i <= 80 ? Number.NaN : 48.0));
-  const rGap = simulateFoc6Mos(makeChannel('iaG', 'Ia', 'A', t, ia), makeChannel('ibG', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
-    vbusCh: makeChannel('vbG', 'Vbus', 'V', t, vbusGap),
-  });
-  assert.ok(Number.isFinite(rGap.pInvMeanW) && rGap.pInvMeanW > 0);
-  assert.ok(rGap.warnings.some((w) => w.includes('NaN/Inf 异常值')));
+  assert.throws(
+    () => simulateFoc6Mos(makeChannel('iaG', 'Ia', 'A', t, ia), makeChannel('ibG', 'Ib', 'A', t, ib), DEFAULT_FOC_MODEL, mos, ctrl, {
+      vbusCh: makeChannel('vbG', 'Vbus', 'V', t, vbusGap),
+    }),
+    /NaN\/Inf/ 
+  );
 
   const tBack = Float64Array.from(t);
   tBack[50] = tBack[48];
@@ -836,7 +1032,7 @@ test('Audit items #4, #5, #8, #9, #11, #13, #15, #16: strict units, single-shunt
   assert.equal(coldStall.inheritedHotState, false);
   assert.equal(hotStall.inheritedHotState, true);
   assert.equal(hotStall.effectiveStallPfAngleDeg, 0); // resistive ignores PF=45
-  assert.ok(hotStall.inheritedMaxTjC > hotStall.inheritedBoardTempC + 2.0);
+  assert.ok(hotStall.inheritedMaxTjC !== null && hotStall.inheritedMaxTjC > hotStall.inheritedBoardTempC + 2.0);
   assert.ok(
     hotStall.tSafeSec !== null && coldStall.tSafeSec !== null && hotStall.tSafeSec < coldStall.tSafeSec,
     `Hot stall t_safe (${hotStall.tSafeSec}) must be shorter than cold stall (${coldStall.tSafeSec})`
@@ -993,6 +1189,10 @@ test('Audit P0/P1: Dynamic SOA fail-closed INVALID, temp validation, ZVS Eoss sk
     makeChannel('tk', 'Tj_K', 'K', tTh, Float32Array.from({ length: 100 }, () => 300.15))
   );
   assert.equal(kRes.offsetC, -273.15);
+  assert.throws(
+    () => validateTemperatureChannel(makeChannel('t-unknown', 'Temperature', '', tTh, new Float32Array(100).fill(25))),
+    /未标注温度单位/
+  );
 
   // Non-monotonic timebase rejected by deconvolveThermalImpedance
   const tBad = Float64Array.from({ length: 50 }, (_, i) => (i === 25 ? 0.1 : i * 0.05));
@@ -1005,6 +1205,21 @@ test('Audit P0/P1: Dynamic SOA fail-closed INVALID, temp validation, ZVS Eoss sk
   );
   assert.throws(() =>
     deconvolveThermalImpedance(tempGood.t, Float64Array.from(tempGood.v), { mode: 'cooling', powerW: 10, targetOrder: 2 })
+  );
+
+  // Thermal deconvolution must reject truncated arrays and invalid samples
+  // inside the selected gate instead of silently deleting them before fitting.
+  const validThermalT = Float64Array.from({ length: 80 }, (_, i) => i * 0.05);
+  const validThermalY = Float64Array.from(validThermalT, (t) => 25 + 20 * (1 - Math.exp(-t / 0.6)));
+  assert.throws(
+    () => deconvolveThermalImpedance(validThermalT, validThermalY.slice(0, -1), { mode: 'heating', powerW: 10, targetOrder: 2 }),
+    /长度不一致/
+  );
+  const invalidThermalY = validThermalY.slice();
+  invalidThermalY[30] = Number.NaN;
+  assert.throws(
+    () => deconvolveThermalImpedance(validThermalT, invalidThermalY, { mode: 'heating', powerW: 10, targetOrder: 2 }),
+    /NaN\/Inf/
   );
 
   // 3. Rds feedback toggle & ZVS Eoss skip check
@@ -1037,7 +1252,7 @@ test('Audit P0/P1: Dynamic SOA fail-closed INVALID, temp validation, ZVS Eoss sk
       { r: 1.6, c: 0.5, tauEst: 0.8, layerLabel: 'PCB' },
     ],
     0.05,
-    { pathMode: 'junction_ambient', rJcDatasheetOhm: 0.6 }
+    { pathMode: 'junction_ambient', rJcDatasheetOhm: 0.4 }
   );
   assert.equal(constrainedModel.modelKind, 'datasheet_constrained');
   const asymModel = { ...constrainedModel, perSwitchRjcScale: [1.0, 1.3, 1.0, 1.0, 1.0, 1.0] };
@@ -1052,6 +1267,8 @@ test('Audit P0/P1: Dynamic SOA fail-closed INVALID, temp validation, ZVS Eoss sk
     { rdsOn25Mohm: 5, tempCoeffAlphaPerC: 0.0045, eonPlusEoffUj: 400, eossUj: 10, qrrNc: 30, vRefV: 48, iRefA: 25, vsdV: 0.8 },
     { vBusConstV: 48, tAmbC: 25, modulation: 'SVPWM', modDepthM: 0.85, pfAngleDeg: 0, fswHz: 20000, tDeadNs: 200 }
   );
+  assert.ok(simAsym.warnings.some((w) => w.includes('Eoss') && w.includes('Coss')));
+  assert.ok(simAsym.warnings.some((w) => w.includes('单颗硬开关 MOS')));
   const ah = simAsym.summaries.find((s) => s.key === 'AH')!;
   const al = simAsym.summaries.find((s) => s.key === 'AL')!;
   assert.ok(al.tjPeakC > ah.tjPeakC, `Expected AL with 1.3x Rjc (${al.tjPeakC}) > AH (${ah.tjPeakC})`);
@@ -1070,6 +1287,147 @@ test('Audit P0/P1: Dynamic SOA fail-closed INVALID, temp validation, ZVS Eoss sk
   assert.ok(dptRes.vdsPeakV > dptRes.vBusSteadyV + 5);
   assert.ok(dptRes.vMillerPlateauV !== null && dptRes.vMillerPlateauV > 3.0 && dptRes.vMillerPlateauV < 7.0);
   assert.ok(dptRes.iRrPeakA > 5 && dptRes.qRrNc > 10);
+});
+
+test('SOA rejects malformed curves, mismatched arrays, invalid units and out-of-curve extrapolation', () => {
+  const t = Float64Array.from({ length: 8 }, (_, i) => i * 1e-4);
+  const v = new Float32Array(8).fill(24);
+  const i = new Float32Array(8).fill(10);
+
+  const badUnit = evaluateDynamicSoa(
+    makeChannel('bad-v', 'Vds', 's', t, v),
+    makeChannel('good-i', 'Ids', 'A', t, i),
+    SOA_PRESETS[0]
+  );
+  assert.equal(badUnit.status, 'INVALID');
+  assert.equal(badUnit.pass, false);
+
+  const mismatched = makeChannel('short-i', 'Ids', 'A', t, i);
+  mismatched.v = new Float32Array(7).fill(10);
+  const shapeInvalid = evaluateDynamicSoa(
+    makeChannel('good-v', 'Vds', 'V', t, v),
+    mismatched,
+    SOA_PRESETS[0]
+  );
+  assert.equal(shapeInvalid.status, 'INVALID');
+
+  const incompleteCurve = {
+    ...SOA_PRESETS[0],
+    curves: { ...SOA_PRESETS[0].curves, '10ms': [] },
+  } as typeof SOA_PRESETS[number];
+  const curveInvalid = evaluateDynamicSoa(
+    makeChannel('curve-v', 'Vds', 'V', t, v),
+    makeChannel('curve-i', 'Ids', 'A', t, i),
+    incompleteCurve
+  );
+  assert.equal(curveInvalid.status, 'INVALID');
+
+  assert.equal(
+    Number.isNaN(interpolateSoaCurveAtVds([{ vds: 1, id: 10 }, { vds: 10, id: 1 }], 12)),
+    true,
+    'SOA interpolation must not flat-extrapolate an undefined high-voltage region'
+  );
+});
+
+test('FFT rejects mismatched and non-monotonic timebases but resamples valid non-uniform captures', () => {
+  const uniformT = Float64Array.from({ length: 128 }, (_, i) => i / 128000);
+  const sine = Float32Array.from(uniformT, (t) => Math.sin(2 * Math.PI * 1000 * t));
+  assert.throws(
+    () => computeFFT(uniformT, sine.slice(0, -1), 128000, { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: true }, 'fft-bad-len', 'bad length'),
+    /长度不一致/
+  );
+
+  const nonMonotonicT = uniformT.slice();
+  nonMonotonicT[40] = nonMonotonicT[39];
+  assert.throws(
+    () => computeFFT(nonMonotonicT, sine, 128000, { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: true }, 'fft-bad-time', 'bad time'),
+    /非单调/
+  );
+
+  const invalidSpectrum = sine.slice();
+  invalidSpectrum[50] = Number.NaN;
+  assert.throws(
+    () => computeFFT(uniformT, invalidSpectrum, 128000, { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: true }, 'fft-bad-value', 'bad value'),
+    /NaN\/Inf/
+  );
+
+  const jitteredT = Float64Array.from(uniformT, (t, i) => t + (i % 2 ? 0.08 / 128000 : 0));
+  const jitteredSine = Float32Array.from(jitteredT, (t) => Math.sin(2 * Math.PI * 1000 * t));
+  const resampled = computeFFT(jitteredT, jitteredSine, 128000, { range: 'entire', window: 'hann', scale: 'magnitude', zeroPadding: 1, removeDC: true }, 'fft-jittered', 'jittered');
+  assert.match(resampled.nonUniformWarning || '', /resampled/);
+});
+
+test('common timebase alignment rejects mismatched sample arrays and NaN values in the analysis window', () => {
+  const t = Float64Array.from({ length: 12 }, (_, i) => i * 1e-3);
+  const a = makeChannel('sync-a', 'Ia', 'A', t, new Float32Array(12).fill(1));
+  const short = makeChannel('sync-short', 'Ib', 'A', t, new Float32Array(11).fill(1));
+  const lengthFail = alignChannelsToCommonTimebase([a, short]);
+  assert.equal(lengthFail.valid, false);
+  assert.match(lengthFail.invalidReason || '', /一一对应关系已破坏/);
+
+  const nanValues = new Float32Array(12).fill(1);
+  nanValues[5] = Number.NaN;
+  const badSignal = makeChannel('sync-nan', 'Ic', 'A', t, nanValues);
+  const valueFail = alignChannelsToCommonTimebase([a, badSignal]);
+  assert.equal(valueFail.valid, false);
+  assert.match(valueFail.invalidReason || '', /NaN\/Inf/);
+
+  const offGridT = Float64Array.from({ length: 12 }, (_, i) => i * 1e-3 + (i % 2 ? 1e-4 : 0));
+  const offGridBad = new Float32Array(12).fill(1);
+  offGridBad[5] = Number.NaN;
+  const offGridFail = alignChannelsToCommonTimebase([a, makeChannel('sync-offgrid-nan', 'Ib', 'A', offGridT, offGridBad)]);
+  assert.equal(offGridFail.valid, false, 'resampling must not skip invalid source points that do not land on the target grid');
+});
+
+test('FOC thermal simulation rejects duplicate timestamps and incomplete auxiliary coverage', () => {
+  const duplicateT = new Float64Array([0, 0.001, 0.001, 0.003, 0.004, 0.005]);
+  const goodT = new Float64Array([0, 0.001, 0.002, 0.003, 0.004, 0.005]);
+  const ia = makeChannel('ia-dup', 'Ia', 'A', duplicateT, new Float32Array([1, 2, 3, 4, 5, 6]));
+  const ib = makeChannel('ib-good', 'Ib', 'A', goodT, new Float32Array([1, 2, 3, 4, 5, 6]));
+  const mos = {
+    rdsOn25Mohm: 5,
+    tempCoeffAlphaPerC: 0.0045,
+    eonPlusEoffUj: 100,
+    eossUj: 0,
+    qrrNc: 0,
+    vRefV: 48,
+    iRefA: 10,
+    vsdV: 0.8,
+  };
+  const ctrl = {
+    vBusConstV: 48,
+    tAmbC: 25,
+    modulation: 'SVPWM' as const,
+    modDepthM: 0.8,
+    pfAngleDeg: 0,
+    fswHz: 20000,
+    tDeadNs: 200,
+  };
+  assert.throws(() => simulateFoc6Mos(ia, ib, DEFAULT_FOC_MODEL, mos, ctrl), /重复时间戳/);
+
+  const iaGood = makeChannel('ia-good', 'Ia', 'A', goodT, new Float32Array([1, 2, 3, 4, 5, 6]));
+  const ibPartialT = new Float64Array([0.001, 0.002, 0.003, 0.004, 0.005]);
+  const ibPartial = makeChannel('ib-partial', 'Ib', 'A', ibPartialT, new Float32Array([1, 2, 3, 4, 5]));
+  const clippedOverlap = simulateFoc6Mos(iaGood, ibPartial, DEFAULT_FOC_MODEL, mos, ctrl);
+  assert.ok(clippedOverlap.alignmentWarnings.some((w) => w.includes('裁剪到共同覆盖区间')));
+
+  // A large gap entirely outside the selected gate must not invalidate the
+  // clean measured interval; only gaps intersecting the actual gate are fatal.
+  const gatedGapT = Float64Array.from({ length: 12 }, (_, i) => i < 6 ? i * 0.001 : 0.5 + (i - 6) * 0.001);
+  const gatedIa = makeChannel('ia-gated-gap', 'Ia', 'A', gatedGapT, new Float32Array(12).fill(4));
+  const gatedIb = makeChannel('ib-gated-gap', 'Ib', 'A', gatedGapT, new Float32Array(12).fill(-2));
+  const cleanStartGate = simulateFoc6Mos(gatedIa, gatedIb, DEFAULT_FOC_MODEL, mos, ctrl, {
+    tStart: 0.5,
+    tEnd: 0.505,
+    gateThermalMode: 'cold',
+  });
+  assert.equal(cleanStartGate.time.length, 6);
+  const cleanEndGate = simulateFoc6Mos(gatedIa, gatedIb, DEFAULT_FOC_MODEL, mos, ctrl, {
+    tStart: 0,
+    tEnd: 0.005,
+    gateThermalMode: 'cold',
+  });
+  assert.equal(cleanEndGate.time.length, 6);
 });
 
 import { alignChannelsToCommonTimebase, inspectChannelSamplingGaps } from './timeSync';
@@ -1141,6 +1499,28 @@ test('Round-2 P0/P1: timeSync fail-closed, SOA INDETERMINATE, Loss INCOMPLETE/pr
     { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
   );
   assert.equal(lossCov.incomplete, true);
+
+
+  // A switching transition represented by only two acquired samples cannot support a credible edge-energy/Tj result.
+  const tFastEdge = Float64Array.from({ length: 8 }, (_, i) => i * 1e-6);
+  const vFastEdge = Float32Array.from([0, 0, 100, 100, 100, 100, 100, 100]);
+  const iFastEdge = Float32Array.from([10, 10, 0, 0, 0, 0, 0, 0]);
+  const underResolved = computeLossWithDeskewAndEoss(
+    makeChannel('v_fast_edge', 'Vds', 'V', tFastEdge, vFastEdge),
+    makeChannel('i_fast_edge', 'Ids', 'A', tFastEdge, iFastEdge),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
+  );
+  assert.equal(underResolved.incomplete, true);
+  assert.ok(underResolved.incompleteReasons.some((reason) => reason.includes('少于 4 个采样点')));
+  assert.ok(Number.isNaN(underResolved.tjMaxC));
+
+  assert.throws(() => computeLossWithDeskewAndEoss(
+    makeChannel('v_no_rc', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('i_no_rc', 'Ids', 'A', tLoss, iLoss),
+    [],
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
+  ), /缺少 Cauer 热网络/);
 
   const tLossGap = Float64Array.from({ length: 30 }, (_, i) => (i < 15 ? i * 1e-4 : 0.005 + (i - 15) * 1e-4));
   const lossGap = computeLossWithDeskewAndEoss(
@@ -1260,3 +1640,63 @@ test('Round-2 P0/P1: timeSync fail-closed, SOA INDETERMINATE, Loss INCOMPLETE/pr
   );
   assert.equal(ssBadT.valid, false);
 });
+
+
+test('CSV manual sample-rate override thins explicit Time rows and retains original source values', () => {
+  const csv = 'Time (ms),Ia\n10,1\n10.5,2\n11.0,3\n';
+  const preview = previewCsv(csv);
+  assert.equal(preview.timeColIndex, 0);
+
+  const previewMeta = computeCsvPreviewQuality(csv, preview, 'ms', 2000);
+  assert.ok(previewMeta);
+  assert.ok(Math.abs((previewMeta!.sampleRate || 0) - 2000) < 1e-6);
+  assert.equal(previewMeta!.originalTimeStart, 0.01);
+  assert.equal(previewMeta!.originalTimeEnd, 0.011);
+
+  const parsed = parseFullCsv(csv, {
+    delimiter: ',', hasHeader: true, skipLines: 0, timeColIndex: 0,
+    timeUnit: 'ms', sampleRateOverrideHz: 1000,
+    columnMappings: preview.columnMappings, resample: false, colors: ['#fff'],
+  });
+  const ch = parsed.channels[parsed.drawOrder[0]];
+  assert.deepEqual(Array.from(ch.t), [0.01, 0.011]);
+  assert.deepEqual(Array.from(ch.v), [1, 3]);
+  assert.ok(ch.fs !== null && Math.abs(ch.fs - 1000) < 1e-9);
+  assert.equal(parsed.quality.decimatedSampleCount, 1);
+});
+
+test('CSV manual sample-rate override creates index-based time only when no Time column is selected', () => {
+  const csv = 'Ia,Ib\n1,2\n3,4\n5,6\n';
+  const preview = previewCsv(csv);
+  const mappings = preview.columnMappings.map((m) => ({ ...m, role: 'channel' as const }));
+  const parsed = parseFullCsv(csv, {
+    delimiter: ',', hasHeader: true, skipLines: 0, timeColIndex: -1,
+    timeUnit: 's', sampleRateOverrideHz: 500,
+    columnMappings: mappings, resample: false, colors: ['#fff', '#000'],
+  });
+  const ch = parsed.channels[parsed.drawOrder[0]];
+  assert.deepEqual(Array.from(ch.t), [0, 0.002, 0.004]);
+  assert.equal(ch.fs, 500);
+});
+
+test('Torque ripple requires a valid one-to-one waveform and verified source before claiming measured shaft torque', () => {
+  const t = Float64Array.from({ length: 256 }, (_, i) => i / 20000);
+  const values = Float32Array.from(t, (x) => 1 + 0.1 * Math.sin(2 * Math.PI * 100 * x));
+  const torqueChannel = makeChannel('tq', 'Torque', 'Nm', t, values);
+  const unknownSource = analyzeTorqueAndCurrentRipple(torqueChannel, 100);
+  assert.equal(unknownSource.valid, true);
+  assert.equal(unknownSource.signalKind, 'torque');
+  assert.equal(unknownSource.isTrueMechanicalTorque, false);
+  assert.match(unknownSource.warning || '', /来源待核实|来源/);
+
+  torqueChannel.metadata = { ...torqueChannel.metadata!, dataProvenance: 'measured' };
+  const measuredSource = analyzeTorqueAndCurrentRipple(torqueChannel, 100);
+  assert.equal(measuredSource.isTrueMechanicalTorque, true);
+
+  const badT = t.slice();
+  badT[80] = badT[79];
+  const invalid = analyzeTorqueAndCurrentRipple(makeChannel('tq-bad', 'Torque', 'Nm', badT, values), 100);
+  assert.equal(invalid.valid, false);
+  assert.match(invalid.invalidReason || '', /重复或倒退/);
+});
+

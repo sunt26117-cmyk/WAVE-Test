@@ -6,6 +6,9 @@
 export type TimeQualityStatus = 'uniform' | 'non-uniform' | 'severe-jitter';
 
 export interface SamplingMetadata {
+  /** Distinguishes acquired instrument data from analytical/model-generated samples. */
+  dataProvenance?: 'measured' | 'derived_estimate' | 'synthetic_steady_state' | 'simulated_switching';
+  sourceModel?: string;
   originalSampleCount: number;
   originalTimeStart: number;
   originalTimeEnd: number;
@@ -29,6 +32,14 @@ export interface SamplingMetadata {
   rawGapCount?: number;
   resampledFromNonUniform?: boolean;
   syntheticClockUsed?: boolean;
+  /** User-requested thinning rate; selected measured timestamps remain authoritative. */
+  requestedSampleRateHz?: number;
+  /** Number of source rows intentionally omitted by time-domain thinning. */
+  decimatedSampleCount?: number;
+  /** True when only existing source rows were retained (no interpolation). */
+  sourceRowsDecimated?: boolean;
+  /** Preview thinning counts are based on a bounded row scan, not the full file. */
+  decimationCountEstimated?: boolean;
 }
 
 export type ChannelCoupling = 'DC' | 'AC';

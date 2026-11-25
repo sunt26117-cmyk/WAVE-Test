@@ -18,7 +18,7 @@ import {
   solveSinglePoint,
 } from '../../modules/focDyno/motorPhysics';
 import { RawRuntimeLogEntry } from '../../modules/focDyno/demoData';
-import { parseSpreadsheetFile } from '../../modules/focDyno/dynoCalibrator';
+import { detectHeaderEngineeringScale, parseSpreadsheetFile } from '../../modules/focDyno/dynoCalibrator';
 import {
   ScopeCurrentUnit,
   ScopeSpeedUnit,
@@ -150,6 +150,14 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
         return 1;
       };
       const tMult = tCol ? detectTimeMultiplier(tCol) : 1;
+      const vScale = detectHeaderEngineeringScale(vCol, 'voltage');
+      const iScale = detectHeaderEngineeringScale(iCol, 'current');
+      const nScale = detectHeaderEngineeringScale(nCol, 'speed');
+      const badUnit = [vScale, iScale, nScale].find((u) => u.invalidToken);
+      if (badUnit?.invalidToken) {
+        onNotify(`运行日志单位「${badUnit.invalidToken}」无法安全换算，请将列单位改为 V/mV、A/mA、RPM/krpm 或 rad/s。`);
+        return;
+      }
 
       const parseTimeStringSec = (raw: unknown): number => {
         if (typeof raw !== 'string') return Number.NaN;
@@ -160,7 +168,15 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
 
       let tStrBase = Number.NaN;
       const parsed: RawRuntimeLogEntry[] = [];
-      ds.rows.forEach((row, idx) => {
+      for (let idx = 0; idx < ds.rows.length; idx++) {
+        const row = ds.rows[idx];
+        const vRaw = Number(row[vCol]);
+        const iRaw = Number(row[iCol]);
+        const nRaw = Number(row[nCol]);
+        // Ignore wholly blank/non-numeric data rows, but never fabricate a time
+        // for a row carrying valid engineering values and a broken Time cell.
+        if (!Number.isFinite(vRaw) || !Number.isFinite(iRaw) || !Number.isFinite(nRaw)) continue;
+
         let t = idx * 0.002;
         if (tCol) {
           const rawT = row[tCol];
@@ -172,22 +188,34 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
             if (Number.isFinite(hms)) {
               if (!Number.isFinite(tStrBase)) tStrBase = hms;
               t = hms - tStrBase;
+            } else {
+              throw new Error(`第 ${idx + 2} 行 Time 单元格无效；检测到 Time 列后禁止回退到合成 2 ms 时间轴。`);
             }
           }
         }
-        const v = Number(row[vCol]);
-        const i = Number(row[iCol]);
-        const n = Number(row[nCol]);
-        if (Number.isFinite(v) && Number.isFinite(i) && Number.isFinite(n)) {
-          parsed.push({ timeS: Number.isFinite(t) ? t : idx * 0.002, vMeasV: v, iBusA: i, nRpm: n });
+
+        const v = vRaw * vScale.scale;
+        const i = iRaw * iScale.scale;
+        const n = nRaw * nScale.scale;
+        if (!Number.isFinite(v) || v <= 0 || !Number.isFinite(i) || !Number.isFinite(n)) {
+          throw new Error(`第 ${idx + 2} 行 V_bus/I_bus/n_rpm 转换后无效（V_bus 必须大于 0）。`);
         }
-      });
+        if (parsed.length > 0 && t <= parsed[parsed.length - 1].timeS) {
+          throw new Error(`第 ${idx + 2} 行 Time 重复或倒退；请先按时间升序整理运行日志。`);
+        }
+        parsed.push({ timeS: t, vMeasV: v, iBusA: i, nRpm: n });
+      }
 
       if (parsed.length === 0) {
         onNotify('未解析出有效的运行日志数值行。');
         return;
       }
-      setScopeExtractWarnings([]);
+      const importWarnings: string[] = [];
+      if (!tCol) importWarnings.push('文件未包含 Time 列，按原始行号以 500 Sa/s（2 ms）重建时间轴。');
+      if (!vScale.unit) importWarnings.push('V_bus 列未声明单位，按 V 处理。');
+      if (!iScale.unit) importWarnings.push('I_bus 列未声明单位，按 A 处理。');
+      if (!nScale.unit) importWarnings.push('n_rpm 列未声明单位，按 RPM 处理。');
+      setScopeExtractWarnings(importWarnings);
       setScopeVbusScaleNote(null);
       onUpdateLog(parsed, ds.fileName);
     } catch (err) {
@@ -254,7 +282,7 @@ export const Tab2RuntimeEst: React.FC<Tab2Props> = ({
   const handlePushBatchToScope = () => {
     const tab = buildOscilloscopeTabFromBatchLog(logProcessed, logFileName);
     if (!tab) {
-      onNotify('当前日志点数不足，无法发送到示波器。');
+      onNotify('日志不足或时间戳无效（NaN、重复、倒退），无法生成可靠时间轴；请检查日志时间列。');
       return;
     }
     onSendTabToScope(tab);

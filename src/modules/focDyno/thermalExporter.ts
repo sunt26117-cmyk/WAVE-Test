@@ -39,6 +39,8 @@ export interface SixMosSummary {
   modulationMode: ExporterModulationMode;
   includeDuty: boolean;
   modulationNote: string;
+  dataProvenance: 'synthetic_steady_state';
+  waveformModel: 'ideal_sinusoidal_current_average_duty';
   feHz: number;
   iqPeakA: number;
   iphRmsA: number;
@@ -149,7 +151,9 @@ export function synthesizeSixMosWaveform(
         tAmbC: exportPt.tAmbC,
         modulationMode: modulation,
         includeDuty,
-        modulationNote: '支持直接一键导入本软件「MOS Thermal → 4. BLDC FOC 6-MOS」评估（SVPWM / DPWM1）',
+        modulationNote: '该工况未生成有效波形；本模块的成功输出也仅为理想稳态合成数据，非实测 PWM 波形。',
+        dataProvenance: 'synthetic_steady_state',
+        waveformModel: 'ideal_sinusoidal_current_average_duty',
         feHz: res.feHz,
         iqPeakA: Number.NaN,
         iphRmsA: Number.NaN,
@@ -173,6 +177,8 @@ export function synthesizeSixMosWaveform(
 
   const samples: WaveformSample[] = new Array(totalSamples);
   const lines: string[] = [
+    '# WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_STEADY_STATE',
+    '# WAVEFORM_MODEL=IDEAL_SINUSOIDAL_PHASE_CURRENT_AND_CYCLE_AVERAGE_DUTY_NOT_PWM_SWITCHING_WAVEFORM',
     includeDuty ? 'Time,Ia,Ib,Ic,Vbus,Duty_A,Duty_B,Duty_C' : 'Time,Ia,Ib,Ic,Vbus',
   ];
 
@@ -217,8 +223,10 @@ export function synthesizeSixMosWaveform(
     modulationMode: modulation,
     includeDuty,
     modulationNote: includeDuty
-      ? `已生成 ${modulation} Duty_A/B/C 实测占空比序列，可直接驱动 6-MOS 损耗计算`
-      : '可直接一键注入本软件「MOS Thermal → BLDC FOC 6-MOS」执行结温仿真',
+      ? `已生成 ${modulation} 周期平均 Duty_A/B/C 模型序列（非实测 PWM 开关波形）；仅适用于平均模型估算，不代表实测占空比或开关损耗波形。`
+      : '理想稳态正弦相电流模型；可用于受限的平均损耗/热趋势估算，不代表实测 FOC 波形。',
+    dataProvenance: 'synthetic_steady_state',
+    waveformModel: 'ideal_sinusoidal_current_average_duty',
     feHz: res.feHz,
     iqPeakA: iq,
     iphRmsA: Number.isFinite(res.iphRmsA) ? res.iphRmsA : 0,
