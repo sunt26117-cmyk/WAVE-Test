@@ -43,21 +43,73 @@ export type FocModelProvenanceKind =
 export const MOS_SWITCH_KEYS: MosSwitchKey[] = ['AH', 'AL', 'BH', 'BL', 'CH', 'CL'];
 
 export interface PcbZoneConfig {
+  /** Local PCB thermal-region centroid, relative to the imported board origin. */
   xMm: number;
   yMm: number;
+  /** Optional effective region area used to derive a first-order thermal capacitance. */
+  areaMm2?: number;
+  /** Explicit local thermal capacitance (preferred when extracted from FEA/test). */
   cPcbJPerC?: number;
+  /** Vertical thermal resistance from the local zone to the common board/heatsink node. */
   rVertCPerW?: number;
+}
+
+export interface PcbMaterialLayerConfig {
+  name: string;
+  thicknessMm: number;
+  /** Legacy isotropic conductivity fallback; prefer directional conductivities for anisotropic PCB layers. */
+  conductivityWPerMK: number;
+  conductivityInPlaneWPerMK?: number;
+  conductivityThroughPlaneWPerMK?: number;
+  densityKgPerM3: number;
+  specificHeatJPerKgK: number;
+  /** 0..1 coverage fraction within each zone. */
+  coverageFraction?: number;
+}
+
+export interface PcbThermalLinkConfig {
+  /** Zone index 0..5 or MOS_SWITCH_KEYS identifier (AH/AL/BH/BL/CH/CL). */
+  fromZone: number | MosSwitchKey;
+  toZone: number | MosSwitchKey;
+  /** Effective in-plane conducting width and path length. */
+  widthMm?: number;
+  lengthMm?: number;
+  /** Number of equivalent parallel copper paths/layers. */
+  parallelLayers?: number;
+  /** Optional explicit effective conductivity (W/m/K); defaults to copper. */
+  conductivityWPerMK?: number;
+  /** Optional effective thickness (mm); defaults to configured copper stack thickness. */
+  thicknessMm?: number;
+  /** Optional directly extracted conductance, takes precedence over geometry. */
+  conductanceWPerC?: number;
 }
 
 export interface PcbSpatialThermalMatrixConfig {
   zones?: PcbZoneConfig[];
+  /** One or more physical layers used to estimate local thermal mass and in-plane conductance. */
+  stackup?: PcbMaterialLayerConfig[];
+  /** Explicit physical links. When supplied, no all-to-all geometry coupling is generated. */
+  links?: PcbThermalLinkConfig[];
   copperOz?: number;
   copperWidthMm?: number;
   layoutPitchMm?: number;
+  /** Symmetric pairwise thermal conductance matrix; diagonal must be zero. */
   mutualConductanceMatrixWPerC?: number[][];
   zoneVerticalRthCPerW?: number[];
   zoneThermalCapJPerC?: number[];
-  provenance?: 'measured' | 'geometry_estimated' | 'user_matrix';
+  provenance?: 'measured' | 'geometry_estimated' | 'user_matrix' | 'fea_extracted' | 'datasheet_estimated';
+  sourceLabel?: string;
+  referenceTemperatureC?: number;
+}
+
+export interface PcbSpatialImportDocument {
+  schema: 'wave-test-pcb-thermal';
+  schemaVersion: 1;
+  deviceName?: string;
+  boardName?: string;
+  /** Coordinates and dimensions in millimetres; conductance/capacity retain SI units. */
+  units: 'mm';
+  config: PcbSpatialThermalMatrixConfig;
 }
 
 export function getModulationLinearCeiling(modulation: FocModulationMode): number {
@@ -313,6 +365,13 @@ export function resolveSpatialThermalNetwork(model: FocThermalModel): ResolvedSp
   const rBrdFirst = Math.max(0.05, brd[0]?.r ?? 0.45);
   const cBrdFirst = Math.max(0.05, brd[0]?.c ?? 0.85);
   const cfg = model.spatialMatrix;
+  if (cfg) {
+    const allowedProvenance: NonNullable<PcbSpatialThermalMatrixConfig['provenance']>[] = ['measured', 'geometry_estimated', 'user_matrix', 'fea_extracted', 'datasheet_estimated'];
+    if (cfg.provenance !== undefined && !allowedProvenance.includes(cfg.provenance)) throw new Error(`PCB 热网络 provenance 非法：${String(cfg.provenance)}。`);
+    if (cfg.stackup !== undefined && !Array.isArray(cfg.stackup)) throw new Error('PCB stackup 必须为数组。');
+    if (cfg.links !== undefined && !Array.isArray(cfg.links)) throw new Error('PCB links 必须为数组。');
+    if (cfg.zones !== undefined && !Array.isArray(cfg.zones)) throw new Error('PCB zones 必须为数组。');
+  }
 
   const cPcb = new Float64Array(6);
   const rVert = new Float64Array(6);
@@ -351,8 +410,11 @@ export function resolveSpatialThermalNetwork(model: FocThermalModel): ResolvedSp
     };
   }
 
-  // pcb_spatial_coupled: build passive symmetric 6-zone PCB spatial network
-  const pitch = Math.max(2, cfg?.layoutPitchMm ?? 14);
+  // pcb_spatial_coupled: physical six-zone network. Prefer an imported conductance
+  // matrix or explicit copper links; geometry-only estimation creates a nearest-neighbour
+  // graph instead of the previous unrealistic all-to-all coupling.
+  const pitch = cfg?.layoutPitchMm ?? 14;
+  if (!Number.isFinite(pitch) || pitch <= 0) throw new Error('PCB 布局节距必须为有限正数。');
   const defaultZones: PcbZoneConfig[] = [
     { xMm: 0, yMm: 0 },
     { xMm: 0, yMm: pitch * 0.65 },
@@ -361,21 +423,82 @@ export function resolveSpatialThermalNetwork(model: FocThermalModel): ResolvedSp
     { xMm: 2 * pitch, yMm: 0 },
     { xMm: 2 * pitch, yMm: pitch * 0.65 },
   ];
-  const zones = cfg?.zones && cfg.zones.length === 6 ? cfg.zones : defaultZones;
+  if (cfg?.zones && cfg.zones.length !== 6) {
+    throw new Error(`PCB zones 必须严格包含 6 个区域 (AH/AL/BH/BL/CH/CL)，当前 ${cfg.zones.length} 个；禁止静默回退默认布局。`);
+  }
+  const zones = cfg?.zones ?? defaultZones;
+  zones.forEach((z, i) => {
+    if (!Number.isFinite(z.xMm) || !Number.isFinite(z.yMm)) {
+      throw new Error(`PCB 区域 ${MOS_SWITCH_KEYS[i]} 的坐标必须为有限数值。`);
+    }
+    if (z.areaMm2 !== undefined && (!Number.isFinite(z.areaMm2) || z.areaMm2 <= 0)) {
+      throw new Error(`PCB 区域 ${MOS_SWITCH_KEYS[i]} 的 areaMm2 必须为有限正数。`);
+    }
+  });
+  for (let i = 0; i < 6; i++) {
+    for (let j = i + 1; j < 6; j++) {
+      if (Math.hypot(zones[i].xMm - zones[j].xMm, zones[i].yMm - zones[j].yMm) <= 1e-6) {
+        throw new Error(`PCB 区域 ${MOS_SWITCH_KEYS[i]} 与 ${MOS_SWITCH_KEYS[j]} 坐标重合，无法建立空间热网络。`);
+      }
+    }
+  }
+
   const copperOz = cfg?.copperOz ?? 2.0;
   const copperWidthMm = cfg?.copperWidthMm ?? 12.0;
   if (!Number.isFinite(copperOz) || copperOz <= 0 || !Number.isFinite(copperWidthMm) || copperWidthMm <= 0) {
     throw new Error('PCB 空间热网络铜厚 (oz) 与有效导热铜宽 (mm) 必须为有限正数。');
   }
-  const copperThickM = copperOz * 34.8e-6;
-  const kCu = 385.0; // W/(m*K)
+  const copperThicknessMm = copperOz * 0.0348;
+  const defaultKCu = 385.0;
+  const stackup = cfg?.stackup ?? [];
+  stackup.forEach((layer, i) => {
+    if (
+      !layer.name?.trim() || !Number.isFinite(layer.thicknessMm) || layer.thicknessMm <= 0 ||
+      !Number.isFinite(layer.conductivityWPerMK) || layer.conductivityWPerMK <= 0 ||
+      (layer.conductivityInPlaneWPerMK !== undefined && (!Number.isFinite(layer.conductivityInPlaneWPerMK) || layer.conductivityInPlaneWPerMK <= 0)) ||
+      (layer.conductivityThroughPlaneWPerMK !== undefined && (!Number.isFinite(layer.conductivityThroughPlaneWPerMK) || layer.conductivityThroughPlaneWPerMK <= 0)) ||
+      !Number.isFinite(layer.densityKgPerM3) || layer.densityKgPerM3 <= 0 ||
+      !Number.isFinite(layer.specificHeatJPerKgK) || layer.specificHeatJPerKgK <= 0 ||
+      (layer.coverageFraction !== undefined && (!Number.isFinite(layer.coverageFraction) || layer.coverageFraction < 0 || layer.coverageFraction > 1))
+    ) throw new Error(`PCB stackup 第 ${i + 1} 层材料/厚度/热参数非法。`);
+  });
 
   const padOffsets = model.perSwitchPadOffsetCPerW;
+  if (padOffsets && padOffsets.length !== 6) throw new Error('perSwitchPadOffsetCPerW 必须为 6 个数值。');
+  if (cfg?.zoneThermalCapJPerC && cfg.zoneThermalCapJPerC.length !== 6) throw new Error('zoneThermalCapJPerC 必须为 6 个数值。');
+  if (cfg?.zoneVerticalRthCPerW && cfg.zoneVerticalRthCPerW.length !== 6) throw new Error('zoneVerticalRthCPerW 必须为 6 个数值。');
+
+  const deriveZoneCap = (zone: PcbZoneConfig): number | undefined => {
+    if (!zone.areaMm2 || stackup.length === 0) return undefined;
+    const areaM2 = zone.areaMm2 * 1e-6;
+    let cap = 0;
+    for (const layer of stackup) {
+      const volumeM3 = areaM2 * (layer.thicknessMm * 1e-3) * (layer.coverageFraction ?? 1);
+      cap += volumeM3 * layer.densityKgPerM3 * layer.specificHeatJPerKgK;
+    }
+    return cap > 0 && Number.isFinite(cap) ? cap : undefined;
+  };
+  const deriveZoneVerticalR = (zone: PcbZoneConfig): number | undefined => {
+    if (!zone.areaMm2 || stackup.length === 0) return undefined;
+    const areaM2 = zone.areaMm2 * 1e-6;
+    let resistance = 0;
+    for (const layer of stackup) {
+      const coverage = layer.coverageFraction ?? 1;
+      if (coverage <= 0) continue;
+      const kZ = layer.conductivityThroughPlaneWPerMK ?? layer.conductivityWPerMK;
+      resistance += (layer.thicknessMm * 1e-3) / (kZ * areaM2 * coverage);
+    }
+    return resistance > 0 && Number.isFinite(resistance) ? resistance : undefined;
+  };
+
   for (let m = 0; m < 6; m++) {
-    const cap = cfg?.zoneThermalCapJPerC?.[m] ?? zones[m].cPcbJPerC ?? Math.max(0.04, cBrdFirst / 6);
-    const baseRv = cfg?.zoneVerticalRthCPerW?.[m] ?? zones[m].rVertCPerW ?? Math.max(0.15, rBrdFirst * 1.4);
-    const extraPad = padOffsets && padOffsets.length === 6 && Number.isFinite(padOffsets[m]) && padOffsets[m] > 0 ? padOffsets[m] : 0;
-    const rv = baseRv + extraPad;
+    const cap = cfg?.zoneThermalCapJPerC?.[m] ?? zones[m].cPcbJPerC ?? deriveZoneCap(zones[m]) ?? Math.max(0.04, cBrdFirst / 6);
+    const baseRv = cfg?.zoneVerticalRthCPerW?.[m] ?? zones[m].rVertCPerW ?? deriveZoneVerticalR(zones[m]) ?? Math.max(0.15, rBrdFirst * 1.4);
+    const extraPad = padOffsets ? padOffsets[m] : 0;
+    if (extraPad !== undefined && (!Number.isFinite(extraPad) || extraPad < 0)) {
+      throw new Error(`PCB 区域 ${MOS_SWITCH_KEYS[m]} 的 Pad 附加热阻必须为有限非负数。`);
+    }
+    const rv = baseRv + (extraPad ?? 0);
     if (!Number.isFinite(cap) || cap <= 0 || !Number.isFinite(rv) || rv <= 0) {
       throw new Error(`PCB 空间区域 ${MOS_SWITCH_KEYS[m]} 的热容 C_pcb 或垂直热阻 R_vert 必须为有限正数。`);
     }
@@ -383,60 +506,176 @@ export function resolveSpatialThermalNetwork(model: FocThermalModel): ResolvedSp
     rVert[m] = rv;
   }
 
-  if (cfg?.mutualConductanceMatrixWPerC) {
-    const mat = cfg.mutualConductanceMatrixWPerC;
+  const hasMatrix = Boolean(cfg?.mutualConductanceMatrixWPerC);
+  const hasLinks = Boolean(cfg?.links && cfg.links.length > 0);
+  if (hasMatrix && hasLinks) throw new Error('PCB 热网络不能同时提供 mutualConductanceMatrixWPerC 和 links；请选用一种互热定义，避免重复计入。');
+
+  if (hasMatrix) {
+    const mat = cfg!.mutualConductanceMatrixWPerC!;
     if (!Array.isArray(mat) || mat.length !== 6 || mat.some((row) => !Array.isArray(row) || row.length !== 6)) {
       throw new Error('PCB 互热导矩阵 mutualConductanceMatrixWPerC 必须为 6×6 矩阵。');
     }
     for (let i = 0; i < 6; i++) {
-      for (let j = i + 1; j < 6; j++) {
+      for (let j = 0; j < 6; j++) {
         const gij = mat[i][j];
-        const gji = mat[j][i];
-        if (!Number.isFinite(gij) || !Number.isFinite(gji)) {
-          throw new Error(`PCB 互热导矩阵 (${MOS_SWITCH_KEYS[i]}, ${MOS_SWITCH_KEYS[j]}) 含非有限数值。`);
+        if (!Number.isFinite(gij) || gij < -1e-12) {
+          throw new Error(`PCB 互热导矩阵 (${MOS_SWITCH_KEYS[i]}, ${MOS_SWITCH_KEYS[j]}) 必须为有限非负值。`);
         }
-        if (gij < -1e-12 || gji < -1e-12) {
-          throw new Error(`PCB 互热导矩阵 (${MOS_SWITCH_KEYS[i]}, ${MOS_SWITCH_KEYS[j]}) 必须为非负值以满足热力学无源性。`);
+        if (i === j && Math.abs(gij) > 1e-9) throw new Error(`PCB 互热导矩阵对角线必须为 0；区域 ${MOS_SWITCH_KEYS[i]} 的对角值被忽略会掩盖输入错误。`);
+        if (j > i) {
+          const gji = mat[j][i];
+          if (!Number.isFinite(gji) || gji < -1e-12) throw new Error(`PCB 互热导矩阵 (${MOS_SWITCH_KEYS[j]}, ${MOS_SWITCH_KEYS[i]}) 必须为有限非负值。`);
+          if (Math.abs(gij - gji) > 1e-6 * Math.max(1, Math.abs(gij), Math.abs(gji))) {
+            throw new Error(`PCB 互热导矩阵非对称 (${MOS_SWITCH_KEYS[i]}↔${MOS_SWITCH_KEYS[j]}: ${gij} vs ${gji})，违背热传导互易定理。`);
+          }
+          gLat[i][j] = gLat[j][i] = Math.max(0, 0.5 * (gij + gji));
         }
-        if (Math.abs(gij - gji) > 1e-6 * Math.max(1, Math.abs(gij), Math.abs(gji))) {
-          throw new Error(`PCB 互热导矩阵非对称 (${MOS_SWITCH_KEYS[i]}↔${MOS_SWITCH_KEYS[j]}: ${gij} vs ${gji})，违背热传导互易定理。`);
-        }
-        const gSym = Math.max(0, 0.5 * (gij + gji));
-        gLat[i][j] = gSym;
-        gLat[j][i] = gSym;
       }
     }
+  } else if (hasLinks) {
+    const zoneIndex = (v: number | MosSwitchKey): number => {
+      const idx = typeof v === 'number' ? v : MOS_SWITCH_KEYS.indexOf(v);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= 6) throw new Error(`PCB thermal link 区域索引无效：${String(v)}。`);
+      return idx;
+    };
+    const copperStackThicknessMm = stackup
+      .filter((layer) => /cu|copper|铜/i.test(layer.name))
+      .reduce((sum, layer) => sum + layer.thicknessMm * (layer.coverageFraction ?? 1), 0) || copperThicknessMm;
+    for (const [linkIdx, link] of cfg!.links!.entries()) {
+      const from = zoneIndex(link.fromZone);
+      const to = zoneIndex(link.toZone);
+      if (from === to) throw new Error(`PCB link #${linkIdx + 1} 不允许连接同一个区域。`);
+      let g = link.conductanceWPerC;
+      if (g === undefined) {
+        const width = link.widthMm ?? copperWidthMm;
+        const length = link.lengthMm ?? Math.hypot(zones[from].xMm - zones[to].xMm, zones[from].yMm - zones[to].yMm);
+        const layers = link.parallelLayers ?? 1;
+        if (![width, length, layers].every(Number.isFinite) || width <= 0 || length <= 0 || layers <= 0) {
+          throw new Error(`PCB link #${linkIdx + 1} 的宽度、长度和并联路径数必须为有限正数。`);
+        }
+        if (link.conductivityWPerMK !== undefined || link.thicknessMm !== undefined || stackup.length === 0) {
+          const thickness = link.thicknessMm ?? copperStackThicknessMm;
+          const k = link.conductivityWPerMK ?? defaultKCu;
+          if (![thickness, k].every(Number.isFinite) || thickness <= 0 || k <= 0) throw new Error(`PCB link #${linkIdx + 1} 的厚度或导热率非法。`);
+          g = k * (width * 1e-3) * (thickness * 1e-3) * layers / (length * 1e-3);
+        } else {
+          // Parallel in-plane conduction through each imported PCB layer; directional kx/ky
+          // is used instead of incorrectly applying through-plane FR4 conductivity.
+          g = stackup.reduce((sum, layer) => {
+            const kXY = layer.conductivityInPlaneWPerMK ?? layer.conductivityWPerMK;
+            const aM2 = (width * 1e-3) * (layer.thicknessMm * 1e-3) * (layer.coverageFraction ?? 1);
+            return sum + kXY * aM2 / (length * 1e-3);
+          }, 0) * layers;
+        }
+      }
+      if (!Number.isFinite(g) || g < 0) throw new Error(`PCB link #${linkIdx + 1} 的导热系数必须为有限非负值。`);
+      gLat[from][to] += g;
+      gLat[to][from] += g;
+    }
   } else {
+    // Geometry-only estimate: connect only nearest-neighbour zones. Do not create
+    // artificial direct thermal paths between every pair of MOS regions.
+    const minDistance = new Float64Array(6).fill(Infinity);
+    for (let i = 0; i < 6; i++) {
+      for (let j = 0; j < 6; j++) if (i !== j) {
+        const d = Math.hypot(zones[i].xMm - zones[j].xMm, zones[i].yMm - zones[j].yMm);
+        minDistance[i] = Math.min(minDistance[i], d);
+      }
+    }
+    const thicknessM = copperThicknessMm * 1e-3;
     for (let i = 0; i < 6; i++) {
       for (let j = i + 1; j < 6; j++) {
-        const dx = zones[i].xMm - zones[j].xMm;
-        const dy = zones[i].yMm - zones[j].yMm;
-        const distMm = Math.hypot(dx, dy);
-        if (!Number.isFinite(distMm) || distMm <= 1e-3) {
-          throw new Error(`PCB 空间区域 ${MOS_SWITCH_KEYS[i]} 与 ${MOS_SWITCH_KEYS[j]} 几何坐标重合或无效，无法计算横向热导。`);
-        }
-        // Only couple adjacent/moderate distance zones meaningfully via 2D copper conductance G = k * t * w / L
-        const wEffM = copperWidthMm * 1e-3;
-        const dM = distMm * 1e-3;
-        const gPair = (kCu * copperThickM * wEffM) / dM;
+        const distanceMm = Math.hypot(zones[i].xMm - zones[j].xMm, zones[i].yMm - zones[j].yMm);
+        const neighbourLimit = 1.35 * Math.max(minDistance[i], minDistance[j]);
+        if (distanceMm > neighbourLimit) continue;
+        const gPair = defaultKCu * thicknessM * (copperWidthMm * 1e-3) / (distanceMm * 1e-3);
         gLat[i][j] = gPair;
         gLat[j][i] = gPair;
       }
     }
   }
 
-  const prov =
-    cfg?.provenance === 'measured'
-      ? '实测热耦合矩阵 (measured)'
-      : cfg?.provenance === 'user_matrix'
-      ? '自定义对称无源互导矩阵'
-      : `几何铜箔估算 (${copperOz.toFixed(1)}oz, pitch=${pitch.toFixed(0)}mm)`;
+  const prov = cfg?.provenance === 'measured'
+    ? '实测热耦合矩阵 (measured)'
+    : cfg?.provenance === 'fea_extracted'
+    ? 'FEA 提取热网络 (fea_extracted)'
+    : cfg?.provenance === 'user_matrix'
+    ? '用户导入对称无源互导矩阵'
+    : cfg?.provenance === 'datasheet_estimated'
+    ? '材料/数据手册估算热网络'
+    : `几何近邻估算 (${copperOz.toFixed(1)}oz, pitch=${pitch.toFixed(1)}mm)`;
+  const source = cfg?.sourceLabel ? ` · ${cfg.sourceLabel}` : '';
   return {
     mode,
     cPcb,
     rVert,
     gLat,
-    provenanceLabel: `pcb_spatial_coupled · ${prov}`,
+    provenanceLabel: `pcb_spatial_coupled · ${prov}${source}`,
+  };
+}
+
+
+/** Parse a versioned PCB thermal-network JSON document for future CAD/FEA/test imports. */
+export function parsePcbSpatialImportJson(text: string): PcbSpatialImportDocument {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch (err) {
+    throw new Error(`PCB 热网络 JSON 解析失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!raw || typeof raw !== 'object') throw new Error('PCB 热网络导入文件必须是 JSON 对象。');
+  const doc = raw as Partial<PcbSpatialImportDocument>;
+  if (doc.schema !== 'wave-test-pcb-thermal' || doc.schemaVersion !== 1 || doc.units !== 'mm' || !doc.config || typeof doc.config !== 'object') {
+    throw new Error('PCB 热网络文件格式不匹配：需要 schema=wave-test-pcb-thermal、schemaVersion=1、units=mm 和 config。');
+  }
+  const allowedProvenance: NonNullable<PcbSpatialThermalMatrixConfig['provenance']>[] = ['measured', 'geometry_estimated', 'user_matrix', 'fea_extracted', 'datasheet_estimated'];
+  const provenance = doc.config.provenance ?? (doc.config.mutualConductanceMatrixWPerC ? 'user_matrix' : 'geometry_estimated');
+  if (!allowedProvenance.includes(provenance)) throw new Error(`PCB 热网络 provenance 非法：${String(provenance)}。`);
+  const config: PcbSpatialThermalMatrixConfig = {
+    ...doc.config,
+    provenance,
+  };
+  const testModel: FocThermalModel = {
+    zthJC: DEFAULT_FOC_MODEL.zthJC,
+    zthBoard: DEFAULT_FOC_MODEL.zthBoard,
+    thermalTopologyMode: 'pcb_spatial_coupled',
+    spatialMatrix: config,
+  };
+  resolveSpatialThermalNetwork(testModel); // Run the same physical/schema validation used by the solver.
+  return { ...doc, config } as PcbSpatialImportDocument;
+}
+
+export function createPcbSpatialImportTemplate(): PcbSpatialImportDocument {
+  return {
+    schema: 'wave-test-pcb-thermal',
+    schemaVersion: 1,
+    deviceName: '请填写逆变器/MOS 型号',
+    boardName: '请填写 PCB 版本',
+    units: 'mm',
+    config: {
+      provenance: 'geometry_estimated',
+      sourceLabel: 'CAD/FEA/热测试导入模板',
+      copperOz: 2,
+      copperWidthMm: 8,
+      zones: MOS_SWITCH_KEYS.map((key, i) => ({
+        xMm: Math.floor(i / 2) * 20,
+        yMm: (i % 2) * 12,
+        areaMm2: 120,
+        rVertCPerW: 1.5,
+      })),
+      stackup: [
+        { name: 'Top copper', thicknessMm: 0.07, conductivityWPerMK: 385, conductivityInPlaneWPerMK: 385, conductivityThroughPlaneWPerMK: 385, densityKgPerM3: 8960, specificHeatJPerKgK: 385, coverageFraction: 0.55 },
+        { name: 'FR4 core', thicknessMm: 1.2, conductivityWPerMK: 0.35, conductivityInPlaneWPerMK: 0.35, conductivityThroughPlaneWPerMK: 0.28, densityKgPerM3: 1850, specificHeatJPerKgK: 1100, coverageFraction: 1 },
+        { name: 'Bottom copper', thicknessMm: 0.07, conductivityWPerMK: 385, conductivityInPlaneWPerMK: 385, conductivityThroughPlaneWPerMK: 385, densityKgPerM3: 8960, specificHeatJPerKgK: 385, coverageFraction: 0.4 },
+      ],
+      links: [
+        { fromZone: 'AH', toZone: 'BH', widthMm: 8, lengthMm: 20, parallelLayers: 1 },
+        { fromZone: 'BH', toZone: 'CH', widthMm: 8, lengthMm: 20, parallelLayers: 1 },
+        { fromZone: 'AL', toZone: 'BL', widthMm: 8, lengthMm: 20, parallelLayers: 1 },
+        { fromZone: 'BL', toZone: 'CL', widthMm: 8, lengthMm: 20, parallelLayers: 1 },
+        { fromZone: 'AH', toZone: 'AL', widthMm: 8, lengthMm: 12, parallelLayers: 1 },
+        { fromZone: 'BH', toZone: 'BL', widthMm: 8, lengthMm: 12, parallelLayers: 1 },
+        { fromZone: 'CH', toZone: 'CL', widthMm: 8, lengthMm: 12, parallelLayers: 1 },
+      ],
+    },
   };
 }
 
@@ -2880,7 +3119,13 @@ export function simulateFoc6Mos(
   if (eossSource === 'vbus_sq_approx') {
     warnings.push('当前 Eoss 仅输入 Vref 处的单点能量，并按 Eoss∝Vbus² 低精度 V² 近似缩放（等效假设 Coss 不随电压变化）；真实 MOS Coss 通常强非线性，需用器件 Eoss(V)/Qoss(V) 曲线替代。');
   } else if (eossSource === 'nonlinear_curve') {
-    warnings.push(`Eoss 已采用非线性 ${mos.eossCurve!.kind.toUpperCase()} 曲线 PCHIP 插值计算${eossCurveOutOfRangeCount > 0 ? `（其中 ${eossCurveOutOfRangeCount} 次脉冲电压超出曲线上限，已边界截断）` : ''}。`);
+    warnings.push(`Eoss 已采用非线性 ${mos.eossCurve!.kind.toUpperCase()} 曲线 PCHIP 插值计算（来源=${mos.eossCurve!.provenance ?? 'unspecified'}）；超出曲线定义域的脉冲会拒绝计算，不使用边界截断值。`);
+    if (mos.eossCurve!.referenceTemperatureC !== undefined) {
+      const tjCurveDelta = Math.max(...summaries.map((summary) => Math.abs(summary.tjAvgC - mos.eossCurve!.referenceTemperatureC!)));
+      if (tjCurveDelta > 10) {
+        warnings.push(`Eoss 曲线参考温度为 ${mos.eossCurve!.referenceTemperatureC}°C，当前六管平均结温与参考温度最大偏差 ${tjCurveDelta.toFixed(1)}°C；当前曲线无温度维度，未进行温度修正，Eoss 结果属于参考温度曲线估算。`);
+      }
+    }
   } else if (eossSource === 'included_in_esw') {
     warnings.push('已启用 Eoss 防重算保护 (eossAlreadyIncludedInEsw=true)：Esw 已涵盖 Coss 充放电损耗，独立 Eoss 项置零。');
   }

@@ -1744,6 +1744,7 @@ Provenance: synthetic_assumed_uncalibrated
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import math
 
 
@@ -1763,6 +1764,13 @@ class DynamicPmsmParams:
     current_bandwidth_rad_s: float | None = None
     kp_speed: float | None = None
     ki_speed: float | None = None
+    # Optional rectangular nonlinear flux-linkage map: dict with id_axis_a, iq_axis_a, psi_d_vs, psi_q_vs.
+    flux_map: dict | None = None
+    winding_temp_c: float | None = None
+    magnet_temp_c: float | None = None
+    reference_temp_c: float = 25.0
+    rs_temp_coeff_per_c: float = 0.00393
+    psi_temp_coeff_per_c: float = 0.0
 
 
 @dataclass
@@ -1788,14 +1796,105 @@ class DynamicPmsmConfig:
     scenario: list[DynamicScenarioStep] = field(default_factory=list)
 
 
+def parse_pmsm_flux_map_json(text: str) -> dict:
+    doc = json.loads(text)
+    if not isinstance(doc, dict) or doc.get("schema") != "wave-test-pmsm-flux-map" or doc.get("schemaVersion") != 1 or doc.get("units") != {"current": "A", "fluxLinkage": "Vs"}:
+        raise ValueError("PMSM flux-map JSON schema/units mismatch")
+    provenance = doc.get("provenance", "user_import")
+    if provenance not in ("fea_extracted", "measured", "user_import", "assumed"):
+        raise ValueError("PMSM flux-map provenance must be fea_extracted/measured/user_import/assumed")
+    result = {
+        "id_axis_a": doc.get("idAxisA", []), "iq_axis_a": doc.get("iqAxisA", []),
+        "psi_d_vs": doc.get("psiDVs", []), "psi_q_vs": doc.get("psiQVs", []),
+        "provenance": provenance,
+        "manufacturer": doc.get("manufacturer"), "part_number": doc.get("partNumber"),
+        "reference_temperature_c": doc.get("referenceTemperatureC"), "source_note": doc.get("sourceNote"),
+    }
+    validate_pmsm_flux_map(result)
+    return result
+
+
 def ke_prime_to_psi_f(ke_prime: float, pole_pairs: int) -> float:
     return float(ke_prime) / max(1, int(pole_pairs))
 
 
+def validate_pmsm_flux_map(flux_map: dict) -> None:
+    id_axis = flux_map.get("id_axis_a") or []
+    iq_axis = flux_map.get("iq_axis_a") or []
+    psi_d = flux_map.get("psi_d_vs") or []
+    psi_q = flux_map.get("psi_q_vs") or []
+    if len(id_axis) < 2 or len(iq_axis) < 2 or any(not math.isfinite(float(v)) for v in id_axis + iq_axis):
+        raise ValueError("PMSM flux-map axes require at least two finite values")
+    if any(id_axis[k] <= id_axis[k-1] for k in range(1, len(id_axis))) or any(iq_axis[k] <= iq_axis[k-1] for k in range(1, len(iq_axis))):
+        raise ValueError("PMSM flux-map axes must be strictly increasing")
+    if id_axis[0] > 0.0 or id_axis[-1] < 0.0 or iq_axis[0] > 0.0 or iq_axis[-1] < 0.0:
+        raise ValueError("PMSM flux-map Id/Iq axes must include zero current")
+    ref_temp = flux_map.get("reference_temperature_c")
+    if ref_temp is None or not math.isfinite(float(ref_temp)):
+        raise ValueError("PMSM flux-map requires a finite reference_temperature_c")
+    for matrix in (psi_d, psi_q):
+        if len(matrix) != len(id_axis) or any(len(row) != len(iq_axis) for row in matrix):
+            raise ValueError("PMSM flux-map matrix dimensions do not match axes")
+        if any(not math.isfinite(float(v)) for row in matrix for v in row):
+            raise ValueError("PMSM flux-map contains non-finite flux values")
+    # Check positive-definite incremental inductance and reciprocal cross derivatives
+    # at every cell centre, matching the TypeScript validator.
+    for i in range(len(id_axis) - 1):
+        did = id_axis[i+1] - id_axis[i]
+        for j in range(len(iq_axis) - 1):
+            diq = iq_axis[j+1] - iq_axis[j]
+            ldd = 0.5 * ((psi_d[i+1][j] - psi_d[i][j]) + (psi_d[i+1][j+1] - psi_d[i][j+1])) / did
+            ldq = 0.5 * ((psi_d[i][j+1] - psi_d[i][j]) + (psi_d[i+1][j+1] - psi_d[i+1][j])) / diq
+            lqd = 0.5 * ((psi_q[i+1][j] - psi_q[i][j]) + (psi_q[i+1][j+1] - psi_q[i][j+1])) / did
+            lqq = 0.5 * ((psi_q[i][j+1] - psi_q[i][j]) + (psi_q[i+1][j+1] - psi_q[i+1][j])) / diq
+            scale = max(1e-9, abs(ldd), abs(ldq), abs(lqd), abs(lqq))
+            if ldd <= 1e-9 * scale or lqq <= 1e-9 * scale or ldd*lqq - ldq*lqd <= 1e-12*scale*scale:
+                raise ValueError(f"PMSM flux-map incremental inductance matrix is not positive definite in cell Id[{i}],Iq[{j}]")
+            if abs(ldq-lqd) > 0.35 * scale:
+                raise ValueError(f"PMSM flux-map cross differential inductances are not reciprocal in cell Id[{i}],Iq[{j}]")
+
+
+def _axis_bracket(axis: list[float], value: float, label: str) -> tuple[int, int, float]:
+    if value < axis[0] - 1e-9 or value > axis[-1] + 1e-9:
+        raise ValueError(f"{label}={value:.6g} A outside PMSM flux-map [{axis[0]}, {axis[-1]}] A")
+    x = min(axis[-1], max(axis[0], value))
+    hi = 1
+    while hi < len(axis) - 1 and axis[hi] < x:
+        hi += 1
+    lo = hi - 1
+    return lo, hi, (x - axis[lo]) / (axis[hi] - axis[lo])
+
+
+def evaluate_pmsm_flux(id_a: float, iq_a: float, psi_f_vs: float, ld_h: float, lq_h: float, flux_map: dict | None = None):
+    if not math.isfinite(id_a) or not math.isfinite(iq_a):
+        raise ValueError("PMSM dq current must be finite")
+    if flux_map is None:
+        return psi_f_vs + ld_h * id_a, lq_h * iq_a, ld_h, 0.0, 0.0, lq_h
+    validate_pmsm_flux_map(flux_map)
+    ia, ib, fi = _axis_bracket(flux_map["id_axis_a"], id_a, "Id")
+    qa, qb, fq = _axis_bracket(flux_map["iq_axis_a"], iq_a, "Iq")
+    dx = flux_map["id_axis_a"][ib] - flux_map["id_axis_a"][ia]
+    dy = flux_map["iq_axis_a"][qb] - flux_map["iq_axis_a"][qa]
+    def interpolate(matrix):
+        v00, v10 = matrix[ia][qa], matrix[ib][qa]
+        v01, v11 = matrix[ia][qb], matrix[ib][qb]
+        value = (1-fi)*(1-fq)*v00 + fi*(1-fq)*v10 + (1-fi)*fq*v01 + fi*fq*v11
+        did = ((1-fq)*(v10-v00) + fq*(v11-v01)) / dx
+        diq = ((1-fi)*(v01-v00) + fi*(v11-v10)) / dy
+        return value, did, diq
+    d, ldd, ldq = interpolate(flux_map["psi_d_vs"])
+    q, lqd, lqq = interpolate(flux_map["psi_q_vs"])
+    det = ldd*lqq - ldq*lqd
+    if ldd <= 0 or lqq <= 0 or det <= 0 or not all(math.isfinite(v) for v in (d,q,ldd,ldq,lqd,lqq)):
+        raise ValueError("PMSM flux-map incremental inductance matrix is not positive definite")
+    return d, q, ldd, ldq, lqd, lqq
+
+
 def calc_dynamic_pmsm_torque(
-    id_a: float, iq_a: float, pole_pairs: int, psi_f_vs: float, ld_h: float, lq_h: float
+    id_a: float, iq_a: float, pole_pairs: int, psi_f_vs: float, ld_h: float, lq_h: float, flux_map: dict | None = None
 ) -> float:
-    return 1.5 * pole_pairs * (psi_f_vs * iq_a + (ld_h - lq_h) * id_a * iq_a)
+    psi_d, psi_q, *_ = evaluate_pmsm_flux(id_a, iq_a, psi_f_vs, ld_h, lq_h, flux_map)
+    return 1.5 * pole_pairs * (psi_d * iq_a - psi_q * id_a)
 
 
 def compute_mtpa_and_fw_target(
@@ -1804,6 +1903,45 @@ def compute_mtpa_and_fw_target(
     v_bus_v: float,
     params: DynamicPmsmParams,
 ) -> dict[str, float | bool]:
+    if params.flux_map is not None:
+        flux_map = params.flux_map
+        validate_pmsm_flux_map(flux_map)
+        sign = 1.0 if i_torque_cmd_a >= 0 else -1.0
+        i_max_map = float(params.i_max_a)
+        requested_iq = sign * min(abs(i_torque_cmd_a), i_max_map)
+        target_torque = calc_dynamic_pmsm_torque(0.0, requested_iq, params.pole_pairs, params.psi_f_vs, params.ld_h, params.lq_h, flux_map)
+        v_max = max(0.5, float(v_bus_v)) / math.sqrt(3.0) * 0.96
+        rs = float(params.rs_ohm)
+        best = None
+        closest = None
+        for k in range(49):
+            id_c = -i_max_map + 2.0 * i_max_map * k / 48.0
+            iq_cap = math.sqrt(max(0.0, i_max_map*i_max_map-id_c*id_c))
+            if iq_cap <= 1e-10:
+                continue
+            tq_max = calc_dynamic_pmsm_torque(id_c, sign*iq_cap, params.pole_pairs, params.psi_f_vs, params.ld_h, params.lq_h, flux_map)
+            lo, hi = 0.0, iq_cap
+            if abs(tq_max) >= abs(target_torque):
+                for _ in range(34):
+                    mid = 0.5*(lo+hi)
+                    tq = calc_dynamic_pmsm_torque(id_c, sign*mid, params.pole_pairs, params.psi_f_vs, params.ld_h, params.lq_h, flux_map)
+                    if abs(tq) < abs(target_torque): lo = mid
+                    else: hi = mid
+            iq_c = sign*(0.5*(lo+hi) if abs(tq_max) >= abs(target_torque) else iq_cap)
+            tq = calc_dynamic_pmsm_torque(id_c, iq_c, params.pole_pairs, params.psi_f_vs, params.ld_h, params.lq_h, flux_map)
+            psi_d, psi_q, *_ = evaluate_pmsm_flux(id_c, iq_c, params.psi_f_vs, params.ld_h, params.lq_h, flux_map)
+            we = omega_e_rad_s
+            vmag = math.hypot(rs*id_c-we*psi_q, rs*iq_c+we*psi_d)
+            item = (abs(tq-target_torque), id_c*id_c+iq_c*iq_c, vmag, id_c, iq_c)
+            if closest is None or item[0]+max(0.0,vmag-v_max)*0.1 < closest[0]+max(0.0,closest[2]-v_max)*0.1:
+                closest = item
+            if vmag <= v_max and (best is None or item[0] < best[0]-1e-6 or (abs(item[0]-best[0]) <= 1e-6 and item[1] < best[1])):
+                best = item
+        chosen = best or closest
+        if chosen is None:
+            return {"id_ref_a":0.0,"iq_ref_a":0.0,"current_limited":True,"field_weakening_active":True}
+        return {"id_ref_a":chosen[3],"iq_ref_a":chosen[4],"current_limited":abs(i_torque_cmd_a)>i_max_map+1e-9 or chosen[0]>max(1e-3,abs(target_torque)*0.02),"field_weakening_active":abs(omega_e_rad_s)>1 and chosen[3]<-0.05}
+
     i_max = max(0.05, float(params.i_max_a))
     abs_cmd = abs(i_torque_cmd_a)
     current_limited = abs_cmd > i_max + 1e-9
@@ -1871,10 +2009,11 @@ def _sample_scenario_at(
             "vd_ref_v": 0.0,
             "vq_ref_v": 0.0,
         }
-    chosen = scenario[-1]
+    chosen = scenario[0]
     for step in scenario:
-        if step.t_start_sec - 1e-12 <= t_sec <= step.t_end_sec + 1e-12:
+        if t_sec >= step.t_start_sec - 1e-12:
             chosen = step
+        if step.t_start_sec - 1e-12 <= t_sec <= step.t_end_sec + 1e-12:
             break
     v_step = chosen.v_bus_v if (chosen.v_bus_v is not None and math.isfinite(chosen.v_bus_v) and chosen.v_bus_v > 0.5) else params.v_bus_v
     return {
@@ -1943,14 +2082,41 @@ def build_dynamic_preset_scenario(preset: str) -> tuple[dict[str, float | int | 
 
 
 def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsmConfig) -> dict:
-    p = max(1, int(round(raw_params.pole_pairs)))
-    rs = max(1e-4, float(raw_params.rs_ohm))
-    ld = max(1e-6, float(raw_params.ld_h))
-    lq = max(1e-6, float(raw_params.lq_h))
-    psi_f = max(1e-5, float(raw_params.psi_f_vs))
-    j_rot = max(1e-7, float(raw_params.j_kg_m2))
-    b_visc = max(0.0, float(raw_params.b_nm_s_per_rad))
-    t_coul = max(0.0, float(raw_params.t_coulomb_nm))
+    if int(raw_params.pole_pairs) != raw_params.pole_pairs or raw_params.pole_pairs < 1:
+        raise ValueError("pole_pairs must be a positive integer")
+    p = int(raw_params.pole_pairs)
+    for name, value in (("rs_ohm",raw_params.rs_ohm),("ld_h",raw_params.ld_h),("lq_h",raw_params.lq_h),("psi_f_vs",raw_params.psi_f_vs),("j_kg_m2",raw_params.j_kg_m2),("v_bus_v",raw_params.v_bus_v),("i_max_a",raw_params.i_max_a)):
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if not math.isfinite(raw_params.b_nm_s_per_rad) or raw_params.b_nm_s_per_rad < 0 or not math.isfinite(raw_params.t_coulomb_nm) or raw_params.t_coulomb_nm < 0:
+        raise ValueError("damping and Coulomb friction must be finite and nonnegative")
+    rs_base = float(raw_params.rs_ohm)
+    ld = float(raw_params.ld_h)
+    lq = float(raw_params.lq_h)
+    psi_f_base = float(raw_params.psi_f_vs)
+    j_rot = float(raw_params.j_kg_m2)
+    b_visc = float(raw_params.b_nm_s_per_rad)
+    t_coul = float(raw_params.t_coulomb_nm)
+    reference_temp = float(raw_params.reference_temp_c)
+    winding_temp = float(raw_params.winding_temp_c if raw_params.winding_temp_c is not None else reference_temp)
+    magnet_temp = float(raw_params.magnet_temp_c if raw_params.magnet_temp_c is not None else reference_temp)
+    rs_alpha = float(raw_params.rs_temp_coeff_per_c)
+    psi_alpha = float(raw_params.psi_temp_coeff_per_c)
+    if not all(math.isfinite(v) for v in (reference_temp, winding_temp, magnet_temp, rs_alpha, psi_alpha)) or rs_alpha < 0:
+        raise ValueError("temperature and temperature coefficients must be finite; Rs coefficient must be nonnegative")
+    rs = rs_base * (1.0 + rs_alpha * (winding_temp-reference_temp))
+    psi_f = psi_f_base * (1.0 + psi_alpha * (magnet_temp-reference_temp))
+    if not math.isfinite(rs) or rs <= 0 or not math.isfinite(psi_f) or psi_f <= 0:
+        raise ValueError("temperature-corrected Rs/psi_f is not positive and finite")
+    if raw_params.flux_map is not None:
+        validate_pmsm_flux_map(raw_params.flux_map)
+        map_temp = float(raw_params.flux_map["reference_temperature_c"])
+        if abs(magnet_temp-map_temp) > 1e-6:
+            raise ValueError("magnet temperature differs from single-temperature flux map; import a map at the required temperature")
+        if abs(psi_alpha) > 1e-15:
+            raise ValueError("psi temperature coefficient cannot be applied to nonlinear flux map; import a map at the required temperature")
+        if raw_params.flux_map["id_axis_a"][0] > -float(raw_params.i_max_a) or raw_params.flux_map["id_axis_a"][-1] < float(raw_params.i_max_a) or raw_params.flux_map["iq_axis_a"][0] > -float(raw_params.i_max_a) or raw_params.flux_map["iq_axis_a"][-1] < float(raw_params.i_max_a):
+            raise ValueError(f"PMSM flux map must cover +/- Imax ({float(raw_params.i_max_a):.4g} A) on both Id/Iq axes")
     params = DynamicPmsmParams(
         pole_pairs=p,
         rs_ohm=rs,
@@ -1960,23 +2126,44 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
         j_kg_m2=j_rot,
         b_nm_s_per_rad=b_visc,
         t_coulomb_nm=t_coul,
-        v_bus_v=max(1.0, float(raw_params.v_bus_v)),
-        i_max_a=max(0.1, float(raw_params.i_max_a)),
+        v_bus_v=float(raw_params.v_bus_v),
+        i_max_a=float(raw_params.i_max_a),
+        flux_map=raw_params.flux_map,
+        winding_temp_c=raw_params.winding_temp_c,
+        magnet_temp_c=raw_params.magnet_temp_c,
+        reference_temp_c=raw_params.reference_temp_c,
+        rs_temp_coeff_per_c=rs_alpha,
+        psi_temp_coeff_per_c=psi_alpha,
         control_mode=raw_params.control_mode,
         current_bandwidth_rad_s=raw_params.current_bandwidth_rad_s,
         kp_speed=raw_params.kp_speed,
         ki_speed=raw_params.ki_speed,
     )
 
-    duration = max(1e-3, min(10.0, float(raw_config.duration_sec)))
-    dt_out = max(1e-5, min(0.02, float(raw_config.dt_out_sec)))
-    n_out = max(2, min(4000, int(math.floor(duration / dt_out)) + 1))
+    duration = float(raw_config.duration_sec)
+    dt_out = float(raw_config.dt_out_sec)
+    if not math.isfinite(duration) or not 1e-3 <= duration <= 10.0:
+        raise ValueError("duration_sec must be within 1 ms..10 s")
+    if not math.isfinite(dt_out) or not 1e-5 <= dt_out <= 0.02:
+        raise ValueError("dt_out_sec must be within 10 us..20 ms")
+    n_out = int(math.floor(duration / dt_out)) + 1
+    if not 2 <= n_out <= 4000:
+        raise ValueError("output sample count outside supported range 2..4000")
     eff_dt_out = duration / (n_out - 1)
+    prev_end = -float("inf")
+    for idx, step in enumerate(raw_config.scenario):
+        if not all(math.isfinite(float(v)) for v in (step.t_start_sec, step.t_end_sec, step.t_load_nm)) or step.t_start_sec < 0 or step.t_end_sec <= step.t_start_sec or step.t_end_sec > duration + 1e-9 or step.t_start_sec < prev_end - 1e-9:
+            raise ValueError(f"scenario step #{idx+1} has invalid/overlapping time or load")
+        if step.v_bus_v is not None and (not math.isfinite(step.v_bus_v) or step.v_bus_v <= 0):
+            raise ValueError(f"scenario step #{idx+1} v_bus_v must be positive")
+        prev_end = step.t_end_sec
 
     tau_elec_min = min(ld, lq) / rs
     max_step_h = min(2e-5, 0.05 * tau_elec_min, eff_dt_out)
     substeps = max(1, int(math.ceil(eff_dt_out / max(1e-7, max_step_h))))
     h = eff_dt_out / substeps
+    if substeps > 20000 or substeps * (n_out - 1) > 20_000_000:
+        raise ValueError("RK4 integration step budget exceeded")
 
     bw_i = max(100.0, float(raw_params.current_bandwidth_rad_s)) if raw_params.current_bandwidth_rad_s is not None else 2.0 * math.pi * 300.0
     kp_d = ld * bw_i
@@ -1990,8 +2177,14 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
     ki_w = float(raw_params.ki_speed) if raw_params.ki_speed is not None else (kp_w * bw_w * 0.25)
 
     warnings = [
-        "此模块为合成假设动态模型 (synthetic_assumed_uncalibrated)，使用独立的 Ld/Lq/J/B 参数与 RK4 求解，不等同于 Tab 1 稳态测功标定或实测示波器采集。"
+        "此模块为合成假设动态模型 (synthetic_assumed_uncalibrated)，使用独立 dq 动态方程与 RK4 求解，不等同于实测示波器波形或已标定电机模型。"
     ]
+    if params.flux_map is not None:
+        warnings.append(f"已启用非线性磁链 Map：{params.flux_map.get('provenance')} / {params.flux_map.get('part_number') or '未标注型号'}；参考温度 {params.flux_map.get('reference_temperature_c')}°C。")
+    else:
+        warnings.append("当前使用线性磁链模型 ψd=ψf+Ld·Id、ψq=Lq·Iq。")
+    if abs(winding_temp-reference_temp) > 1e-9:
+        warnings.append(f"Rs 已按绕组温度 {winding_temp:g}°C 及参考温度 {reference_temp:g}°C 做静态温度修正；未模拟动态热反馈。")
 
     time_arr: list[float] = []
     theta_e_arr: list[float] = []
@@ -2001,6 +2194,17 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
     iq_arr: list[float] = []
     vd_arr: list[float] = []
     vq_arr: list[float] = []
+    psi_d_arr: list[float] = []
+    psi_q_arr: list[float] = []
+    p_elec_arr: list[float] = []
+    p_copper_arr: list[float] = []
+    p_mech_arr: list[float] = []
+    p_load_arr: list[float] = []
+    p_friction_arr: list[float] = []
+    p_magnetic_stored_rate_arr: list[float] = []
+    p_mechanical_stored_rate_arr: list[float] = []
+    p_electrical_balance_residual_arr: list[float] = []
+    p_mechanical_balance_residual_arr: list[float] = []
     ia_arr: list[float] = []
     ib_arr: list[float] = []
     ic_arr: list[float] = []
@@ -2039,8 +2243,9 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
             curr_limited = bool(tgt["current_limited"])
             err_d = float(tgt["id_ref_a"]) - cur_id
             err_q = float(tgt["iq_ref_a"]) - cur_iq
-            vd_cmd = kp_d * err_d + int_id - we * lq * cur_iq
-            vq_cmd = kp_q * err_q + int_iq + we * (ld * cur_id + psi_f)
+            psi_d, psi_q, *_ = evaluate_pmsm_flux(cur_id, cur_iq, psi_f, ld, lq, params.flux_map)
+            vd_cmd = kp_d * err_d + int_id - we * psi_q
+            vq_cmd = kp_q * err_q + int_iq + we * psi_d
 
         v_mag = math.hypot(vd_cmd, vq_cmd)
         v_limited = v_mag > v_max
@@ -2058,9 +2263,15 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
 
     def rhs(cur_id: float, cur_iq: float, cur_omega_m: float, vd: float, vq: float, t_load_nm: float):
         we = p * cur_omega_m
-        d_id = (vd - rs * cur_id + we * lq * cur_iq) / ld
-        d_iq = (vq - rs * cur_iq - we * (ld * cur_id + psi_f)) / lq
-        te = calc_dynamic_pmsm_torque(cur_id, cur_iq, p, psi_f, ld, lq)
+        psi_d, psi_q, ldd, ldq, lqd, lqq = evaluate_pmsm_flux(cur_id, cur_iq, psi_f, ld, lq, params.flux_map)
+        f_d = vd - rs * cur_id + we * psi_q
+        f_q = vq - rs * cur_iq - we * psi_d
+        det = ldd * lqq - ldq * lqd
+        if det <= 0 or not math.isfinite(det):
+            raise ValueError("PMSM incremental inductance matrix lost positive definiteness")
+        d_id = (f_d * lqq - ldq * f_q) / det
+        d_iq = (ldd * f_q - lqd * f_d) / det
+        te = 1.5 * p * (psi_d * cur_iq - psi_q * cur_id)
         fric = b_visc * cur_omega_m + t_coul * math.tanh(cur_omega_m / 0.5)
         d_omega_m = (te - fric - t_load_nm) / j_rot
         return d_id, d_iq, d_omega_m, we
@@ -2078,7 +2289,21 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
     for k in range(n_out):
         t_cur = k * eff_dt_out
         ctrl = eval_control(t_cur, id_a, iq_a, omega_m)
-        te_now = calc_dynamic_pmsm_torque(id_a, iq_a, p, psi_f, ld, lq)
+        te_now = calc_dynamic_pmsm_torque(id_a, iq_a, p, psi_f, ld, lq, params.flux_map)
+        psi_d_now, psi_q_now, *_ = evaluate_pmsm_flux(id_a, iq_a, psi_f, ld, lq, params.flux_map)
+        p_elec_now = 1.5 * (ctrl["vd"] * id_a + ctrl["vq"] * iq_a)
+        p_copper_now = 1.5 * rs * (id_a * id_a + iq_a * iq_a)
+        p_mech_now = te_now * omega_m
+        p_load_now = float(ctrl["cmd"]["t_load_nm"]) * omega_m
+        p_friction_now = (b_visc * omega_m + t_coul * math.tanh(omega_m / 0.5)) * omega_m
+        rhs_now = rhs(id_a, iq_a, omega_m, ctrl["vd"], ctrl["vq"], float(ctrl["cmd"]["t_load_nm"]))
+        _, _, ldd_now, ldq_now, lqd_now, lqq_now = evaluate_pmsm_flux(id_a, iq_a, psi_f, ld, lq, params.flux_map)
+        dpsi_d_dt = ldd_now * rhs_now[0] + ldq_now * rhs_now[1]
+        dpsi_q_dt = lqd_now * rhs_now[0] + lqq_now * rhs_now[1]
+        p_magnetic_stored_rate_now = 1.5 * (id_a * dpsi_d_dt + iq_a * dpsi_q_dt)
+        p_mechanical_stored_rate_now = j_rot * omega_m * rhs_now[2]
+        p_electrical_balance_residual_now = p_elec_now - p_copper_now - p_mech_now - p_magnetic_stored_rate_now
+        p_mechanical_balance_residual_now = p_mech_now - p_load_now - p_friction_now - p_mechanical_stored_rate_now
         n_rpm_now = (omega_m * 60.0) / (2.0 * math.pi)
 
         ia = id_a * math.cos(theta_e) - iq_a * math.sin(theta_e)
@@ -2096,6 +2321,17 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
         iq_arr.append(iq_a)
         vd_arr.append(ctrl["vd"])
         vq_arr.append(ctrl["vq"])
+        psi_d_arr.append(psi_d_now)
+        psi_q_arr.append(psi_q_now)
+        p_elec_arr.append(p_elec_now)
+        p_copper_arr.append(p_copper_now)
+        p_mech_arr.append(p_mech_now)
+        p_load_arr.append(p_load_now)
+        p_friction_arr.append(p_friction_now)
+        p_magnetic_stored_rate_arr.append(p_magnetic_stored_rate_now)
+        p_mechanical_stored_rate_arr.append(p_mechanical_stored_rate_now)
+        p_electrical_balance_residual_arr.append(p_electrical_balance_residual_now)
+        p_mechanical_balance_residual_arr.append(p_mechanical_balance_residual_now)
         ia_arr.append(ia)
         ib_arr.append(ib)
         ic_arr.append(ic)
@@ -2104,7 +2340,8 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
         v_bus_arr.append(float(ctrl["cmd"]["v_bus_v"]))
         m_norm_arr.append(m_norm)
         volt_lim_arr.append(1 if ctrl["v_limited"] else 0)
-        curr_lim_arr.append(1 if ctrl["curr_limited"] else 0)
+        actual_current_limited = math.hypot(id_a, iq_a) > params.i_max_a + 1e-6
+        curr_lim_arr.append(1 if (ctrl["curr_limited"] or actual_current_limited) else 0)
 
         p_mech = omega_m * te_now
         if abs(omega_m) < 0.05 and abs(te_now) < 1e-3:
@@ -2121,7 +2358,7 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
         min_rpm = min(min_rpm, n_rpm_now)
         if ctrl["v_limited"]:
             volt_hits += 1
-        if ctrl["curr_limited"]:
+        if ctrl["curr_limited"] or math.hypot(id_a, iq_a) > params.i_max_a + 1e-6:
             curr_hits += 1
         last_vd = ctrl["vd"]
         last_vq = ctrl["vq"]
@@ -2164,9 +2401,10 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
                 int_iq += h * (ki_q * err_q + bw_i * aw_q)
 
     we_end = p * omega_m
-    analytical_vd = rs * id_a - we_end * lq * iq_a
-    analytical_vq = rs * iq_a + we_end * (ld * id_a + psi_f)
-    analytical_te = calc_dynamic_pmsm_torque(id_a, iq_a, p, psi_f, ld, lq)
+    psi_d_end, psi_q_end, *_ = evaluate_pmsm_flux(id_a, iq_a, psi_f, ld, lq, params.flux_map)
+    analytical_vd = rs * id_a - we_end * psi_q_end
+    analytical_vq = rs * iq_a + we_end * psi_d_end
+    analytical_te = calc_dynamic_pmsm_torque(id_a, iq_a, p, psi_f, ld, lq, params.flux_map)
     end_rhs = rhs(id_a, iq_a, omega_m, last_vd, last_vq, last_tload)
 
     if volt_hits > 0:
@@ -2176,7 +2414,7 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
 
     return {
         "provenance": "synthetic_assumed_uncalibrated",
-        "source_model": "dynamic_pmsm_dq_rk4",
+        "source_model": "dynamic_pmsm_dq_rk4_flux_map" if params.flux_map is not None else "dynamic_pmsm_dq_rk4",
         "warnings": warnings,
         "dt_internal_sec": h,
         "substeps_per_output": substeps,
@@ -2188,6 +2426,18 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
         "iq_a": iq_arr,
         "vd_v": vd_arr,
         "vq_v": vq_arr,
+        "psi_d_vs": psi_d_arr,
+        "psi_q_vs": psi_q_arr,
+        "p_elec_w": p_elec_arr,
+        "p_copper_w": p_copper_arr,
+        "p_mech_w": p_mech_arr,
+        "p_load_w": p_load_arr,
+        "p_friction_w": p_friction_arr,
+        "p_magnetic_stored_rate_w": p_magnetic_stored_rate_arr,
+        "p_mechanical_stored_rate_w": p_mechanical_stored_rate_arr,
+        "p_electrical_balance_residual_w": p_electrical_balance_residual_arr,
+        "p_mechanical_balance_residual_w": p_mechanical_balance_residual_arr,
+        "flux_map_provenance": (params.flux_map or {}).get("provenance", "linear_parameter_model"),
         "ia_a": ia_arr,
         "ib_a": ib_arr,
         "ic_a": ic_arr,
@@ -2242,6 +2492,7 @@ from dynamic_pmsm import (
     DynamicPmsmParams,
     DynamicScenarioStep,
     build_dynamic_preset_scenario,
+    parse_pmsm_flux_map_json,
     simulate_dynamic_pmsm,
 )
 from motor_physics import (
@@ -2836,6 +3087,17 @@ with tab3:
 
 with tab4:
     st.subheader("独立 PMSM 动态 dq 轴 ODE 瞬态仿真 (FD-03)")
+    flux_map_file = st.file_uploader("导入 PMSM 非线性磁链 Map JSON（ψd/ψq vs Id/Iq）", type=["json"], key="dynamic_pmsm_flux_map_json")
+    if flux_map_file is not None:
+        try:
+            st.session_state["dynamic_pmsm_flux_map"] = parse_pmsm_flux_map_json(flux_map_file.getvalue().decode("utf-8-sig"))
+            st.success(f"已加载磁链 Map：{flux_map_file.name}")
+        except Exception as exc:
+            st.error(f"磁链 Map 导入失败：{exc}")
+            st.session_state.pop("dynamic_pmsm_flux_map", None)
+    imported_flux_map = st.session_state.get("dynamic_pmsm_flux_map")
+    if imported_flux_map:
+        st.caption(f"非线性磁链 Map：{imported_flux_map.get('part_number') or '未标注型号'} · {imported_flux_map.get('provenance')} · 参考温度 {imported_flux_map.get('reference_temperature_c')}°C；超出 Id/Iq 范围将拒绝积分。")
     st.warning(
         "来源标识: synthetic_assumed_uncalibrated (MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED) — "
         "本标签页仅执行独立的动态 dq 电磁-机械常微分方程仿真，参数 (Ld/Lq/J/B) 独立设定，绝不混入 Tab 1 稳态测功标定或实测示波器采集。"
@@ -2854,6 +3116,16 @@ with tab4:
     d_imax = float(dc6.number_input("相电流上限 Imax (A)", 0.5, 200.0, float(patch.get("i_max_a", 12.0)), format="%.1f"))
     d_mode = dc7.selectbox("控制策略", ["mtpa_current_loop", "id_zero", "open_loop_vdq"], key="dyn_mode")
 
+    tref_c, tw_c, tm_c, rs_a_c, psi_a_c = st.columns(5)
+    d_tref = float(tref_c.number_input("参数参考温度 (°C)", -40.0, 200.0, 25.0, key="dyn_tref_c"))
+    d_tw = float(tw_c.number_input("绕组温度 (°C)", -40.0, 250.0, 25.0, key="dyn_tw_c"))
+    map_ref_temp = float(imported_flux_map.get("reference_temperature_c", 25.0)) if imported_flux_map else 25.0
+    d_tm = float(tm_c.number_input("磁体温度 (°C)", -40.0, 200.0, map_ref_temp, key="dyn_tm_c"))
+    d_rs_alpha_ppm = float(rs_a_c.number_input("Rs 温度系数 (ppm/°C)", 0.0, 10000.0, 3930.0, key="dyn_rs_alpha_ppm"))
+    d_psi_alpha_ppm = float(psi_a_c.number_input("ψf 温度系数 (ppm/°C)", -10000.0, 10000.0, 0.0, key="dyn_psi_alpha_ppm"))
+    if imported_flux_map:
+        st.caption("非线性磁链 Map 按单一参考温度使用；磁体温度必须与 Map 参考温度一致，不能对整张 Map 额外乘温度系数。")
+
     dyn_p = DynamicPmsmParams(
         pole_pairs=int(patch.get("pole_pairs", st.session_state["params"].pole_pairs)),
         rs_ohm=float(patch.get("rs_ohm", 0.395)),
@@ -2866,71 +3138,96 @@ with tab4:
         v_bus_v=d_vbus,
         i_max_a=d_imax,
         control_mode=d_mode,
+        flux_map=imported_flux_map,
+        winding_temp_c=d_tw,
+        magnet_temp_c=d_tm,
+        reference_temp_c=d_tref,
+        rs_temp_coeff_per_c=d_rs_alpha_ppm * 1e-6,
+        psi_temp_coeff_per_c=d_psi_alpha_ppm * 1e-6,
     )
-    dyn_res = simulate_dynamic_pmsm(dyn_p, base_cfg)
-    for w in dyn_res["warnings"]:
+    try:
+        dyn_res = simulate_dynamic_pmsm(dyn_p, base_cfg)
+    except (ValueError, ArithmeticError) as exc:
+        dyn_res = None
+        st.error(f"动态 PMSM 仿真被输入/模型边界保护阻止：{exc}")
+    if dyn_res is not None:
+      for w in dyn_res["warnings"]:
         st.info(w)
 
-    dm1, dm2, dm3, dm4 = st.columns(4)
-    dm1.metric("峰值 |I| (A)", f"{dyn_res['peak_abs_current_a']:.3f}")
-    dm2.metric("峰值 |Te| (N·m)", f"{dyn_res['peak_abs_torque_nm']:.4f}")
-    dm3.metric("电压圆限幅点数", f"{dyn_res['voltage_limit_hits']}")
-    dm4.metric("末态稳态电压残差 (V)", f"{dyn_res['steady_check']['voltage_diff_v']:.4f}")
+      dm1, dm2, dm3, dm4 = st.columns(4)
+      dm1.metric("峰值 |I| (A)", f"{dyn_res['peak_abs_current_a']:.3f}")
+      dm2.metric("峰值 |Te| (N·m)", f"{dyn_res['peak_abs_torque_nm']:.4f}")
+      dm3.metric("电压圆限幅点数", f"{dyn_res['voltage_limit_hits']}")
+      dm4.metric("末态稳态电压残差 (V)", f"{dyn_res['steady_check']['voltage_diff_v']:.4f}")
+      balance_cols = st.columns(2)
+      balance_cols[0].metric("最大电气功率平衡残差 (W)", f"{max(abs(x) for x in dyn_res['p_electrical_balance_residual_w']):.3e}")
+      balance_cols[1].metric("最大机械功率平衡残差 (W)", f"{max(abs(x) for x in dyn_res['p_mechanical_balance_residual_w']):.3e}")
 
-    fig_dyn = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=("dq 电流 Id / Iq (A)", "电磁与负载转矩 Te / T_load (N·m)", "机械转速 n (RPM)"))
-    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["id_a"], name="Id (A)", line=dict(color="#60A5FA")), row=1, col=1)
-    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["iq_a"], name="Iq (A)", line=dict(color="#F472B6")), row=1, col=1)
-    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["te_nm"], name="Te (N·m)", line=dict(color="#FB923C")), row=2, col=1)
-    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["t_load_nm"], name="T_load (N·m)", line=dict(dash="dash", color="#94A3B8")), row=2, col=1)
-    fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["n_rpm"], name="n (RPM)", line=dict(color="#A78BFA")), row=3, col=1)
-    fig_dyn.update_layout(template="plotly_dark", height=620)
-    st.plotly_chart(fig_dyn, width="stretch")
+      fig_dyn = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=("dq 电流 Id / Iq (A)", "电磁与负载转矩 Te / T_load (N·m)", "机械转速 n (RPM)"))
+      fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["id_a"], name="Id (A)", line=dict(color="#60A5FA")), row=1, col=1)
+      fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["iq_a"], name="Iq (A)", line=dict(color="#F472B6")), row=1, col=1)
+      fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["te_nm"], name="Te (N·m)", line=dict(color="#FB923C")), row=2, col=1)
+      fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["t_load_nm"], name="T_load (N·m)", line=dict(dash="dash", color="#94A3B8")), row=2, col=1)
+      fig_dyn.add_trace(go.Scatter(x=dyn_res["time"], y=dyn_res["n_rpm"], name="n (RPM)", line=dict(color="#A78BFA")), row=3, col=1)
+      fig_dyn.update_layout(template="plotly_dark", height=620)
+      st.plotly_chart(fig_dyn, width="stretch")
 
-    df_dyn_csv = pd.DataFrame({
-        "Time_s": dyn_res["time"],
-        "n_rpm": dyn_res["n_rpm"],
-        "Id_A": dyn_res["id_a"],
-        "Iq_A": dyn_res["iq_a"],
-        "Vd_V": dyn_res["vd_v"],
-        "Vq_V": dyn_res["vq_v"],
-        "Te_Nm": dyn_res["te_nm"],
-        "T_load_Nm": dyn_res["t_load_nm"],
-        "quadrant": dyn_res["quadrant_mode"],
-    })
-    csv_header = "# WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED\n# SOURCE_MODEL=dynamic_pmsm_dq_rk4\n"
-    st.download_button(
-        f"下载动态仿真 CSV ({len(df_dyn_csv)} 行)",
-        data=(csv_header + df_dyn_csv.to_csv(index=False)).encode("utf-8"),
-        file_name="dynamic_pmsm_synthetic.csv",
-        mime="text/csv",
-    )
-`;
+      df_dyn_csv = pd.DataFrame({
+          "Time_s": dyn_res["time"],
+          "n_rpm": dyn_res["n_rpm"],
+          "Id_A": dyn_res["id_a"],
+          "Iq_A": dyn_res["iq_a"],
+          "Vd_V": dyn_res["vd_v"],
+          "Vq_V": dyn_res["vq_v"],
+          "PsiD_Vs": dyn_res["psi_d_vs"],
+          "PsiQ_Vs": dyn_res["psi_q_vs"],
+          "Pelec_W": dyn_res["p_elec_w"],
+          "Pcu_W": dyn_res["p_copper_w"],
+          "Pmech_W": dyn_res["p_mech_w"],
+          "Pload_W": dyn_res["p_load_w"],
+          "Pfriction_W": dyn_res["p_friction_w"],
+          "PmagneticStoredRate_W": dyn_res["p_magnetic_stored_rate_w"],
+          "PmechanicalStoredRate_W": dyn_res["p_mechanical_stored_rate_w"],
+          "ElectricalBalanceResidual_W": dyn_res["p_electrical_balance_residual_w"],
+          "MechanicalBalanceResidual_W": dyn_res["p_mechanical_balance_residual_w"],
+          "Te_Nm": dyn_res["te_nm"],
+          "T_load_Nm": dyn_res["t_load_nm"],
+          "quadrant": dyn_res["quadrant_mode"],
+      })
+      csv_header = f"# WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED\n# SOURCE_MODEL={('dynamic_pmsm_dq_rk4_flux_map' if imported_flux_map else 'dynamic_pmsm_dq_rk4')}\n"
+      st.download_button(
+          f"下载动态仿真 CSV ({len(df_dyn_csv)} 行)",
+          data=(csv_header + df_dyn_csv.to_csv(index=False)).encode("utf-8"),
+          file_name="dynamic_pmsm_synthetic.csv",
+          mime="text/csv",
+      )
+  `;
 
-export async function downloadPythonBundleZip(): Promise<void> {
-  const zip = new JSZip();
-  zip.file('requirements.txt', REQUIREMENTS_TXT);
-  zip.file('motor_physics.py', MOTOR_PHYSICS_PY);
-  zip.file('dyno_calibrator.py', DYNO_CALIBRATOR_PY);
-  zip.file('thermal_exporter.py', THERMAL_EXPORTER_PY);
-  zip.file('dynamic_pmsm.py', DYNAMIC_PMSM_PY);
-  zip.file('app.py', APP_PY);
+  export async function downloadPythonBundleZip(): Promise<void> {
+    const zip = new JSZip();
+    zip.file('requirements.txt', REQUIREMENTS_TXT);
+    zip.file('motor_physics.py', MOTOR_PHYSICS_PY);
+    zip.file('dyno_calibrator.py', DYNO_CALIBRATOR_PY);
+    zip.file('thermal_exporter.py', THERMAL_EXPORTER_PY);
+    zip.file('dynamic_pmsm.py', DYNAMIC_PMSM_PY);
+    zip.file('app.py', APP_PY);
 
-  const blob = await zip.generateAsync({ type: 'blob' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'bldc_foc_dyno_v2_python.zip';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'bldc_foc_dyno_v2_python.zip';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 
-export const PYTHON_BUNDLE_FILES: Array<{ name: string; content: string }> = [
-  { name: 'requirements.txt', content: REQUIREMENTS_TXT },
-  { name: 'motor_physics.py', content: MOTOR_PHYSICS_PY },
-  { name: 'dyno_calibrator.py', content: DYNO_CALIBRATOR_PY },
-  { name: 'thermal_exporter.py', content: THERMAL_EXPORTER_PY },
-  { name: 'dynamic_pmsm.py', content: DYNAMIC_PMSM_PY },
-  { name: 'app.py', content: APP_PY },
-];
+  export const PYTHON_BUNDLE_FILES: Array<{ name: string; content: string }> = [
+    { name: 'requirements.txt', content: REQUIREMENTS_TXT },
+    { name: 'motor_physics.py', content: MOTOR_PHYSICS_PY },
+    { name: 'dyno_calibrator.py', content: DYNO_CALIBRATOR_PY },
+    { name: 'thermal_exporter.py', content: THERMAL_EXPORTER_PY },
+    { name: 'dynamic_pmsm.py', content: DYNAMIC_PMSM_PY },
+    { name: 'app.py', content: APP_PY },
+  ];

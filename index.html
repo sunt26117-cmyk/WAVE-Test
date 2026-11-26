@@ -2294,6 +2294,17 @@
                   <label class="block text-[10px] text-slate-400 mb-0.5" title="PCB 空间非对称热阻：用于模拟三相中臂 (B相) 铜箔散热受限或边缘管更凉。">热路径非对称 (%)</label>
                   <input id="focRjcSpreadPctInput" type="number" step="5" min="0" max="60" value="0" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]" />
                 </div>
+                <div class="col-span-2 sm:col-span-6">
+                  <details class="rounded border border-[#26313d] bg-[#10151b] p-2">
+                    <summary class="cursor-pointer text-[10px] text-cyan-200">导入 PCB 六区热网络 JSON（可选；优先于几何估算）</summary>
+                    <div class="mt-2 flex flex-wrap items-center gap-2">
+                      <input id="focPcbSpatialJsonFileInput" type="file" accept=".json,application/json" class="text-[10px] text-slate-300" />
+                      <button id="focPcbSpatialTemplateBtn" type="button" class="rounded border border-sky-700 px-2 py-1 text-[10px] text-sky-200">下载六区 JSON 模板</button>
+                    </div>
+                    <textarea id="focPcbSpatialJsonInput" rows="4" spellcheck="false" placeholder='粘贴 wave-test-pcb-thermal v1 JSON：zones / stackup / links 或 6×6 mutualConductanceMatrixWPerC' class="mt-2 w-full rounded border border-[#283340] bg-[#0b1016] p-2 font-mono text-[10px] text-slate-200"></textarea>
+                    <p class="mt-1 text-[10px] text-slate-500">坐标与长度统一使用 mm；热导 W/°C、热容 J/°C、热阻 °C/W。可导入 CAD/FEA/热测试提取的六区热容、垂直热阻和区域互热。留空时使用 geometry_estimated 近邻估算，不代表实际 PCB。</p>
+                  </details>
+                </div>
               </div>
 
               <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 pt-1 border-t border-[#1b222c] items-end">
@@ -2306,11 +2317,38 @@
                     <option value="custom_qoss">自定义 V:Qoss(nC) 对</option>
                     <option value="custom_coss">自定义 V:Coss(pF) 对</option>
                     <option value="custom_eoss">自定义 V:Eoss(µJ) 对</option>
+                    <option value="custom_json">导入器件曲线 JSON</option>
+                    <option value="custom_csv">导入器件曲线 CSV</option>
                   </select>
                 </div>
                 <div class="sm:col-span-4">
                   <label class="block text-[10px] text-slate-400 mb-0.5" title="格式示例：0:0, 12:22, 24:36, 48:55, 80:78">曲线数据点 (V:val, 逗号分隔)</label>
                   <input id="focEossCurveInput" type="text" placeholder="0:0, 12:22, 24:36, 48:55, 80:78" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-sky-200 font-mono text-[11px]" />
+                </div>
+                <div class="sm:col-span-12">
+                  <details class="rounded border border-[#26313d] bg-[#10151b] p-2">
+                    <summary class="cursor-pointer text-[10px] text-sky-200">器件 Eoss/Qoss/Coss 曲线 JSON 导入（带型号和测试条件）</summary>
+                    <div class="flex flex-wrap items-center gap-2 my-2">
+                      <input id="focEossCurveJsonFileInput" type="file" accept=".json,application/json" class="text-[10px] text-slate-300" />
+                      <button id="focEossCurveJsonTemplateBtn" type="button" class="rounded border border-sky-700 px-2 py-1 text-[10px] text-sky-200">生成当前曲线类型 JSON 模板</button>
+                    </div>
+                    <textarea id="focEossCurveJsonInput" rows="3" spellcheck="false" placeholder='{"schema":"wave-test-eoss-curve","schemaVersion":1,"kind":"qoss_nc","voltageUnit":"V","valueUnit":"nC","provenance":"datasheet","manufacturer":"...","partNumber":"...","points":[{"vds":0,"value":0},{"vds":10,"value":18}]}' class="mt-2 w-full rounded border border-[#283340] bg-[#0b1016] p-2 font-mono text-[10px] text-slate-200"></textarea>
+                    <p class="mt-1 text-[10px] text-slate-500">JSON 曲线支持 Eoss(V)、Qoss(V)、Coss(V)，明确单位、来源、器件型号和参考测试条件。Qoss/Coss 积分要求数据包含 0V 起点，超出曲线电压范围会拒绝正式计算。</p>
+                    <div class="mt-3 border-t border-[#26313d] pt-2">
+                      <div class="mb-1 text-[10px] text-sky-200">CSV 导入（两列：Vds, Value；支持首行列名和 # 注释）</div>
+                      <div class="grid grid-cols-3 gap-2">
+                        <select id="focEossCsvKindSelect" class="rounded border border-[#283340] bg-[#0b1016] p-1 text-[10px] text-slate-200"><option value="eoss_uj">Eoss(V)</option><option value="qoss_nc" selected>Qoss(V)</option><option value="coss_pf">Coss(V)</option></select>
+                        <select id="focEossCsvVoltageUnitSelect" class="rounded border border-[#283340] bg-[#0b1016] p-1 text-[10px] text-slate-200"><option value="V">V</option><option value="mV">mV</option></select>
+                        <select id="focEossCsvValueUnitSelect" class="rounded border border-[#283340] bg-[#0b1016] p-1 text-[10px] text-slate-200"><option value="uJ">µJ</option><option value="nJ">nJ</option><option value="mJ">mJ</option><option value="nC" selected>nC</option><option value="uC">µC</option><option value="pF">pF</option><option value="nF">nF</option></select>
+                      </div>
+                      <input id="focEossCurveCsvFileInput" type="file" accept=".csv,text/csv,.txt,text/plain" class="my-2 text-[10px] text-slate-300" />
+                      <textarea id="focEossCurveCsvInput" rows="3" spellcheck="false" placeholder="Vds,Value
+0,0
+10,18
+20,31" class="w-full rounded border border-[#283340] bg-[#0b1016] p-2 font-mono text-[10px] text-slate-200"></textarea>
+                      <p class="mt-1 text-[10px] text-slate-500">CSV 导入需要在上方选择正确曲线类型和单位；数据必须覆盖实际 Vbus 工作范围，超范围拒绝作为正式损耗输入。</p>
+                    </div>
+                  </details>
                 </div>
                 <div class="sm:col-span-4 flex flex-col justify-end gap-1 pb-0.5">
                   <label class="inline-flex items-center gap-1.5 text-[11px] text-emerald-200 cursor-pointer" title="当 Esw 来自双脉冲波形实测积分 Eon+Eoff 时，Eon 已包含二极管反向恢复功耗，勾选后可防止与 Qrr 重复叠加。">

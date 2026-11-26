@@ -16,6 +16,159 @@
 import { TabState, WaveformChannel } from '../../types/models';
 import { analyzeSamplingQuality } from '../qualityCheck';
 
+export type PmsmFluxMapProvenance = 'fea_extracted' | 'measured' | 'user_import' | 'assumed';
+
+/** Rectangular nonlinear flux-linkage map. Matrices are indexed [idAxisIndex][iqAxisIndex]. */
+export interface PmsmFluxMap {
+  idAxisA: number[];
+  iqAxisA: number[];
+  psiDVs: number[][];
+  psiQVs: number[][];
+  provenance: PmsmFluxMapProvenance;
+  manufacturer?: string;
+  partNumber?: string;
+  referenceTemperatureC?: number;
+  sourceNote?: string;
+}
+
+export interface PmsmFluxMapImportDocument {
+  schema: 'wave-test-pmsm-flux-map';
+  schemaVersion: 1;
+  units: { current: 'A'; fluxLinkage: 'Vs' };
+  provenance: PmsmFluxMapProvenance;
+  manufacturer?: string;
+  partNumber?: string;
+  referenceTemperatureC?: number;
+  sourceNote?: string;
+  idAxisA: number[];
+  iqAxisA: number[];
+  psiDVs: number[][];
+  psiQVs: number[][];
+}
+
+export interface PmsmFluxEvaluation {
+  psiDVs: number;
+  psiQVs: number;
+  lddH: number;
+  ldqH: number;
+  lqdH: number;
+  lqqH: number;
+}
+
+function validateStrictAxis(axis: number[], label: string): void {
+  if (!Array.isArray(axis) || axis.length < 2 || axis.some((v) => !Number.isFinite(v))) {
+    throw new Error(`${label} 至少需要 2 个有限数值。`);
+  }
+  for (let i = 1; i < axis.length; i++) if (!(axis[i] > axis[i - 1])) {
+    throw new Error(`${label} 必须严格递增且不能重复。`);
+  }
+}
+
+export function validatePmsmFluxMap(map: PmsmFluxMap): void {
+  validateStrictAxis(map.idAxisA, 'PMSM flux-map Id 轴');
+  validateStrictAxis(map.iqAxisA, 'PMSM flux-map Iq 轴');
+  if (map.idAxisA[0] > 0 || map.idAxisA[map.idAxisA.length - 1] < 0 || map.iqAxisA[0] > 0 || map.iqAxisA[map.iqAxisA.length - 1] < 0) throw new Error('PMSM 磁链 Map 的 Id/Iq 轴都必须包含 0A 工作点。');
+  const ni = map.idAxisA.length;
+  const nq = map.iqAxisA.length;
+  for (const [name, matrix] of [['psiDVs', map.psiDVs], ['psiQVs', map.psiQVs]] as const) {
+    if (!Array.isArray(matrix) || matrix.length !== ni || matrix.some((row) => !Array.isArray(row) || row.length !== nq || row.some((v) => !Number.isFinite(v)))) {
+      throw new Error(`${name} 必须为 ${ni}×${nq} 的有限数值矩阵，行索引对应 Id，列索引对应 Iq。`);
+    }
+  }
+  // Check the local differential-inductance matrix at every cell center. A passive
+  // reciprocal magnetic map must have positive incremental energy curvature.
+  for (let i = 0; i < ni - 1; i++) {
+    for (let j = 0; j < nq - 1; j++) {
+      const did = map.idAxisA[i + 1] - map.idAxisA[i];
+      const diq = map.iqAxisA[j + 1] - map.iqAxisA[j];
+      const ldd = 0.5 * ((map.psiDVs[i + 1][j] - map.psiDVs[i][j]) + (map.psiDVs[i + 1][j + 1] - map.psiDVs[i][j + 1])) / did;
+      const ldq = 0.5 * ((map.psiDVs[i][j + 1] - map.psiDVs[i][j]) + (map.psiDVs[i + 1][j + 1] - map.psiDVs[i + 1][j])) / diq;
+      const lqd = 0.5 * ((map.psiQVs[i + 1][j] - map.psiQVs[i][j]) + (map.psiQVs[i + 1][j + 1] - map.psiQVs[i][j + 1])) / did;
+      const lqq = 0.5 * ((map.psiQVs[i][j + 1] - map.psiQVs[i][j]) + (map.psiQVs[i + 1][j + 1] - map.psiQVs[i + 1][j])) / diq;
+      const scale = Math.max(1e-9, Math.abs(ldd), Math.abs(ldq), Math.abs(lqd), Math.abs(lqq));
+      if (!(ldd > 1e-9 * scale) || !(lqq > 1e-9 * scale) || !(ldd * lqq - ldq * lqd > 1e-12 * scale * scale)) {
+        throw new Error(`PMSM flux-map 在 Id=${map.idAxisA[i]}~${map.idAxisA[i + 1]}A、Iq=${map.iqAxisA[j]}~${map.iqAxisA[j + 1]}A 区域的增量电感矩阵不是正定矩阵。`);
+      }
+      if (Math.abs(ldq - lqd) > 0.35 * scale) {
+        throw new Error(`PMSM flux-map 在局部网格的交叉微分电感不互易 (L_dq=${ldq.toExponential(2)}, L_qd=${lqd.toExponential(2)})；请检查单位、网格方向或数据噪声。`);
+      }
+    }
+  }
+  if (map.referenceTemperatureC === undefined || !Number.isFinite(map.referenceTemperatureC)) {
+    throw new Error('PMSM flux-map 必须提供有限 referenceTemperatureC，禁止对未知温度数据进行无依据应用。');
+  }
+  if (!['fea_extracted', 'measured', 'user_import', 'assumed'].includes(map.provenance)) {
+    throw new Error('PMSM flux-map provenance 必须为 fea_extracted/measured/user_import/assumed。');
+  }
+}
+
+export function parsePmsmFluxMapJson(text: string): PmsmFluxMap {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch (err) {
+    throw new Error(`PMSM 磁链 Map JSON 解析失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!raw || typeof raw !== 'object') throw new Error('PMSM 磁链 Map 必须为 JSON 对象。');
+  const doc = raw as Partial<PmsmFluxMapImportDocument>;
+  if (doc.schema !== 'wave-test-pmsm-flux-map' || doc.schemaVersion !== 1 || doc.units?.current !== 'A' || doc.units?.fluxLinkage !== 'Vs') {
+    throw new Error('PMSM 磁链 Map 文件格式不匹配：需要 wave-test-pmsm-flux-map v1，电流单位 A、磁链单位 Vs。');
+  }
+  const map: PmsmFluxMap = {
+    idAxisA: doc.idAxisA || [], iqAxisA: doc.iqAxisA || [],
+    psiDVs: doc.psiDVs || [], psiQVs: doc.psiQVs || [],
+    provenance: doc.provenance || 'user_import',
+    manufacturer: doc.manufacturer, partNumber: doc.partNumber,
+    referenceTemperatureC: doc.referenceTemperatureC, sourceNote: doc.sourceNote,
+  };
+  validatePmsmFluxMap(map);
+  return map;
+}
+
+export function createPmsmFluxMapImportTemplate(): PmsmFluxMapImportDocument {
+  return {
+    schema: 'wave-test-pmsm-flux-map', schemaVersion: 1,
+    units: { current: 'A', fluxLinkage: 'Vs' }, provenance: 'fea_extracted',
+    manufacturer: '', partNumber: '', referenceTemperatureC: 25,
+    idAxisA: [-20, 0, 20], iqAxisA: [-20, 0, 20],
+    psiDVs: [[0.006, 0.006, 0.006], [0.010, 0.010, 0.010], [0.014, 0.014, 0.014]],
+    psiQVs: [[-0.020, 0, 0.020], [-0.020, 0, 0.020], [-0.020, 0, 0.020]],
+    sourceNote: 'Replace template values with measured or FEA-extracted flux linkage data. Template values are illustrative only.',
+  };
+}
+
+function findAxisBracket(axis: number[], value: number, label: string): { lo: number; hi: number; f: number } {
+  if (value < axis[0] - 1e-9 || value > axis[axis.length - 1] + 1e-9) {
+    throw new Error(`${label}=${value.toFixed(4)}A 超出磁链 Map 范围 [${axis[0]}, ${axis[axis.length - 1]}]A；禁止边界保持或无依据外推。`);
+  }
+  const x = Math.max(axis[0], Math.min(axis[axis.length - 1], value));
+  let hi = 1;
+  while (hi < axis.length - 1 && axis[hi] < x) hi++;
+  const lo = hi - 1;
+  return { lo, hi, f: (x - axis[lo]) / (axis[hi] - axis[lo]) };
+}
+
+export function evaluatePmsmFluxMap(map: PmsmFluxMap, idA: number, iqA: number): PmsmFluxEvaluation {
+  if (!Number.isFinite(idA) || !Number.isFinite(iqA)) throw new Error('PMSM flux-map 查询电流必须为有限值。');
+  const bi = findAxisBracket(map.idAxisA, idA, 'Id');
+  const bq = findAxisBracket(map.iqAxisA, iqA, 'Iq');
+  const dx = map.idAxisA[bi.hi] - map.idAxisA[bi.lo];
+  const dy = map.iqAxisA[bq.hi] - map.iqAxisA[bq.lo];
+  const interp = (m: number[][]) => {
+    const v00 = m[bi.lo][bq.lo], v10 = m[bi.hi][bq.lo];
+    const v01 = m[bi.lo][bq.hi], v11 = m[bi.hi][bq.hi];
+    const f = (1 - bi.f) * (1 - bq.f) * v00 + bi.f * (1 - bq.f) * v10 + (1 - bi.f) * bq.f * v01 + bi.f * bq.f * v11;
+    const dId = ((1 - bq.f) * (v10 - v00) + bq.f * (v11 - v01)) / dx;
+    const dIq = ((1 - bi.f) * (v01 - v00) + bi.f * (v11 - v10)) / dy;
+    return { value: f, dId, dIq };
+  };
+  const d = interp(map.psiDVs);
+  const q = interp(map.psiQVs);
+  const det = d.dId * q.dIq - d.dIq * q.dId;
+  if (!(d.dId > 0) || !(q.dIq > 0) || !(det > 0) || ![d.value, q.value, d.dId, d.dIq, q.dId, q.dIq].every(Number.isFinite)) {
+    throw new Error('PMSM flux-map 查询位置的增量电感矩阵非正定或含非法值，已阻止动态积分。');
+  }
+  return { psiDVs: d.value, psiQVs: q.value, lddH: d.dId, ldqH: d.dIq, lqdH: q.dId, lqqH: q.dIq };
+}
+
 export type DynamicControlMode = 'mtpa_current_loop' | 'id_zero' | 'open_loop_vdq';
 export type DynamicQuadrantMode = 'motoring' | 'regen' | 'standstill';
 
@@ -37,6 +190,14 @@ export interface DynamicPmsmParams {
   /** Optional speed-loop PI gains (used when step specifies speedRefRpm). */
   kpSpeed?: number;
   kiSpeed?: number;
+  /** Optional nonlinear flux-linkage map ψd(Id,Iq), ψq(Id,Iq), in V·s. */
+  fluxMap?: PmsmFluxMap;
+  /** Static operating temperatures; no transient thermal feedback is implied. */
+  windingTempC?: number;
+  magnetTempC?: number;
+  referenceTempC?: number;
+  rsTempCoeffPerC?: number;
+  psiTempCoeffPerC?: number;
 }
 
 export interface DynamicScenarioStep {
@@ -83,7 +244,7 @@ export interface DynamicSteadyCheck {
 
 export interface DynamicPmsmResult {
   provenance: 'synthetic_assumed_uncalibrated';
-  sourceModel: 'dynamic_pmsm_dq_rk4';
+  sourceModel: 'dynamic_pmsm_dq_rk4' | 'dynamic_pmsm_dq_rk4_flux_map';
   warnings: string[];
   dtInternalSec: number;
   substepsPerOutput: number;
@@ -95,6 +256,21 @@ export interface DynamicPmsmResult {
   iqA: Float64Array;
   vdV: Float64Array;
   vqV: Float64Array;
+  psiDVs: Float64Array;
+  psiQVs: Float64Array;
+  pElecW: Float64Array;
+  pCopperW: Float64Array;
+  pMechW: Float64Array;
+  pLoadW: Float64Array;
+  pFrictionW: Float64Array;
+  /** Rate of stored magnetic energy change derived from incremental flux-linkage dynamics. */
+  pMagneticStoredRateW: Float64Array;
+  /** Rate of stored rotor kinetic energy change J·ω·dω/dt. */
+  pMechanicalStoredRateW: Float64Array;
+  /** P_elec - P_copper - P_mech - dW_magnetic/dt; should approach numerical zero. */
+  pElectricalBalanceResidualW: Float64Array;
+  /** P_mech - P_load - P_friction - dW_kinetic/dt; should approach numerical zero. */
+  pMechanicalBalanceResidualW: Float64Array;
   iaA: Float64Array;
   ibA: Float64Array;
   icA: Float64Array;
@@ -112,6 +288,8 @@ export interface DynamicPmsmResult {
   voltageLimitHits: number;
   currentLimitHits: number;
   steadyCheck: DynamicSteadyCheck;
+  fluxMapProvenance: PmsmFluxMapProvenance | 'linear_parameter_model';
+  fluxMapOutOfRangeCount: number;
 }
 
 export interface DynamicCommandTarget {
@@ -128,16 +306,106 @@ export function kePrimeToPsiF(kePrime: number, polePairs: number): number {
   return kePrime / Math.max(1, polePairs);
 }
 
-/** Compute electromagnetic torque Te = 1.5 * p * (psi_f * iq + (Ld - Lq) * id * iq). */
+/** Evaluate linear or imported nonlinear dq flux linkage in the amplitude-invariant convention. */
+export function evaluateDynamicPmsmFlux(
+  idA: number,
+  iqA: number,
+  psiFVs: number,
+  ldH: number,
+  lqH: number,
+  fluxMap?: PmsmFluxMap,
+  psiScale = 1
+): PmsmFluxEvaluation {
+  if (fluxMap) {
+    const mapped = evaluatePmsmFluxMap(fluxMap, idA, iqA);
+    return {
+      ...mapped,
+      psiDVs: mapped.psiDVs * psiScale,
+      psiQVs: mapped.psiQVs * psiScale,
+      lddH: mapped.lddH * psiScale,
+      ldqH: mapped.ldqH * psiScale,
+      lqdH: mapped.lqdH * psiScale,
+      lqqH: mapped.lqqH * psiScale,
+    };
+  }
+  return {
+    psiDVs: psiFVs + ldH * idA,
+    psiQVs: lqH * iqA,
+    lddH: ldH, ldqH: 0, lqdH: 0, lqqH: lqH,
+  };
+}
+
+/** Electromagnetic torque from co-energy: Te = 1.5*p*(psi_d*iq - psi_q*id). */
 export function calcDynamicPmsmTorque(
   idA: number,
   iqA: number,
   polePairs: number,
   psiFVs: number,
   ldH: number,
-  lqH: number
+  lqH: number,
+  fluxMap?: PmsmFluxMap
 ): number {
-  return 1.5 * polePairs * (psiFVs * iqA + (ldH - lqH) * idA * iqA);
+  const flux = evaluateDynamicPmsmFlux(idA, iqA, psiFVs, ldH, lqH, fluxMap);
+  return 1.5 * polePairs * (flux.psiDVs * iqA - flux.psiQVs * idA);
+}
+
+/**
+ * Map-aware MTPA/field-weakening target search. The incoming command is an Iq-equivalent
+ * torque-producing current request for backward compatibility; its torque is preserved
+ * while the solver searches Id/Iq inside the current circle and voltage ellipse.
+ */
+function computeFluxMapCurrentTarget(
+  iTorqueCmdA: number,
+  omegaERadS: number,
+  vBusV: number,
+  params: DynamicPmsmParams
+): { idRefA: number; iqRefA: number; currentLimited: boolean; fieldWeakeningActive: boolean } {
+  const iMax = Math.max(0.05, params.iMaxA);
+  const sign = iTorqueCmdA >= 0 ? 1 : -1;
+  const requestedIq = Math.min(Math.abs(iTorqueCmdA), iMax) * sign;
+  const psiScale = 1; // Flux-map temperature compensation requires a temperature-indexed map; do not scale Ld/Lq derivatives as if they were PM flux only.
+  const targetTorque = calcDynamicPmsmTorque(0, requestedIq, params.polePairs, params.psiFVs, params.ldH, params.lqH, params.fluxMap);
+  const rs = params.rsOhm * (1 + (params.rsTempCoeffPerC ?? 0) * ((params.windingTempC ?? params.referenceTempC ?? 25) - (params.referenceTempC ?? 25)));
+  const vMax = Math.max(0.5, vBusV) / Math.sqrt(3) * 0.96;
+  const absTarget = Math.abs(targetTorque);
+  let best: { id: number; iq: number; current2: number; torqueError: number; voltage: number } | null = null;
+  // Spell the type out: `typeof best` captures the *narrowed* type (null) right
+  // after the initialiser, which makes the assignment below a type error.
+  let closest: { id: number; iq: number; current2: number; torqueError: number; voltage: number } | null = null;
+  const idSamples = 48;
+  for (let k = 0; k <= idSamples; k++) {
+    const id = -iMax + (2 * iMax * k) / idSamples;
+    const iqMax = Math.sqrt(Math.max(0, iMax * iMax - id * id));
+    if (iqMax < 1e-10) continue;
+    let lo = 0;
+    let hi = iqMax;
+    let iq = sign * iqMax;
+    const torqueAtMax = calcDynamicPmsmTorque(id, iq, params.polePairs, params.psiFVs, params.ldH, params.lqH, params.fluxMap);
+    if (Math.abs(torqueAtMax) >= absTarget) {
+      for (let it = 0; it < 34; it++) {
+        const mid = 0.5 * (lo + hi);
+        const tq = calcDynamicPmsmTorque(id, sign * mid, params.polePairs, params.psiFVs, params.ldH, params.lqH, params.fluxMap);
+        if (Math.abs(tq) < absTarget) lo = mid; else hi = mid;
+      }
+      iq = sign * 0.5 * (lo + hi);
+    }
+    const torque = calcDynamicPmsmTorque(id, iq, params.polePairs, params.psiFVs, params.ldH, params.lqH, params.fluxMap);
+    const flux = evaluateDynamicPmsmFlux(id, iq, params.psiFVs, params.ldH, params.lqH, params.fluxMap, psiScale);
+    const vd = rs * id - omegaERadS * flux.psiQVs;
+    const vq = rs * iq + omegaERadS * flux.psiDVs;
+    const vMag = Math.hypot(vd, vq);
+    const candidate = { id, iq, current2: id * id + iq * iq, torqueError: Math.abs(torque - targetTorque), voltage: vMag };
+    if (!closest || candidate.torqueError + Math.max(0, candidate.voltage - vMax) * 0.1 < closest.torqueError + Math.max(0, closest.voltage - vMax) * 0.1) closest = candidate;
+    if (vMag <= vMax && (!best || candidate.torqueError < best.torqueError - 1e-6 || (Math.abs(candidate.torqueError - best.torqueError) <= 1e-6 && candidate.current2 < best.current2))) best = candidate;
+  }
+  const chosen = best || closest;
+  if (!chosen) return { idRefA: 0, iqRefA: 0, currentLimited: true, fieldWeakeningActive: true };
+  return {
+    idRefA: chosen.id,
+    iqRefA: chosen.iq,
+    currentLimited: Math.abs(iTorqueCmdA) > iMax + 1e-9 || chosen.torqueError > Math.max(1e-3, absTarget * 0.02),
+    fieldWeakeningActive: Math.abs(omegaERadS) > 1 && chosen.id < -0.05,
+  };
 }
 
 /**
@@ -150,6 +418,7 @@ export function computeMtpaAndFieldWeakeningTarget(
   vBusV: number,
   params: DynamicPmsmParams
 ): { idRefA: number; iqRefA: number; currentLimited: boolean; fieldWeakeningActive: boolean } {
+  if (params.fluxMap) return computeFluxMapCurrentTarget(iTorqueCmdA, omegaERadS, vBusV, params);
   const iMax = Math.max(0.05, params.iMaxA);
   const absCmd = Math.abs(iTorqueCmdA);
   const currentLimited = absCmd > iMax + 1e-9;
@@ -213,12 +482,11 @@ function sampleScenarioAt(tSec: number, params: DynamicPmsmParams, scenario: Dyn
   if (scenario.length === 0) {
     return { tLoadNm: 0, vBusV: params.vBusV, iqRefA: 0, vdRefV: 0, vqRefV: 0 };
   }
-  let chosen = scenario[scenario.length - 1];
+  // In a gap, hold the preceding command. Before the first segment, use the first command.
+  let chosen = scenario[0];
   for (const step of scenario) {
-    if (tSec >= step.tStartSec - 1e-12 && tSec <= step.tEndSec + 1e-12) {
-      chosen = step;
-      break;
-    }
+    if (tSec >= step.tStartSec - 1e-12) chosen = step;
+    if (tSec >= step.tStartSec - 1e-12 && tSec <= step.tEndSec + 1e-12) break;
   }
   return {
     tLoadNm: Number.isFinite(chosen.tLoadNm) ? chosen.tLoadNm : 0,
@@ -296,54 +564,115 @@ export function simulateDynamicPmsm(
   rawParams: DynamicPmsmParams,
   rawConfig: DynamicPmsmConfig
 ): DynamicPmsmResult {
-  const p = Math.max(1, Math.round(rawParams.polePairs));
-  const rs = Math.max(1e-4, rawParams.rsOhm);
-  const ld = Math.max(1e-6, rawParams.ldH);
-  const lq = Math.max(1e-6, rawParams.lqH);
-  const psiF = Math.max(1e-5, rawParams.psiFVs);
-  const jRot = Math.max(1e-7, rawParams.jKgM2);
-  const bVisc = Math.max(0, rawParams.bNmSPerRad);
-  const tCoul = Math.max(0, rawParams.tCoulombNm);
-  const params: DynamicPmsmParams = {
-    ...rawParams,
-    polePairs: p,
-    rsOhm: rs,
-    ldH: ld,
-    lqH: lq,
-    psiFVs: psiF,
-    jKgM2: jRot,
-    bNmSPerRad: bVisc,
-    tCoulombNm: tCoul,
-    vBusV: Math.max(1, rawParams.vBusV),
-    iMaxA: Math.max(0.1, rawParams.iMaxA),
+  const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const requirePositive = (name: string, value: unknown): number => {
+    if (!finite(value) || value <= 0) throw new Error(`${name} 必须为有限正数。`);
+    return value;
+  };
+  const requireNonNegative = (name: string, value: unknown): number => {
+    if (!finite(value) || value < 0) throw new Error(`${name} 必须为有限非负数。`);
+    return value;
   };
 
-  const duration = Math.max(1e-3, Math.min(10, rawConfig.durationSec));
-  const dtOut = Math.max(1e-5, Math.min(0.02, rawConfig.dtOutSec));
-  const nOut = Math.max(2, Math.min(4000, Math.floor(duration / dtOut) + 1));
+  if (!Number.isInteger(rawParams.polePairs) || rawParams.polePairs < 1) throw new Error('极对数 polePairs 必须为正整数。');
+  const p = rawParams.polePairs;
+  const rsBase = requirePositive('Rs', rawParams.rsOhm);
+  const ld = requirePositive('Ld', rawParams.ldH);
+  const lq = requirePositive('Lq', rawParams.lqH);
+  const psiFBase = requirePositive('永磁体磁链 ψf', rawParams.psiFVs);
+  const jRot = requirePositive('转动惯量 J', rawParams.jKgM2);
+  const bVisc = requireNonNegative('粘性阻尼 B', rawParams.bNmSPerRad);
+  const tCoul = requireNonNegative('库仑摩擦 T_coulomb', rawParams.tCoulombNm);
+  const vBusDefault = requirePositive('母线电压 Vbus', rawParams.vBusV);
+  const iMax = requirePositive('电流上限 Imax', rawParams.iMaxA);
+  if (!['mtpa_current_loop', 'id_zero', 'open_loop_vdq'].includes(rawParams.controlMode)) throw new Error('未知 PMSM 控制模式。');
+
+  const referenceTempC = rawParams.referenceTempC ?? 25;
+  const windingTempC = rawParams.windingTempC ?? referenceTempC;
+  const magnetTempC = rawParams.magnetTempC ?? (rawParams.fluxMap?.referenceTemperatureC ?? referenceTempC);
+  if (![referenceTempC, windingTempC, magnetTempC].every(finite)) throw new Error('绕组、磁体及参考温度必须为有限值。');
+  const rsAlpha = rawParams.rsTempCoeffPerC ?? 0.00393; // Copper winding default; keep parity with Python/UI defaults.
+  const psiAlpha = rawParams.psiTempCoeffPerC ?? 0;
+  requireNonNegative('Rs 温度系数', rsAlpha);
+  if (!finite(psiAlpha)) throw new Error('磁链温度系数必须为有限值。');
+  const rs = rsBase * (1 + rsAlpha * (windingTempC - referenceTempC));
+  if (!(rs > 0) || !Number.isFinite(rs)) throw new Error('温度修正后的 Rs 非法或非正。');
+  const psiF = psiFBase * (1 + psiAlpha * (magnetTempC - referenceTempC));
+  if (!(psiF > 0) || !Number.isFinite(psiF)) throw new Error('温度修正后的永磁体磁链 ψf 非法或非正。');
+  if (rawParams.fluxMap) {
+    validatePmsmFluxMap(rawParams.fluxMap);
+    const mapReferenceTemp = rawParams.fluxMap.referenceTemperatureC;
+    if (mapReferenceTemp === undefined || !Number.isFinite(mapReferenceTemp)) throw new Error('非线性 PMSM 磁链 Map 必须提供 referenceTemperatureC，禁止将未知温度数据当作当前温度使用。');
+    if (Math.abs(magnetTempC - mapReferenceTemp) > 1e-6) throw new Error(`磁体温度 ${magnetTempC}°C 与磁链 Map 参考温度 ${mapReferenceTemp}°C 不一致；请导入对应温度 Map。`);
+    if (rawParams.fluxMap.idAxisA[0] > -iMax || rawParams.fluxMap.idAxisA[rawParams.fluxMap.idAxisA.length - 1] < iMax || rawParams.fluxMap.iqAxisA[0] > -iMax || rawParams.fluxMap.iqAxisA[rawParams.fluxMap.iqAxisA.length - 1] < iMax) throw new Error(`PMSM 磁链 Map 电流覆盖范围必须至少覆盖 ±Imax（当前 Imax=${iMax}A）；禁止控制器搜索到 Map 外部。`);
+    const mapTemp = rawParams.fluxMap.referenceTemperatureC;
+    if (mapTemp !== undefined && Math.abs(magnetTempC - mapTemp) > 1e-6) {
+      throw new Error(`当前磁体温度 ${magnetTempC}°C 与磁链 Map 参考温度 ${mapTemp}°C 不一致。当前 Map 未提供温度维度，禁止对非线性磁链曲线整体套用 ψf 温度系数。`);
+    }
+    if (rawParams.psiTempCoeffPerC !== undefined && rawParams.psiTempCoeffPerC !== 0) {
+      throw new Error('使用非线性磁链 Map 时，不允许对整个 ψd/ψq Map 乘永磁体温度系数；请导入对应温度的磁链 Map。');
+    }
+  }
+
+  const duration = requirePositive('仿真总时长', rawConfig.durationSec);
+  const dtOut = requirePositive('输出采样间隔', rawConfig.dtOutSec);
+  if (duration < 1e-3 || duration > 10) throw new Error('仿真总时长必须在 1 ms～10 s 范围内。');
+  if (dtOut < 1e-5 || dtOut > 0.02) throw new Error('输出采样间隔必须在 10 µs～20 ms 范围内。');
+  if (!Array.isArray(rawConfig.scenario)) throw new Error('动态工况 scenario 必须为数组。');
+  const nOut = Math.floor(duration / dtOut) + 1;
+  if (nOut < 2 || nOut > 4000) throw new Error(`输出采样点数 ${nOut} 超出允许范围 2～4000；请调整总时长或输出采样间隔。`);
   const effDtOut = duration / (nOut - 1);
+
+  let previousEnd = -Infinity;
+  for (let i = 0; i < rawConfig.scenario.length; i++) {
+    const step = rawConfig.scenario[i];
+    if (![step.tStartSec, step.tEndSec, step.tLoadNm].every(finite) || step.tStartSec < 0 || step.tEndSec <= step.tStartSec || step.tEndSec > duration + 1e-9) {
+      throw new Error(`工况段 #${i + 1} 的起止时间或负载扭矩无效。`);
+    }
+    if (step.tStartSec < previousEnd - 1e-9) throw new Error(`工况段 #${i + 1} 与前一段重叠或顺序错误。`);
+    for (const [name, value] of Object.entries({ speedRefRpm: step.speedRefRpm, iqRefA: step.iqRefA, vdRefV: step.vdRefV, vqRefV: step.vqRefV, vBusV: step.vBusV })) {
+      if (value !== undefined && !finite(value)) throw new Error(`工况段 #${i + 1} 的 ${name} 不是有限数值。`);
+    }
+    if (step.vBusV !== undefined && step.vBusV <= 0) throw new Error(`工况段 #${i + 1} 的 Vbus 必须大于零。`);
+    previousEnd = step.tEndSec;
+  }
+  const initialId = rawConfig.initialIdA ?? 0;
+  const initialIq = rawConfig.initialIqA ?? 0;
+  const initialSpeed = rawConfig.initialSpeedRpm ?? 0;
+  const initialTheta = rawConfig.initialThetaERad ?? 0;
+  if (![initialId, initialIq, initialSpeed, initialTheta].every(finite)) throw new Error('初始电流、转速和电角度必须为有限值。');
+
+  const params: DynamicPmsmParams = {
+    ...rawParams, polePairs: p, rsOhm: rs, ldH: ld, lqH: lq, psiFVs: psiF,
+    jKgM2: jRot, bNmSPerRad: bVisc, tCoulombNm: tCoul,
+    vBusV: vBusDefault, iMaxA: iMax,
+    windingTempC, magnetTempC, referenceTempC,
+  };
 
   const tauElecMin = Math.min(ld, lq) / rs;
   const maxStepH = Math.min(2e-5, 0.05 * tauElecMin, effDtOut);
-  const substeps = Math.max(1, Math.ceil(effDtOut / Math.max(1e-7, maxStepH)));
+  const substeps = Math.max(1, Math.ceil(effDtOut / maxStepH));
+  if (!Number.isSafeInteger(substeps) || substeps > 20000 || substeps * (nOut - 1) > 20_000_000) {
+    throw new Error(`RK4 内部步数过大 (${substeps}/输出步)，超出 2,000 万总积分步预算；请降低仿真时长或放宽输出采样间隔。`);
+  }
   const h = effDtOut / substeps;
 
-  // Current PI gains (pole placement at omega_bw_i)
-  const bwI = Math.max(100, rawParams.currentBandwidthRadS ?? 2 * Math.PI * 300);
+  const bwI = rawParams.currentBandwidthRadS === undefined ? 2 * Math.PI * 300 : requirePositive('电流环带宽', rawParams.currentBandwidthRadS);
   const kpD = ld * bwI;
   const kiD = rs * bwI;
   const kpQ = lq * bwI;
   const kiQ = rs * bwI;
-
-  // Speed PI gains (tuned relative to J & Kt0)
   const kt0 = 1.5 * p * psiF;
   const bwW = Math.min(bwI * 0.15, 120);
-  const kpW = rawParams.kpSpeed ?? (jRot * bwW) / Math.max(1e-4, kt0);
-  const kiW = rawParams.kiSpeed ?? (kpW * bwW * 0.25);
+  const kpW = rawParams.kpSpeed === undefined ? (jRot * bwW) / Math.max(1e-4, kt0) : requireNonNegative('速度环 Kp', rawParams.kpSpeed);
+  const kiW = rawParams.kiSpeed === undefined ? kpW * bwW * 0.25 : requireNonNegative('速度环 Ki', rawParams.kiSpeed);
 
   const warnings: string[] = [
-    '此模块为合成假设动态模型 (synthetic_assumed_uncalibrated)，使用独立的 Ld/Lq/J/B 参数与 RK4 求解，不等同于 Tab 1 稳态测功标定或实测示波器采集。',
+    '此模块为合成假设动态模型 (synthetic_assumed_uncalibrated)，使用独立 dq 动态方程与 RK4 求解，不等同于实测示波器波形或已标定电机模型。',
   ];
+  if (rawParams.fluxMap) warnings.push(`已启用非线性磁链 Map：${rawParams.fluxMap.provenance}${rawParams.fluxMap.partNumber ? ` / ${rawParams.fluxMap.partNumber}` : ''}；Map 参考温度 ${rawParams.fluxMap.referenceTemperatureC ?? '未指定'}°C。`);
+  else warnings.push('当前使用线性参数磁链模型 ψd=ψf+Ld·Id、ψq=Lq·Iq。');
+  if (windingTempC !== referenceTempC) warnings.push(`Rs 已按绕组温度 ${windingTempC}°C 和参考温度 ${referenceTempC}°C 进行静态温度修正；未模拟动态热反馈。`);
 
   const time = new Float64Array(nOut);
   const thetaEArr = new Float64Array(nOut);
@@ -353,6 +682,17 @@ export function simulateDynamicPmsm(
   const iqArr = new Float64Array(nOut);
   const vdArr = new Float64Array(nOut);
   const vqArr = new Float64Array(nOut);
+  const psiDArr = new Float64Array(nOut);
+  const psiQArr = new Float64Array(nOut);
+  const pElecArr = new Float64Array(nOut);
+  const pCopperArr = new Float64Array(nOut);
+  const pMechArr = new Float64Array(nOut);
+  const pLoadArr = new Float64Array(nOut);
+  const pFrictionArr = new Float64Array(nOut);
+  const pMagneticStoredRateArr = new Float64Array(nOut);
+  const pMechanicalStoredRateArr = new Float64Array(nOut);
+  const pElectricalBalanceResidualArr = new Float64Array(nOut);
+  const pMechanicalBalanceResidualArr = new Float64Array(nOut);
   const iaArr = new Float64Array(nOut);
   const ibArr = new Float64Array(nOut);
   const icArr = new Float64Array(nOut);
@@ -364,61 +704,65 @@ export function simulateDynamicPmsm(
   const currLimArr = new Uint8Array(nOut);
   const quadrantMode: DynamicQuadrantMode[] = [];
 
-  let id = Number.isFinite(rawConfig.initialIdA) ? (rawConfig.initialIdA as number) : 0;
-  let iq = Number.isFinite(rawConfig.initialIqA) ? (rawConfig.initialIqA as number) : 0;
-  let omegaM = ((Number.isFinite(rawConfig.initialSpeedRpm) ? (rawConfig.initialSpeedRpm as number) : 0) * 2 * Math.PI) / 60;
-  let thetaE = Number.isFinite(rawConfig.initialThetaERad) ? (rawConfig.initialThetaERad as number) : 0;
-
+  let id = initialId;
+  let iq = initialIq;
+  let omegaM = (initialSpeed * 2 * Math.PI) / 60;
+  let thetaE = initialTheta;
   let intId = 0;
   let intIq = 0;
   let intW = 0;
+
+  const fluxAt = (idA: number, iqA: number) => evaluateDynamicPmsmFlux(idA, iqA, psiF, ld, lq, params.fluxMap);
+  const torqueAt = (idA: number, iqA: number) => {
+    const f = fluxAt(idA, iqA);
+    return 1.5 * p * (f.psiDVs * iqA - f.psiQVs * idA);
+  };
 
   const evalControl = (tSec: number, curId: number, curIq: number, curOmegaM: number) => {
     const cmd = sampleScenarioAt(tSec, params, rawConfig.scenario);
     const vMax = cmd.vBusV / Math.sqrt(3);
     const we = p * curOmegaM;
-
+    const flux = fluxAt(curId, curIq);
+    const kpDLocal = flux.lddH * bwI;
+    const kpQLocal = flux.lqqH * bwI;
+    const kpICurrent = rs * bwI;
     let vdCmd = cmd.vdRefV;
     let vqCmd = cmd.vqRefV;
     let iCurrLimited = false;
-
     if (params.controlMode !== 'open_loop_vdq') {
       let iTorqCmd = 0;
-      if (cmd.iqRefA !== undefined && Number.isFinite(cmd.iqRefA)) {
-        iTorqCmd = cmd.iqRefA;
-      } else {
+      if (cmd.iqRefA !== undefined) iTorqCmd = cmd.iqRefA;
+      else {
         const wRef = ((cmd.speedRefRpm ?? 0) * 2 * Math.PI) / 60;
         const errW = wRef - curOmegaM;
-        const unsatI = kpW * errW + intW;
-        iTorqCmd = unsatI;
+        iTorqCmd = kpW * errW + intW;
       }
       const target = computeMtpaAndFieldWeakeningTarget(iTorqCmd, we, cmd.vBusV, params);
       iCurrLimited = target.currentLimited;
-
       const errD = target.idRefA - curId;
       const errQ = target.iqRefA - curIq;
-      // Decoupled dq voltage command
-      vdCmd = kpD * errD + intId - we * lq * curIq;
-      vqCmd = kpQ * errQ + intIq + we * (ld * curId + psiF);
+      vdCmd = kpDLocal * errD + intId - we * flux.psiQVs;
+      vqCmd = kpQLocal * errQ + intIq + we * flux.psiDVs;
     }
-
     const vMag = Math.hypot(vdCmd, vqCmd);
     const vLimited = vMag > vMax;
     const scale = vLimited && vMag > 1e-12 ? vMax / vMag : 1;
-    const vd = vdCmd * scale;
-    const vq = vqCmd * scale;
-    return { cmd, vd, vq, vdCmd, vqCmd, vMax, vLimited, iCurrLimited };
+    return { cmd, vd: vdCmd * scale, vq: vqCmd * scale, vdCmd, vqCmd, vMax, vLimited, iCurrLimited };
   };
 
   const rhs = (curId: number, curIq: number, curOmegaM: number, vd: number, vq: number, tLoadNm: number) => {
     const we = p * curOmegaM;
-    const dId = (vd - rs * curId + we * lq * curIq) / ld;
-    const dIq = (vq - rs * curIq - we * (ld * curId + psiF)) / lq;
-    const te = calcDynamicPmsmTorque(curId, curIq, p, psiF, ld, lq);
-    const fric = bVisc * curOmegaM + tCoul * Math.tanh(curOmegaM / 0.5);
-    const dOmegaM = (te - fric - tLoadNm) / jRot;
-    const dThetaE = we;
-    return { dId, dIq, dOmegaM, dThetaE, te };
+    const flux = fluxAt(curId, curIq);
+    const fD = vd - rs * curId + we * flux.psiQVs;
+    const fQ = vq - rs * curIq - we * flux.psiDVs;
+    const det = flux.lddH * flux.lqqH - flux.ldqH * flux.lqdH;
+    if (!(det > 0) || !Number.isFinite(det)) throw new Error('PMSM 增量电感矩阵失去正定性，已终止 RK4 积分。');
+    const dId = (fD * flux.lqqH - flux.ldqH * fQ) / det;
+    const dIq = (flux.lddH * fQ - flux.lqdH * fD) / det;
+    const te = 1.5 * p * (flux.psiDVs * curIq - flux.psiQVs * curId);
+    const fricTorque = bVisc * curOmegaM + tCoul * Math.tanh(curOmegaM / 0.5);
+    const dOmegaM = (te - fricTorque - tLoadNm) / jRot;
+    return { dId, dIq, dOmegaM, dThetaE: we, te };
   };
 
   let peakAbsCurrentA = 0;
@@ -427,7 +771,6 @@ export function simulateDynamicPmsm(
   let minSpeedRpm = Infinity;
   let voltageLimitHits = 0;
   let currentLimitHits = 0;
-
   let lastVd = 0;
   let lastVq = 0;
   let lastTload = 0;
@@ -435,111 +778,81 @@ export function simulateDynamicPmsm(
   for (let k = 0; k < nOut; k++) {
     const tCur = k * effDtOut;
     const ctrl = evalControl(tCur, id, iq, omegaM);
-    const teNow = calcDynamicPmsmTorque(id, iq, p, psiF, ld, lq);
+    const fluxNow = fluxAt(id, iq);
+    const teNow = 1.5 * p * (fluxNow.psiDVs * iq - fluxNow.psiQVs * id);
     const nRpmNow = (omegaM * 60) / (2 * Math.PI);
-
-    const cosT = Math.cos(thetaE);
-    const sinT = Math.sin(thetaE);
-    const cosTm = Math.cos(thetaE - (2 * Math.PI) / 3);
-    const sinTm = Math.sin(thetaE - (2 * Math.PI) / 3);
+    const cosT = Math.cos(thetaE), sinT = Math.sin(thetaE);
+    const cosTm = Math.cos(thetaE - (2 * Math.PI) / 3), sinTm = Math.sin(thetaE - (2 * Math.PI) / 3);
     const ia = id * cosT - iq * sinT;
     const ib = id * cosTm - iq * sinTm;
     const ic = -(ia + ib);
-
     const vMag = Math.hypot(ctrl.vd, ctrl.vq);
     const mNorm = ctrl.vMax > 0 ? vMag / ctrl.vMax : 0;
+    const pElec = 1.5 * (ctrl.vd * id + ctrl.vq * iq);
+    const pCopper = 1.5 * rs * (id * id + iq * iq);
+    const pMech = teNow * omegaM;
+    const pLoad = ctrl.cmd.tLoadNm * omegaM;
+    const pFriction = (bVisc * omegaM + tCoul * Math.tanh(omegaM / 0.5)) * omegaM;
+    const rhsNow = rhs(id, iq, omegaM, ctrl.vd, ctrl.vq, ctrl.cmd.tLoadNm);
+    const dPsiDdt = fluxNow.lddH * rhsNow.dId + fluxNow.ldqH * rhsNow.dIq;
+    const dPsiQdt = fluxNow.lqdH * rhsNow.dId + fluxNow.lqqH * rhsNow.dIq;
+    const pMagneticStoredRate = 1.5 * (id * dPsiDdt + iq * dPsiQdt);
+    const pMechanicalStoredRate = jRot * omegaM * rhsNow.dOmegaM;
+    const pElectricalBalanceResidual = pElec - pCopper - pMech - pMagneticStoredRate;
+    const pMechanicalBalanceResidual = pMech - pLoad - pFriction - pMechanicalStoredRate;
+    [pElec, pCopper, pMech, pLoad, pFriction, pMagneticStoredRate, pMechanicalStoredRate, pElectricalBalanceResidual, pMechanicalBalanceResidual, fluxNow.psiDVs, fluxNow.psiQVs].forEach((x) => {
+      if (!Number.isFinite(x)) throw new Error(`动态 PMSM 在 t=${tCur.toFixed(6)}s 产生非有限物理结果，已终止计算。`);
+    });
 
-    time[k] = tCur;
-    thetaEArr[k] = thetaE;
-    omegaMArr[k] = omegaM;
-    nRpmArr[k] = nRpmNow;
-    idArr[k] = id;
-    iqArr[k] = iq;
-    vdArr[k] = ctrl.vd;
-    vqArr[k] = ctrl.vq;
-    iaArr[k] = ia;
-    ibArr[k] = ib;
-    icArr[k] = ic;
-    teArr[k] = teNow;
-    tLoadArr[k] = ctrl.cmd.tLoadNm;
-    vBusArr[k] = ctrl.cmd.vBusV;
-    mNormArr[k] = mNorm;
+    time[k] = tCur; thetaEArr[k] = thetaE; omegaMArr[k] = omegaM; nRpmArr[k] = nRpmNow;
+    idArr[k] = id; iqArr[k] = iq; vdArr[k] = ctrl.vd; vqArr[k] = ctrl.vq;
+    psiDArr[k] = fluxNow.psiDVs; psiQArr[k] = fluxNow.psiQVs;
+    pElecArr[k] = pElec; pCopperArr[k] = pCopper; pMechArr[k] = pMech; pLoadArr[k] = pLoad; pFrictionArr[k] = pFriction;
+    pMagneticStoredRateArr[k] = pMagneticStoredRate; pMechanicalStoredRateArr[k] = pMechanicalStoredRate;
+    pElectricalBalanceResidualArr[k] = pElectricalBalanceResidual; pMechanicalBalanceResidualArr[k] = pMechanicalBalanceResidual;
+    iaArr[k] = ia; ibArr[k] = ib; icArr[k] = ic; teArr[k] = teNow;
+    tLoadArr[k] = ctrl.cmd.tLoadNm; vBusArr[k] = ctrl.cmd.vBusV; mNormArr[k] = mNorm;
     voltLimArr[k] = ctrl.vLimited ? 1 : 0;
-    currLimArr[k] = ctrl.iCurrLimited ? 1 : 0;
+    const actualCurrentLimited = Math.hypot(id, iq) > iMax + 1e-6;
+    currLimArr[k] = (ctrl.iCurrLimited || actualCurrentLimited) ? 1 : 0;
 
-    const pMech = omegaM * teNow;
-    const qMode: DynamicQuadrantMode =
-      Math.abs(omegaM) < 0.05 && Math.abs(teNow) < 1e-3
-        ? 'standstill'
-        : pMech < -1e-3
-        ? 'regen'
-        : 'motoring';
+    const qMode: DynamicQuadrantMode = Math.abs(omegaM) < 0.05 && Math.abs(teNow) < 1e-3 ? 'standstill' : pMech < -1e-3 ? 'regen' : 'motoring';
     quadrantMode.push(qMode);
-
     peakAbsCurrentA = Math.max(peakAbsCurrentA, Math.hypot(id, iq));
     peakAbsTorqueNm = Math.max(peakAbsTorqueNm, Math.abs(teNow));
     peakSpeedRpm = Math.max(peakSpeedRpm, nRpmNow);
     minSpeedRpm = Math.min(minSpeedRpm, nRpmNow);
     if (ctrl.vLimited) voltageLimitHits++;
-    if (ctrl.iCurrLimited) currentLimitHits++;
-    lastVd = ctrl.vd;
-    lastVq = ctrl.vq;
-    lastTload = ctrl.cmd.tLoadNm;
-
+    if (ctrl.iCurrLimited || actualCurrentLimited) currentLimitHits++;
+    lastVd = ctrl.vd; lastVq = ctrl.vq; lastTload = ctrl.cmd.tLoadNm;
     if (k === nOut - 1) break;
 
-    for (let s = 0; s < substeps; s++) {
-      const ts = tCur + s * h;
+    for (let step = 0; step < substeps; step++) {
+      const ts = tCur + step * h;
       const cStep = evalControl(ts, id, iq, omegaM);
       const k1 = rhs(id, iq, omegaM, cStep.vd, cStep.vq, cStep.cmd.tLoadNm);
-      const k2 = rhs(
-        id + 0.5 * h * k1.dId,
-        iq + 0.5 * h * k1.dIq,
-        omegaM + 0.5 * h * k1.dOmegaM,
-        cStep.vd,
-        cStep.vq,
-        cStep.cmd.tLoadNm
-      );
-      const k3 = rhs(
-        id + 0.5 * h * k2.dId,
-        iq + 0.5 * h * k2.dIq,
-        omegaM + 0.5 * h * k2.dOmegaM,
-        cStep.vd,
-        cStep.vq,
-        cStep.cmd.tLoadNm
-      );
-      const k4 = rhs(
-        id + h * k3.dId,
-        iq + h * k3.dIq,
-        omegaM + h * k3.dOmegaM,
-        cStep.vd,
-        cStep.vq,
-        cStep.cmd.tLoadNm
-      );
-
+      const k2 = rhs(id + 0.5 * h * k1.dId, iq + 0.5 * h * k1.dIq, omegaM + 0.5 * h * k1.dOmegaM, cStep.vd, cStep.vq, cStep.cmd.tLoadNm);
+      const k3 = rhs(id + 0.5 * h * k2.dId, iq + 0.5 * h * k2.dIq, omegaM + 0.5 * h * k2.dOmegaM, cStep.vd, cStep.vq, cStep.cmd.tLoadNm);
+      const k4 = rhs(id + h * k3.dId, iq + h * k3.dIq, omegaM + h * k3.dOmegaM, cStep.vd, cStep.vq, cStep.cmd.tLoadNm);
       id += (h / 6) * (k1.dId + 2 * k2.dId + 2 * k3.dId + k4.dId);
       iq += (h / 6) * (k1.dIq + 2 * k2.dIq + 2 * k3.dIq + k4.dIq);
       omegaM += (h / 6) * (k1.dOmegaM + 2 * k2.dOmegaM + 2 * k3.dOmegaM + k4.dOmegaM);
       thetaE += (h / 6) * (k1.dThetaE + 2 * k2.dThetaE + 2 * k3.dThetaE + k4.dThetaE);
-
+      if (![id, iq, omegaM, thetaE].every(Number.isFinite)) throw new Error(`动态 PMSM 在 t=${ts.toFixed(6)}s 数值发散，已终止计算。`);
       if (params.controlMode !== 'open_loop_vdq') {
-        const we = p * omegaM;
         let iTorqCmd = 0;
-        if (cStep.cmd.iqRefA !== undefined && Number.isFinite(cStep.cmd.iqRefA)) {
-          iTorqCmd = cStep.cmd.iqRefA;
-        } else {
+        if (cStep.cmd.iqRefA !== undefined) iTorqCmd = cStep.cmd.iqRefA;
+        else {
           const wRef = ((cStep.cmd.speedRefRpm ?? 0) * 2 * Math.PI) / 60;
           const errW = wRef - omegaM;
           const unsatI = kpW * errW + intW;
-          const satI = Math.max(-params.iMaxA, Math.min(params.iMaxA, unsatI));
-          // Anti-windup back-calculation
+          const satI = Math.max(-iMax, Math.min(iMax, unsatI));
           intW += h * (kiW * errW + 0.25 * bwW * (satI - unsatI));
           iTorqCmd = satI;
         }
-        const tgt = computeMtpaAndFieldWeakeningTarget(iTorqCmd, we, cStep.cmd.vBusV, params);
+        const tgt = computeMtpaAndFieldWeakeningTarget(iTorqCmd, p * omegaM, cStep.cmd.vBusV, params);
         const errD = tgt.idRefA - id;
         const errQ = tgt.iqRefA - iq;
-        // Back-calculation anti-windup on voltage circle clamp
         const awD = cStep.vLimited ? (cStep.vd - cStep.vdCmd) * 0.5 : 0;
         const awQ = cStep.vLimited ? (cStep.vq - cStep.vqCmd) * 0.5 : 0;
         intId += h * (kiD * errD + bwI * awD);
@@ -548,64 +861,32 @@ export function simulateDynamicPmsm(
     }
   }
 
-  // Analytical steady-state parity check at final state
   const weEnd = p * omegaM;
-  const analyticalVdV = rs * id - weEnd * lq * iq;
-  const analyticalVqV = rs * iq + weEnd * (ld * id + psiF);
-  const analyticalTeNm = calcDynamicPmsmTorque(id, iq, p, psiF, ld, lq);
+  const fluxEnd = fluxAt(id, iq);
+  const analyticalVdV = rs * id - weEnd * fluxEnd.psiQVs;
+  const analyticalVqV = rs * iq + weEnd * fluxEnd.psiDVs;
+  const analyticalTeNm = 1.5 * p * (fluxEnd.psiDVs * iq - fluxEnd.psiQVs * id);
   const endRhs = rhs(id, iq, omegaM, lastVd, lastVq, lastTload);
-
-  if (voltageLimitHits > 0) {
-    warnings.push(`仿真中有 ${voltageLimitHits} 个采样点触发 SVPWM 电压圆限幅 (|Vdq| ≥ Vbus/√3)。`);
-  }
-  if (currentLimitHits > 0) {
-    warnings.push(`仿真中有 ${currentLimitHits} 个采样点触发相电流上限限幅 (|I| ≥ ${params.iMaxA.toFixed(1)} A)。`);
-  }
+  if (voltageLimitHits > 0) warnings.push(`仿真中有 ${voltageLimitHits} 个采样点触发 SVPWM 电压圆限幅 (|Vdq| ≥ Vbus/√3)。`);
+  if (currentLimitHits > 0) warnings.push(`仿真中有 ${currentLimitHits} 个采样点触发相电流上限或参考限幅 (Imax=${iMax.toFixed(1)} A)。`);
 
   return {
-    provenance: 'synthetic_assumed_uncalibrated',
-    sourceModel: 'dynamic_pmsm_dq_rk4',
-    warnings,
-    dtInternalSec: h,
-    substepsPerOutput: substeps,
-    time,
-    thetaE: thetaEArr,
-    omegaM: omegaMArr,
-    nRpm: nRpmArr,
-    idA: idArr,
-    iqA: iqArr,
-    vdV: vdArr,
-    vqV: vqArr,
-    iaA: iaArr,
-    ibA: ibArr,
-    icA: icArr,
-    teNm: teArr,
-    tLoadNm: tLoadArr,
-    vBusV: vBusArr,
-    mNorm: mNormArr,
-    voltageLimited: voltLimArr,
-    currentLimited: currLimArr,
-    quadrantMode,
-    peakAbsCurrentA,
-    peakAbsTorqueNm,
-    peakSpeedRpm,
-    minSpeedRpm,
-    voltageLimitHits,
-    currentLimitHits,
+    provenance: 'synthetic_assumed_uncalibrated', sourceModel: rawParams.fluxMap ? 'dynamic_pmsm_dq_rk4_flux_map' : 'dynamic_pmsm_dq_rk4',
+    warnings, dtInternalSec: h, substepsPerOutput: substeps,
+    time, thetaE: thetaEArr, omegaM: omegaMArr, nRpm: nRpmArr, idA: idArr, iqA: iqArr, vdV: vdArr, vqV: vqArr,
+    psiDVs: psiDArr, psiQVs: psiQArr, pElecW: pElecArr, pCopperW: pCopperArr, pMechW: pMechArr, pLoadW: pLoadArr, pFrictionW: pFrictionArr,
+    pMagneticStoredRateW: pMagneticStoredRateArr, pMechanicalStoredRateW: pMechanicalStoredRateArr,
+    pElectricalBalanceResidualW: pElectricalBalanceResidualArr, pMechanicalBalanceResidualW: pMechanicalBalanceResidualArr,
+    iaA: iaArr, ibA: ibArr, icA: icArr, teNm: teArr, tLoadNm: tLoadArr, vBusV: vBusArr, mNorm: mNormArr,
+    voltageLimited: voltLimArr, currentLimited: currLimArr, quadrantMode,
+    peakAbsCurrentA, peakAbsTorqueNm, peakSpeedRpm, minSpeedRpm, voltageLimitHits, currentLimitHits,
+    fluxMapProvenance: rawParams.fluxMap?.provenance ?? 'linear_parameter_model', fluxMapOutOfRangeCount: 0,
     steadyCheck: {
-      finalSpeedRpm: (omegaM * 60) / (2 * Math.PI),
-      finalIdA: id,
-      finalIqA: iq,
-      analyticalTeNm,
-      analyticalVdV,
-      analyticalVqV,
-      simTeNm: teArr[nOut - 1],
-      simVdV: lastVd,
-      simVqV: lastVq,
+      finalSpeedRpm: (omegaM * 60) / (2 * Math.PI), finalIdA: id, finalIqA: iq,
+      analyticalTeNm, analyticalVdV, analyticalVqV, simTeNm: teArr[nOut - 1], simVdV: lastVd, simVqV: lastVq,
       torqueDiffNm: Math.abs(teArr[nOut - 1] - analyticalTeNm),
       voltageDiffV: Math.hypot(lastVd - analyticalVdV, lastVq - analyticalVqV),
-      diDtNormAps: Math.hypot(endRhs.dId, endRhs.dIq),
-      dOmegaDtNormRadS2: Math.abs(endRhs.dOmegaM),
+      diDtNormAps: Math.hypot(endRhs.dId, endRhs.dIq), dOmegaDtNormRadS2: Math.abs(endRhs.dOmegaM),
     },
   };
 }
@@ -666,7 +947,7 @@ function makeDynChannel(
       gapIndices: [...meta.gapIndices],
       signalNanCount: 0,
       dataProvenance: 'synthetic_assumed_uncalibrated',
-      sourceModel: 'dynamic_pmsm_dq_rk4',
+      sourceModel: meta.sourceModel ?? 'dynamic_pmsm_dq_rk4',
     },
   };
 }
@@ -678,7 +959,7 @@ export function buildDynamicPmsmScopeTab(result: DynamicPmsmResult, label = 'Dyn
   const dt = meta.medianDt ?? meta.nominalDt ?? (result.time[n - 1] - result.time[0]) / (n - 1);
   const fs = dt > 0 ? 1 / dt : 1000;
   meta.dataProvenance = 'synthetic_assumed_uncalibrated';
-  meta.sourceModel = 'dynamic_pmsm_dq_rk4';
+  meta.sourceModel = result.sourceModel;
 
   const channels: Record<string, WaveformChannel> = {
     ch_ia: makeDynChannel('ch_ia', 'Ia (sim dq)', 'A', '#facc15', result.time, result.iaA, fs, dt, meta),
@@ -689,13 +970,21 @@ export function buildDynamicPmsmScopeTab(result: DynamicPmsmResult, label = 'Dyn
     ch_n: makeDynChannel('ch_n', 'Speed (sim)', 'RPM', '#a78bfa', result.time, result.nRpm, fs, dt, meta),
     ch_te: makeDynChannel('ch_te', 'Te (sim)', 'Nm', '#fb923c', result.time, result.teNm, fs, dt, meta),
     ch_tload: makeDynChannel('ch_tload', 'T_load', 'Nm', '#94a3b8', result.time, result.tLoadNm, fs, dt, meta),
+    ch_pelec: makeDynChannel('ch_pelec', 'P_elec (sim)', 'W', '#f97316', result.time, result.pElecW, fs, dt, meta),
+    ch_pcu: makeDynChannel('ch_pcu', 'P_copper (sim)', 'W', '#eab308', result.time, result.pCopperW, fs, dt, meta),
+    ch_pmech: makeDynChannel('ch_pmech', 'P_mech (sim)', 'W', '#22c55e', result.time, result.pMechW, fs, dt, meta),
+    ch_pmag: makeDynChannel('ch_pmag', 'dW_magnetic/dt (sim)', 'W', '#c084fc', result.time, result.pMagneticStoredRateW, fs, dt, meta),
+    ch_pbal: makeDynChannel('ch_pbal', 'Electrical power balance residual', 'W', '#f87171', result.time, result.pElectricalBalanceResidualW, fs, dt, meta),
+    ch_pmecbal: makeDynChannel('ch_pmecbal', 'Mechanical power balance residual', 'W', '#fb7185', result.time, result.pMechanicalBalanceResidualW, fs, dt, meta),
+    ch_psid: makeDynChannel('ch_psid', 'Psi_d (sim)', 'Vs', '#a78bfa', result.time, result.psiDVs, fs, dt, meta),
+    ch_psiq: makeDynChannel('ch_psiq', 'Psi_q (sim)', 'Vs', '#38bdf8', result.time, result.psiQVs, fs, dt, meta),
   };
 
   return {
     id: `dyno_dyn_pmsm_${Date.now()}`,
     fileName: `${label}_SYNTHETIC_UNCALIBRATED.csv`,
     channels,
-    drawOrder: ['ch_ia', 'ch_ib', 'ch_ic', 'ch_id', 'ch_iq', 'ch_n', 'ch_te', 'ch_tload'],
+    drawOrder: ['ch_ia', 'ch_ib', 'ch_ic', 'ch_id', 'ch_iq', 'ch_n', 'ch_te', 'ch_tload', 'ch_pelec', 'ch_pcu', 'ch_pmech', 'ch_pmag', 'ch_pbal', 'ch_pmecbal', 'ch_psid', 'ch_psiq'],
     activeChannelId: 'ch_iq',
     separateView: true,
     plotMode: 'time',
@@ -716,8 +1005,8 @@ export function buildDynamicPmsmScopeTab(result: DynamicPmsmResult, label = 'Dyn
 export function buildDynamicPmsmCsv(result: DynamicPmsmResult): string {
   const lines = [
     '# WAVEFORM_PROVENANCE=MODEL_SYNTHETIC_DYNAMIC_ASSUMED_UNCALIBRATED',
-    '# SOURCE_MODEL=dynamic_pmsm_dq_rk4',
-    'Time_s,n_rpm,Id_A,Iq_A,Vd_V,Vq_V,Ia_A,Ib_A,Ic_A,Te_Nm,T_load_Nm,Vbus_V,m_norm,voltage_limited,current_limited,quadrant',
+    `# SOURCE_MODEL=${result.sourceModel}`,
+    'Time_s,n_rpm,Id_A,Iq_A,Vd_V,Vq_V,PsiD_Vs,PsiQ_Vs,Ia_A,Ib_A,Ic_A,Te_Nm,T_load_Nm,Vbus_V,Pelec_W,Pcu_W,Pmech_W,Pload_W,Pfriction_W,PmagneticStoredRate_W,PmechanicalStoredRate_W,ElectricalBalanceResidual_W,MechanicalBalanceResidual_W,m_norm,voltage_limited,current_limited,quadrant',
   ];
   for (let i = 0; i < result.time.length; i++) {
     lines.push(
@@ -728,12 +1017,23 @@ export function buildDynamicPmsmCsv(result: DynamicPmsmResult): string {
         result.iqA[i].toFixed(4),
         result.vdV[i].toFixed(4),
         result.vqV[i].toFixed(4),
+        result.psiDVs[i].toFixed(7),
+        result.psiQVs[i].toFixed(7),
         result.iaA[i].toFixed(4),
         result.ibA[i].toFixed(4),
         result.icA[i].toFixed(4),
         result.teNm[i].toFixed(5),
         result.tLoadNm[i].toFixed(5),
         result.vBusV[i].toFixed(3),
+        result.pElecW[i].toFixed(4),
+        result.pCopperW[i].toFixed(4),
+        result.pMechW[i].toFixed(4),
+        result.pLoadW[i].toFixed(4),
+        result.pFrictionW[i].toFixed(4),
+        result.pMagneticStoredRateW[i].toFixed(4),
+        result.pMechanicalStoredRateW[i].toFixed(4),
+        result.pElectricalBalanceResidualW[i].toFixed(8),
+        result.pMechanicalBalanceResidualW[i].toFixed(8),
         result.mNorm[i].toFixed(4),
         result.voltageLimited[i],
         result.currentLimited[i],

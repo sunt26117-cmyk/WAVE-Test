@@ -147,10 +147,37 @@ export interface CossCurvePoint {
   val: number; // uJ for eoss_uj, nC for qoss_nc, pF for coss_pf
 }
 
+export type EossCurveProvenance = 'datasheet' | 'dpt_measured' | 'user_import' | 'preset' | 'assumed';
+
 export interface NonlinearEossCurve {
   kind: 'eoss_uj' | 'qoss_nc' | 'coss_pf';
   points: CossCurvePoint[];
   label?: string;
+  provenance?: EossCurveProvenance;
+  manufacturer?: string;
+  partNumber?: string;
+  referenceTemperatureC?: number;
+  testVgsV?: number;
+  rgOnOhm?: number;
+  rgOffOhm?: number;
+  sourceNote?: string;
+}
+
+export interface EossCurveImportDocument {
+  schema: 'wave-test-eoss-curve';
+  schemaVersion: 1;
+  kind: 'eoss_uj' | 'qoss_nc' | 'coss_pf';
+  voltageUnit: 'V' | 'mV';
+  valueUnit: 'uJ' | 'nJ' | 'mJ' | 'nC' | 'uC' | 'pF' | 'nF';
+  label?: string;
+  provenance?: EossCurveProvenance;
+  manufacturer?: string;
+  partNumber?: string;
+  referenceTemperatureC?: number;
+  testVgsV?: number;
+  rgOnOhm?: number;
+  rgOffOhm?: number;
+  points: Array<{ vds: number; value: number }>;
 }
 
 export interface EossCurveEvalResult {
@@ -2147,6 +2174,9 @@ export function integrateQossToEossCurve(qossPoints: CossCurvePoint[], label?: s
     throw new Error('Qoss(V) 曲线至少需要 2 个单调递增的 Vds 数据点。');
   }
   const sorted = [...qossPoints].sort((a, b) => a.vdsV - b.vdsV);
+  if (Math.abs(sorted[0]?.vdsV ?? Infinity) > 1e-6 || Math.abs(sorted[0]?.val ?? Infinity) > 1e-6) {
+    throw new Error('Qoss(V) 必须包含 (0V, 0nC) 原点；缺少原点时不能凭空假设 0V 到首个数据点之间的电荷积分。');
+  }
   for (let i = 0; i < sorted.length; i++) {
     if (!Number.isFinite(sorted[i].vdsV) || sorted[i].vdsV < 0 || !Number.isFinite(sorted[i].val) || sorted[i].val < 0) {
       throw new Error(`Qoss(V) 第 ${i + 1} 点包含负值或非有限值。`);
@@ -2192,6 +2222,9 @@ export function integrateCossToEossCurve(cossPoints: CossCurvePoint[], label?: s
     throw new Error('Coss(V) 曲线至少需要 2 个单调递增的 Vds 数据点。');
   }
   const sorted = [...cossPoints].sort((a, b) => a.vdsV - b.vdsV);
+  if (Math.abs(sorted[0]?.vdsV ?? Infinity) > 1e-6) {
+    throw new Error('Coss(V) 必须包含 0V 起点；缺少低压曲线时无法可靠积分 Eoss(0→V)。');
+  }
   for (let i = 0; i < sorted.length; i++) {
     if (!Number.isFinite(sorted[i].vdsV) || sorted[i].vdsV < 0 || !Number.isFinite(sorted[i].val) || sorted[i].val < 0) {
       throw new Error(`Coss(V) 第 ${i + 1} 点包含负值或非有限值。`);
@@ -2294,14 +2327,129 @@ export function evaluatePchipMonotone(
   return { value: Math.max(0, val), outOfRange, domain };
 }
 
+/**
+ * Validates and imports a versioned Eoss/Qoss/Coss curve document.
+ * All values are normalized to V and the unit implied by `kind` before integration.
+ */
+export function parseEossCurveImportJson(text: string): NonlinearEossCurve {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch (err) {
+    throw new Error(`Eoss 曲线 JSON 解析失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!raw || typeof raw !== 'object') throw new Error('Eoss 曲线导入文件必须是 JSON 对象。');
+  const doc = raw as Partial<EossCurveImportDocument>;
+  if (doc.schema !== 'wave-test-eoss-curve' || doc.schemaVersion !== 1 || !doc.kind || !Array.isArray(doc.points) || doc.points.length < 2) {
+    throw new Error('Eoss 曲线文件格式不匹配：需要 wave-test-eoss-curve v1、kind 和至少 2 个 points。');
+  }
+  const voltageScale = doc.voltageUnit === 'mV' ? 1e-3 : doc.voltageUnit === 'V' ? 1 : NaN;
+  const valueScale: Record<string, number> = { uJ: 1, nJ: 1e-3, mJ: 1e3, nC: 1, uC: 1e3, pF: 1, nF: 1e3 };
+  const valScale = doc.valueUnit ? valueScale[doc.valueUnit] : undefined;
+  const allowedUnit = doc.kind === 'eoss_uj' ? ['uJ', 'nJ', 'mJ'] : doc.kind === 'qoss_nc' ? ['nC', 'uC'] : ['pF', 'nF'];
+  if (!Number.isFinite(voltageScale) || !doc.valueUnit || !allowedUnit.includes(doc.valueUnit) || !Number.isFinite(valScale)) {
+    throw new Error(`Eoss 曲线单位不匹配：${doc.kind} 的电压单位必须为 V/mV，数值单位必须为 ${allowedUnit.join('/') }。`);
+  }
+  const points = doc.points.map((pt, i) => {
+    if (!pt || !Number.isFinite(pt.vds) || !Number.isFinite(pt.value)) throw new Error(`Eoss 曲线第 ${i + 1} 点包含非有限数值。`);
+    return { vdsV: pt.vds * voltageScale, val: pt.value * valScale! };
+  }).sort((a, b) => a.vdsV - b.vdsV);
+  for (let i = 0; i < points.length; i++) {
+    if (points[i].vdsV < 0 || points[i].val < 0 || (i > 0 && points[i].vdsV <= points[i - 1].vdsV)) {
+      throw new Error(`Eoss 曲线第 ${i + 1} 点存在负值或重复电压点。`);
+    }
+  }
+  const allowedProvenance: EossCurveProvenance[] = ['datasheet', 'dpt_measured', 'user_import', 'preset', 'assumed'];
+  const provenance = doc.provenance ?? 'user_import';
+  if (!allowedProvenance.includes(provenance)) throw new Error(`Eoss 曲线 provenance 非法：${String(provenance)}。`);
+  const meta = {
+    label: doc.label || 'Imported nonlinear MOS output-capacitance curve',
+    provenance: provenance as EossCurveProvenance,
+    manufacturer: doc.manufacturer,
+    partNumber: doc.partNumber,
+    referenceTemperatureC: doc.referenceTemperatureC,
+    testVgsV: doc.testVgsV,
+    rgOnOhm: doc.rgOnOhm,
+    rgOffOhm: doc.rgOffOhm,
+    sourceNote: 'Imported user curve; test conditions are metadata and are not inferred when absent.',
+  };
+  const curve = doc.kind === 'qoss_nc'
+    ? integrateQossToEossCurve(points, meta.label)
+    : doc.kind === 'coss_pf'
+      ? integrateCossToEossCurve(points, meta.label)
+      : { kind: 'eoss_uj' as const, points, label: meta.label };
+  const result: NonlinearEossCurve = { ...curve, ...meta };
+  validateNonlinearEossCurve(result);
+  return result;
+}
+
+export function parseEossCurveCsv(
+  csvText: string,
+  kind: EossCurveImportDocument['kind'],
+  voltageUnit: 'V' | 'mV',
+  valueUnit: EossCurveImportDocument['valueUnit'],
+  metadata: Partial<Omit<EossCurveImportDocument, 'schema' | 'schemaVersion' | 'kind' | 'voltageUnit' | 'valueUnit' | 'points'>> = {}
+): NonlinearEossCurve {
+  const rows = csvText.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+  const points: Array<{ vds: number; value: number }> = [];
+  for (const [idx, row] of rows.entries()) {
+    const cols = row.split(/[;,\t]/).map((v) => v.trim());
+    if (cols.length < 2) continue;
+    const voltage = Number(cols[0]);
+    const value = Number(cols[1]);
+    if (!Number.isFinite(voltage) || !Number.isFinite(value)) {
+      if (idx === 0 && /[a-z]/i.test(row)) continue; // Optional header row.
+      throw new Error(`Eoss CSV 第 ${idx + 1} 行不是有效的两列数值。`);
+    }
+    points.push({ vds: voltage, value });
+  }
+  return parseEossCurveImportJson(JSON.stringify({
+    schema: 'wave-test-eoss-curve', schemaVersion: 1, kind, voltageUnit, valueUnit,
+    provenance: metadata.provenance || 'user_import', ...metadata, points,
+  }));
+}
+
+export function validateNonlinearEossCurve(curve: NonlinearEossCurve): void {
+  if (!curve || !Array.isArray(curve.points) || curve.points.length < 2) throw new Error('非线性 Eoss 曲线至少需要 2 个点。');
+  const allowedProvenance: EossCurveProvenance[] = ['datasheet', 'dpt_measured', 'user_import', 'preset', 'assumed'];
+  if (curve.provenance !== undefined && !allowedProvenance.includes(curve.provenance)) throw new Error(`Eoss 曲线 provenance 非法：${String(curve.provenance)}。`);
+  for (let i = 0; i < curve.points.length; i++) {
+    const pt = curve.points[i];
+    if (!Number.isFinite(pt.vdsV) || !Number.isFinite(pt.val) || pt.vdsV < 0 || pt.val < 0) throw new Error(`Eoss 曲线第 ${i + 1} 点包含负值或 NaN/Inf。`);
+    if (i > 0 && pt.vdsV <= curve.points[i - 1].vdsV) throw new Error('Eoss 曲线电压轴必须严格递增，禁止重复/倒序。');
+    if (curve.kind === 'eoss_uj' && i > 0 && pt.val < curve.points[i - 1].val - 1e-9) throw new Error('Eoss(V) 必须单调不减。');
+  }
+  if (curve.kind === 'eoss_uj' && (Math.abs(curve.points[0].vdsV) > 1e-6 || Math.abs(curve.points[0].val) > 1e-6)) {
+    throw new Error('Eoss(V) 必须包含 (0V, 0uJ) 原点。');
+  }
+  for (const [label, value] of [['referenceTemperatureC', curve.referenceTemperatureC], ['testVgsV', curve.testVgsV], ['rgOnOhm', curve.rgOnOhm], ['rgOffOhm', curve.rgOffOhm]] as const) {
+    if (value !== undefined && !Number.isFinite(value)) throw new Error(`Eoss 曲线元数据 ${label} 必须为有限数值。`);
+  }
+  if (curve.referenceTemperatureC !== undefined && (curve.referenceTemperatureC < -100 || curve.referenceTemperatureC > 300)) {
+    throw new Error('Eoss 曲线参考温度超出合理元数据范围 [-100,300]°C。');
+  }
+  for (const [label, value] of [['rgOnOhm', curve.rgOnOhm], ['rgOffOhm', curve.rgOffOhm]] as const) {
+    if (value !== undefined && value <= 0) throw new Error(`Eoss 曲线元数据 ${label} 必须为正数。`);
+  }
+}
+
+export function createEossCurveImportTemplate(kind: EossCurveImportDocument['kind'] = 'eoss_uj'): EossCurveImportDocument {
+  const valueUnit: EossCurveImportDocument['valueUnit'] = kind === 'eoss_uj' ? 'uJ' : kind === 'qoss_nc' ? 'nC' : 'pF';
+  return {
+    schema: 'wave-test-eoss-curve', schemaVersion: 1, kind, voltageUnit: 'V', valueUnit,
+    label: '请填写具体 MOS 型号的 Eoss/Qoss/Coss 曲线', provenance: 'datasheet',
+    manufacturer: '', partNumber: '', referenceTemperatureC: 25,
+    points: kind === 'coss_pf'
+      ? [{ vds: 0, value: 1000 }, { vds: 10, value: 500 }]
+      : [{ vds: 0, value: 0 }, { vds: 10, value: 10 }],
+  };
+}
+
 export function evaluateNonlinearEossUj(
   curve: NonlinearEossCurve,
   vBusV: number,
   options?: { allowOutOfDomainClamp?: boolean }
 ): EossCurveEvalResult {
-  if (!curve || !Array.isArray(curve.points) || curve.points.length < 2) {
-    throw new Error('非线性 Eoss(V)/Qoss(V) 曲线至少需要 2 个有效采样点。');
-  }
+  validateNonlinearEossCurve(curve);
+  if (!Number.isFinite(vBusV) || vBusV < 0) throw new Error('Eoss 曲线查询电压必须为有限非负数值。');
   const eossPts =
     curve.kind === 'qoss_nc'
       ? integrateQossToEossCurve(curve.points).points

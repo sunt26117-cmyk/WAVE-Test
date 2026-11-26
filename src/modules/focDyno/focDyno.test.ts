@@ -48,6 +48,9 @@ import {
   calcDynamicPmsmTorque,
   kePrimeToPsiF,
   simulateDynamicPmsm,
+  createPmsmFluxMapImportTemplate,
+  parsePmsmFluxMapJson,
+  evaluatePmsmFluxMap,
 } from './dynamicPmsm';
 import {
   buildOscilloscopeTabFromSixMos,
@@ -1456,3 +1459,61 @@ print(json.dumps({
 });
 
 
+
+
+test('FD-03 software completion: nonlinear flux-map import drives RK4 and reports power-balance diagnostics in TS/Python', () => {
+  const template = createPmsmFluxMapImportTemplate();
+  const imported = parsePmsmFluxMapJson(JSON.stringify(template));
+  assert.equal(imported.referenceTemperatureC, 25);
+  const evalAt = evaluatePmsmFluxMap(imported, 5, 4);
+  assert.ok(evalAt.lddH > 0 && evalAt.lqqH > 0);
+  assert.ok(evalAt.psiDVs > 0);
+  assert.throws(() => evaluatePmsmFluxMap(imported, 25, 0), /超出磁链 Map 范围/);
+
+  const params = {
+    polePairs: 4, rsOhm: 0.08, ldH: 0.2e-3, lqH: 0.5e-3, psiFVs: 0.01,
+    jKgM2: 8e-5, bNmSPerRad: 1e-4, tCoulombNm: 0.002, vBusV: 48, iMaxA: 15,
+    controlMode: 'open_loop_vdq' as const, fluxMap: imported,
+    referenceTempC: 25, windingTempC: 70, magnetTempC: 25, // omitted coefficient must use copper default 0.00393 in TS and Python
+  };
+  const result = simulateDynamicPmsm(params, {
+    durationSec: 0.01, dtOutSec: 1e-4, initialSpeedRpm: 300,
+    scenario: [{ tStartSec: 0, tEndSec: 0.01, tLoadNm: 0.01, vdRefV: 1.0, vqRefV: 2.0 }],
+  });
+  assert.equal(result.sourceModel, 'dynamic_pmsm_dq_rk4_flux_map');
+  assert.equal(result.fluxMapProvenance, 'fea_extracted');
+  assert.ok(result.pMagneticStoredRateW.every(Number.isFinite));
+  assert.ok(result.pElectricalBalanceResidualW.every((v) => Math.abs(v) < 1e-7));
+  assert.ok(result.pMechanicalBalanceResidualW.every((v) => Math.abs(v) < 1e-7));
+  assert.equal(buildDynamicPmsmScopeTab(result)?.channels.ch_psid.metadata.sourceModel, 'dynamic_pmsm_dq_rk4_flux_map');
+  assert.ok(buildDynamicPmsmCsv(result).includes('ElectricalBalanceResidual_W'));
+
+  assert.throws(() => simulateDynamicPmsm({ ...params, iMaxA: 25 }, {
+    durationSec: 0.01, dtOutSec: 1e-4, scenario: [{ tStartSec: 0, tEndSec: 0.01, tLoadNm: 0 }],
+  }), /必须至少覆盖 ±Imax/);
+  assert.throws(() => simulateDynamicPmsm({ ...params, magnetTempC: 45 }, {
+    durationSec: 0.01, dtOutSec: 1e-4, scenario: [{ tStartSec: 0, tEndSec: 0.01, tLoadNm: 0 }],
+  }), /与磁链 Map 参考温度/);
+
+  const dynPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dynamic_pmsm.py')?.content || '';
+  const pyScript = `
+import json, sys
+ns = {}
+exec(sys.stdin.read(), ns)
+doc = json.loads(${JSON.stringify(JSON.stringify(template))})
+flux = ns['parse_pmsm_flux_map_json'](json.dumps(doc))
+p = ns['DynamicPmsmParams'](pole_pairs=4,rs_ohm=0.08,ld_h=0.2e-3,lq_h=0.5e-3,psi_f_vs=0.01,j_kg_m2=8e-5,b_nm_s_per_rad=1e-4,t_coulomb_nm=0.002,v_bus_v=48,i_max_a=15,control_mode='open_loop_vdq',flux_map=flux,reference_temp_c=25,winding_temp_c=70,magnet_temp_c=25,rs_temp_coeff_per_c=0.00393)
+cfg = ns['DynamicPmsmConfig'](duration_sec=0.01,dt_out_sec=1e-4,initial_speed_rpm=300,scenario=[ns['DynamicScenarioStep'](0,0.01,t_load_nm=0.01,vd_ref_v=1.0,vq_ref_v=2.0)])
+r = ns['simulate_dynamic_pmsm'](p,cfg)
+print(json.dumps({'source_model':r['source_model'],'last_id':r['id_a'][-1],'last_iq':r['iq_a'][-1],'last_te':r['te_nm'][-1],'max_e_res':max(abs(x) for x in r['p_electrical_balance_residual_w']),'max_m_res':max(abs(x) for x in r['p_mechanical_balance_residual_w'])}))
+`;
+  const pyProc = spawnSync('python3', ['-c', pyScript], { input: dynPy, encoding: 'utf8' });
+  assert.equal(pyProc.status, 0, `Python flux-map parity failed: ${pyProc.stderr}`);
+  const pyOut = JSON.parse(pyProc.stdout);
+  assert.equal(pyOut.source_model, result.sourceModel);
+  assert.ok(Math.abs(pyOut.last_id - result.idA[result.idA.length - 1]) < 1e-8);
+  assert.ok(Math.abs(pyOut.last_iq - result.iqA[result.iqA.length - 1]) < 1e-8);
+  assert.ok(Math.abs(pyOut.last_te - result.teNm[result.teNm.length - 1]) < 1e-8);
+  assert.ok(pyOut.max_e_res < 1e-7);
+  assert.ok(pyOut.max_m_res < 1e-7);
+});

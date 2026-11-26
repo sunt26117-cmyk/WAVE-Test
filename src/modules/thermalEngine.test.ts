@@ -14,6 +14,9 @@ import {
   integrateCossToEossCurve,
   evaluatePchipMonotone,
   evaluateNonlinearEossUj,
+  parseEossCurveCsv,
+  parseEossCurveImportJson,
+  createEossCurveImportTemplate,
   validateTemperatureChannel,
 } from './thermalEngine';
 import { evaluateDynamicSoa, interpolateSoaCurveAtVds, SOA_PRESETS } from './dynamicSoa';
@@ -25,6 +28,8 @@ import {
   getModulationLinearCeiling,
   reconstructSensorlessDutySample,
   resolveSpatialThermalNetwork,
+  parsePcbSpatialImportJson,
+  createPcbSpatialImportTemplate,
   runFocStallSweep,
   simulateFoc6Mos,
   splitCauerToFocModel,
@@ -2200,3 +2205,46 @@ test('MT-04: Nonlinear Eoss(V)/Qoss(V)/Coss(V) integration, monotone PCHIP accur
   );
 });
 
+
+
+test('PCB spatial thermal import template and versioned JSON validation', () => {
+  const template = createPcbSpatialImportTemplate();
+  const imported = parsePcbSpatialImportJson(JSON.stringify(template));
+  assert.equal(imported.schema, 'wave-test-pcb-thermal');
+  assert.equal(imported.config?.provenance, 'geometry_estimated');
+  const resolved = resolveSpatialThermalNetwork({
+    ...DEFAULT_FOC_MODEL,
+    thermalTopologyMode: 'pcb_spatial_coupled',
+    spatialMatrix: imported.config,
+  });
+  assert.equal(resolved.cPcb.length, 6);
+  assert.equal(resolved.gLat.length, 6);
+  assert.ok(resolved.gLat[0][2] > 0, 'Template should include the AH-BH adjacent horizontal copper path');
+  assert.ok(resolved.gLat[0][1] > 0, 'Template should include the AH-AL local vertical copper path');
+  assert.throws(() => parsePcbSpatialImportJson(JSON.stringify({ ...template, units: 'SI' })), /units=mm/);
+  assert.throws(() => parsePcbSpatialImportJson(JSON.stringify({ ...template, config: { ...template.config, provenance: 'guessed_measured' } })), /provenance 非法/);
+  assert.throws(() => parsePcbSpatialImportJson('{bad json'), /JSON 解析失败/);
+});
+
+test('Eoss CSV/JSON import normalizes units and preserves strict query-domain behavior', () => {
+  const qossCurve = parseEossCurveCsv(
+    `# device test curve
+Vds,Qoss
+0,0
+20,10
+40,18`,
+    'qoss_nc', 'V', 'nC', { label: 'CSV test Qoss', partNumber: 'TEST-MOS', provenance: 'user_import' }
+  );
+  assert.equal(qossCurve.kind, 'eoss_uj');
+  assert.equal(qossCurve.partNumber, 'TEST-MOS');
+  assert.equal(evaluateNonlinearEossUj(qossCurve, 30).outOfRange, false);
+  assert.throws(() => evaluateNonlinearEossUj(qossCurve, 50, { allowOutOfDomainClamp: false }), /超出 Eoss/);
+
+  const jsonTemplate = createEossCurveImportTemplate('eoss_uj');
+  const parsedJson = parseEossCurveImportJson(JSON.stringify(jsonTemplate));
+  assert.equal(parsedJson.kind, 'eoss_uj');
+  assert.throws(() => parseEossCurveImportJson(JSON.stringify({ ...jsonTemplate, provenance: 'guessed_measured' })), /provenance 非法/);
+  assert.throws(() => parseEossCurveImportJson(JSON.stringify({ ...jsonTemplate, rgOnOhm: 0 })), /rgOnOhm 必须为正数/);
+  assert.throws(() => parseEossCurveCsv(`Vds,Eoss\n0,1\n10,2`, 'eoss_uj', 'V', 'uJ'), /0V, 0uJ/);
+  assert.throws(() => parseEossCurveCsv(`Vds,Qoss\n0,0\n10,2`, 'qoss_nc', 'V', 'uJ'), /单位不匹配/);
+});

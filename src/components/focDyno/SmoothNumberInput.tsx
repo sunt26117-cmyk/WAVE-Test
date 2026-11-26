@@ -10,6 +10,7 @@ interface SmoothNumberInputProps {
   className?: string;
   placeholder?: string;
   ariaLabel?: string;
+  disabled?: boolean;
 }
 
 export const SmoothNumberInput: React.FC<SmoothNumberInputProps> = ({
@@ -22,6 +23,7 @@ export const SmoothNumberInput: React.FC<SmoothNumberInputProps> = ({
   className = '',
   placeholder,
   ariaLabel,
+  disabled = false,
 }) => {
   const formatVal = (v: number): string => {
     if (!Number.isFinite(v)) return '';
@@ -78,6 +80,7 @@ export const SmoothNumberInput: React.FC<SmoothNumberInputProps> = ({
       value={text}
       placeholder={placeholder}
       aria-label={ariaLabel}
+      disabled={disabled}
       onFocus={() => setFocused(true)}
       onChange={handleChange}
       onBlur={commitText}

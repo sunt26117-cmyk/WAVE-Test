@@ -23,6 +23,9 @@ import {
   NonlinearEossCurve,
   integrateQossToEossCurve,
   integrateCossToEossCurve,
+  parseEossCurveImportJson,
+  parseEossCurveCsv,
+  createEossCurveImportTemplate,
   deconvolveThermalImpedance,
   detectThermalStepOnset,
   computePowerFromVISources,
@@ -56,6 +59,8 @@ import {
   splitCauerToFocModel,
   focModelToSpice,
   validateFocSpiceNetlist,
+  parsePcbSpatialImportJson,
+  createPcbSpatialImportTemplate,
   simulateFoc6Mos,
   runFocStallSweep,
   runFocControlSweep,
@@ -1020,7 +1025,78 @@ export class ThermalWorkbenchController {
     document.getElementById('focTopologyModeSelect')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focPcbCopperOzInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focPcbPitchMmInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
+    document.getElementById('focPcbSpatialJsonInput')?.addEventListener('change', () => {
+      try { this.refreshFocModelAndSpice(); } catch (err) { this.app.showToast(err instanceof Error ? err.message : String(err), 'error'); }
+    });
+    document.getElementById('focPcbSpatialJsonFileInput')?.addEventListener('change', async (ev) => {
+      const file = (ev.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      try {
+        const raw = await file.text();
+        parsePcbSpatialImportJson(raw);
+        const target = document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null;
+        if (target) target.value = raw;
+        this.refreshFocModelAndSpice();
+        this.app.showToast(`已导入 PCB 热网络：${file.name}`, 'success');
+      } catch (err) {
+        const target = document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null;
+        if (target) target.value = '';
+        this.invalidateFocCaches(true);
+        this.app.showToast(`PCB 热网络导入失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    });
+    document.getElementById('focPcbSpatialTemplateBtn')?.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(createPcbSpatialImportTemplate(), null, 2)], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'wave-test-pcb-thermal-template.json';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    });
     document.getElementById('focEonIncludesQrrChk')?.addEventListener('change', () => this.invalidateFocCaches(true));
+    document.getElementById('focEossCurveJsonInput')?.addEventListener('change', () => this.invalidateFocCaches(true));
+    document.getElementById('focEossCurveJsonTemplateBtn')?.addEventListener('click', () => {
+      const kind = ((document.getElementById('focEossCsvKindSelect') as HTMLSelectElement | null)?.value || 'qoss_nc') as 'eoss_uj' | 'qoss_nc' | 'coss_pf';
+      const template = createEossCurveImportTemplate(kind);
+      const target = document.getElementById('focEossCurveJsonInput') as HTMLTextAreaElement | null;
+      if (target) target.value = JSON.stringify(template, null, 2);
+      const mode = document.getElementById('focEossCurveModeSelect') as HTMLSelectElement | null;
+      if (mode) mode.value = 'custom_json';
+      this.invalidateFocCaches(true);
+      this.app.showToast(`已生成 ${kind} 器件曲线 JSON 模板；请替换为具体器件数据后导入。`, 'info');
+    });
+    document.getElementById('focEossCurveJsonFileInput')?.addEventListener('change', async (ev) => {
+      const file = (ev.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      try {
+        const raw = await file.text();
+        parseEossCurveImportJson(raw);
+        const target = document.getElementById('focEossCurveJsonInput') as HTMLTextAreaElement | null;
+        if (target) target.value = raw;
+        this.invalidateFocCaches(true);
+        this.app.showToast(`已载入器件 Eoss JSON：${file.name}`, 'success');
+      } catch (err) {
+        const target = document.getElementById('focEossCurveJsonInput') as HTMLTextAreaElement | null;
+        if (target) target.value = '';
+        this.invalidateFocCaches(true);
+        this.app.showToast(`Eoss JSON 导入失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    });
+    document.getElementById('focEossCurveCsvInput')?.addEventListener('change', () => this.invalidateFocCaches(true));
+    for (const id of ['focEossCsvKindSelect', 'focEossCsvVoltageUnitSelect', 'focEossCsvValueUnitSelect']) {
+      document.getElementById(id)?.addEventListener('change', () => this.invalidateFocCaches(true));
+    }
+    document.getElementById('focEossCurveCsvFileInput')?.addEventListener('change', async (ev) => {
+      const file = (ev.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const target = document.getElementById('focEossCurveCsvInput') as HTMLTextAreaElement | null;
+        if (target) target.value = text;
+        this.invalidateFocCaches(true);
+        this.app.showToast(`已载入 Eoss CSV：${file.name}；请核对曲线类型和单位后运行。`, 'success');
+      } catch (err) {
+        this.app.showToast(`Eoss CSV 读取失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    });
     document.getElementById('focEossIncludedChk')?.addEventListener('change', () => this.invalidateFocCaches(true));
     document.getElementById('focEossCurveModeSelect')?.addEventListener('change', (ev) => {
       const mode = (ev.target as HTMLSelectElement).value;
@@ -1029,6 +1105,14 @@ export class ThermalWorkbenchController {
         if (mode === 'preset_si_80v') inp.value = '0:0, 12:18, 24:31, 48:50, 60:58, 80:72';
         else if (mode === 'preset_sic_650v') inp.value = '0:1400, 25:620, 100:240, 200:145, 400:98, 650:78';
       }
+      this.invalidateFocCaches(true);
+    });
+    document.getElementById('focEossCsvKindSelect')?.addEventListener('change', (ev) => {
+      const kind = (ev.target as HTMLSelectElement).value;
+      const unitSelect = document.getElementById('focEossCsvValueUnitSelect') as HTMLSelectElement | null;
+      if (!unitSelect) return;
+      const allowed = kind === 'eoss_uj' ? ['uJ', 'nJ', 'mJ'] : kind === 'qoss_nc' ? ['nC', 'uC'] : ['pF', 'nF'];
+      unitSelect.innerHTML = allowed.map((u) => `<option value="${u}">${u}</option>`).join('');
       this.invalidateFocCaches(true);
     });
 
@@ -2650,11 +2734,21 @@ export class ThermalWorkbenchController {
     const pitchMmRaw = parseFloat((document.getElementById('focPcbPitchMmInput') as HTMLInputElement | null)?.value || '14');
     baseModel.thermalTopologyMode = topologyMode;
     if (topologyMode !== 'shared_board') {
-      baseModel.spatialMatrix = {
-        copperOz: Number.isFinite(copperOzRaw) && copperOzRaw > 0 ? copperOzRaw : 2.0,
-        layoutPitchMm: Number.isFinite(pitchMmRaw) && pitchMmRaw >= 4 ? pitchMmRaw : 14,
-        provenance: 'geometry_estimated',
-      };
+      const pcbJson = (document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null)?.value?.trim() || '';
+      if (pcbJson) {
+        const imported = parsePcbSpatialImportJson(pcbJson);
+        baseModel.spatialMatrix = imported.config;
+        baseModel.modelKind = imported.config.provenance === 'measured' ? 'datasheet_constrained' : baseModel.modelKind;
+        baseModel.provenanceNote = `${baseModel.provenanceNote || ''} PCB 网络来源：${imported.boardName || imported.deviceName || imported.config.sourceLabel || '导入 JSON'}。`;
+        baseModel.thermalTopologyMode = 'pcb_spatial_coupled';
+      } else {
+        baseModel.spatialMatrix = {
+          copperOz: Number.isFinite(copperOzRaw) && copperOzRaw > 0 ? copperOzRaw : 2.0,
+          layoutPitchMm: Number.isFinite(pitchMmRaw) && pitchMmRaw >= 4 ? pitchMmRaw : 14,
+          provenance: 'geometry_estimated',
+          sourceLabel: 'UI 几何近邻默认估算；并非实际 PCB 提取数据',
+        };
+      }
     }
 
     return baseModel;
@@ -2705,9 +2799,18 @@ export class ThermalWorkbenchController {
       'focTopologyModeSelect',
       'focPcbCopperOzInput',
       'focPcbPitchMmInput',
+      'focPcbSpatialJsonInput',
+      'focPcbSpatialJsonFileInput',
       'focRjcSpreadPctInput',
       'focEossCurveModeSelect',
       'focEossCurveInput',
+      'focEossCurveJsonInput',
+      'focEossCurveJsonFileInput',
+      'focEossCurveCsvInput',
+      'focEossCsvKindSelect',
+      'focEossCsvVoltageUnitSelect',
+      'focEossCsvValueUnitSelect',
+      'focEossCurveCsvFileInput',
     ];
     const eonInclQrr = (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ? '1' : '0';
     const eossIncl = (document.getElementById('focEossIncludedChk') as HTMLInputElement | null)?.checked ? '1' : '0';
@@ -2761,6 +2864,21 @@ export class ThermalWorkbenchController {
   private parseFocNonlinearEossCurve(): NonlinearEossCurve | undefined {
     const mode = (document.getElementById('focEossCurveModeSelect') as HTMLSelectElement | null)?.value || 'scalar';
     if (mode === 'scalar') return undefined;
+    if (mode === 'custom_json') {
+      const rawJson = (document.getElementById('focEossCurveJsonInput') as HTMLTextAreaElement | null)?.value?.trim() || '';
+      if (!rawJson) throw new Error('请选择或粘贴 Eoss/Qoss/Coss JSON 曲线数据。');
+      return parseEossCurveImportJson(rawJson);
+    }
+    if (mode === 'custom_csv') {
+      const csv = (document.getElementById('focEossCurveCsvInput') as HTMLTextAreaElement | null)?.value?.trim() || '';
+      if (!csv) throw new Error('请导入或粘贴 Eoss/Qoss/Coss CSV 两列数据。');
+      const kind = ((document.getElementById('focEossCsvKindSelect') as HTMLSelectElement | null)?.value || 'eoss_uj') as 'eoss_uj' | 'qoss_nc' | 'coss_pf';
+      const voltageUnit = ((document.getElementById('focEossCsvVoltageUnitSelect') as HTMLSelectElement | null)?.value || 'V') as 'V' | 'mV';
+      const valueUnit = ((document.getElementById('focEossCsvValueUnitSelect') as HTMLSelectElement | null)?.value || 'uJ') as 'uJ' | 'nJ' | 'mJ' | 'nC' | 'uC' | 'pF' | 'nF';
+      return parseEossCurveCsv(csv, kind, voltageUnit, valueUnit, {
+        label: 'CSV 导入 Eoss/Qoss/Coss 曲线', provenance: 'user_import',
+      });
+    }
 
     if (mode === 'preset_si_80v') {
       return integrateQossToEossCurve(

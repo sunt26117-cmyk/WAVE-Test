@@ -330,15 +330,17 @@ export class OscilloscopeApp {
     window.dispatchEvent(new CustomEvent('wvp-theme-changed', { detail: { themeId: preset.id } }));
   }
 
-  public showToast(message: string, level: 'info' | 'warn' | 'error' = 'info'): void {
+  public showToast(message: string, level: 'info' | 'warn' | 'error' | 'success' = 'info'): void {
     const el = document.getElementById('scopeToast');
     if (!el) return;
     el.innerText = message;
-    el.classList.remove('hidden', 'border-amber-500/60', 'text-amber-200', 'border-red-500/70', 'text-red-200', 'border-cyan-500/60', 'text-cyan-200');
+    el.classList.remove('hidden', 'border-amber-500/60', 'text-amber-200', 'border-red-500/70', 'text-red-200', 'border-cyan-500/60', 'text-cyan-200', 'border-emerald-500/60', 'text-emerald-200');
     if (level === 'error') {
       el.classList.add('border-red-500/70', 'text-red-200');
     } else if (level === 'warn') {
       el.classList.add('border-amber-500/60', 'text-amber-200');
+    } else if (level === 'success') {
+      el.classList.add('border-emerald-500/60', 'text-emerald-200');
     } else {
       el.classList.add('border-cyan-500/60', 'text-cyan-200');
     }
