@@ -2003,7 +2003,7 @@ class StarCoupled6MosThermalSolver {
         const brdCkDtM = new Float64Array(kb);
         for (let k = 0; k < kb; k++) {
           const rk = this.brd[k].r * 6 + (k === 0 ? this.spatial.rVert[m] : 0);
-          const ck = this.brd[k].c / 6;
+          const ck = k === 0 ? this.spatial.cPcb[m] : this.brd[k].c / 6;
           brdCkDtM[k] = ck / subDt;
           const gL = k > 0 ? 1 / (this.brd[k - 1].r * 6 + (k - 1 === 0 ? this.spatial.rVert[m] : 0)) : 0;
           const gR = 1 / rk;
@@ -3986,31 +3986,74 @@ export function simulateFoc6Mos(
   const evalSwSteadyAtTj =
     hasDptLut && lutActiveDimsLatest.includes('Tj') && mos.dptLut
       ? (tjCand: number[]): number[] => {
-          const pSwMeanCand = [0, 0, 0, 0, 0, 0];
-          const strideSteady = Math.max(1, Math.floor(len / 240));
-          let wSum = 0;
-          for (let k = 0; k < len; k += strideSteady) {
-            const idx = i0 + k;
-            const tCurr = iaCh.t[idx];
-            const ia = iaSampler.sample(tCurr, idx);
-            const ib = ibSampler.sample(tCurr, idx);
-            const ic = icSampler ? icSampler.sample(tCurr, idx) : -(ia + ib);
-            const vbus = vbusSampler ? vbusSampler.sample(tCurr, idx) : ctrl.vBusConstV;
-            const da = duty.a[k];
-            const db = duty.b[k];
-            const dc = duty.c[k];
-            const lA = computePhaseMosLosses(ia, da, vbus, tjCand[0], tjCand[1], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
-            const lB = computePhaseMosLosses(ib, db, vbus, tjCand[2], tjCand[3], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
-            const lC = computePhaseMosLosses(ic, dc, vbus, tjCand[4], tjCand[5], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
-            pSwMeanCand[0] += lA.pHighSw + lA.pHighDead;
-            pSwMeanCand[1] += lA.pLowSw + lA.pLowDead;
-            pSwMeanCand[2] += lB.pHighSw + lB.pHighDead;
-            pSwMeanCand[3] += lB.pLowSw + lB.pLowDead;
-            pSwMeanCand[4] += lC.pHighSw + lC.pHighDead;
-            pSwMeanCand[5] += lC.pLowSw + lC.pLowDead;
-            wSum++;
+          const pSwEnergyCand = [0, 0, 0, 0, 0, 0];
+          const evalCount = len > 1 && useTimeAvg ? len - 1 : len;
+          const maxSteadySamples = 4096;
+          let totalWeight = 0;
+          if (useTimeAvg && len > 1) {
+            // Use exact piecewise-constant elapsed-time weighting (matching the main energy loop).
+            // For very long captures (>4096 samples), select samples by elapsed time so dense
+            // low-current segments cannot starve coarse high-current segments.
+            const tFirst = iaCh.t[i0];
+            const tLast = iaCh.t[i0 + len - 1];
+            const minSpanDt = evalCount > maxSteadySamples ? (tLast - tFirst) / maxSteadySamples : 0;
+            let k = 0;
+            while (k < len - 1) {
+              const idx = i0 + k;
+              const tCurr = iaCh.t[idx];
+              let nextK = k + 1;
+              if (minSpanDt > 0) {
+                while (nextK < len - 1 && iaCh.t[i0 + nextK] - tCurr < minSpanDt) {
+                  nextK++;
+                }
+              }
+              const dtSpan = iaCh.t[i0 + nextK] - tCurr;
+              if (Number.isFinite(dtSpan) && dtSpan > 0) {
+                const ia = iaSampler.sample(tCurr, idx);
+                const ib = ibSampler.sample(tCurr, idx);
+                const ic = icSampler ? icSampler.sample(tCurr, idx) : -(ia + ib);
+                const vbus = vbusSampler ? vbusSampler.sample(tCurr, idx) : ctrl.vBusConstV;
+                const da = duty.a[k];
+                const db = duty.b[k];
+                const dc = duty.c[k];
+                const lA = computePhaseMosLosses(ia, da, vbus, tjCand[0], tjCand[1], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+                const lB = computePhaseMosLosses(ib, db, vbus, tjCand[2], tjCand[3], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+                const lC = computePhaseMosLosses(ic, dc, vbus, tjCand[4], tjCand[5], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+                pSwEnergyCand[0] += (lA.pHighSw + lA.pHighDead) * dtSpan;
+                pSwEnergyCand[1] += (lA.pLowSw + lA.pLowDead) * dtSpan;
+                pSwEnergyCand[2] += (lB.pHighSw + lB.pHighDead) * dtSpan;
+                pSwEnergyCand[3] += (lB.pLowSw + lB.pLowDead) * dtSpan;
+                pSwEnergyCand[4] += (lC.pHighSw + lC.pHighDead) * dtSpan;
+                pSwEnergyCand[5] += (lC.pLowSw + lC.pLowDead) * dtSpan;
+                totalWeight += dtSpan;
+              }
+              k = nextK;
+            }
+          } else {
+            const strideSteady = Math.max(1, Math.floor(len / 240));
+            for (let k = 0; k < len; k += strideSteady) {
+              const idx = i0 + k;
+              const tCurr = iaCh.t[idx];
+              const ia = iaSampler.sample(tCurr, idx);
+              const ib = ibSampler.sample(tCurr, idx);
+              const ic = icSampler ? icSampler.sample(tCurr, idx) : -(ia + ib);
+              const vbus = vbusSampler ? vbusSampler.sample(tCurr, idx) : ctrl.vBusConstV;
+              const da = duty.a[k];
+              const db = duty.b[k];
+              const dc = duty.c[k];
+              const lA = computePhaseMosLosses(ia, da, vbus, tjCand[0], tjCand[1], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+              const lB = computePhaseMosLosses(ib, db, vbus, tjCand[2], tjCand[3], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+              const lC = computePhaseMosLosses(ic, dc, vbus, tjCand[4], tjCand[5], ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos);
+              pSwEnergyCand[0] += lA.pHighSw + lA.pHighDead;
+              pSwEnergyCand[1] += lA.pLowSw + lA.pLowDead;
+              pSwEnergyCand[2] += lB.pHighSw + lB.pHighDead;
+              pSwEnergyCand[3] += lB.pLowSw + lB.pLowDead;
+              pSwEnergyCand[4] += lC.pHighSw + lC.pHighDead;
+              pSwEnergyCand[5] += lC.pLowSw + lC.pLowDead;
+              totalWeight += 1;
+            }
           }
-          return pSwMeanCand.map((v) => v / Math.max(1, wSum));
+          return pSwEnergyCand.map((v) => v / Math.max(1e-18, totalWeight));
         }
       : undefined;
 
@@ -4343,11 +4386,21 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
       : 0.25;
   const rTotalPhase = rPhaseUsedOhm + Math.max(0, opts.mos.rdsOn25Mohm * 1e-3);
   const svpwmCeiling = getModulationLinearCeiling('SVPWM');
+  const deadEdgeDuty = opts.tDeadNs * 1e-9 * opts.fswHz;
+  if (deadEdgeDuty >= 0.45) {
+    throw new Error(`堵转死区占空比过大 (${(deadEdgeDuty * 100).toFixed(1)}%)，单边死区已占用 ≥45% 开关周期，无法建立有效 PWM 脉冲。`);
+  }
+  // True dead-time-safe linear SVPWM ceiling: max duty = 0.5 + (sqrt(3)/4)*m must stay strictly below (1 - deadEdgeDuty)
+  // across all 72 swept electrical angles so narrow-pulse deletion is never entered silently.
+  const svpwmUsableCeiling =
+    deadEdgeDuty > 0
+      ? svpwmCeiling * Math.max(0.01, 1 - 2 * deadEdgeDuty - 1e-5)
+      : svpwmCeiling;
   const mReqStall = (2 * opts.iPeakA * rTotalPhase) / Math.max(1, opts.vBusV);
-  const stallVoltageLimited = stallMode === 'resistive' && mReqStall > svpwmCeiling + 1e-6;
+  const stallVoltageLimited = stallMode === 'resistive' && mReqStall > svpwmUsableCeiling + 1e-6;
   const effM =
     stallMode === 'resistive'
-      ? Math.min(svpwmCeiling, Math.max(0.005, mReqStall))
+      ? Math.min(svpwmUsableCeiling, Math.max(0.005, mReqStall))
       : opts.modDepthM;
   const effMod: FocModulationMode = stallMode === 'resistive' ? 'SVPWM' : opts.modulation;
   const effPfAngleDeg = stallMode === 'user_m' ? (opts.pfAngleDeg ?? 0) : 0;
@@ -4622,7 +4675,13 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
   }
   if (!stallSteadyConverged) stallWarnings.push('堵转稳态热方程至少一个电角度未收敛；SAFE 判定已强制为 false，不能把稳态温度外推作为安全结论。');
   if (stallThermalRunaway) stallWarnings.push('堵转角度扫描检测到热失控；应按非安全工况处理。');
-  if (stallVoltageLimited) stallWarnings.push('目标 I_pk 在当前 Vbus、R_phase 和 SVPWM 线性电压能力下不可实现；本次热结果仍按用户请求电流强制计算，只能作为条件性上界估算，不得据此判定实际可运行工况 SAFE。');
+  if (stallVoltageLimited) {
+    const deadNote =
+      deadEdgeDuty > 0
+        ? `（已计入死区最小脉冲宽度限制：deadEdgeDuty=${(deadEdgeDuty * 100).toFixed(2)}%，可用线性调制上限 m=${svpwmUsableCeiling.toFixed(4)}）`
+        : '';
+    stallWarnings.push(`目标 I_pk 在当前 Vbus、R_phase 和 SVPWM 线性电压能力${deadNote}下不可实现；本次热结果仍按用户请求电流强制计算，只能作为条件性上界估算，不得据此判定实际可运行工况 SAFE。`);
+  }
   stallWarnings.push('堵转 I²t 的 RMS 字段采用平衡正弦电流等效参考 I_pk/√2；锁定转子固定电角度下各相电流是静态相量投影，不是实际随时间的相 RMS。i2tWorstLegA2s 按 t_safe 最不利电角度的单相静态电流平方积分。');
   stallWarnings.push('t_safe 已对 0°～355°、每 5° 的全部 72 个锁定转子电角度分别进行热瞬态扫描，并取最早 Tj_limit 越限时间；采用 280 点对数时间输出网格，并在首次越限区间进行 18 轮热网络重放二分细化；属于模型估计值，不替代实测堵转保护标定。');
   if (opts.rPhaseOhm === undefined) {

@@ -698,7 +698,29 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   assert.equal(stallDefaultRs.stallVoltageLimited, true);
   assert.equal(stallDefaultRs.thermalSafeAtRequestedCurrent, true, 'thermal-only result may be safe under the forced-current assumption');
   assert.equal(stallDefaultRs.steadySafe, false, 'an infeasible voltage-limited operating point must never be presented as SAFE');
-  assert.ok(Math.abs(stallDefaultRs.effectiveStallModDepthM - getModulationLinearCeiling('SVPWM')) < 1e-6);
+  const deadEdgeDuty = 200 * 1e-9 * 20000;
+  const expectedUsableCeiling = getModulationLinearCeiling('SVPWM') * (1 - 2 * deadEdgeDuty - 1e-5);
+  assert.ok(
+    Math.abs(stallDefaultRs.effectiveStallModDepthM - expectedUsableCeiling) < 1e-6,
+    `Expected dead-time-safe SVPWM linear ceiling ${expectedUsableCeiling}, got ${stallDefaultRs.effectiveStallModDepthM}`
+  );
+  // With zero dead-time, resistive voltage-limited stall reaches the exact ideal SVPWM linear ceiling 2/sqrt(3)
+  const stallZeroDead = runFocStallSweep({
+    iPeakA: 135,
+    tjLimitC: 2000,
+    tAmbC: 25,
+    modulation: 'SVPWM',
+    modDepthM: 0.85,
+    fswHz: 20000,
+    tDeadNs: 0,
+    mos,
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 48,
+    horizonSec: 120,
+    stallDutyMode: 'resistive',
+  });
+  assert.equal(stallZeroDead.stallVoltageLimited, true);
+  assert.ok(Math.abs(stallZeroDead.effectiveStallModDepthM - getModulationLinearCeiling('SVPWM')) < 1e-6);
 });
 
 

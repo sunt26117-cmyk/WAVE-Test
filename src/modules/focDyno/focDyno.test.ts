@@ -1,6 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+
+function resolvePythonExecutable(): string | null {
+  for (const candidate of ['python3', 'python']) {
+    const probe = spawnSync(candidate, ['--version'], { encoding: 'utf8' });
+    if (!probe.error && probe.status === 0) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+const PYTHON_EXECUTABLE = resolvePythonExecutable();
 import {
   SVPWM_LINEAR_LIMIT,
   calcKeFromKv,
@@ -994,7 +1006,11 @@ test('FOC DynoLab audit: out-of-range eta quarantine, holdout CV, openLoopModDep
   assert.ok(appPy.includes('20% 留出交叉验证'));
 });
 
-test('FOC DynoLab live python3 parity: motor_physics.py numerically matches TS solver across operating modes', () => {
+test('FOC DynoLab live python3 parity: motor_physics.py numerically matches TS solver across operating modes', (t) => {
+  if (!PYTHON_EXECUTABLE) {
+    t.skip('No python3/python interpreter available in PATH');
+    return;
+  }
   const motorPhysicsPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'motor_physics.py')?.content || '';
   assert.ok(motorPhysicsPy.length > 1000);
 
@@ -1068,11 +1084,11 @@ print(json.dumps(sanitize({
 }), allow_nan=False))
 `;
 
-  const proc = spawnSync('python3', ['-c', pyScript], {
+  const proc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], {
     input: motorPhysicsPy,
     encoding: 'utf8',
   });
-  assert.equal(proc.status, 0, `python3 execution failed: ${proc.stderr}`);
+  assert.equal(proc.status, 0, `${PYTHON_EXECUTABLE} execution failed: ${proc.stderr}`);
   const pyData = JSON.parse(proc.stdout);
   const tinyParams = { ...DEMO_MOTOR_PARAMS, iIdleA: 0, etaInv: 1, iDeadbandA: 0, rLineOhm: 0 };
   const tinyTs = solveSinglePoint(13.5, 1e-16, 1000, tinyParams);
@@ -1246,23 +1262,25 @@ exec(files["motor_physics.py"], ns)
 segs, gaps, med_dt, thresh = ns["partition_continuous_time_segments"](${JSON.stringify(timesGap)})
 print(json.dumps({"segs": [list(s) for s in segs], "gaps": gaps, "med_dt": med_dt}))
 `;
-  const proc = spawnSync('python3', ['-c', pyCheck], {
-    input: JSON.stringify({
-      'motor_physics.py': motorPy,
-      'dyno_calibrator.py': dynoPy,
-      'thermal_exporter.py': thermPy,
-      'dynamic_pmsm.py': dynPy,
-      'app.py': appPy,
-    }),
-    encoding: 'utf8',
-  });
-  assert.equal(proc.status, 0, `Python AST/parity check failed: ${proc.stderr}`);
-  const pyRes = JSON.parse(proc.stdout);
-  assert.deepEqual(pyRes.gaps, segDiag.gapIndices);
-  assert.deepEqual(
-    pyRes.segs,
-    segDiag.segments.map((s) => [s.startIdx, s.endIdx])
-  );
+  if (PYTHON_EXECUTABLE) {
+    const proc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyCheck], {
+      input: JSON.stringify({
+        'motor_physics.py': motorPy,
+        'dyno_calibrator.py': dynoPy,
+        'thermal_exporter.py': thermPy,
+        'dynamic_pmsm.py': dynPy,
+        'app.py': appPy,
+      }),
+      encoding: 'utf8',
+    });
+    assert.equal(proc.status, 0, `Python AST/parity check failed: ${proc.stderr}`);
+    const pyRes = JSON.parse(proc.stdout);
+    assert.deepEqual(pyRes.gaps, segDiag.gapIndices);
+    assert.deepEqual(
+      pyRes.segs,
+      segDiag.segments.map((s) => [s.startIdx, s.endIdx])
+    );
+  }
 });
 
 test('FD-02: normalized Jacobian SVD, 95% CI, correlation matrix, and rank-deficient fallback retain baseline', () => {
@@ -1513,16 +1531,18 @@ print(json.dumps({
     "volt_diff": res["steady_check"]["voltage_diff_v"],
 }))
 `;
-  const pyProc = spawnSync('python3', ['-c', pyParityScript], { input: dynPy, encoding: 'utf8' });
-  assert.equal(pyProc.status, 0, `Python dynamic_pmsm execution failed: ${pyProc.stderr}`);
-  const pyOut = JSON.parse(pyProc.stdout);
-  assert.equal(pyOut.provenance, 'synthetic_assumed_uncalibrated');
-  const lastIdx = ipmRes.time.length - 1;
-  assert.ok(Math.abs(pyOut.last_rpm - ipmRes.nRpm[lastIdx]) < 1e-6);
-  assert.ok(Math.abs(pyOut.last_id - ipmRes.idA[lastIdx]) < 1e-6);
-  assert.ok(Math.abs(pyOut.last_iq - ipmRes.iqA[lastIdx]) < 1e-6);
-  assert.ok(Math.abs(pyOut.last_te - ipmRes.teNm[lastIdx]) < 1e-7);
-  assert.equal(pyOut.volt_hits, ipmRes.voltageLimitHits);
+  if (PYTHON_EXECUTABLE) {
+    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyParityScript], { input: dynPy, encoding: 'utf8' });
+    assert.equal(pyProc.status, 0, `Python dynamic_pmsm execution failed: ${pyProc.stderr}`);
+    const pyOut = JSON.parse(pyProc.stdout);
+    assert.equal(pyOut.provenance, 'synthetic_assumed_uncalibrated');
+    const lastIdx = ipmRes.time.length - 1;
+    assert.ok(Math.abs(pyOut.last_rpm - ipmRes.nRpm[lastIdx]) < 1e-6);
+    assert.ok(Math.abs(pyOut.last_id - ipmRes.idA[lastIdx]) < 1e-6);
+    assert.ok(Math.abs(pyOut.last_iq - ipmRes.iqA[lastIdx]) < 1e-6);
+    assert.ok(Math.abs(pyOut.last_te - ipmRes.teNm[lastIdx]) < 1e-7);
+    assert.equal(pyOut.volt_hits, ipmRes.voltageLimitHits);
+  }
 });
 
 
@@ -1574,13 +1594,15 @@ cfg = ns['DynamicPmsmConfig'](duration_sec=0.01,dt_out_sec=1e-4,initial_speed_rp
 r = ns['simulate_dynamic_pmsm'](p,cfg)
 print(json.dumps({'source_model':r['source_model'],'last_id':r['id_a'][-1],'last_iq':r['iq_a'][-1],'last_te':r['te_nm'][-1],'max_e_res':max(abs(x) for x in r['p_electrical_balance_residual_w']),'max_m_res':max(abs(x) for x in r['p_mechanical_balance_residual_w'])}))
 `;
-  const pyProc = spawnSync('python3', ['-c', pyScript], { input: dynPy, encoding: 'utf8' });
-  assert.equal(pyProc.status, 0, `Python flux-map parity failed: ${pyProc.stderr}`);
-  const pyOut = JSON.parse(pyProc.stdout);
-  assert.equal(pyOut.source_model, result.sourceModel);
-  assert.ok(Math.abs(pyOut.last_id - result.idA[result.idA.length - 1]) < 1e-8);
-  assert.ok(Math.abs(pyOut.last_iq - result.iqA[result.iqA.length - 1]) < 1e-8);
-  assert.ok(Math.abs(pyOut.last_te - result.teNm[result.teNm.length - 1]) < 1e-8);
-  assert.ok(pyOut.max_e_res < 1e-7);
-  assert.ok(pyOut.max_m_res < 1e-7);
+  if (PYTHON_EXECUTABLE) {
+    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8' });
+    assert.equal(pyProc.status, 0, `Python flux-map parity failed: ${pyProc.stderr}`);
+    const pyOut = JSON.parse(pyProc.stdout);
+    assert.equal(pyOut.source_model, result.sourceModel);
+    assert.ok(Math.abs(pyOut.last_id - result.idA[result.idA.length - 1]) < 1e-8);
+    assert.ok(Math.abs(pyOut.last_iq - result.iqA[result.iqA.length - 1]) < 1e-8);
+    assert.ok(Math.abs(pyOut.last_te - result.teNm[result.teNm.length - 1]) < 1e-8);
+    assert.ok(pyOut.max_e_res < 1e-7);
+    assert.ok(pyOut.max_m_res < 1e-7);
+  }
 });

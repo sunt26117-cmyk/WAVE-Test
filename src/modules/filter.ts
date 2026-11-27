@@ -852,7 +852,7 @@ function applyRcFilterVariableDt(
           const dt = t[i] - t[i - 1];
           const alpha = dt > 0 ? Math.exp(-dt / tau) : 1;
           const x = buf[i];
-          y = alpha * (y + x - xPrev);
+          y = alpha * y + 0.5 * (1 + alpha) * (x - xPrev);
           xPrev = x;
           buf[i] = y;
         }
@@ -878,7 +878,7 @@ function applyRcFilterVariableDt(
           const dt = t[i + 1] - t[i];
           const alpha = dt > 0 ? Math.exp(-dt / tau) : 1;
           const x = buf[i];
-          y = alpha * (y + x - xNext);
+          y = alpha * y + 0.5 * (1 + alpha) * (x - xNext);
           xNext = x;
           buf[i] = y;
         }

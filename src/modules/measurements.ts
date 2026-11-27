@@ -578,6 +578,7 @@ export function computeMeasurements(
     let state: 'low' | 'high' = firstValidIdx <= endIdx && valAt(firstValidIdx) >= midLevel ? 'high' : 'low';
     let needReseed = false;
 
+    let segStartIdx = firstValidIdx;
     for (let i = firstValidIdx + 1; i <= endIdx; i++) {
       const vPrev = valAt(i - 1);
       const vCurr = valAt(i);
@@ -588,33 +589,56 @@ export function computeMeasurements(
       if (!isFinite(vCurr)) {
         segmentId++;
         needReseed = true;
+        segStartIdx = i + 1;
         continue;
       }
       if (!isFinite(vPrev) || (Number.isFinite(gapThreshold) && dtStep > gapThreshold)) {
         if (isFinite(vPrev)) segmentId++;
         state = vCurr >= midLevel ? 'high' : 'low';
         needReseed = false;
+        segStartIdx = i;
         continue;
       }
       if (needReseed) {
         state = vCurr >= midLevel ? 'high' : 'low';
         needReseed = false;
+        segStartIdx = i;
         continue;
       }
 
-      const dv = vCurr - vPrev;
       if (state === 'low' && vCurr >= midHigh) {
-        const frac = Math.abs(dv) > 1e-15 ? Math.max(0, Math.min(1, (midLevel - vPrev) / dv)) : 0.5;
-        const cTime = tPrev + frac * dtStep;
+        // Backtrack within the current continuous segment to the true midLevel crossing bracket
+        let j = i;
+        while (j > segStartIdx && valAt(j - 1) > midLevel) {
+          j--;
+        }
+        const vjPrev = j > segStartIdx ? valAt(j - 1) : vPrev;
+        const vjCurr = j > segStartIdx ? valAt(j) : vCurr;
+        const tjPrev = j > segStartIdx ? t[j - 1] : tPrev;
+        const tjCurr = j > segStartIdx ? t[j] : tCurr;
+        const dvj = vjCurr - vjPrev;
+        const frac = Math.abs(dvj) > 1e-15 ? Math.max(0, Math.min(1, (midLevel - vjPrev) / dvj)) : 0.5;
+        const cTime = tjPrev + frac * (tjCurr - tjPrev);
         risingEdges.push({ time: cTime, segmentId });
         events.push({ type: 'rise', time: cTime, segmentId });
         state = 'high';
+        segStartIdx = i;
       } else if (state === 'high' && vCurr <= midLow) {
-        const frac = Math.abs(dv) > 1e-15 ? Math.max(0, Math.min(1, (midLevel - vPrev) / dv)) : 0.5;
-        const cTime = tPrev + frac * dtStep;
+        let j = i;
+        while (j > segStartIdx && valAt(j - 1) < midLevel) {
+          j--;
+        }
+        const vjPrev = j > segStartIdx ? valAt(j - 1) : vPrev;
+        const vjCurr = j > segStartIdx ? valAt(j) : vCurr;
+        const tjPrev = j > segStartIdx ? t[j - 1] : tPrev;
+        const tjCurr = j > segStartIdx ? t[j] : tCurr;
+        const dvj = vjCurr - vjPrev;
+        const frac = Math.abs(dvj) > 1e-15 ? Math.max(0, Math.min(1, (midLevel - vjPrev) / dvj)) : 0.5;
+        const cTime = tjPrev + frac * (tjCurr - tjPrev);
         fallingEdges.push({ time: cTime, segmentId });
         events.push({ type: 'fall', time: cTime, segmentId });
         state = 'low';
+        segStartIdx = i;
       }
     }
 
