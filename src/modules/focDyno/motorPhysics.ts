@@ -154,6 +154,56 @@ export interface RuntimeLogProcessAudit {
 
 export const SVPWM_LINEAR_LIMIT = 2 / Math.sqrt(3); // 1.1547005383792517
 
+/**
+ * Validate the physical parameter contract before solving. The solver used to
+ * silently clamp several invalid values (notably etaInv), which made the
+ * TypeScript and embedded Python engines capable of solving different models.
+ */
+export function validateMotorParams(params: MotorParams): void {
+  if (!params || typeof params !== 'object') throw new TypeError('FOC 电机参数对象缺失。');
+
+  const finiteFields: Array<[keyof MotorParams, string]> = [
+    ['polePairs', '极对数'], ['kePrime', "Ke'"], ['rLL25Ohm', '25°C 线电阻 R_LL'],
+    ['tCoilC', '绕组温度 T_coil'], ['lLLmH', '线电感 L_LL'], ['n0Rpm', '参考空载转速 n0'],
+    ['betaSat', '磁饱和系数 β'], ['p0A', '随速损耗系数 a'], ['p0B', '随速损耗系数 b'],
+    ['iIdleA', '静态偏置 I_idle'], ['etaInv', '逆变器效率 η_inv'], ['iDeadbandA', '零漂死区 I_deadband'],
+    ['rLineOhm', '线束电阻 R_line'], ['rdsOnMOhm', 'MOS Rds(on)'], ['tDeadNs', '死区时间 t_dead'],
+    ['fSwKhz', 'PWM 频率 f_sw'], ['vSdV', '体二极管压降 V_sd'],
+  ];
+  for (const [key, label] of finiteFields) {
+    if (!Number.isFinite(params[key] as number)) throw new RangeError(`${label} 必须是有限数值。`);
+  }
+  if (!Number.isInteger(params.polePairs) || params.polePairs < 1 || params.polePairs > 100) {
+    throw new RangeError('极对数必须是 1–100 范围内的正整数。');
+  }
+  if (params.kePrime <= 0) throw new RangeError("Ke' 必须大于 0。请检查反电势/KV 换算。");
+  if (params.rLL25Ohm <= 0) throw new RangeError('25°C 线电阻 R_LL 必须大于 0。');
+  if (params.tCoilC <= -273.15) throw new RangeError('绕组温度不能低于绝对零度。');
+  if (params.lLLmH < 0) throw new RangeError('线电感 L_LL 不能为负数。');
+  if (params.n0Rpm <= 0) throw new RangeError('参考空载转速 n0 必须大于 0。');
+  if (params.betaSat < 0 || params.p0A < 0 || params.p0B < 0) {
+    throw new RangeError('β、P0 一次项和二次项必须为非负数；若不使用对应修正，请设为 0。');
+  }
+  if (params.rsEffOverrideOhm !== null && (!Number.isFinite(params.rsEffOverrideOhm) || params.rsEffOverrideOhm <= 0)) {
+    throw new RangeError('Rs_eff 覆盖值必须为正数；不使用覆盖值时请设为 null。');
+  }
+  if (params.iIdleA < 0 || params.iDeadbandA < 0 || params.rLineOhm < 0 || params.rdsOnMOhm < 0 ||
+      params.tDeadNs < 0 || params.fSwKhz < 0 || params.vSdV < 0) {
+    throw new RangeError('I_idle、I_deadband、R_line、Rds(on)、t_dead、f_sw 和 V_sd 不能为负数。');
+  }
+  if (params.etaInv <= 0 || params.etaInv > 1) {
+    throw new RangeError('逆变器效率 η_inv 必须满足 0 < η_inv ≤ 1；1.0 表示关闭逆变器效率修正。');
+  }
+  if (params.tDeadNs > 0 && params.fSwKhz <= 0) {
+    throw new RangeError('死区时间 t_dead > 0 时，PWM 频率 f_sw 必须大于 0；若不计算死区压降，请将 t_dead 设为 0。');
+  }
+}
+
+function validateSolverPointInputs(vMeasV: number, nRpm: number, label: string): void {
+  if (!Number.isFinite(vMeasV)) throw new RangeError(`${label}：母线电压必须是有限数值。`);
+  if (!Number.isFinite(nRpm)) throw new RangeError(`${label}：转速必须是有限数值。`);
+}
+
 export function calcOmegaM(nRpm: number): number {
   return (2 * Math.PI * nRpm) / 60;
 }
@@ -181,12 +231,22 @@ export function calcLqH(lLLmH: number): number {
   return (lLLmH * 1e-3) / 2;
 }
 
+/**
+ * V_test is the effective DC-link command Vdc*m_norm, not an arbitrary phase
+ * voltage or a motor-terminal line-line RMS measurement. Under linear SVPWM,
+ * E_phase,peak is approximated as V_test/sqrt(3).
+ */
 export function calcKeFromNoLoad(vTestV: number, n0Rpm: number): number {
   if (n0Rpm <= 0) return 0;
   const omegaM0 = calcOmegaM(n0Rpm);
   return (vTestV / Math.sqrt(3)) / omegaM0;
 }
 
+/**
+ * Uses this application's KV convention: Ke' = 60/(2*pi*sqrt(3)*KV).
+ * Vendor KV ratings are not interchangeable unless their voltage definition,
+ * waveform/modulation and no-load test conditions match this convention.
+ */
 export function calcKeFromKv(kvRpmPerV: number): number {
   if (kvRpmPerV <= 0) return 0;
   return 60 / (2 * Math.PI * Math.sqrt(3) * kvRpmPerV);
@@ -242,6 +302,9 @@ export function solveSinglePoint(
   nRpm: number,
   params: MotorParams
 ): SinglePointResult {
+  validateMotorParams(params);
+  validateSolverPointInputs(vMeasV, nRpm, 'FOC 单点求解');
+  if (!Number.isFinite(iBusA) && !Number.isNaN(iBusA)) throw new RangeError('FOC 单点求解：母线电流不能为无穷大。NaN 仅用于标识无效采样点。');
   const omegaM = calcOmegaM(nRpm);
   const omegaE = calcOmegaE(nRpm, params.polePairs);
   const feHz = calcFeHz(nRpm, params.polePairs);
@@ -258,7 +321,7 @@ export function solveSinglePoint(
   const p0W = calcP0LossW(nRpm, params.p0A, params.p0B);
   const pInW = vMeasV * iBusA;
   const iNetA = iBusA - params.iIdleA;
-  const etaInv = Math.min(0.999, Math.max(0.1, params.etaInv));
+  const etaInv = params.etaInv;
   const deadband = Math.max(0, params.iDeadbandA);
 
   let mode: OperatingMode = 'motoring';
@@ -339,7 +402,9 @@ export function solveSinglePoint(
     } else {
       const signEq = eq0 >= 0 ? 1 : -1;
       const beta = Math.max(0, params.betaSat);
-      iqA = (-eq0 + signEq * Math.sqrt(delta)) / (2 * rsOhm);
+      // Rationalized quadratic root avoids catastrophic cancellation near zero load.
+      // Equivalent to (-eq0 + signEq*sqrt(delta))/(2*Rs), but preserves tiny Iq.
+      iqA = signEq * (4 / 3) * pElecW / (Math.sqrt(delta) + Math.abs(eq0));
 
       if (beta > 0 && Number.isFinite(iqA)) {
         let hitRegenLimit = false;
@@ -374,7 +439,8 @@ export function solveSinglePoint(
               hitRegenLimit = true;
               break;
             }
-            const fp = (-eqCur + signEq * Math.sqrt(dIter)) / (2 * rsOhm);
+            const stableDenom = Math.sqrt(dIter) + Math.abs(eqCur);
+            const fp = stableDenom > 0 ? signEq * (4 / 3) * pElecW / stableDenom : 0;
             nextIq = 0.5 * iqA + 0.5 * fp;
           }
           iqA = nextIq;
@@ -499,6 +565,9 @@ export function forwardVerifyPoint(
   vMeasV: number,
   params: MotorParams
 ): ForwardVerifyResult {
+  validateMotorParams(params);
+  validateSolverPointInputs(vMeasV, nRpm, 'FOC 正向校验');
+  if (!Number.isFinite(iqA)) throw new RangeError('FOC 正向校验：Iq 必须是有限数值。');
   const omegaM = calcOmegaM(nRpm);
   const omegaE = calcOmegaE(nRpm, params.polePairs);
   const feHz = calcFeHz(nRpm, params.polePairs);
@@ -508,7 +577,7 @@ export function forwardVerifyPoint(
   const kSat = calcKsat(iqA, params.betaSat);
   const eqV = params.kePrime * omegaM * kSat;
   const pElecW = 1.5 * (eqV * iqA + rsOhm * iqA * iqA);
-  const etaInv = Math.min(0.999, Math.max(0.1, params.etaInv));
+  const etaInv = params.etaInv;
 
   const pDcBus = pElecW >= 0 ? pElecW / etaInv : pElecW * etaInv;
   const rLine = Math.max(0, params.rLineOhm);
@@ -529,7 +598,10 @@ export function forwardVerifyPoint(
     if (disc < 0 || !Number.isFinite(disc)) {
       lineCollapse = true;
     } else {
-      iBusEstA = (-bCoef - Math.sqrt(disc)) / (2 * rLine);
+      // Select the low-current physical root without subtracting nearly equal terms.
+      const stableDenom = -bCoef + Math.sqrt(disc);
+      if (stableDenom > 0) iBusEstA = (2 * cCoef) / stableDenom;
+      else lineCollapse = true;
     }
   }
 

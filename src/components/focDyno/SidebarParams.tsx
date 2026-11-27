@@ -74,21 +74,58 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
   return (
     <aside className="dyno-panel w-full shrink-0 border-b lg:w-80 lg:border-b-0 lg:border-r lg:overflow-y-auto">
       <div className="flex items-center justify-between border-b dyno-border px-4 py-3">
-        <div>
+        <div className="min-w-0">
           <h2 className="text-xs font-semibold tracking-wide dyno-text-primary">电机与驱动物理基准</h2>
           <p className="text-[11px] dyno-text-muted">等幅值变换 · 国际单位制 (SI)</p>
         </div>
-        <button
-          type="button"
-          onClick={onResetDemoParams}
-          title="恢复 13.5V / 30W 默认物理参数"
-          className="dyno-btn-ghost inline-flex items-center gap-1 rounded-sm border px-2.5 py-1 text-[11px] font-medium whitespace-nowrap cursor-pointer"
-        >
-          <RotateCcw className="h-3 w-3" />
-          恢复默认
-        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => update({
+              iIdleA: 0,
+              etaInv: 1,
+              iDeadbandA: 0,
+              rLineOhm: 0,
+              rdsOnMOhm: 0,
+              tDeadNs: 0,
+              vSdV: 0,
+            })}
+            title="理想驱动基线：关闭逆变效率、线束、静态电流、MOS 压降与死区修正。用于隔离电机模型，不代表真实驱动器。"
+            className="dyno-btn-ghost rounded-sm border px-2 py-1 text-[10px] font-medium whitespace-nowrap cursor-pointer"
+          >
+            理想基线
+          </button>
+          <button
+            type="button"
+            onClick={() => update({
+              iIdleA: 0.06,
+              etaInv: 0.95,
+              iDeadbandA: 0.02,
+              rLineOhm: 0.04,
+              tDeadNs: 450,
+              fSwKhz: 20,
+              vSdV: 0.85,
+            })}
+            title="仅供 12–24V 演示计算的示例假设，不是低压 BLDC 通用推荐值；须按实际驱动器、线束与波形复核。"
+            className="dyno-btn-ghost rounded-sm border px-2 py-1 text-[10px] font-medium whitespace-nowrap cursor-pointer"
+          >
+            演示假设
+          </button>
+          <button
+            type="button"
+            onClick={onResetDemoParams}
+            title="恢复 13.5V 演示电机与驱动假设，不代表目标电机实测值"
+            className="dyno-btn-ghost inline-flex items-center gap-1 rounded-sm border px-2 py-1 text-[10px] font-medium whitespace-nowrap cursor-pointer"
+          >
+            <RotateCcw className="h-3 w-3" />
+            演示默认
+          </button>
+        </div>
       </div>
 
+      <div className="px-4 pt-2 text-[10px] leading-relaxed dyno-text-muted">
+        必要基准：极对数、Ke、R_LL、L_LL 和绕组温度应来自目标电机/测量。未辨识的 β、P0(a/b) 可设为 0 关闭对应修正，但这不代表实际磁饱和/铁耗/风摩为 0；关闭后高电流转矩或高速轻载效率可能偏乐观。驱动器选填项用中性值关闭：I_idle / I_deadband / R_line / Rds / t_dead / Vsd = 0，η_inv = 1。不要把演示值当作实测标定。
+      </div>
       <div className="divide-y dyno-divide px-4 py-2">
         {/* 1. Motor Nameplate & Winding */}
         <div className="py-1.5">
@@ -137,7 +174,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ tCoilC: v })}
               />
               <NumberField
-                label="线电感 L_LL"
+                label="线电感 L_LL（电机专属；0 会使电压裕量偏乐观）"
                 unit="mH"
                 value={params.lLLmH}
                 step={0.01}
@@ -147,8 +184,9 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
               />
               <div className="dyno-well mt-2 flex items-center justify-between rounded-sm border px-2.5 py-1.5 font-mono text-[10px] tabular-nums dyno-text-muted">
                 <span>Rs_anchor: {rsAnchor.toFixed(4)} Ω</span>
-                <span>Lq: {lqMh.toFixed(3)} mH</span>
+                <span>Lq≈L_LL/2: {lqMh.toFixed(3)} mH</span>
               </div>
+              <p className="px-1 pb-1 text-[10px] leading-relaxed dyno-text-muted">模型边界：Rs 温度修正固定按铜绕组 0.00393/°C 近似；T_coil 应是绕组温度，不是壳温。Lq=L_LL/2 是非凸极/简化换算，不包含独立 Ld、凸极效应及交叉饱和；IPMSM、弱磁或高电流工况应导入实测 Ld/Lq/磁链图，不能把本值当作完整电机磁模型。</p>
             </div>
           )}
         </div>
@@ -172,7 +210,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ n0Rpm: Math.max(10, v) })}
               />
               <NumberField
-                label="磁饱和系数 β"
+                label="磁饱和系数 β（0=不计饱和修正）"
                 unit="1/A²"
                 value={params.betaSat}
                 step={0.0005}
@@ -181,7 +219,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ betaSat: Math.max(0, v) })}
               />
               <NumberField
-                label="随速损一次项 a"
+                label="随速损一次项 a（0=不计该损耗项）"
                 unit="W/RPM"
                 value={params.p0A}
                 step={0.00005}
@@ -190,7 +228,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ p0A: Math.max(0, v) })}
               />
               <NumberField
-                label="随速损二次项 b"
+                label="随速损二次项 b（0=不计该损耗项）"
                 unit="W/RPM²"
                 value={params.p0B}
                 step={1e-7}
@@ -218,7 +256,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
           {openSec.inv && (
             <div className="space-y-0.5 pb-2">
               <NumberField
-                label="静态偏置 I_idle"
+                label="静态偏置 I_idle（选填）"
                 unit="A"
                 value={params.iIdleA}
                 step={0.005}
@@ -227,16 +265,16 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ iIdleA: Math.max(0, v) })}
               />
               <NumberField
-                label="逆变器级效率 η_inv"
+                label="逆变器级效率 η_inv（选填，0<η≤1；1=不修正）"
                 value={params.etaInv}
                 step={0.005}
-                min={0.5}
-                max={0.999}
+                min={0.001}
+                max={1}
                 precision={3}
-                onChange={(v) => update({ etaInv: Math.min(0.999, Math.max(0.1, v)) })}
+                onChange={(v) => update({ etaInv: Math.min(1, Math.max(0.001, v)) })}
               />
               <NumberField
-                label="零漂死区 I_deadband"
+                label="零漂死区 I_deadband（选填）"
                 unit="A"
                 value={params.iDeadbandA}
                 step={0.005}
@@ -245,7 +283,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ iDeadbandA: Math.max(0, v) })}
               />
               <NumberField
-                label="线束内阻 R_line"
+                label="线束内阻 R_line（选填）"
                 unit="Ω"
                 value={params.rLineOhm}
                 step={0.005}
@@ -267,7 +305,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
           {openSec.drop && (
             <div className="space-y-0.5 pb-2">
               <NumberField
-                label="MOSFET Rds(on)"
+                label="MOSFET Rds(on)（选填）"
                 unit="mΩ"
                 value={params.rdsOnMOhm}
                 step={0.5}
@@ -276,7 +314,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ rdsOnMOhm: Math.max(0, v) })}
               />
               <NumberField
-                label="死区时间 t_dead"
+                label="死区时间 t_dead（选填）"
                 unit="ns"
                 value={params.tDeadNs}
                 step={10}
@@ -285,16 +323,16 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
                 onChange={(v) => update({ tDeadNs: Math.max(0, v) })}
               />
               <NumberField
-                label="PWM 载波 f_sw"
+                label="PWM 载波 f_sw（t_dead>0 时必需）"
                 unit="kHz"
                 value={params.fSwKhz}
                 step={1}
-                min={1}
+                min={0}
                 precision={1}
-                onChange={(v) => update({ fSwKhz: Math.max(0.5, v) })}
+                onChange={(v) => update({ fSwKhz: Math.max(0, v) })}
               />
               <NumberField
-                label="体二极管压降 V_sd"
+                label="体二极管压降 V_sd（选填）"
                 unit="V"
                 value={params.vSdV}
                 step={0.05}

@@ -140,6 +140,7 @@ import {
   releaseExcelWorkbookSession,
 } from '../parsers/excelParser';
 import { excelImportModal, ExcelImportedSheetPayload } from '../modules/excelImportModal';
+import { mergeExcelChannelsByTime, resolveExcelMergedViewport, type ExcelMergeTimeMode } from '../modules/excelTimeAlignment';
 import { escapeHtml, escapeCsvCell } from '../utils/html';
 
 type DragMode =
@@ -1442,6 +1443,7 @@ export class OscilloscopeApp {
       enableGoldenBand: boolean;
       goldenMode: 'percent' | 'absolute';
       goldenTolerance: number;
+      minCoveragePct?: number;
       addDiffChannels: boolean;
     },
     items: Array<{
@@ -1554,6 +1556,7 @@ export class OscilloscopeApp {
         channelId: targetChannelId,
         mode: groupConfig.goldenMode,
         tolerance: Math.max(0.01, groupConfig.goldenTolerance || 5),
+        minCoveragePct: Math.max(0, Math.min(100, groupConfig.minCoveragePct ?? 80)),
         refT: new Float64Array(targetCh.t),
         refV: new Float32Array(items[0].alignedRefV),
         refUnit: targetCh.unit,
@@ -3021,39 +3024,35 @@ export class OscilloscopeApp {
 
   private createTabFromExcelPayloads(
     items: ExcelImportedSheetPayload[],
-    disposition: 'separate' | 'merge'
+    disposition: 'separate' | 'merge',
+    timeAlignment: ExcelMergeTimeMode = 'preserve'
   ): void {
     const colors = this.getRawColors();
-    if (disposition === 'merge' && items.length > 1) {
-      const mergedChannels: Record<string, WaveformChannel> = {};
-      const mergedDrawOrder: string[] = [];
-      let maxPts = 0;
-
-      items.forEach((item) => {
-        item.drawOrder.forEach((cid) => {
-          const ch = item.channels[cid];
-          if (!ch) return;
-          const idx = mergedDrawOrder.length;
-          const newId = `${cid}_m${idx}`;
-          const cloned: WaveformChannel = {
-            ...ch,
-            id: newId,
-            name: `[${item.sheetName}] ${ch.name}`,
-            color: colors[idx % colors.length] || ch.color,
-          };
-          mergedChannels[newId] = cloned;
-          mergedDrawOrder.push(newId);
-          if (cloned.v.length > maxPts) maxPts = cloned.v.length;
-        });
-      });
-
+    if (disposition === 'merge') {
+      const merged = mergeExcelChannelsByTime(items, colors, timeAlignment);
+      let mergedDrawOrder = merged.drawOrder;
+      const mergedChannels = merged.channels;
       if (mergedDrawOrder.length === 0) return;
+      if (timeAlignment === 'preserve' && !merged.canMergePreservingTime) {
+        const reason = merged.warnings.join(' ');
+        this.showToast(
+          `未创建混合时间坐标的合并视图。请确认各文件首样本确实对应同一时刻后，选择「首样本对齐」；否则请分别打开。${reason}`,
+          'error'
+        );
+        return;
+      }
+      const viewport = resolveExcelMergedViewport(merged);
+      if (!viewport) {
+        this.showToast('无法为合并波形建立有效时间视窗：请检查各通道是否至少有两个严格递增的有效时间点。', 'error');
+        return;
+      }
+      mergedDrawOrder = [viewport.primaryChannelId, ...mergedDrawOrder.filter((id) => id !== viewport.primaryChannelId)];
       this.markRawChannelsAndFit(mergedChannels);
       const uniqueFiles = Array.from(new Set(items.map((it) => it.fileName)));
       const tabTitle =
         uniqueFiles.length === 1
-          ? `${uniqueFiles[0]} (${items.length} sheets)`
-          : `${uniqueFiles[0]} +${uniqueFiles.length - 1} (${items.length} sheets)`;
+          ? `${uniqueFiles[0]} (${items.length} sheets, merged)`
+          : `${uniqueFiles[0]} +${uniqueFiles.length - 1} (${items.length} sheets, merged)`;
 
       this.addTab({
         id: `tab_${Date.now()}_${Math.random()}`,
@@ -3061,7 +3060,7 @@ export class OscilloscopeApp {
         fileFingerprint: items.map((it) => `${it.fingerprint}::${it.sheetName}`).join('|'),
         channels: mergedChannels,
         drawOrder: mergedDrawOrder,
-        view: { startIndex: 0, endIndex: Math.max(2, maxPts) },
+        view: { startIndex: viewport.startIndex, endIndex: viewport.endIndex },
         cursors: {
           enabled: false,
           mode: 'off',
@@ -3090,7 +3089,15 @@ export class OscilloscopeApp {
         activeChannelId: mergedDrawOrder[0],
         activeTool: 'pan',
       });
-      this.showToast(`已合并导入 ${items.length} 个 Sheet (${mergedDrawOrder.length} 条通道)`, 'info');
+      const overlapText = merged.hasCommonOverlap
+        ? `公共时间窗 ${formatEng(merged.commonOverlapSec, 's', 3)} · 最小覆盖 ${merged.minimumOverlapPct.toFixed(1)}%`
+        : '无公共时间重叠区间';
+      const modeText = timeAlignment === 'align-start' ? '首样本平移至 t=0' : '保留源时间坐标';
+      this.showToast(
+        `已合并 ${items.length} 个 Sheet / ${mergedDrawOrder.length} 条通道 · ${modeText} · ${overlapText} · 不强制插值对齐`,
+        merged.warnings.length ? 'warn' : 'info'
+      );
+      merged.warnings.forEach((warning) => this.showToast(warning, 'warn'));
       return;
     }
 
@@ -3149,7 +3156,7 @@ export class OscilloscopeApp {
         files: excelFiles,
         colors,
         onConfirm: (res) => {
-          this.createTabFromExcelPayloads(res.items, res.tabDisposition);
+          this.createTabFromExcelPayloads(res.items, res.tabDisposition, res.timeAlignment);
         },
         onNotify: (msg, level) => this.showToast(msg, level),
       });

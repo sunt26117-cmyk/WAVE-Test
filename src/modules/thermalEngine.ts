@@ -2822,10 +2822,12 @@ export function computeLossWithDeskewAndEoss(
   if (opts.tStart !== undefined && !Number.isFinite(opts.tStart)) throw new Error('损耗仿真起始时间必须为有限值。');
   if (opts.tEnd !== undefined && !Number.isFinite(opts.tEnd)) throw new Error('损耗仿真结束时间必须为有限值。');
   if (opts.vOnThreshV !== undefined && (!Number.isFinite(opts.vOnThreshV) || opts.vOnThreshV < 0)) throw new Error('MOS 导通电压阈值必须为非负有限值。');
-  if (opts.initialNodeT !== undefined && (opts.initialNodeT.length !== cauerStages.length || !opts.initialNodeT.every(Number.isFinite))) {
-    throw new Error('initialNodeT 必须与 Cauer 阶梯数量一致，且所有节点温度均为有限值。');
+  if (opts.initialNodeT !== undefined && (opts.initialNodeT.length !== cauerStages.length || !opts.initialNodeT.every((value) => Number.isFinite(value) && value > -273.15 && value <= 1000))) {
+    throw new Error('initialNodeT 必须与 Cauer 阶梯数量一致；每个节点温度须高于绝对零度且不超过 1000°C。');
   }
-  if (opts.initialTjC !== undefined && !Number.isFinite(opts.initialTjC)) throw new Error('初始结温 initialTjC 必须为有限值。');
+  if (opts.initialTjC !== undefined && (!Number.isFinite(opts.initialTjC) || opts.initialTjC <= -273.15 || opts.initialTjC > 1000)) {
+    throw new Error('初始结温 initialTjC 必须高于绝对零度且不超过 1000°C。');
+  }
 
   let i0 = 0;
   let i1 = nVFull - 1;
@@ -2930,7 +2932,10 @@ export function computeLossWithDeskewAndEoss(
   const r25Ohm = rdsOn25Mohm * 1e-3;
   const alpha = tempCoeffAlphaPerC;
   const vOnThresh = opts.vOnThreshV ?? Math.max(0.5, vMin + vSpan * 0.15);
-  const rdsFeedbackEnabled = opts.rdsFeedbackEnabled !== false;
+  const rdsFeedbackEnabled = opts.rdsFeedbackEnabled === true;
+  if (rdsFeedbackEnabled && (!(rdsOn25Mohm > 0) || !(tempCoeffAlphaPerC > 0))) {
+    throw new Error('已启用 Rds(on)(Tj) 反馈，但缺少有效的 Rds(on)@25°C 或温度系数 α；拒绝使用隐含默认值。');
+  }
 
   const sampleIdsStrict = (targetT: number): { val: number; covered: boolean } => {
     const tArr = idsCh.t;
@@ -3101,7 +3106,7 @@ export function computeLossWithDeskewAndEoss(
   let maxThermalSubsteps = 1;
   let minThermalStepSec = Infinity;
   let peakThermalStepErrorC = 0;
-  let thermalSolverStatus: 'CONVERGED' | 'STEP_CAP_REACHED' = 'CONVERGED';
+  const thermalSolverState: { status: 'CONVERGED' | 'STEP_CAP_REACHED' } = { status: 'CONVERGED' };
 
   const advanceCauerNodeT = (dtStep: number, pStepW: number) => {
     if (mStages <= 0 || dtStep <= 0) return;
@@ -3118,7 +3123,7 @@ export function computeLossWithDeskewAndEoss(
     if (diag.substepsUsed > maxThermalSubsteps) maxThermalSubsteps = diag.substepsUsed;
     if (diag.minStepSec < minThermalStepSec) minThermalStepSec = diag.minStepSec;
     if (diag.peakStepErrorC > peakThermalStepErrorC) peakThermalStepErrorC = diag.peakStepErrorC;
-    if (diag.hitStepCap) thermalSolverStatus = 'STEP_CAP_REACHED';
+    if (diag.hitStepCap) thermalSolverState.status = 'STEP_CAP_REACHED';
   };
 
   if (
@@ -3180,8 +3185,10 @@ export function computeLossWithDeskewAndEoss(
     );
   } else if (eossUj > 0) {
     warnings.push(
-      `当前 Eoss=${eossUj.toFixed(2)}µJ 为恒定标量/低精度 V² 近似；真实 MOSFET Coss(V) 呈强非线性，建议导入器件 Eoss(V)/Qoss(V) 曲线。`
+      `当前 Eoss=${eossUj.toFixed(2)}µJ 为恒定标量/低精度 V² 近似；仅代表输入所对应的电压/温度条件，不能跨母线电压直接外推。真实 MOSFET Coss(V) 呈强非线性，建议导入器件 Eoss(V)/Qoss(V) 曲线。`
     );
+  } else {
+    warnings.push('未提供 Eoss(V)/Qoss(V) 曲线或标量 Eoss：本次未执行 Coss 储能修正。结果仅依据 Vds×Ids 波形积分及已启用的热反馈计算，不得解释为已完整剥离/补偿 Coss 开关能量。');
   }
 
   // Strip Eoss across identified turn-off (Vds rising) and hard-switched turn-on (Vds falling w/ positive Ids)
@@ -3327,10 +3334,7 @@ export function computeLossWithDeskewAndEoss(
   const pLossMeanW =
     totalDurationSec > 1e-15 ? energyStrippedJ / totalDurationSec : evalLen > 0 ? sumLoss / evalLen : 0;
 
-  // thermalSolverStatus is only reassigned inside the advanceCauerNodeT closure,
-  // which TypeScript's flow analysis does not track, so it wrongly narrows the
-  // variable to its initialiser here. Widen back to the declared union.
-  if ((thermalSolverStatus as 'CONVERGED' | 'STEP_CAP_REACHED') === 'STEP_CAP_REACHED') {
+  if (thermalSolverState.status === 'STEP_CAP_REACHED') {
     const reason = `闭环 Cauer 热网络在个别步长达到最大自适应子步保护上限 (32768)，最大估计截断误差 ${peakThermalStepErrorC.toExponential(2)}°C；能量积分可供诊断，但 Tj 曲线不具备收敛保证。`;
     warnings.push(reason);
     tjC.fill(Number.NaN);
@@ -3341,7 +3345,7 @@ export function computeLossWithDeskewAndEoss(
       switchingEvents, zvsTurnOnCount, incomplete: true, incompleteReasons: [reason],
       nonFiniteMasked: 0, outOfCoverageCount: 0, thermalPathMode, warnings,
       maxThermalSubsteps, minThermalStepSec: Number.isFinite(minThermalStepSec) ? minThermalStepSec : 0,
-      peakThermalStepErrorC, thermalSolverStatus,
+      peakThermalStepErrorC, thermalSolverStatus: thermalSolverState.status,
     };
   }
 
@@ -3367,7 +3371,7 @@ export function computeLossWithDeskewAndEoss(
     maxThermalSubsteps,
     minThermalStepSec: Number.isFinite(minThermalStepSec) ? minThermalStepSec : 0,
     peakThermalStepErrorC,
-    thermalSolverStatus,
+    thermalSolverStatus: thermalSolverState.status,
   };
 }
 

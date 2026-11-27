@@ -1521,8 +1521,6 @@ export function computeThinSvd(A: number[][]): {
     return { U: [], S: [], V: [] };
   }
   const W = A.map((row) => row.slice());
-  // Explicit element type: without it TS infers (0 | 1)[][] from the identity
-  // initialiser and rejects the real-valued Jacobi rotations below.
   const V: number[][] = Array.from({ length: p }, (_, i) =>
     Array.from({ length: p }, (__, j) => (i === j ? 1 : 0))
   );

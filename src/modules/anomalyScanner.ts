@@ -4,6 +4,7 @@
 
 import { AnomalyEvent, GoldenBandConfig, WaveformChannel } from '../types/models';
 import { computeChannelMean, getChannelDisplayValue } from './oscilloscopeScale';
+import { computeTemporalCoverage } from './temporalCompare';
 import {
   areTimebasesSynchronized,
   DEFAULT_SAMPLING_GAP_FACTOR,
@@ -387,19 +388,20 @@ export function evaluateGoldenTolerance(
     }
   }
 
+  const rangeReference = cfg.metricRefV && cfg.metricRefV.length >= 2 ? cfg.metricRefV : alignedRefV;
   let refMin = Infinity;
   let refMax = -Infinity;
-  const step = n > 100000 ? Math.floor(n / 40000) : 1;
-  for (let i = 0; i < n; i += step) {
-    const rv = alignedRefV[i];
+  // Vpp defines the percent band; scan every knot so a narrow peak cannot be skipped.
+  for (let i = 0; i < rangeReference.length; i++) {
+    const rv = rangeReference[i];
     if (Number.isFinite(rv)) {
       if (rv < refMin) refMin = rv;
       if (rv > refMax) refMax = rv;
     }
   }
   if (!Number.isFinite(refMin) || !Number.isFinite(refMax)) {
-    for (let i = 0; i < n; i++) {
-      const rv = alignedRefV[i];
+    for (let i = 0; i < rangeReference.length; i++) {
+      const rv = rangeReference[i];
       if (Number.isFinite(rv)) {
         if (rv < refMin) refMin = rv;
         if (rv > refMax) refMax = rv;
@@ -413,7 +415,107 @@ export function evaluateGoldenTolerance(
       ? (Math.max(0.01, cfg.tolerance) / 100) * refSpan
       : Math.max(1e-9, cfg.tolerance);
 
+  const minCoveragePct =
+    cfg.minCoveragePct !== undefined && Number.isFinite(cfg.minCoveragePct)
+      ? Math.max(0, Math.min(100, cfg.minCoveragePct))
+      : 80;
+  const metricT = cfg.metricT;
+  const metricTargetV = cfg.metricTargetV;
+  const metricRefV = cfg.metricRefV;
+  const metricIntervalValid = cfg.metricIntervalValid;
+  if (metricT && metricTargetV && metricRefV && metricIntervalValid &&
+      metricT.length >= 2 && metricTargetV.length === metricT.length &&
+      metricRefV.length === metricT.length && metricIntervalValid.length === metricT.length - 1) {
+    const metricUsed = new Uint8Array(metricT.length);
+    const validIntervals: number[] = [];
+    let coveredDurationSec = 0;
+    for (let i = 0; i < metricIntervalValid.length; i++) {
+      const dt = metricT[i + 1] - metricT[i];
+      if (!metricIntervalValid[i] || !(dt > 0) ||
+          !Number.isFinite(metricTargetV[i]) || !Number.isFinite(metricTargetV[i + 1]) ||
+          !Number.isFinite(metricRefV[i]) || !Number.isFinite(metricRefV[i + 1])) continue;
+      validIntervals.push(i);
+      coveredDurationSec += dt;
+      metricUsed[i] = 1;
+      metricUsed[i + 1] = 1;
+    }
+    const targetDurationSec = ch.t.length >= 2 ? Math.max(0, ch.t[ch.t.length - 1] - ch.t[0]) : 0;
+    const coveragePct = targetDurationSec > 0 ? Math.max(0, Math.min(100, coveredDurationSec / targetDurationSec * 100)) : 0;
+    let meanTarget = 0, meanReference = 0;
+    if (cfg.removeDcOffset && coveredDurationSec > 0) {
+      let targetIntegral = 0, referenceIntegral = 0;
+      for (const i of validIntervals) {
+        const dt = metricT[i + 1] - metricT[i];
+        targetIntegral += dt * (metricTargetV[i] + metricTargetV[i + 1]) / 2;
+        referenceIntegral += dt * (metricRefV[i] + metricRefV[i + 1]) / 2;
+      }
+      meanTarget = targetIntegral / coveredDurationSec;
+      meanReference = referenceIntegral / coveredDurationSec;
+    }
+    const goldenRefShift = cfg.removeDcOffset ? meanTarget - meanReference : 0;
+    let totalCompared = 0, violationCount = 0, maxDeviation = 0;
+    const violationIndices: number[] = [];
+    const violationTargetIndices = new Set<number>();
+    const nearestTargetIndex = (time: number): number => {
+      let lo = 0, hi = ch.t.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (ch.t[mid] < time) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo <= 0) return 0;
+      if (lo >= ch.t.length) return ch.t.length - 1;
+      return Math.abs(ch.t[lo] - time) < Math.abs(ch.t[lo - 1] - time) ? lo : lo - 1;
+    };
+    for (let i = 0; i < metricT.length; i++) {
+      if (!metricUsed[i]) continue;
+      totalCompared++;
+      const deviation = Math.abs(metricTargetV[i] - (metricRefV[i] + goldenRefShift));
+      if (deviation > maxDeviation) maxDeviation = deviation;
+      if (deviation > halfWidth) {
+        violationCount++;
+        if (violationTargetIndices.size < 2500) violationTargetIndices.add(nearestTargetIndex(metricT[i]));
+      }
+    }
+    violationIndices.push(...violationTargetIndices);
+    if (coveredDurationSec <= 0 || totalCompared < 2) {
+      return {
+        pass: false, status: 'INSUFFICIENT_DATA',
+        invalidReason: '无连续有效可比时间区间（仅孤立点或区间跨越采样缺口）。',
+        violationCount: 0, totalCompared: 0, totalTargetSamples: n,
+        invalidCount: metricT.length, coveragePct: 0, maxDeviation: Number.NaN,
+        bandHalfWidth: halfWidth, violationIndices: [], alignedRefV,
+      };
+    }
+    if (coveragePct < minCoveragePct) {
+      return {
+        pass: false, status: 'INSUFFICIENT_DATA',
+        invalidReason: `按有效时间区间计算的覆盖率为 ${coveragePct.toFixed(1)}%，低于最低要求 ${minCoveragePct.toFixed(0)}%，禁止判定 PASS。`,
+        violationCount, totalCompared, totalTargetSamples: n,
+        invalidCount: metricT.length - totalCompared, coveragePct, maxDeviation,
+        bandHalfWidth: halfWidth, violationIndices, alignedRefV,
+      };
+    }
+    const status: GoldenStatus = violationCount === 0 ? 'PASS' : 'FAIL';
+    return {
+      pass: status === 'PASS', status, invalidReason: null,
+      violationCount, totalCompared, totalTargetSamples: n,
+      invalidCount: metricT.length - totalCompared, coveragePct, maxDeviation,
+      bandHalfWidth: halfWidth, violationIndices, alignedRefV,
+    };
+  }
+
   const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
+  const validMask = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const val = getChannelDisplayValue(ch, i, mean);
+    validMask[i] = Number.isFinite(val) && Number.isFinite(alignedRefV[i]) ? 1 : 0;
+  }
+  const temporalCoverage = computeTemporalCoverage(
+    ch.t,
+    validMask,
+    chCheck.timebase.gapThresholdSec
+  );
   let violationCount = 0;
   let totalCompared = 0;
   let invalidCount = 0;
@@ -421,6 +523,7 @@ export function evaluateGoldenTolerance(
   const violationIndices: number[] = [];
 
   for (let i = 0; i < n; i++) {
+    if (!temporalCoverage.coveredSampleMask[i]) continue;
     const val = getChannelDisplayValue(ch, i, mean);
     const rVal = alignedRefV[i];
     if (!Number.isFinite(val) || !Number.isFinite(rVal)) {
@@ -431,26 +534,18 @@ export function evaluateGoldenTolerance(
     totalCompared++;
     const dev = Math.abs(val - rVal);
     if (dev > maxDeviation) maxDeviation = dev;
-
     if (dev > halfWidth) {
       violationCount++;
-      if (violationIndices.length < 2500) {
-        violationIndices.push(i);
-      }
+      if (violationIndices.length < 2500) violationIndices.push(i);
     }
   }
-
-  const coveragePct = n > 0 ? (totalCompared / n) * 100 : 0;
-  const minCoveragePct =
-    cfg.minCoveragePct !== undefined && Number.isFinite(cfg.minCoveragePct)
-      ? Math.max(0, Math.min(100, cfg.minCoveragePct))
-      : 50;
-
-  if (totalCompared === 0) {
+  invalidCount = n - totalCompared;
+  const coveragePct = temporalCoverage.coveragePct;
+  if (temporalCoverage.coveredDurationSec <= 0 || totalCompared < 2) {
     return {
       pass: false,
       status: 'INSUFFICIENT_DATA',
-      invalidReason: '无有效可比样本（参考与目标波形无时间重叠、跨缺口或全为 NaN/Inf）。',
+      invalidReason: '无连续有效可比时间区间（仅孤立采样点、全为 NaN/Inf 或区间跨越采样缺口）。',
       violationCount: 0,
       totalCompared: 0,
       totalTargetSamples: n,
@@ -467,7 +562,7 @@ export function evaluateGoldenTolerance(
     return {
       pass: false,
       status: 'INSUFFICIENT_DATA',
-      invalidReason: `有效比对覆盖率仅 ${coveragePct.toFixed(1)}%，低于最低要求 ${minCoveragePct.toFixed(0)}%，禁止直接判定 PASS。`,
+      invalidReason: `按时间跨度计算的有效覆盖率仅 ${coveragePct.toFixed(1)}%，低于最低要求 ${minCoveragePct.toFixed(0)}%，禁止直接判定 PASS。`,
       violationCount,
       totalCompared,
       totalTargetSamples: n,

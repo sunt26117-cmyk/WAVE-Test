@@ -149,18 +149,193 @@ export interface FocThermalModel {
   spatialMatrix?: PcbSpatialThermalMatrixConfig;
 }
 
+/**
+ * One common electrical-device parameter set applied to all six identical MOSFETs.
+ * Per-switch differences belong to current/duty and thermal-path/PCB data, not to
+ * six separate electrical part-number parameter sets.
+ */
+export type RdsOnTempCurveProvenance = 'datasheet' | 'measured' | 'user_import' | 'assumed';
+
+export interface RdsOnTempCurvePoint {
+  tjC: number;
+  /** Rds(on)(Tj) divided by Rds(on) at 25°C, dimensionless. */
+  ratioTo25C: number;
+}
+
+/**
+ * Normalized Rds(on)-Tj curve for the common MOS part used at all six bridge positions.
+ * The curve is valid only at its declared gate voltage and must contain a 25°C ratio=1 anchor.
+ */
+export interface RdsOnTempCurve {
+  schema: 'wave-test-rdson-temperature';
+  schemaVersion: 1;
+  referenceTemperatureC: 25;
+  referenceGateVoltageV: number;
+  provenance: RdsOnTempCurveProvenance;
+  label?: string;
+  manufacturer?: string;
+  partNumber?: string;
+  /** Explicitly records when values were digitized from a datasheet graph rather than tabulated. */
+  sourceNote?: string;
+  points: RdsOnTempCurvePoint[];
+}
+
+export interface RdsOnTempCurveImportDocument extends Omit<RdsOnTempCurve, 'points'> {
+  points: RdsOnTempCurvePoint[];
+}
+
+export function validateRdsOnTempCurve(curve: RdsOnTempCurve): void {
+  if (!curve || curve.schema !== 'wave-test-rdson-temperature' || curve.schemaVersion !== 1 ||
+      curve.referenceTemperatureC !== 25 || !Array.isArray(curve.points) || curve.points.length < 3) {
+    throw new Error('Rds(on)-Tj 曲线格式无效：需要 wave-test-rdson-temperature v1、25°C 参考点和至少 3 个数据点。');
+  }
+  if (!Number.isFinite(curve.referenceGateVoltageV) || curve.referenceGateVoltageV <= 0 || curve.referenceGateVoltageV > 30) {
+    throw new Error('Rds(on)-Tj 曲线必须填写有效的参考栅极驱动电压 Vgs（0～30V）。');
+  }
+  if (!['datasheet', 'measured', 'user_import', 'assumed'].includes(curve.provenance)) {
+    throw new Error(`Rds(on)-Tj 曲线来源无效：${String(curve.provenance)}。`);
+  }
+  let previousT = -Infinity;
+  let previousRatio = 0;
+  for (let i = 0; i < curve.points.length; i++) {
+    const point = curve.points[i];
+    if (!point || !Number.isFinite(point.tjC) || !Number.isFinite(point.ratioTo25C) ||
+        point.tjC < -100 || point.tjC > 250 || point.ratioTo25C < 0.05 || point.ratioTo25C > 10) {
+      throw new Error(`Rds(on)-Tj 曲线第 ${i + 1} 点无效：温度需在 -100～250°C，归一化比值需在 0.05～10。`);
+    }
+    if (point.tjC <= previousT) throw new Error('Rds(on)-Tj 曲线温度轴必须严格递增，不能重复或倒序。');
+    if (i > 0 && point.ratioTo25C + 0.02 < previousRatio) {
+      throw new Error('当前低压硅 MOS Rds(on)-Tj 曲线出现明显负温度系数段；请检查单位、数据提取和器件工作区。');
+    }
+    previousT = point.tjC;
+    previousRatio = point.ratioTo25C;
+  }
+  const at25 = interpolateRdsOnTempCurveUnchecked(curve, 25);
+  if (Math.abs(at25 - 1) > 0.05) {
+    throw new Error(`Rds(on)-Tj 曲线在 25°C 的归一化值应为 1.0，当前插值为 ${at25.toFixed(4)}；请确认归一化基准。`);
+  }
+}
+
+function interpolateRdsOnTempCurveUnchecked(curve: RdsOnTempCurve, tjC: number): number {
+  const points = curve.points;
+  if (tjC < points[0].tjC - 1e-9 || tjC > points[points.length - 1].tjC + 1e-9) {
+    throw new Error(`MOS 结温 ${tjC.toFixed(2)}°C 超出 Rds(on)-Tj 曲线范围 [${points[0].tjC}°C, ${points[points.length - 1].tjC}°C]；禁止线性外推。`);
+  }
+  if (tjC <= points[0].tjC) return points[0].ratioTo25C;
+  if (tjC >= points[points.length - 1].tjC) return points[points.length - 1].ratioTo25C;
+  let lo = 0;
+  let hi = points.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >>> 1;
+    if (points[mid].tjC <= tjC) lo = mid;
+    else hi = mid;
+  }
+  const a = points[lo];
+  const b = points[hi];
+  const u = (tjC - a.tjC) / (b.tjC - a.tjC);
+  return a.ratioTo25C + u * (b.ratioTo25C - a.ratioTo25C);
+}
+
+export function evaluateRdsOnTempCurveRatio(curve: RdsOnTempCurve, tjC: number): number {
+  validateRdsOnTempCurve(curve);
+  if (!Number.isFinite(tjC)) throw new Error('MOS 结温查询值必须为有限数值。');
+  return interpolateRdsOnTempCurveUnchecked(curve, tjC);
+}
+
+export function parseRdsOnTempCurveImportJson(text: string): RdsOnTempCurve {
+  let raw: unknown;
+  try { raw = JSON.parse(text); }
+  catch (err) { throw new Error(`Rds(on)-Tj JSON 解析失败：${err instanceof Error ? err.message : String(err)}`); }
+  if (!raw || typeof raw !== 'object') throw new Error('Rds(on)-Tj 导入文件必须是 JSON 对象。');
+  const doc = raw as Partial<RdsOnTempCurveImportDocument>;
+  const curve = doc as RdsOnTempCurve;
+  validateRdsOnTempCurve(curve);
+  return {
+    ...curve,
+    points: curve.points.map((point) => ({ tjC: Number(point.tjC), ratioTo25C: Number(point.ratioTo25C) })),
+  };
+}
+
+export function createRdsOnTempCurveImportTemplate(): RdsOnTempCurveImportDocument {
+  return {
+    schema: 'wave-test-rdson-temperature',
+    schemaVersion: 1,
+    referenceTemperatureC: 25,
+    referenceGateVoltageV: 10,
+    provenance: 'datasheet',
+    label: '请替换为目标 MOS 数据手册 Rds(on)-Tj 归一化曲线',
+    manufacturer: '',
+    partNumber: '',
+    points: [],
+  };
+}
+
+function validateRdsOnTempCurveForMos(mos: FocMosParams): void {
+  const curve = mos.rdsOnTempCurve;
+  if (!curve) return;
+  validateRdsOnTempCurve(curve);
+  const operatingVgs = mos.rdsOperatingVgsV;
+  if (!Number.isFinite(operatingVgs) || (operatingVgs as number) <= 0 || (operatingVgs as number) > 30) {
+    throw new Error('使用 Rds(on)-Tj 曲线时，必须填写 MOS 实际导通栅源电压 Vgs,on（0～30 V）；不能只填写曲线测试条件。');
+  }
+  if (Math.abs((operatingVgs as number) - curve.referenceGateVoltageV) > 0.1) {
+    throw new Error(`Rds(on)-Tj 曲线测试 Vgs=${curve.referenceGateVoltageV.toFixed(2)} V，与当前实际 Vgs,on=${(operatingVgs as number).toFixed(2)} V 不一致（允许偏差 ±0.10 V）；请导入匹配实际驱动条件的曲线。`);
+  }
+  const rds25ReferenceVgs = mos.rds25ReferenceVgsV;
+  if (!Number.isFinite(rds25ReferenceVgs) || (rds25ReferenceVgs as number) <= 0 || (rds25ReferenceVgs as number) > 30) {
+    throw new Error('使用 Rds(on)-Tj 曲线时，必须填写 Rds(on)@25°C 绝对值对应的数据手册/实测 Vgs（0～30 V）。');
+  }
+  if (Math.abs((rds25ReferenceVgs as number) - curve.referenceGateVoltageV) > 0.1) {
+    throw new Error(`Rds(on)@25°C 的参考 Vgs=${(rds25ReferenceVgs as number).toFixed(2)} V，与 Rds(on)-Tj 曲线参考 Vgs=${curve.referenceGateVoltageV.toFixed(2)} V 不一致（允许偏差 ±0.10 V）；归一化比例不能修正不同 Vgs 下的绝对 Rds 差异。`);
+  }
+}
+
+function getFocMosRdsFactorAtTj(mos: FocMosParams, tjC: number): number {
+  if (mos.rdsOnTempCurve) {
+    validateRdsOnTempCurveForMos(mos);
+    return interpolateRdsOnTempCurveUnchecked(mos.rdsOnTempCurve, tjC);
+  }
+  // Preserve the legacy alpha model's lower clamp and runaway behavior. The
+  // curve path has its own bounded ratios and never extrapolates out of range.
+  const factor = Math.max(0.1, 1 + (mos.tempCoeffAlphaPerC || 0) * (tjC - 25));
+  if (!Number.isFinite(factor) || factor <= 0) {
+    throw new Error(`Rds(on) 温度修正系数异常：Tj=${tjC.toFixed(2)}°C，factor=${factor}。`);
+  }
+  return factor;
+}
+
 export interface FocMosParams {
   rdsOn25Mohm: number;
-  tempCoeffAlphaPerC: number; // e.g. 0.0045 (/°C)
+  /** True only after Rds(on)@25°C has been checked against the target device at the specified Vgs/test condition. */
+  rdsDataConfirmed?: boolean;
+  /** Optional measured/datasheet normalized curve; when present it overrides the linear alpha approximation. */
+  rdsOnTempCurve?: RdsOnTempCurve;
+  /** Actual nominal on-state gate-source voltage; required to match a supplied Rds(Tj) curve. */
+  rdsOperatingVgsV?: number;
+  /** Vgs at which the absolute Rds(on)@25°C value was specified/measured; must match the normalized curve reference when a curve is used. */
+  rds25ReferenceVgsV?: number;
+  tempCoeffAlphaPerC: number; // e.g. 0.0045 (/°C), fallback only when no curve is supplied
   vsdV: number; // body diode drop (V)
   eonPlusEoffUj: number; // switching loss ref Eon+Eoff (uJ) at vRefV, iRefA
   vRefV: number;
   iRefA: number;
-  qrrNc: number; // reverse recovery charge (nC) at iRefA
+  qrrNc: number; // recovered charge (nC) at qrrIrefA, or iRefA when omitted
+  /** Reference current for the datasheet/DPT Qr or Qrr value; separate from Eon/Eoff Iref. */
+  qrrIrefA?: number;
+  /** Datasheet/DPT drain-source voltage at which qrrNc was measured; provenance only, not a voltage-scaling law. */
+  qrrReferenceVdsV?: number;
+  /** Datasheet/DPT commutation di/dt condition in A/us (usually negative); provenance only. */
+  qrrReferenceDiDtAperUs?: number;
+  /** Datasheet/DPT junction temperature at which qrrNc was measured. */
+  qrrReferenceTjC?: number;
+  /** Gate-source voltage during the body-diode reverse-recovery test, commonly 0 V. */
+  qrrReferenceVgsV?: number;
   eossUj?: number; // optional zero-current Coss discharge energy (uJ) at vRefV (default 0 to avoid double-counting datasheet Eon)
   eossCurve?: NonlinearEossCurve; // optional nonlinear Eoss(V)/Qoss(V)/Coss(V) curve evaluated via monotone PCHIP
   eossAlreadyIncludedInEsw?: boolean; // explicit double-count guard when DPT Eon/Eoff already includes Coss energy
   eonIncludesQrr?: boolean; // true when Eon+Eoff comes from DPT waveform integral (Qrr already captured inside Eon)
+  /** True when the datasheet's recovered charge Qr already includes output charge Qoss (Nexperia: Qr = Qs + Qoss). */
+  qrrIncludesQoss?: boolean;
   rgOnOhm?: number;
   rgOffOhm?: number;
   rgProvenance?: DptParameterProvenance;
@@ -216,7 +391,12 @@ export interface ThermalNetworkStateSnapshot {
   tjMaxC: number;
 }
 
+export type FocResultQualification = 'DEVICE_PARAMETERIZED' | 'ASSUMPTION_BASED' | 'INCOMPLETE_LOSS_MODEL';
+
 export interface FocSimulationResult {
+  /** Evidence class for interpreting all Tj/P_inv outputs; never equates model completion with safety sign-off. */
+  resultQualification: FocResultQualification;
+  qualificationReasons: string[];
   time: Float64Array;
   tj: Record<MosSwitchKey, Float32Array>;
   pMos: Record<MosSwitchKey, Float32Array>;
@@ -256,7 +436,7 @@ export interface FocSimulationResult {
     tjProvenance: DptParameterProvenance;
     rgProvenance: DptParameterProvenance;
   };
-  eossSource: 'included_in_esw' | 'nonlinear_curve' | 'vbus_sq_approx' | 'none';
+  eossSource: 'included_in_esw' | 'included_in_qrr' | 'nonlinear_curve' | 'vbus_sq_approx' | 'none';
   alignmentWarnings: string[];
   warnings: string[];
   thermalInitInfo: FocThermalInitInfo;
@@ -296,6 +476,8 @@ export interface FocStallSweepOptions {
 }
 
 export interface FocStallSweepResult {
+  resultQualification: FocResultQualification;
+  qualificationReasons: string[];
   anglesDeg: number[];
   steadyMaxTjPerAngle: number[];
   worstAngleDeg: number;
@@ -1287,38 +1469,21 @@ export function validateFocSpiceNetlist(
  * Computes sensorless high-side duties d_a, d_b, d_c from phase currents Ia, Ib, Ic using Clarke transform.
  * Reports overmodulation if requested m > linear ceiling of chosen modulation strategy or any phase duty saturates.
  */
-export function reconstructSensorlessDutySample(
-  ia: number,
-  ib: number,
-  ic: number,
+function computeDutyFromVoltageAngle(
+  thetaV: number,
   modulation: FocModulationMode,
-  modDepthM: number,
-  pfAngleDeg: number
-): { da: number; db: number; dc: number; overmodulated: boolean; linearCeilingM: number; zeroCurrentFallback: boolean } {
+  modDepthM: number
+): { da: number; db: number; dc: number; overmodulated: boolean; linearCeilingM: number } {
   const linearCeilingM = getModulationLinearCeiling(modulation);
-  const sqrt3Inv = 1 / Math.sqrt(3);
-  const iAlpha = (2 / 3) * (ia - 0.5 * (ib + ic));
-  const iBeta = (ib - ic) * sqrt3Inv;
-  const mag = Math.hypot(iAlpha, iBeta);
-
-  if (mag < 1e-6) {
-    return { da: 0.5, db: 0.5, dc: 0.5, overmodulated: false, linearCeilingM, zeroCurrentFallback: true };
-  }
-
   const reqM = Math.max(0, modDepthM);
   if (reqM <= 1e-6) {
-    return { da: 0.5, db: 0.5, dc: 0.5, overmodulated: false, linearCeilingM, zeroCurrentFallback: false };
+    return { da: 0.5, db: 0.5, dc: 0.5, overmodulated: false, linearCeilingM };
   }
-
-  const thetaI = Math.atan2(iBeta, iAlpha);
-  const thetaV = thetaI + (pfAngleDeg * Math.PI) / 180;
-  const twoPi3 = (2 * Math.PI) / 3;
   const m = Math.min(1.2, reqM);
-
+  const twoPi3 = (2 * Math.PI) / 3;
   const ua = m * Math.cos(thetaV);
   const ub = m * Math.cos(thetaV - twoPi3);
   const uc = m * Math.cos(thetaV + twoPi3);
-
   let u0 = 0;
   if (modulation === 'SVPWM') {
     u0 = -0.5 * (Math.max(ua, ub, uc) + Math.min(ua, ub, uc));
@@ -1331,34 +1496,73 @@ export function reconstructSensorlessDutySample(
     else if (absC >= absA && absC >= absB) uk = uc;
     u0 = (uk >= 0 ? 1 : -1) - uk;
   }
-
   const rawA = 0.5 + 0.5 * (ua + u0);
   const rawB = 0.5 + 0.5 * (ub + u0);
   const rawC = 0.5 + 0.5 * (uc + u0);
-  const overmodulated =
-    reqM > linearCeilingM + 1e-6 ||
-    rawA < -1e-6 ||
-    rawA > 1 + 1e-6 ||
-    rawB < -1e-6 ||
-    rawB > 1 + 1e-6 ||
-    rawC < -1e-6 ||
-    rawC > 1 + 1e-6;
+  const overmodulated = reqM > linearCeilingM + 1e-6 ||
+    rawA < -1e-6 || rawA > 1 + 1e-6 ||
+    rawB < -1e-6 || rawB > 1 + 1e-6 ||
+    rawC < -1e-6 || rawC > 1 + 1e-6;
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  return { da: clamp01(rawA), db: clamp01(rawB), dc: clamp01(rawC), overmodulated, linearCeilingM };
+}
 
-  const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
-  return {
-    da: clamp01(rawA),
-    db: clamp01(rawB),
-    dc: clamp01(rawC),
-    overmodulated,
-    linearCeilingM,
-    zeroCurrentFallback: false,
-  };
+/**
+ * Computes sensorless high-side duties d_a, d_b, d_c from phase currents Ia, Ib, Ic using Clarke transform.
+ * Reports overmodulation if requested m > linear ceiling of chosen modulation strategy or any phase duty saturates.
+ */
+export function reconstructSensorlessDutySample(
+  ia: number,
+  ib: number,
+  ic: number,
+  modulation: FocModulationMode,
+  modDepthM: number,
+  pfAngleDeg: number
+): { da: number; db: number; dc: number; overmodulated: boolean; linearCeilingM: number; zeroCurrentFallback: boolean } {
+  const sqrt3Inv = 1 / Math.sqrt(3);
+  const iAlpha = (2 / 3) * (ia - 0.5 * (ib + ic));
+  const iBeta = (ib - ic) * sqrt3Inv;
+  const mag = Math.hypot(iAlpha, iBeta);
+  if (mag < 1e-6) {
+    return { ...computeDutyFromVoltageAngle(0, modulation, modDepthM), zeroCurrentFallback: true };
+  }
+  const thetaI = Math.atan2(iBeta, iAlpha);
+  const thetaV = thetaI + (pfAngleDeg * Math.PI) / 180;
+  return { ...computeDutyFromVoltageAngle(thetaV, modulation, modDepthM), zeroCurrentFallback: false };
 }
 
 /**
  * Computes instantaneous per-MOS conduction, hard-switching + Qrr, and dead-time body-diode losses
  * for one half-bridge phase (H = upper switch, L = lower switch), conserving high + low + dead-time period.
  */
+/** Enforce one consistent energy boundary for datasheet Qr and separate Eoss. */
+export function validateMosEnergyAccounting(mos: FocMosParams): void {
+  if (mos.qrrReferenceVdsV !== undefined && (!Number.isFinite(mos.qrrReferenceVdsV) || mos.qrrReferenceVdsV <= 0)) {
+    throw new Error('Qr/Qrr 参考测试 VDS 必须为有限正数。');
+  }
+  if (mos.qrrReferenceDiDtAperUs !== undefined && (!Number.isFinite(mos.qrrReferenceDiDtAperUs) || Math.abs(mos.qrrReferenceDiDtAperUs) <= 0 || Math.abs(mos.qrrReferenceDiDtAperUs) > 1e5)) {
+    throw new Error('Qr/Qrr 参考 di/dt 必须为有限非零数值，单位 A/µs。');
+  }
+  if (mos.qrrReferenceTjC !== undefined && (!Number.isFinite(mos.qrrReferenceTjC) || mos.qrrReferenceTjC < -100 || mos.qrrReferenceTjC > 250)) {
+    throw new Error('Qr/Qrr 参考结温必须位于 -100～250°C。');
+  }
+  if (mos.qrrReferenceVgsV !== undefined && (!Number.isFinite(mos.qrrReferenceVgsV) || mos.qrrReferenceVgsV < -20 || mos.qrrReferenceVgsV > 20)) {
+    throw new Error('Qr/Qrr 参考测试 VGS 必须位于 -20～20V。');
+  }
+  const qrrIsActive = !mos.dptLut?.length && mos.qrrNc > 0 && mos.eonIncludesQrr !== true;
+  const separateEossIsActive = mos.eossAlreadyIncludedInEsw !== true &&
+    (Boolean(mos.eossCurve) || (mos.eossUj ?? 0) > 0);
+  if (mos.qrrIncludesQoss === true && qrrIsActive && separateEossIsActive) {
+    throw new Error(
+      '当前 Qr 数据已包含 Qoss/电容性恢复；不能在同一标量换流能量账本中再独立叠加 Eoss。请清空 Eoss/曲线，或使用明确分离 Qs、Qoss 与互补管 Eoss 的 DPT 事件能量模型。'
+    );
+  }
+}
+
+function qossCoveredByQr(mos: FocMosParams): boolean {
+  return !mos.dptLut?.length && mos.qrrIncludesQoss === true && mos.qrrNc > 0 && mos.eonIncludesQrr !== true;
+}
+
 export function computePhaseMosLosses(
   iPhase: number,
   dutyHigh: number,
@@ -1388,20 +1592,64 @@ export function computePhaseMosLosses(
   lutRgProvenance?: DptParameterProvenance;
   eossOutOfRange?: boolean;
 } {
-  const d = Math.max(0, Math.min(1, dutyHigh));
+  if (!Number.isFinite(iPhase)) throw new Error('相电流必须为有限数值。');
+  if (!Number.isFinite(dutyHigh) || dutyHigh < 0 || dutyHigh > 1) {
+    throw new Error(`PWM 高侧占空比必须位于 0～1，当前值=${String(dutyHigh)}。`);
+  }
+  if (!Number.isFinite(vBus) || vBus < 0) throw new Error('母线电压必须为有限非负数值。');
+  if (!Number.isFinite(tjHighC) || !Number.isFinite(tjLowC)) throw new Error('上下管结温必须为有限数值。');
+  if (!Number.isFinite(fswHz) || fswHz < 0 || fswHz > 5e6) throw new Error('PWM 频率必须为 0～5 MHz 的有限数值。');
+  if (!Number.isFinite(tDeadNs) || tDeadNs < 0 || tDeadNs > 1e6) throw new Error('死区时间必须为 0～1,000,000 ns 的有限数值。');
+  if (!Number.isFinite(mos.rdsOn25Mohm) || mos.rdsOn25Mohm <= 0) throw new Error('MOS Rds(on)@25°C 必须为有限正数。');
+  if (!Number.isFinite(mos.vsdV) || mos.vsdV < 0 || mos.vsdV > 10) throw new Error('MOS 体二极管压降 Vsd 必须为 0～10 V 的有限数值。');
+  if (!mos.rdsOnTempCurve && (!Number.isFinite(mos.tempCoeffAlphaPerC) || mos.tempCoeffAlphaPerC < 0 || mos.tempCoeffAlphaPerC > 0.05)) throw new Error('MOS Rds 温度系数 α 必须为 0～0.05 /°C 的有限数值。');
+  if (!Number.isFinite(mos.vRefV) || mos.vRefV <= 0 || !Number.isFinite(mos.iRefA) || mos.iRefA <= 0) {
+    throw new Error('Eon/Eoff 参考电压 Vref 和参考电流 Iref 必须为有限正数。');
+  }
+  if (mos.qrrIrefA !== undefined && (!Number.isFinite(mos.qrrIrefA) || mos.qrrIrefA <= 0)) {
+    throw new Error('Qr/Qrr 独立参考电流 qrrIrefA 必须为有限正数。');
+  }
+  validateMosEnergyAccounting(mos);
+  if (!Number.isFinite(mos.eonPlusEoffUj) || mos.eonPlusEoffUj < 0 ||
+      !Number.isFinite(mos.qrrNc) || mos.qrrNc < 0 ||
+      (mos.eossUj !== undefined && (!Number.isFinite(mos.eossUj) || mos.eossUj < 0))) {
+    throw new Error('Eon+Eoff、Qrr 和 Eoss 必须为有限非负数值。');
+  }
+  const d = dutyHigh;
   const r25 = Math.max(1e-6, mos.rdsOn25Mohm * 1e-3);
-  const alpha = mos.tempCoeffAlphaPerC || 0;
-  const ronH = Math.max(1e-6, r25 * (1 + alpha * (tjHighC - 25)));
-  const ronL = Math.max(1e-6, r25 * (1 + alpha * (tjLowC - 25)));
+  const rdsFactorHigh = getFocMosRdsFactorAtTj(mos, tjHighC);
+  const rdsFactorLow = getFocMosRdsFactorAtTj(mos, tjLowC);
+  const ronH = Math.max(1e-6, r25 * rdsFactorHigh);
+  const ronL = Math.max(1e-6, r25 * rdsFactorLow);
 
-  // Whenever a leg duty clamps to 0 or 1 (DPWM1 60° clamp or external/saturated flat-top), PWM switching stops
-  const clamped = d >= 1 - 1e-4 || d <= 1e-4;
-  const tDeadSec = Math.max(0, tDeadNs) * 1e-9;
-  const rawDeadDuty = !clamped && fswHz > 0 ? Math.min(1, 2 * tDeadSec * fswHz) : 0;
-  const deadDuty = iPhase >= 0 ? Math.min(1 - d, rawDeadDuty) : Math.min(d, rawDeadDuty);
+  // PWM command duty is reduced by one dead-time interval at each active edge:
+  // D_H,cond = d - t_dead*fsw; D_L,cond = (1-d) - t_dead*fsw.
+  // Both dead-time intervals are carried by the same body diode for a given
+  // current direction (low-side diode for positive phase current, high-side for
+  // negative current). Do not subtract the full 2*t_dead*fsw from only one
+  // channel: that preserves total leg loss but biases the individual MOS losses.
+  // Only a mathematically clamped leg (0% or 100% within floating-point noise)
+  // is treated as having no recurring PWM edges. A small but non-zero pulse is
+  // still a real command and must be checked against the dead-time/min-pulse limit.
+  const staticDutyClamp = d <= 1e-12 || d >= 1 - 1e-12;
+  const tDeadSec = tDeadNs * 1e-9;
+  const requestedDeadEdgeDuty = fswHz > 0 ? tDeadSec * fswHz : 0;
+  // If a commanded pulse is no wider than one dead-time interval, the actual
+  // result depends on MCU pulse deletion / dead-time compensation behavior. Do
+  // not guess that behavior in a steady average model: reject this point and
+  // require the real PWM/gate timing or a valid minimum-pulse constraint.
+  if (!staticDutyClamp && requestedDeadEdgeDuty > 0 &&
+      (d <= requestedDeadEdgeDuty || (1 - d) <= requestedDeadEdgeDuty)) {
+    throw new Error(
+      `PWM 指令脉冲宽度不足：duty=${d.toFixed(6)}，单边死区占空比=${requestedDeadEdgeDuty.toFixed(6)}。` +
+      '当前平均损耗模型无法判断 MCU/驱动器的窄脉冲删除与死区补偿行为，拒绝输出单管损耗/结温；请确认实际 PWM 最小脉宽或导入实测 duty/gate 波形。'
+    );
+  }
+  const deadEdgeDuty = staticDutyClamp ? 0 : requestedDeadEdgeDuty;
+  const deadDuty = 2 * deadEdgeDuty;
 
-  const highCondDuty = iPhase >= 0 ? d : Math.max(0, d - deadDuty);
-  const lowCondDuty = iPhase >= 0 ? Math.max(0, 1 - d - deadDuty) : 1 - d;
+  const highCondDuty = staticDutyClamp ? d : Math.max(0, d - deadEdgeDuty);
+  const lowCondDuty = staticDutyClamp ? 1 - d : Math.max(0, 1 - d - deadEdgeDuty);
 
   const iSq = iPhase * iPhase;
   const pHighCond = iSq * ronH * highCondDuty;
@@ -1419,7 +1667,7 @@ export function computePhaseMosLosses(
   let lutRgProvenance: DptParameterProvenance | undefined;
   let eossOutOfRange = false;
 
-  if (!clamped && fswHz > 0) {
+  if (!staticDutyClamp && fswHz > 0) {
     const iAbs = Math.abs(iPhase);
     const vPos = Math.max(0, vBus);
     const vScale = vPos / Math.max(1e-3, mos.vRefV);
@@ -1471,7 +1719,8 @@ export function computePhaseMosLosses(
     } else {
       const iScale = iAbs / Math.max(1e-3, mos.iRefA);
       eSwJ = Math.max(0, mos.eonPlusEoffUj) * 1e-6 * vScale * iScale;
-      eQrrJ = mos.eonIncludesQrr ? 0 : Math.max(0, mos.qrrNc) * 1e-9 * vPos * iScale;
+      const qrrCurrentScale = iAbs / Math.max(1e-3, mos.qrrIrefA ?? mos.iRefA);
+      eQrrJ = mos.eonIncludesQrr ? 0 : Math.max(0, mos.qrrNc) * 1e-9 * vPos * qrrCurrentScale;
     }
 
     let eOssJ = 0;
@@ -2042,6 +2291,8 @@ function solveCoupledThermalSteadyState(params: {
   pCond25W: number[];
   pFixedW: number[];
   alphaPerC: number;
+  /** Optional nonlinear per-switch Rds(Tj)/Rds25 factor; when supplied, supersedes alphaPerC. */
+  evalCondFactorAtTj?: (tjVec: number[]) => number[];
   rJcTotalByArm: number[];
   rBrdTotal: number;
   tAmbC: number;
@@ -2055,13 +2306,13 @@ function solveCoupledThermalSteadyState(params: {
   converged: boolean;
   thermalRunaway: boolean;
 } {
-  const { pCond25W, pFixedW, alphaPerC, rJcTotalByArm, rBrdTotal, tAmbC, tInitSeedC, spatial, evalFixedPowerAtTj } = params;
+  const { pCond25W, pFixedW, alphaPerC, evalCondFactorAtTj, rJcTotalByArm, rBrdTotal, tAmbC, tInitSeedC, spatial, evalFixedPowerAtTj } = params;
   const kArm = pCond25W.map((p25) => alphaPerC * p25);
   const p0Arm = pCond25W.map((p25, m) => pFixedW[m] + p25 * (1 - 25 * alphaPerC));
   const useNonShared = Boolean(spatial && spatial.mode !== 'shared_board');
   const hasTjSwCoupling = Boolean(evalFixedPowerAtTj);
 
-  if (!useNonShared && !hasTjSwCoupling) {
+  if (!useNonShared && !hasTjSwCoupling && !evalCondFactorAtTj) {
     const armStable = kArm.every((km, m) => 1 - rJcTotalByArm[m] * km > 1e-6);
     let gLoop = Infinity;
     let analyticOk = false;
@@ -2139,8 +2390,12 @@ function solveCoupledThermalSteadyState(params: {
     const dynFixed = evalFixedPowerAtTj ? evalFixedPowerAtTj(tjVec) : null;
     const pArm = new Array<number>(6);
     let pSum = 0;
+    const condFactors = evalCondFactorAtTj ? evalCondFactorAtTj(tjVec) : null;
+    if (condFactors && (condFactors.length !== 6 || condFactors.some((v) => !Number.isFinite(v) || v < 0.05 || v > 10))) {
+      throw new Error('Rds(Tj) 曲线反馈必须返回六个 0.05～10 的有限正数系数。');
+    }
     for (let m = 0; m < 6; m++) {
-      const rFactor = Math.max(0.1, 1 + alphaPerC * (tjVec[m] - 25));
+      const rFactor = condFactors ? condFactors[m] : Math.max(0.1, 1 + alphaPerC * (tjVec[m] - 25));
       const pF = dynFixed ? dynFixed[m] : pFixedW[m];
       pArm[m] = pF + pCond25W[m] * rFactor;
       pSum += pArm[m];
@@ -2208,6 +2463,747 @@ function solveCoupledThermalSteadyState(params: {
 }
 
 /**
+ * Fixed operating-point input for average-loss / steady-state thermal analysis.
+ *
+ * iqPeakA/idPeakA use the amplitude-invariant dq convention used by DynoLab.
+ * For a rotating operating point, dq currents, Vbus, PWM and modulation are
+ * treated as constant while electrical angle is integrated over one full cycle.
+ * For a locked-rotor point, currents are evaluated at one fixed electrical angle.
+ */
+export interface FocSteadyOperatingPoint {
+  iqPeakA: number;
+  idPeakA?: number;
+  electricalFrequencyHz: number;
+  mode?: 'rotating' | 'locked_rotor';
+  electricalAngleDeg?: number;
+  /** Optional operating-point provenance copied from the DynoLab steady solver. */
+  mechanicalSpeedRpm?: number;
+  torqueNm?: number;
+  mechanicalPowerW?: number;
+  busInputPowerW?: number;
+  dcLinkPowerW?: number;
+  motorElectricalPowerW?: number;
+  impliedInverterLossW?: number;
+}
+
+export interface FocSteadyMosResult {
+  key: MosSwitchKey;
+  pCondW: number;
+  pSwitchingW: number;
+  pDeadTimeW: number;
+  pTotalW: number;
+  pCondAt25CW: number;
+  tjSteadyC: number;
+  boardSteadyC: number;
+}
+
+export interface FocSteadyStateResult {
+  resultQualification: FocResultQualification;
+  qualificationReasons: string[];
+  mode: 'rotating' | 'locked_rotor';
+  iqPeakA: number;
+  idPeakA: number;
+  electricalFrequencyHz: number;
+  pwmCyclesPerElectricalCycle: number | null;
+  vBusConstV: number;
+  modulation: FocModulationMode;
+  modDepthM: number;
+  pfAngleDeg: number;
+  fswHz: number;
+  tDeadNs: number;
+  tAmbC: number;
+  mechanicalSpeedRpm: number | null;
+  torqueNm: number | null;
+  mechanicalPowerW: number | null;
+  busInputPowerW: number | null;
+  dcLinkPowerW: number | null;
+  motorElectricalPowerW: number | null;
+  impliedInverterLossW: number | null;
+  inverterLossBudgetMarginW: number | null;
+  powerBalanceStatus: 'WITHIN_BUDGET' | 'EXCEEDS_BUDGET' | 'NOT_AVAILABLE';
+  phaseCurrentPeakA: number;
+  /** Null for locked-rotor DC phase currents; see phaseCurrentA for per-phase values. */
+  phaseCurrentRmsA: number | null;
+  phaseCurrentA: { a: number; b: number; c: number } | null;
+  electricalAngleDeg: number | null;
+  integrationSamples: number;
+  integrationErrorPct: number | null;
+  /** True when the rotating-cycle quadrature converged to <=0.2% between the last two resolutions. */
+  integrationAccuracyMet: boolean;
+  perSwitch: FocSteadyMosResult[];
+  pCondTotalW: number;
+  pSwitchingTotalW: number;
+  pDeadTimeTotalW: number;
+  pInverterTotalW: number;
+  tBoardSteadyC: number;
+  tjMaxSteadyC: number;
+  hottestKey: MosSwitchKey;
+  steadyConverged: boolean;
+  thermalRunaway: boolean;
+  dutyMin: number;
+  dutyMax: number;
+  warnings: string[];
+}
+
+export interface FocSteadyStateOptions {
+  model: FocThermalModel;
+  mos: FocMosParams;
+  ctrl: FocControlParams;
+  operatingPoint: FocSteadyOperatingPoint;
+  /** Electrical-angle midpoint samples. Default 720; ignored for locked-rotor points. */
+  integrationSamples?: number;
+}
+
+export type FocVoltageEnvelopeStatus =
+  | 'CALCULATED'
+  | 'VOLTAGE_LIMITED'
+  | 'MODEL_OUT_OF_RANGE'
+  | 'THERMAL_NOT_CONVERGED'
+  | 'THERMAL_RUNAWAY'
+  | 'INVALID_INPUT';
+
+export interface FocVoltageEnvelopeRow {
+  vBusV: number;
+  requiredModDepthM: number;
+  modulationCeiling: number;
+  status: FocVoltageEnvelopeStatus;
+  result: FocSteadyStateResult | null;
+  note: string;
+}
+
+export interface FocVoltageEnvelopeOptions extends FocSteadyStateOptions {
+  /** Bus-voltage cases to evaluate. Defaults to the user's 12-V vehicle range: 9 / 13.5 / 16 V. */
+  voltagePoints?: number[];
+  /** Bus voltage at which ctrl.modDepthM represents the requested motor fundamental voltage. Defaults to ctrl.vBusConstV. */
+  referenceVoltageV?: number;
+}
+
+interface FocSteadyLossAverage {
+  pCond25W: number[];
+  pSwitchingW: number[];
+  pDeadTimeW: number[];
+  dutyMin: number;
+  dutyMax: number;
+  lutActiveDims: Set<DptAxisName>;
+  lutCollapsedDims: Set<DptAxisName>;
+  lutOutOfRangeCount: number;
+}
+
+function averageFocSteadyLosses(
+  point: FocSteadyOperatingPoint,
+  modelMode: 'rotating' | 'locked_rotor',
+  sampleCount: number,
+  electricalAngleDeg: number,
+  mos: FocMosParams,
+  ctrl: FocControlParams,
+  tjBySwitch: number[]
+): FocSteadyLossAverage {
+  const sums = {
+    cond25: new Float64Array(6),
+    sw: new Float64Array(6),
+    dead: new Float64Array(6),
+  };
+  const activeDims = new Set<DptAxisName>();
+  const collapsedDims = new Set<DptAxisName>();
+  let outOfRangeCount = 0;
+  let dutyMin = 1;
+  let dutyMax = 0;
+  const n = modelMode === 'locked_rotor' ? 1 : sampleCount;
+  const angle0 = (electricalAngleDeg * Math.PI) / 180;
+  const root3 = Math.sqrt(3);
+  const vBus = ctrl.vBusConstV;
+
+  for (let k = 0; k < n; k++) {
+    // Midpoint integration avoids double-counting the 0/2π boundary.
+    const theta = modelMode === 'locked_rotor' ? angle0 : (2 * Math.PI * (k + 0.5)) / n;
+    // Inverse amplitude-invariant Park/Clarke convention. At Id=0 and
+    // theta=90°, this reproduces the existing DynoLab stall vector:
+    // Ia=Iq, Ib=Ic=-Iq/2.
+    const id = point.idPeakA ?? 0;
+    const iq = point.iqPeakA;
+    const iAlpha = id * Math.cos(theta) + iq * Math.sin(theta);
+    const iBeta = id * Math.sin(theta) - iq * Math.cos(theta);
+    const ia = iAlpha;
+    const ib = -0.5 * iAlpha + (root3 / 2) * iBeta;
+    const ic = -0.5 * iAlpha - (root3 / 2) * iBeta;
+
+    // The generated three-phase set is balanced by construction; use the
+    // stationary-frame current vector directly for the voltage/current angle.
+    // A zero-current rotating point still has a commanded voltage vector (e.g. back-EMF
+    // cancellation / field weakening). Do not let the generic current-angle fallback
+    // silently force 50% duty and suppress Eoss/switching events.
+    const thetaI = Math.hypot(iAlpha, iBeta) >= 1e-9
+      ? Math.atan2(iBeta, iAlpha)
+      : theta - Math.PI / 2;
+    const duty = computeDutyFromVoltageAngle(
+      thetaI + (ctrl.pfAngleDeg * Math.PI) / 180, ctrl.modulation, ctrl.modDepthM
+    );
+    if (duty.overmodulated) {
+      throw new Error(
+        `恒定工况稳态模型目前只接受线性调制区：${ctrl.modulation} 请求 m=${ctrl.modDepthM.toFixed(4)}，上限=${duty.linearCeilingM.toFixed(4)}。请先降低调制度，避免把过调制波形当成线性 SVPWM/DPWM1 计算。`
+      );
+    }
+    dutyMin = Math.min(dutyMin, duty.da, duty.db, duty.dc);
+    dutyMax = Math.max(dutyMax, duty.da, duty.db, duty.dc);
+
+    const phaseInputs: Array<[number, number, number, number]> = [
+      [ia, duty.da, tjBySwitch[0], tjBySwitch[1]],
+      [ib, duty.db, tjBySwitch[2], tjBySwitch[3]],
+      [ic, duty.dc, tjBySwitch[4], tjBySwitch[5]],
+    ];
+    const legs = phaseInputs.map(([current, highDuty, tjHigh, tjLow]) =>
+      computePhaseMosLosses(
+        current, highDuty, vBus, tjHigh, tjLow,
+        ctrl.modulation, ctrl.fswHz, ctrl.tDeadNs, mos
+      )
+    );
+    const p25 = [
+      legs[0].pHighCond25W, legs[0].pLowCond25W,
+      legs[1].pHighCond25W, legs[1].pLowCond25W,
+      legs[2].pHighCond25W, legs[2].pLowCond25W,
+    ];
+    const pSw = [
+      legs[0].pHighSw, legs[0].pLowSw,
+      legs[1].pHighSw, legs[1].pLowSw,
+      legs[2].pHighSw, legs[2].pLowSw,
+    ];
+    const pDead = [
+      legs[0].pHighDead, legs[0].pLowDead,
+      legs[1].pHighDead, legs[1].pLowDead,
+      legs[2].pHighDead, legs[2].pLowDead,
+    ];
+    for (let m = 0; m < 6; m++) {
+      sums.cond25[m] += p25[m];
+      sums.sw[m] += pSw[m];
+      sums.dead[m] += pDead[m];
+    }
+    for (const leg of legs) {
+      leg.lutActiveDims?.forEach((dim) => activeDims.add(dim));
+      leg.lutCollapsedDims?.forEach((dim) => collapsedDims.add(dim));
+      if (leg.lutExtrapolated || leg.lutStatus === 'OUT_OF_RANGE') outOfRangeCount++;
+    }
+  }
+
+  const divisor = n;
+  return {
+    pCond25W: Array.from(sums.cond25, (v) => v / divisor),
+    pSwitchingW: Array.from(sums.sw, (v) => v / divisor),
+    pDeadTimeW: Array.from(sums.dead, (v) => v / divisor),
+    dutyMin,
+    dutyMax,
+    lutActiveDims: activeDims,
+    lutCollapsedDims: collapsedDims,
+    lutOutOfRangeCount: outOfRangeCount,
+  };
+}
+
+function compareSteadyLossIntegration(
+  coarse: FocSteadyLossAverage,
+  fine: FocSteadyLossAverage
+): number {
+  const pairs: Array<[number[], number[]]> = [
+    [coarse.pCond25W, fine.pCond25W],
+    [coarse.pSwitchingW, fine.pSwitchingW],
+    [coarse.pDeadTimeW, fine.pDeadTimeW],
+  ];
+  let maxErrorPct = 0;
+  for (const [a, b] of pairs) {
+    for (let i = 0; i < b.length; i++) {
+      const errorPct = Math.abs(b[i] - a[i]) / Math.max(Math.abs(b[i]), 1e-9) * 100;
+      if (!Number.isFinite(errorPct)) return Infinity;
+      maxErrorPct = Math.max(maxErrorPct, errorPct);
+    }
+  }
+  return maxErrorPct;
+}
+
+/**
+ * Direct constant-condition calculation. It averages the PWM-period loss model
+ * over one electrical cycle (or one fixed rotor angle at standstill), then solves
+ * the six-MOS coupled thermal steady state. It does not synthesize a time trace or
+ * run a thermal transient; the existing simulateFoc6Mos() remains the waveform path.
+ */
+export function simulateFoc6MosSteadyState(options: FocSteadyStateOptions): FocSteadyStateResult {
+  const { model, mos, ctrl, operatingPoint } = options;
+  if (model.splitFeasible === false) {
+    throw new Error(model.splitMeta?.warning || 'ZthJC / Zth_board 热路径拆分不可行，拒绝稳态结温计算。');
+  }
+  const finite = (v: number) => Number.isFinite(v);
+  if (!['SVPWM', 'DPWM1', 'SPWM'].includes(ctrl.modulation)) throw new Error('调制模式无效。');
+  if (!finite(ctrl.vBusConstV) || ctrl.vBusConstV <= 0) throw new Error('恒定母线电压必须为有限正数。');
+  if (!finite(ctrl.fswHz) || ctrl.fswHz <= 0 || ctrl.fswHz > 5e6) throw new Error('恒定 PWM 频率必须位于 (0, 5 MHz]。');
+  if (!finite(ctrl.tDeadNs) || ctrl.tDeadNs < 0 || ctrl.tDeadNs > 1e6) throw new Error('死区时间必须位于 0～1,000,000 ns。');
+  if (!finite(ctrl.modDepthM) || ctrl.modDepthM < 0 || ctrl.modDepthM > 2) throw new Error('调制度必须位于 0～2。');
+  if (!finite(ctrl.pfAngleDeg) || ctrl.pfAngleDeg < -180 || ctrl.pfAngleDeg > 180) throw new Error('功率因数角必须位于 -180°～180°。');
+  if (!finite(ctrl.tAmbC) || ctrl.tAmbC <= -273.15 || ctrl.tAmbC > 1000) throw new Error('环境温度必须高于绝对零度且不超过 1000°C。');
+  if (!finite(mos.rdsOn25Mohm) || mos.rdsOn25Mohm <= 0) throw new Error('Rds(on)@25°C 必须为有限正数（mΩ）。');
+  if (!mos.rdsOnTempCurve && (!finite(mos.tempCoeffAlphaPerC) || mos.tempCoeffAlphaPerC < 0 || mos.tempCoeffAlphaPerC > 0.05)) throw new Error('Rds 温度系数必须为 0～0.05 /°C；如使用器件曲线，该 α 输入不参与计算。');
+  if (mos.rdsOnTempCurve) validateRdsOnTempCurveForMos(mos);
+  validateMosEnergyAccounting(mos);
+  if (!finite(mos.vsdV) || mos.vsdV < 0 || mos.vsdV > 10) throw new Error('体二极管压降必须为 0～10 V。');
+  if (!finite(mos.eonPlusEoffUj) || mos.eonPlusEoffUj < 0 || !finite(mos.qrrNc) || mos.qrrNc < 0) throw new Error('Eon+Eoff 和 Qrr 必须为非负有限数值。');
+  if (!finite(mos.vRefV) || mos.vRefV <= 0 || !finite(mos.iRefA) || mos.iRefA <= 0) throw new Error('Eon/Eoff 参考电压和参考电流必须为有限正数。');
+  if (mos.qrrIrefA !== undefined && (!finite(mos.qrrIrefA) || mos.qrrIrefA <= 0)) throw new Error('Qr/Qrr 独立参考电流必须为有限正数。');
+  if (mos.eossUj !== undefined && (!finite(mos.eossUj) || mos.eossUj < 0)) throw new Error('Eoss 必须为非负有限数值。');
+  if (!finite(operatingPoint.iqPeakA) || !finite(operatingPoint.idPeakA ?? 0)) throw new Error('Id/Iq 必须为有限峰值电流。');
+  if (!finite(operatingPoint.electricalFrequencyHz) || operatingPoint.electricalFrequencyHz < 0) throw new Error('电频率必须为有限非负数。');
+
+  const inferredMode: 'rotating' | 'locked_rotor' = operatingPoint.mode ??
+    (operatingPoint.electricalFrequencyHz > 1e-9 ? 'rotating' : 'locked_rotor');
+  if (inferredMode === 'rotating' && operatingPoint.electricalFrequencyHz <= 0) {
+    throw new Error('旋转工况必须提供大于 0 的电频率；零速工况请选择 locked_rotor。');
+  }
+  if (inferredMode === 'locked_rotor' && operatingPoint.electricalFrequencyHz > 1e-9) {
+    throw new Error('locked_rotor 固定电角度工况的电频率必须为 0；非零电频率请使用 rotating 模式。');
+  }
+  if (inferredMode === 'rotating' && operatingPoint.electricalFrequencyHz >= ctrl.fswHz) {
+    throw new Error('电频率不得达到或超过 PWM 频率；当前工况不满足平均 PWM 损耗模型的基本采样关系。');
+  }
+  const pwmCyclesPerElectricalCycle = inferredMode === 'rotating'
+    ? ctrl.fswHz / operatingPoint.electricalFrequencyHz
+    : null;
+  const electricalAngleDeg = operatingPoint.electricalAngleDeg ?? 90;
+  if (!finite(electricalAngleDeg) || electricalAngleDeg < 0 || electricalAngleDeg > 360) {
+    throw new Error('堵转电角度必须位于 0°～360°。');
+  }
+  const maxM = getModulationLinearCeiling(ctrl.modulation);
+  if (ctrl.modDepthM > maxM + 1e-6) {
+    throw new Error(`恒定工况稳态计算暂不支持过调制：${ctrl.modulation} 的线性上限为 ${maxM.toFixed(4)}，当前 m=${ctrl.modDepthM.toFixed(4)}。`);
+  }
+  if (mos.dptLut && mos.dptLut.length > 0 &&
+      (!(mos.rgOnOhm !== undefined && finite(mos.rgOnOhm) && mos.rgOnOhm >= 0) ||
+       !(mos.rgOffOhm !== undefined && finite(mos.rgOffOhm) && mos.rgOffOhm >= 0))) {
+    throw new Error('启用 DPT LUT 时必须明确输入 Rg_on 和 Rg_off。');
+  }
+
+  const jcStages = model.zthJC.length > 0 ? model.zthJC : DEFAULT_FOC_MODEL.zthJC;
+  const boardStages = model.zthBoard.length > 0 ? model.zthBoard : DEFAULT_FOC_MODEL.zthBoard;
+  const validateStages = (stages: CauerStage[], label: string) => {
+    if (!stages.length) throw new Error(`${label} 热网络不能为空。`);
+    stages.forEach((stage, index) => {
+      if (!finite(stage.r) || stage.r <= 0 || !finite(stage.c) || stage.c <= 0) {
+        throw new Error(`${label} 第 ${index + 1} 阶 R/C 必须为有限正数。`);
+      }
+    });
+  };
+  validateStages(jcStages, 'ZthJC');
+  validateStages(boardStages, 'ZthBoard');
+  // The steady-state path must apply the same strict six-position thermal-input
+  // validation as the transient path. Silent fallback here can mask bad PCB data.
+  if (model.perSwitchRjcScale !== undefined && (
+    !Array.isArray(model.perSwitchRjcScale) || model.perSwitchRjcScale.length !== 6 ||
+    model.perSwitchRjcScale.some((v) => !Number.isFinite(v) || v < 0.01 || v > 100)
+  )) {
+    throw new Error('恒定工况 perSwitchRjcScale 必须严格包含 AH/AL/BH/BL/CH/CL 六个有限正数，范围 0.01～100。');
+  }
+  if (model.perSwitchPadOffsetCPerW !== undefined && (
+    !Array.isArray(model.perSwitchPadOffsetCPerW) || model.perSwitchPadOffsetCPerW.length !== 6 ||
+    model.perSwitchPadOffsetCPerW.some((v) => !Number.isFinite(v) || v < 0 || v > 1e6)
+  )) {
+    throw new Error('恒定工况 perSwitchPadOffsetCPerW 必须严格包含 AH/AL/BH/BL/CH/CL 六个有限非负热阻值。');
+  }
+
+  const requestedSamples = options.integrationSamples ?? 720;
+  if (!Number.isInteger(requestedSamples) || requestedSamples < 72 || requestedSamples > 8192) {
+    throw new Error('电周期积分点数必须为 72～8192 的整数。');
+  }
+  const maxIntegrationSamples = 16384;
+  const operatingPointForSweep = { ...operatingPoint, electricalAngleDeg };
+  const zeroTj = new Array<number>(6).fill(25);
+  let coarseSamples = inferredMode === 'rotating' ? requestedSamples : 1;
+  let finalSamples = coarseSamples;
+  let integrationErrorPct: number | null = null;
+  let integrationAccuracyMet = true;
+  let integrationBaseErrorPct: number | null = null;
+  let integrationThermalErrorPct: number | null = null;
+  let baseLoss!: FocSteadyLossAverage;
+  let finalLoss!: FocSteadyLossAverage;
+  let steady!: ReturnType<typeof solveCoupledThermalSteadyState>;
+  const alpha = mos.tempCoeffAlphaPerC;
+  const armChains = buildPerSwitchJcChains({ ...model, zthJC: jcStages, zthBoard: boardStages });
+  const rJcTotalByArm = armChains.map((chain) => chain.reduce((sum, stage) => sum + stage.r, 0));
+  const rBrdTotal = boardStages.reduce((sum, stage) => sum + stage.r, 0);
+  const tolerancePct = 0.2;
+
+  // Check convergence twice: first at the 25°C reference loss, then again at the
+  // actual coupled steady-state junction temperatures. A DPT LUT can vary with Tj,
+  // so convergence at 25°C alone is not sufficient to qualify the final loss result.
+  // If either check fails, rerun the complete electro-thermal solve at twice the
+  // angular resolution. The hard cap bounds UI cost; failure at the cap is reported
+  // as ASSUMPTION_BASED rather than silently treated as a parameterized result.
+  for (;;) {
+    const solveSamples = inferredMode === 'rotating'
+      ? Math.min(maxIntegrationSamples, coarseSamples * 2)
+      : 1;
+    const coarseBaseLoss = averageFocSteadyLosses(
+      operatingPointForSweep, inferredMode, coarseSamples, electricalAngleDeg, mos, ctrl, zeroTj
+    );
+    const fineBaseLoss = solveSamples === coarseSamples
+      ? coarseBaseLoss
+      : averageFocSteadyLosses(
+          operatingPointForSweep, inferredMode, solveSamples, electricalAngleDeg, mos, ctrl, zeroTj
+        );
+    integrationBaseErrorPct = inferredMode === 'rotating'
+      ? compareSteadyLossIntegration(coarseBaseLoss, fineBaseLoss)
+      : null;
+
+    const activeDims = new Set<DptAxisName>(fineBaseLoss.lutActiveDims);
+    const evalFixedPowerAtTj = activeDims.has('Tj')
+      ? (tjCandidate: number[]): number[] => {
+          const losses = averageFocSteadyLosses(
+            operatingPointForSweep, inferredMode, solveSamples, electricalAngleDeg, mos, ctrl, tjCandidate
+          );
+          return losses.pSwitchingW.map((p, i) => p + losses.pDeadTimeW[i]);
+        }
+      : undefined;
+
+    steady = solveCoupledThermalSteadyState({
+      pCond25W: fineBaseLoss.pCond25W,
+      pFixedW: fineBaseLoss.pSwitchingW.map((p, i) => p + fineBaseLoss.pDeadTimeW[i]),
+      alphaPerC: alpha,
+      evalCondFactorAtTj: mos.rdsOnTempCurve
+        ? (tjVec) => tjVec.map((tj) => getFocMosRdsFactorAtTj(mos, tj))
+        : undefined,
+      rJcTotalByArm,
+      rBrdTotal,
+      tAmbC: ctrl.tAmbC,
+      tInitSeedC: new Array<number>(6).fill(ctrl.tAmbC + 10),
+      spatial: resolveSpatialThermalNetwork({ ...model, zthJC: jcStages, zthBoard: boardStages }),
+      evalFixedPowerAtTj,
+    });
+
+    // A failed thermal solve has no final operating temperature. Do not query a
+    // bounded Rds(Tj)/DPT curve with an intermediate or runaway temperature; retain
+    // only the 25°C reference loss for diagnostics and let result qualification fail.
+    const thermalPointUsable = steady.converged && !steady.thermalRunaway;
+    finalLoss = thermalPointUsable
+      ? averageFocSteadyLosses(
+          operatingPointForSweep, inferredMode, solveSamples, electricalAngleDeg, mos, ctrl, steady.tjSteadyC
+        )
+      : fineBaseLoss;
+
+    if (inferredMode === 'rotating' && thermalPointUsable) {
+      let thermalCoarseLoss: FocSteadyLossAverage;
+      let thermalFineLoss: FocSteadyLossAverage;
+      if (solveSamples < maxIntegrationSamples) {
+        thermalCoarseLoss = finalLoss;
+        thermalFineLoss = averageFocSteadyLosses(
+          operatingPointForSweep, inferredMode, Math.min(maxIntegrationSamples, solveSamples * 2),
+          electricalAngleDeg, mos, ctrl, steady.tjSteadyC
+        );
+      } else {
+        // At the cap compare the final 8192/16384 pair at the solved Tj.
+        thermalCoarseLoss = averageFocSteadyLosses(
+          operatingPointForSweep, inferredMode, Math.floor(solveSamples / 2),
+          electricalAngleDeg, mos, ctrl, steady.tjSteadyC
+        );
+        thermalFineLoss = finalLoss;
+      }
+      integrationThermalErrorPct = compareSteadyLossIntegration(thermalCoarseLoss, thermalFineLoss);
+    } else {
+      integrationThermalErrorPct = null;
+    }
+
+    const errors = [integrationBaseErrorPct, integrationThermalErrorPct]
+      .filter((value): value is number => value !== null);
+    integrationErrorPct = errors.length > 0 ? Math.max(...errors) : null;
+    finalSamples = solveSamples;
+    baseLoss = fineBaseLoss;
+
+    const needsMoreSamples = integrationErrorPct !== null && integrationErrorPct > tolerancePct;
+    if (needsMoreSamples && solveSamples < maxIntegrationSamples) {
+      coarseSamples = solveSamples;
+      continue;
+    }
+    integrationAccuracyMet = !needsMoreSamples;
+    break;
+  }
+  const thermalPointUsable = steady.converged && !steady.thermalRunaway;
+  const keys = MOS_SWITCH_KEYS;
+  const boardByKey = steady.tBoardSteadyByKey;
+  const perSwitch: FocSteadyMosResult[] = keys.map((key, i) => {
+    // Do not leak a thermal solver's last iterate as if it were an operating point.
+    // NaN is intentional: consumers must check steadyConverged/thermalRunaway first.
+    if (!thermalPointUsable) {
+      return {
+        key,
+        pCondW: Number.NaN,
+        pSwitchingW: Number.NaN,
+        pDeadTimeW: Number.NaN,
+        pTotalW: Number.NaN,
+        pCondAt25CW: baseLoss.pCond25W[i],
+        tjSteadyC: Number.NaN,
+        boardSteadyC: Number.NaN,
+      };
+    }
+    const factor = getFocMosRdsFactorAtTj(mos, steady.tjSteadyC[i]);
+    const pCond = baseLoss.pCond25W[i] * factor;
+    const pSw = finalLoss.pSwitchingW[i];
+    const pDead = finalLoss.pDeadTimeW[i];
+    return {
+      key,
+      pCondW: pCond,
+      pSwitchingW: pSw,
+      pDeadTimeW: pDead,
+      pTotalW: pCond + pSw + pDead,
+      pCondAt25CW: baseLoss.pCond25W[i],
+      tjSteadyC: steady.tjSteadyC[i],
+      boardSteadyC: boardByKey[i] ?? steady.tBoardSteadyC,
+    };
+  });
+  const sum = (selector: (r: FocSteadyMosResult) => number) => perSwitch.reduce((a, r) => a + selector(r), 0);
+  let hottestIndex = 0;
+  for (let i = 1; i < perSwitch.length; i++) if (perSwitch[i].tjSteadyC > perSwitch[hottestIndex].tjSteadyC) hottestIndex = i;
+
+  const missingLossInputs: string[] = [];
+  const assumptionReasons: string[] = [];
+  if (!mos.dptLut?.length && mos.eonPlusEoffUj <= 0) missingLossInputs.push('Eon+Eoff/DPT');
+  if (!mos.dptLut?.length && !mos.eonIncludesQrr && mos.qrrNc <= 0) missingLossInputs.push('Qrr');
+  if (!mos.eossAlreadyIncludedInEsw && !mos.eossCurve && (mos.eossUj ?? 0) <= 0 && !qossCoveredByQr(mos)) missingLossInputs.push('Eoss');
+  if (mos.rdsDataConfirmed !== true) assumptionReasons.push('Rds(on)@25°C 未按目标器件 Vgs/测试条件确认');
+  if (mos.rdsOnTempCurve && (mos.rdsOnTempCurve.provenance === 'assumed' || !mos.rdsOnTempCurve.partNumber?.trim())) {
+    assumptionReasons.push('Rds(on)-Tj 曲线来源为假设/未绑定具体器件型号');
+  }
+  if (!mos.dptLut?.length) assumptionReasons.push('开关能量使用单点标量 V/I 缩放，不是多工况 DPT LUT');
+  if (!mos.dptLut?.length && !mos.eonIncludesQrr && mos.qrrNc > 0) {
+    assumptionReasons.push('Qr/Qrr 只使用单点电荷数据，按 |I| 线性缩放并以 Q×Vbus 一阶估算；未按工作 VDS、Tj、di/dt 和实际换流路径建立非线性模型');
+  }
+  const scalarLossLimitations: string[] = [];
+  if (qossCoveredByQr(mos)) {
+    scalarLossLimitations.push('数据口径：当前 Qr 输入已声明包含电容性恢复（Qr=Qs+Qoss）；独立 Eoss 不再叠加。');
+  }
+  if (!mos.dptLut?.length) {
+    if (mos.eonPlusEoffUj > 0) scalarLossLimitations.push('标量 Eon+Eoff 采用 Vbus/Vref 与 |I|/Iref 的线性比例缩放；该近似不包含器件开关能量对结温、Rg、换流电流斜率及非线性 Coss 的完整依赖，不能替代多工况 DPT LUT。');
+    if (!mos.eonIncludesQrr && mos.qrrNc > 0 && mos.qrrIncludesQoss) scalarLossLimitations.push(`当前输入为 Qr@${(mos.qrrIrefA ?? mos.iRefA).toFixed(1)}A（已声明包含 Qoss/电容性恢复）；按 Qr@${(mos.qrrIrefA ?? mos.iRefA).toFixed(1)}A × |I|/${(mos.qrrIrefA ?? mos.iRefA).toFixed(1)}A 与 Qr·Vbus 估算总恢复能量，并禁止额外叠加 Eoss。该近似未分别求解 Qs、Qoss 及其实际能量分配，也未建模 Tj、di/dt、Vgs 和换流寄生参数的非线性。`);
+    else if (!mos.eonIncludesQrr && mos.qrrNc > 0) scalarLossLimitations.push('标量 Qrr 采用 Qrr@Iref × |I|/Iref，并按 Qrr·Vbus 估算恢复能量；未建模 Qrr 对 Tj、di/dt、Vgs 和换流回路寄生参数的非线性依赖。');
+    if (!mos.eossAlreadyIncludedInEsw && !mos.eossCurve && (mos.eossUj ?? 0) > 0) scalarLossLimitations.push('标量 Eoss 采用 Eoss@Vref × (Vbus/Vref)^2；非线性 Coss 区域应优先导入 Eoss(V)/Qoss(V) 曲线。');
+  }
+  if (model.modelKind !== 'datasheet_constrained' || model.zthValidation?.passed !== true) {
+    assumptionReasons.push('热网络未通过目标器件数据手册约束及 JC/Board 拆分验证');
+  }
+  if (model.modelKind === 'fallback_default' || model.modelKind === 'demo_builtin' || !model.modelKind) {
+    assumptionReasons.push('使用默认/演示热网络，不代表目标 MOS 与 PCB 的实测热路径');
+  }
+  if (pwmCyclesPerElectricalCycle !== null && pwmCyclesPerElectricalCycle < 20) {
+    assumptionReasons.push(`每个电周期仅 ${pwmCyclesPerElectricalCycle.toFixed(1)} 个 PWM 周期，平均 PWM 损耗假设偏弱`);
+  }
+  if (!integrationAccuracyMet) {
+    assumptionReasons.push(`电周期积分在 ${finalSamples} 点上限仍未达到 0.2% 收敛门槛（25°C 基准误差=${integrationBaseErrorPct?.toFixed(4) ?? 'N/A'}%，稳态 Tj 误差=${integrationThermalErrorPct?.toFixed(4) ?? 'N/A'}%）；当前功耗/结温不具备参数化结果资格`);
+  }
+  const inverterLossBudgetW = Number.isFinite(operatingPoint.impliedInverterLossW)
+    ? operatingPoint.impliedInverterLossW as number
+    : null;
+  const inverterLossBudgetMarginW = !thermalPointUsable || inverterLossBudgetW === null
+    ? null
+    : inverterLossBudgetW - sum((r) => r.pTotalW);
+  const powerBalanceStatus: FocSteadyStateResult['powerBalanceStatus'] = !thermalPointUsable || inverterLossBudgetW === null
+    ? 'NOT_AVAILABLE'
+    : inverterLossBudgetW < -0.1 || (inverterLossBudgetMarginW as number) < -Math.max(0.1, 0.05 * Math.abs(inverterLossBudgetW))
+      ? 'EXCEEDS_BUDGET'
+      : 'WITHIN_BUDGET';
+  if (powerBalanceStatus === 'EXCEEDS_BUDGET') {
+    assumptionReasons.push('六管计算损耗超过 DynoLab 输入功率/电机电功率差所隐含的逆变器损耗预算；需核对效率定义、器件损耗参数及功率边界');
+  }
+  if (steady.thermalRunaway) {
+    assumptionReasons.push('热稳态求解检测到热失控，不存在可用于工程判断的有限稳态结温。');
+  } else if (!steady.converged) {
+    assumptionReasons.push('热稳态求解未收敛，当前结温只能作为迭代中间值，不得用于安全或设计签核。');
+  }
+  const resultQualification: FocResultQualification = missingLossInputs.length > 0
+    ? 'INCOMPLETE_LOSS_MODEL'
+    : assumptionReasons.length > 0 ? 'ASSUMPTION_BASED' : 'DEVICE_PARAMETERIZED';
+  const qualificationReasons = [...missingLossInputs.map((x) => `缺少 ${x}`), ...assumptionReasons];
+  const warnings: string[] = [
+    inferredMode === 'rotating'
+      ? `恒定旋转工况：Id/Iq 保持恒定，按完整电周期 ${finalSamples} 点做平均损耗积分；fsw/fe=${(pwmCyclesPerElectricalCycle ?? 0).toFixed(1)}；不模拟 PWM 载波边沿与电流纹波。`
+      : `恒定堵转工况：按电角度 ${electricalAngleDeg.toFixed(1)}° 固定 Id/Iq 计算；转子角度变化时结果可能不同。`,
+    '恒定工况稳态结果不包含栅极驱动器静态/动态功耗、控制器功耗、母线电容 ESR、母排/连接器及 PCB 铜箔电阻损耗，除非这些损耗已另行纳入输入热源。',
+    ...scalarLossLimitations,
+  ];
+  if (integrationErrorPct !== null) {
+    warnings.push(integrationAccuracyMet
+      ? `电周期积分已自动加密至 ${finalSamples} 点；25°C 基准积分误差=${integrationBaseErrorPct?.toFixed(4) ?? 'N/A'}%，稳态 Tj 积分误差=${integrationThermalErrorPct?.toFixed(4) ?? 'N/A'}%，最大差异 ${integrationErrorPct.toFixed(4)}%（门槛 0.2%）。`
+      : `电周期积分已加密至上限 ${finalSamples} 点，但 25°C 基准/稳态 Tj 积分误差仍未全部达到 0.2%（基准=${integrationBaseErrorPct?.toFixed(4) ?? 'N/A'}%，稳态 Tj=${integrationThermalErrorPct?.toFixed(4) ?? 'N/A'}%）；结果已降级为假设估算。`);
+  }
+  if (missingLossInputs.length) {
+    warnings.push(`损耗模型不完整：${missingLossInputs.join('、')} 缺失；对应损耗未计入，P_inv/Tj 是已知损耗下的偏低估算。`);
+  }
+  if (mos.rdsOnTempCurve) {
+    const curve = mos.rdsOnTempCurve;
+    warnings.push(`导通电阻温度反馈已使用器件 Rds(on)-Tj 归一化曲线（Vgs=${curve.referenceGateVoltageV.toFixed(2)}V，范围 ${curve.points[0].tjC}～${curve.points[curve.points.length - 1].tjC}°C，来源=${curve.provenance}）；曲线优先于线性 α。${curve.sourceNote ? `数据来源说明：${curve.sourceNote}` : ''}`);
+  } else {
+    warnings.push('Rds(on)-Tj 当前使用线性 α 近似；高结温外推优先替换为目标 MOS 在实际 Vgs 条件下的归一化曲线。');
+  }
+  if (mos.eonIncludesQrr) {
+    warnings.push('反向恢复计量：Esw/DPT Eon+Eoff 已声明包含 Qrr，模型不再额外叠加 Qr·Vbus。');
+  } else if (qossCoveredByQr(mos)) {
+    warnings.push(`反向恢复/电容性恢复计量：当前使用 Qr=${mos.qrrNc.toFixed(2)} nC @ ${(mos.qrrIrefA ?? mos.iRefA).toFixed(1)}A，已声明包含电容性恢复（Qr=Qs+Qoss）；按 Qr·Vbus 一阶估算，不再额外叠加 Eoss。`);
+    if (mos.qrrReferenceVdsV !== undefined || mos.qrrReferenceDiDtAperUs !== undefined || mos.qrrReferenceTjC !== undefined || mos.qrrReferenceVgsV !== undefined) {
+      const refs = [
+        mos.qrrReferenceVdsV !== undefined ? `VDS=${mos.qrrReferenceVdsV.toFixed(1)}V` : '',
+        mos.qrrReferenceDiDtAperUs !== undefined ? `di/dt=${mos.qrrReferenceDiDtAperUs.toFixed(0)}A/µs` : '',
+        mos.qrrReferenceVgsV !== undefined ? `VGS=${mos.qrrReferenceVgsV.toFixed(1)}V` : '',
+        mos.qrrReferenceTjC !== undefined ? `Tj=${mos.qrrReferenceTjC.toFixed(0)}°C` : '',
+      ].filter(Boolean).join('，');
+      const vdsDeltaPct = mos.qrrReferenceVdsV !== undefined && mos.qrrReferenceVdsV > 0
+        ? Math.abs(ctrl.vBusConstV - mos.qrrReferenceVdsV) / mos.qrrReferenceVdsV * 100
+        : null;
+      warnings.push(`Qr 数据手册参考测试条件：${refs}；当前 Vbus=${ctrl.vBusConstV.toFixed(2)}V${vdsDeltaPct === null ? '' : `（相对测试 VDS 差异 ${vdsDeltaPct.toFixed(1)}%）`}。该单点 Qr 没有 VDS/温度/di/dt 特性曲线，未对测试条件差异进行修正；此结果只能作为一阶估算。`);
+    }
+  } else {
+    warnings.push(`反向恢复计量：Esw 未声明包含 Qrr${mos.qrrNc > 0 ? `，额外计入 Qrr·Vbus（Qrr=${mos.qrrNc.toFixed(2)} nC @ ${(mos.qrrIrefA ?? mos.iRefA).toFixed(1)} A）` : '，且 Qrr 输入为 0；未计入额外反向恢复能量'}。`);
+  }
+  if (mos.eossAlreadyIncludedInEsw) {
+    warnings.push('输出电容计量：已启用 Eoss 防重复计量，独立 Eoss 曲线/标量不再叠加。');
+  } else if (qossCoveredByQr(mos)) {
+    warnings.push('输出电容计量：当前 Qr 已包含 Qoss/电容性恢复，独立 Eoss 曲线/标量被屏蔽，避免重复计量。');
+  } else {
+    warnings.push(`输出电容计量：独立计算 Eoss${mos.eossCurve ? '（非线性曲线）' : (mos.eossUj ?? 0) > 0 ? `（标量 ${(mos.eossUj ?? 0).toFixed(3)} µJ @ Vref）` : '输入为 0，未计入'}；请确认 Esw/Eon 数据是否已包含同一能量边界。`);
+  }
+  if (assumptionReasons.length) warnings.push(`结果属于假设估算：${assumptionReasons.join('；')}。`);
+  if (powerBalanceStatus === 'EXCEEDS_BUDGET') {
+    warnings.push(`功率平衡检查失败：六管损耗 ${sum((r) => r.pTotalW).toFixed(3)} W，FOC 效率模型隐含逆变器损耗预算 ${inverterLossBudgetW!.toFixed(3)} W，超出 ${(-inverterLossBudgetMarginW!).toFixed(3)} W。`);
+  }
+  if (baseLoss.lutOutOfRangeCount > 0 || finalLoss.lutOutOfRangeCount > 0) {
+    throw new Error('恒定工况积分中存在 DPT LUT 越界查询，拒绝输出稳态结温。');
+  }
+  if (!steady.converged && !steady.thermalRunaway) {
+    warnings.push('电热耦合稳态迭代未收敛；当前 Tj 不得用于安全或设计签核。');
+  }
+  if (steady.thermalRunaway) warnings.push('检测到热反馈导致无有限稳态平衡点（热失控）。');
+
+  return {
+    resultQualification,
+    qualificationReasons,
+    mode: inferredMode,
+    iqPeakA: operatingPoint.iqPeakA,
+    idPeakA: operatingPoint.idPeakA ?? 0,
+    electricalFrequencyHz: operatingPoint.electricalFrequencyHz,
+    pwmCyclesPerElectricalCycle,
+    vBusConstV: ctrl.vBusConstV,
+    modulation: ctrl.modulation,
+    modDepthM: ctrl.modDepthM,
+    pfAngleDeg: ctrl.pfAngleDeg,
+    fswHz: ctrl.fswHz,
+    tDeadNs: ctrl.tDeadNs,
+    tAmbC: ctrl.tAmbC,
+    mechanicalSpeedRpm: Number.isFinite(operatingPoint.mechanicalSpeedRpm) ? operatingPoint.mechanicalSpeedRpm as number : null,
+    torqueNm: Number.isFinite(operatingPoint.torqueNm) ? operatingPoint.torqueNm as number : null,
+    mechanicalPowerW: Number.isFinite(operatingPoint.mechanicalPowerW) ? operatingPoint.mechanicalPowerW as number : null,
+    busInputPowerW: Number.isFinite(operatingPoint.busInputPowerW) ? operatingPoint.busInputPowerW as number : null,
+    dcLinkPowerW: Number.isFinite(operatingPoint.dcLinkPowerW) ? operatingPoint.dcLinkPowerW as number : null,
+    motorElectricalPowerW: Number.isFinite(operatingPoint.motorElectricalPowerW) ? operatingPoint.motorElectricalPowerW as number : null,
+    impliedInverterLossW: inverterLossBudgetW,
+    inverterLossBudgetMarginW,
+    powerBalanceStatus,
+    phaseCurrentPeakA: Math.hypot(operatingPoint.iqPeakA, operatingPoint.idPeakA ?? 0),
+    phaseCurrentRmsA: inferredMode === 'rotating'
+      ? Math.hypot(operatingPoint.iqPeakA, operatingPoint.idPeakA ?? 0) / Math.sqrt(2)
+      : null,
+    phaseCurrentA: inferredMode === 'locked_rotor'
+      ? (() => {
+          const theta = (electricalAngleDeg * Math.PI) / 180;
+          const id = operatingPoint.idPeakA ?? 0;
+          const iq = operatingPoint.iqPeakA;
+          const alpha = id * Math.cos(theta) + iq * Math.sin(theta);
+          const beta = id * Math.sin(theta) - iq * Math.cos(theta);
+          return { a: alpha, b: -0.5 * alpha + (Math.sqrt(3) / 2) * beta, c: -0.5 * alpha - (Math.sqrt(3) / 2) * beta };
+        })()
+      : null,
+    electricalAngleDeg: inferredMode === 'locked_rotor' ? electricalAngleDeg : null,
+    integrationSamples: finalSamples,
+    integrationErrorPct,
+    integrationAccuracyMet,
+    perSwitch,
+    pCondTotalW: sum((r) => r.pCondW),
+    pSwitchingTotalW: sum((r) => r.pSwitchingW),
+    pDeadTimeTotalW: sum((r) => r.pDeadTimeW),
+    pInverterTotalW: sum((r) => r.pTotalW),
+    tBoardSteadyC: thermalPointUsable ? steady.tBoardSteadyC : Number.NaN,
+    tjMaxSteadyC: thermalPointUsable ? perSwitch[hottestIndex].tjSteadyC : Number.NaN,
+    hottestKey: perSwitch[hottestIndex].key,
+    steadyConverged: steady.converged,
+    thermalRunaway: steady.thermalRunaway,
+    dutyMin: baseLoss.dutyMin,
+    dutyMax: baseLoss.dutyMax,
+    warnings,
+  };
+}
+
+/**
+ * Evaluate the 12-V vehicle bus envelope while preserving the requested motor
+ * fundamental voltage. Id/Iq, electrical frequency, Fsw, dead time, PF and thermal
+ * model remain fixed. Required modulation scales as Vref/Vbus; if it exceeds the
+ * linear modulation ceiling, the case is reported as voltage-limited and no Tj is
+ * fabricated. This is an operating-point sensitivity check, not a motor/FOC
+ * re-solve: a full motor model is still required to recalculate current/torque.
+ */
+export function simulateFoc6MosVoltageEnvelope(options: FocVoltageEnvelopeOptions): FocVoltageEnvelopeRow[] {
+  const referenceVoltageV = options.referenceVoltageV ?? options.ctrl.vBusConstV;
+  if (!Number.isFinite(referenceVoltageV) || referenceVoltageV <= 0) {
+    throw new Error('电压边界评估的参考母线电压必须为有限正数。');
+  }
+  const voltagePoints = options.voltagePoints ?? [9, 13.5, 16];
+  if (!Array.isArray(voltagePoints) || voltagePoints.length < 2 ||
+      voltagePoints.some((v) => !Number.isFinite(v) || v <= 0) ||
+      new Set(voltagePoints).size !== voltagePoints.length) {
+    throw new Error('电压边界评估至少需要两个互不重复的有限正母线电压点。');
+  }
+  if (!Number.isFinite(options.ctrl.modDepthM) || options.ctrl.modDepthM < 0) {
+    throw new Error('参考调制度必须为有限非负数。');
+  }
+  const ceiling = getModulationLinearCeiling(options.ctrl.modulation);
+  if (options.ctrl.modDepthM > ceiling + 1e-6) {
+    throw new Error(`参考工况本身已超过 ${options.ctrl.modulation} 线性调制上限（m=${options.ctrl.modDepthM.toFixed(4)}，上限=${ceiling.toFixed(4)}）；不能以不可实现的参考点开展电压边界评估。`);
+  }
+  return voltagePoints.map((vBusV): FocVoltageEnvelopeRow => {
+    const requiredModDepthM = options.ctrl.modDepthM * referenceVoltageV / vBusV;
+    if (requiredModDepthM > ceiling + 1e-6) {
+      return {
+        vBusV,
+        requiredModDepthM,
+        modulationCeiling: ceiling,
+        status: 'VOLTAGE_LIMITED',
+        result: null,
+        note: `维持参考基波电压需要 m=${requiredModDepthM.toFixed(4)}，超过 ${options.ctrl.modulation} 线性上限 ${ceiling.toFixed(4)}；不能假定原 Id/Iq 工作点仍可维持。`,
+      };
+    }
+    try {
+      const result = simulateFoc6MosSteadyState({
+        ...options,
+        ctrl: { ...options.ctrl, vBusConstV: vBusV, modDepthM: requiredModDepthM },
+      });
+      const status: FocVoltageEnvelopeStatus = result.thermalRunaway
+        ? 'THERMAL_RUNAWAY'
+        : !result.steadyConverged ? 'THERMAL_NOT_CONVERGED' : 'CALCULATED';
+      return {
+        vBusV,
+        requiredModDepthM,
+        modulationCeiling: ceiling,
+        status,
+        result,
+        note: status === 'THERMAL_RUNAWAY'
+          ? '热反馈迭代检测到热失控；保留损耗诊断信息，但不提供可用稳态结温。'
+          : status === 'THERMAL_NOT_CONVERGED'
+            ? '热稳态迭代未收敛；当前温度仅为中间迭代值，不得作为稳态结温或设计依据。'
+            : '在固定 Id/Iq、fe、Fsw、PF 和参考基波电压假设下完成稳态计算。',
+      };
+    } catch (error) {
+      const note = error instanceof Error ? error.message : String(error);
+      const isCoverageFailure = /DPT LUT.*(?:OUT_OF_RANGE|越界|超出)|超出 Eoss(?:\(V\))?\/Qoss|曲线定义域|超出 Rds\(on\)-Tj 曲线范围/.test(note);
+      return {
+        vBusV,
+        requiredModDepthM,
+        modulationCeiling: ceiling,
+        status: isCoverageFailure ? 'MODEL_OUT_OF_RANGE' : 'INVALID_INPUT',
+        result: null,
+        note,
+      };
+    }
+  });
+}
+
+/**
  * Main Phase 2 Transient Simulator:
  * Evaluates 6-MOS inverter junction temperatures & losses directly from FOC Ia, Ib, (Ic) + Vbus (+ optional Duty_A/B/C).
  */
@@ -2233,13 +3229,14 @@ export function simulateFoc6Mos(
   if (!Number.isFinite(ctrl.tAmbC) || ctrl.tAmbC <= -273.15 || ctrl.tAmbC > 1000) throw new Error('环境温度必须位于绝对零度以上且不超过 1000°C。');
 
   if (!finiteInRange(mos.rdsOn25Mohm, Number.EPSILON, 1e6)) throw new Error('MOS Rds(on)@25°C 必须为有限正数（mΩ）。');
-  if (!finiteInRange(mos.tempCoeffAlphaPerC, 0, 0.05)) throw new Error('MOS Rds 温度系数必须为 0～0.05 /°C。');
+  if (!mos.rdsOnTempCurve && !finiteInRange(mos.tempCoeffAlphaPerC, 0, 0.05)) throw new Error('MOS Rds 温度系数必须为 0～0.05 /°C；如使用器件曲线，该 α 输入不参与计算。');
+  if (mos.rdsOnTempCurve) validateRdsOnTempCurveForMos(mos);
   if (!finiteInRange(mos.vsdV, 0, 10)) throw new Error('MOS 体二极管压降必须为 0～10 V。');
   if (!finiteInRange(mos.eonPlusEoffUj, 0, 1e9)) throw new Error('MOS Eon+Eoff 必须为非负有限值（µJ）。');
   if (!finiteInRange(mos.vRefV, Number.EPSILON, 1e6) || !finiteInRange(mos.iRefA, Number.EPSILON, 1e6)) {
     throw new Error('MOS 开关能量参考电压 Vref 和参考电流 Iref 必须为有限正数。');
   }
-  if (!finiteInRange(mos.qrrNc, 0, 1e9) || (mos.eossUj !== undefined && !finiteInRange(mos.eossUj, 0, 1e9))) {
+  if (!finiteInRange(mos.qrrNc, 0, 1e9) || (mos.qrrIrefA !== undefined && !finiteInRange(mos.qrrIrefA, Number.EPSILON, 1e6)) || (mos.eossUj !== undefined && !finiteInRange(mos.eossUj, 0, 1e9))) {
     throw new Error('MOS Qrr / Eoss 必须为非负有限值（nC / µJ）。');
   }
 
@@ -3020,9 +4017,12 @@ export function simulateFoc6Mos(
   const steadySolve = solveCoupledThermalSteadyState({
     pCond25W: useTimeAvg
       ? Array.from(sumCond25Energy, (energy) => energy / accumulatedDt)
-      : summaries.map((s) => s.pCondAvgW / Math.max(0.1, 1 + alpha * (s.tjAvgC - 25))),
+      : summaries.map((s) => s.pCondAvgW / Math.max(0.05, getFocMosRdsFactorAtTj(mos, s.tjAvgC))),
     pFixedW: summaries.map((s) => s.pSwAvgW + s.pDeadAvgW),
     alphaPerC: alpha,
+    evalCondFactorAtTj: mos.rdsOnTempCurve
+      ? (tjVec) => tjVec.map((tj) => getFocMosRdsFactorAtTj(mos, tj))
+      : undefined,
     rJcTotalByArm,
     rBrdTotal,
     tAmbC: ctrl.tAmbC,
@@ -3072,6 +4072,8 @@ export function simulateFoc6Mos(
 
   const eossSource: FocSimulationResult['eossSource'] = mos.eossAlreadyIncludedInEsw
     ? 'included_in_esw'
+    : qossCoveredByQr(mos)
+    ? 'included_in_qrr'
     : mos.eossCurve
     ? 'nonlinear_curve'
     : (mos.eossUj ?? 0) > 0
@@ -3079,6 +4081,29 @@ export function simulateFoc6Mos(
     : 'none';
 
   const warnings: string[] = [...alignmentWarnings];
+  const missingLossInputs: string[] = [];
+  const assumptionReasons: string[] = [];
+  const hasSwitchingEnergyInput = hasDptLut || mos.eonPlusEoffUj > 0;
+  if (!hasSwitchingEnergyInput) missingLossInputs.push('Eon+Eoff/DPT');
+  if (!hasDptLut && !mos.eonIncludesQrr && mos.qrrNc <= 0) missingLossInputs.push('Qrr');
+  if (!mos.eossAlreadyIncludedInEsw && !mos.eossCurve && (mos.eossUj ?? 0) <= 0 && !qossCoveredByQr(mos)) missingLossInputs.push('Eoss');
+  if (mos.rdsDataConfirmed !== true) assumptionReasons.push('Rds(on)@25°C 未按目标器件 Vgs/测试条件确认');
+  if (!hasDptLut) assumptionReasons.push('开关损耗采用单点 Eon+Eoff 标量缩放，而非多工况 DPT LUT');
+  if (model.modelKind !== 'datasheet_constrained' || model.zthValidation?.passed !== true) {
+    assumptionReasons.push('热网络未通过目标器件数据手册约束及拆分一致性验证');
+  }
+  if (missingLossInputs.length > 0) {
+    warnings.push(`损耗模型输入不完整：缺少 ${missingLossInputs.join('、')}；对应损耗按 0 处理，P_inv 与 Tj 是已建模损耗下的偏低估算，不得用于器件热设计签核。`);
+  }
+  if (mos.rdsDataConfirmed !== true) {
+    warnings.push('Rds(on)@25°C 当前按界面起算值参与导通损耗计算，但确认框未勾选；结果必须标为假设估算，不能解释为目标 MOS 实测/数据手册参数结果。');
+  }
+  const resultQualification: FocSimulationResult['resultQualification'] = missingLossInputs.length > 0
+    ? 'INCOMPLETE_LOSS_MODEL'
+    : assumptionReasons.length > 0
+    ? 'ASSUMPTION_BASED'
+    : 'DEVICE_PARAMETERIZED';
+  const qualificationReasons = [...missingLossInputs.map((x) => `未提供 ${x} 损耗数据`), ...assumptionReasons];
   if (model.modelKind === 'fallback_default' || model.modelKind === 'demo_builtin' || !model.modelKind) {
     warnings.push(`当前热网络来源为 ${model.modelKind || '未标注模型'}，不是该 MOSFET/PCB 的实测热阻网络；Tj 只可用于方法验证或趋势比较，不得作为器件热设计签核值。`);
   }
@@ -3128,6 +4153,8 @@ export function simulateFoc6Mos(
     }
   } else if (eossSource === 'included_in_esw') {
     warnings.push('已启用 Eoss 防重算保护 (eossAlreadyIncludedInEsw=true)：Esw 已涵盖 Coss 充放电损耗，独立 Eoss 项置零。');
+  } else if (eossSource === 'included_in_qrr') {
+    warnings.push('当前 Qr 按 Nexperia 定义包含 Qoss（Qr=Qs+Qoss），已屏蔽独立 Eoss，避免同一换流电荷重复计量；Qr×Vbus 仍是总恢复能量的一阶近似，不等同于 DPT 波形能量积分。');
   }
   if (partialDutySelected) {
     warnings.push('仅选择了部分外部 Duty 通道，需同时指定 Duty_A / Duty_B / Duty_C 三路才会启用外部占空比，当前已回退为无传感器重构。');
@@ -3194,6 +4221,8 @@ export function simulateFoc6Mos(
   }
 
   return {
+    resultQualification,
+    qualificationReasons,
     time,
     tj,
     pMos,
@@ -3266,6 +4295,8 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
   if (opts.horizonSec !== undefined && !finiteInRange(opts.horizonSec, 1e-3, 3600)) throw new Error('堵转热瞬态计算时域必须在 1ms～3600s。');
   if (opts.tInitialBoardC !== undefined && !finiteInRange(opts.tInitialBoardC, -273.14, 2000)) throw new Error('初始 Board 温度无效。');
   if (opts.rPhaseOhm !== undefined && !finiteInRange(opts.rPhaseOhm, 1e-9, 1e6)) throw new Error('相电阻 R_phase 必须为有限正数。');
+  if (opts.mos.rdsOnTempCurve) validateRdsOnTempCurveForMos(opts.mos);
+  validateMosEnergyAccounting(opts.mos);
   if (!finiteInRange(opts.mos.rdsOn25Mohm, Number.EPSILON, 1e6) ||
       !finiteInRange(opts.mos.tempCoeffAlphaPerC, 0, 0.05) ||
       !finiteInRange(opts.mos.vsdV, 0, 10) ||
@@ -3273,6 +4304,7 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
       !finiteInRange(opts.mos.vRefV, Number.EPSILON, 1e6) ||
       !finiteInRange(opts.mos.iRefA, Number.EPSILON, 1e6) ||
       !finiteInRange(opts.mos.qrrNc, 0, 1e9) ||
+      (opts.mos.qrrIrefA !== undefined && !finiteInRange(opts.mos.qrrIrefA, Number.EPSILON, 1e6)) ||
       (opts.mos.eossUj !== undefined && !finiteInRange(opts.mos.eossUj, 0, 1e9))) {
     throw new Error('堵转扫描 MOS 损耗参数无效；请检查 Rds(on)、温度系数、Vsd、Eon/Eoff、Vref/Iref、Qrr/Eoss。');
   }
@@ -3366,6 +4398,9 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
         lBaseC.pLowSw + lBaseC.pLowDead,
       ],
       alphaPerC: opts.mos.tempCoeffAlphaPerC || 0,
+      evalCondFactorAtTj: opts.mos.rdsOnTempCurve
+        ? (tjVec) => tjVec.map((tj) => getFocMosRdsFactorAtTj(opts.mos, tj))
+        : undefined,
       rJcTotalByArm: rJcByArm,
       rBrdTotal: rBrd,
       tAmbC: opts.tAmbC,
@@ -3556,12 +4591,35 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
     ? Math.max(...opts.initialThermalState!.armT.map((chain) => chain[0]))
     : null;
 
+  const missingLossInputs: string[] = [];
+  const assumptionReasons: string[] = [];
+  const hasDptLutForStall = Boolean(opts.mos.dptLut && opts.mos.dptLut.length > 0);
+  if (!hasDptLutForStall && opts.mos.eonPlusEoffUj <= 0) missingLossInputs.push('Eon+Eoff/DPT');
+  if (!hasDptLutForStall && !opts.mos.eonIncludesQrr && opts.mos.qrrNc <= 0) missingLossInputs.push('Qrr');
+  if (!opts.mos.eossAlreadyIncludedInEsw && !opts.mos.eossCurve && (opts.mos.eossUj ?? 0) <= 0 && !qossCoveredByQr(opts.mos)) missingLossInputs.push('Eoss');
+  if (opts.mos.rdsDataConfirmed !== true) assumptionReasons.push('Rds(on)@25°C 未按目标器件条件确认');
+  if (!hasDptLutForStall) assumptionReasons.push('开关能量采用单点标量缩放，未使用多工况 DPT LUT');
+  if (opts.model.modelKind !== 'datasheet_constrained' || opts.model.zthValidation?.passed !== true) {
+    assumptionReasons.push('热网络未通过目标器件数据手册约束及拆分一致性验证');
+  }
+  const resultQualification: FocResultQualification = missingLossInputs.length > 0
+    ? 'INCOMPLETE_LOSS_MODEL'
+    : assumptionReasons.length > 0
+    ? 'ASSUMPTION_BASED'
+    : 'DEVICE_PARAMETERIZED';
+  const qualificationReasons = [...missingLossInputs.map((x) => `未提供 ${x} 损耗数据`), ...assumptionReasons];
   const thermalSafeAtRequestedCurrent = stallSteadyConverged && !stallThermalRunaway &&
     Number.isFinite(worstSteadyTjC) && worstSteadyTjC <= opts.tjLimitC;
-  // A thermally safe hypothetical current is not an executable operating point
-  // when the required phase voltage exceeds the linear modulation ceiling.
-  const steadySafe = thermalSafeAtRequestedCurrent && !stallVoltageLimited;
+  // Keep the raw thermal-only result for diagnosis, but SAFE is fail-closed unless
+  // the loss inputs and device thermal network are parameterized with explicit evidence.
+  const steadySafe = thermalSafeAtRequestedCurrent && !stallVoltageLimited && resultQualification === 'DEVICE_PARAMETERIZED';
   const stallWarnings: string[] = [];
+  if (resultQualification !== 'DEVICE_PARAMETERIZED') {
+    stallWarnings.push(`堵转热安全等级=${resultQualification}；当前 t_safe/I²t 仅为模型条件估算，原因：${qualificationReasons.join('；')}。steadySafe 已强制为 false，不允许显示 SAFE。`);
+  }
+  if (!opts.mos.rdsDataConfirmed) {
+    stallWarnings.push('Rds(on)@25°C 未确认时仍按当前起算值计算导通损耗；该结果必须按假设估算解释。');
+  }
   if (!stallSteadyConverged) stallWarnings.push('堵转稳态热方程至少一个电角度未收敛；SAFE 判定已强制为 false，不能把稳态温度外推作为安全结论。');
   if (stallThermalRunaway) stallWarnings.push('堵转角度扫描检测到热失控；应按非安全工况处理。');
   if (stallVoltageLimited) stallWarnings.push('目标 I_pk 在当前 Vbus、R_phase 和 SVPWM 线性电压能力下不可实现；本次热结果仍按用户请求电流强制计算，只能作为条件性上界估算，不得据此判定实际可运行工况 SAFE。');
@@ -3576,6 +4634,8 @@ export function runFocStallSweep(opts: FocStallSweepOptions): FocStallSweepResul
   const i2tWorstLegA2s = tSafeSec !== null ? phaseSquaredRatioAtTransientWorst * iRmsSq * tSafeSec : null;
 
   return {
+    resultQualification,
+    qualificationReasons,
     anglesDeg,
     steadyMaxTjPerAngle,
     worstAngleDeg,

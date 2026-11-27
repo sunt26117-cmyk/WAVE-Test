@@ -14,6 +14,7 @@ import {
   isLtspiceExportText,
   parseLtspiceText,
 } from '../parsers/ltspiceParser';
+import { computeTemporalCoverage } from './temporalCompare';
 import {
   DEFAULT_SAMPLING_GAP_FACTOR,
   resolveUnitPairCompatibility,
@@ -103,9 +104,17 @@ export interface AlignedCompareResult {
   invalidCount: number;
   gapSkippedCount: number;
   coveragePct: number;
+  coveredDurationSec: number;
+  targetDurationSec: number;
   unitScaleApplied: number;
   targetMeanApplied: number;
   refMeanApplied: number;
+  /** Union of both source time grids in target seconds; preserves fast reference edges between target samples. */
+  metricT?: Float64Array;
+  metricTargetV?: Float64Array;
+  metricRefV?: Float64Array;
+  metricIntervalValid?: Uint8Array;
+  metricGridWarning?: string;
 }
 
 export interface WaveformCompareMetrics {
@@ -116,6 +125,8 @@ export interface WaveformCompareMetrics {
   totalSamples: number;
   invalidCount: number;
   coveragePct: number;
+  coveredDurationSec: number;
+  targetDurationSec: number;
   rmse: number | null;
   mae: number | null;
   maxAbsDiff: number | null;
@@ -210,6 +221,173 @@ export function detectRecommendedTimeScale(
   return { timeScale: exactScale, ratio, isLargeMismatch: true };
 }
 
+interface CompareMetricGrid {
+  metricT: Float64Array;
+  metricTargetV: Float64Array;
+  metricRefV: Float64Array;
+  metricIntervalValid: Uint8Array;
+}
+
+/**
+ * Builds the union of the target and transformed reference breakpoints. Sampling only on
+ * the target grid can completely miss a short pulse/edge in a faster reference recording.
+ * This grid keeps every piecewise-linear knot from both captures, while rejecting intervals
+ * whose midpoint falls inside a NaN or acquisition gap in either source.
+ */
+function buildCompareMetricGrid(
+  targetCh: WaveformChannel,
+  refCh: WaveformChannel,
+  timeShiftSec: number,
+  timeScale: number,
+  refScaleToTarget: number,
+  targetGapSec: number,
+  refGapSec: number
+): CompareMetricGrid | null {
+  const targetT = targetCh.t;
+  const refT = refCh.t;
+  const refT0 = refT[0];
+  const targetStart = targetT[0];
+  const targetEnd = targetT[targetT.length - 1];
+  const refStart = refT0 + timeShiftSec;
+  const refEnd = refT0 + (refT[refT.length - 1] - refT0) * timeScale + timeShiftSec;
+  const commonStart = Math.max(targetStart, refStart);
+  const commonEnd = Math.min(targetEnd, refEnd);
+  if (!(commonEnd > commonStart)) return null;
+
+  const maxCount = targetT.length + refT.length + 2;
+  // Avoid an unbounded second copy for very large imported files. The caller retains the
+  // target-grid result and surfaces the fact that full union-knot evaluation was skipped.
+  if (maxCount > 2_500_000) return null;
+  const merged = new Float64Array(maxCount);
+  let count = 0;
+  const append = (value: number) => {
+    if (!Number.isFinite(value) || value < commonStart || value > commonEnd) return;
+    if (count === 0) {
+      merged[count++] = value;
+      return;
+    }
+    const last = merged[count - 1];
+    const tol = Math.max(1e-14, 4 * Number.EPSILON * Math.max(Math.abs(value), Math.abs(last)));
+    if (value - last > tol) merged[count++] = value;
+  };
+  append(commonStart);
+
+  const lowerBound = (arr: Float64Array, value: number): number => {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (arr[mid] < value) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+
+  let i = lowerBound(targetT, commonStart);
+  const queryStart = refT0 + (commonStart - timeShiftSec - refT0) / timeScale;
+  let j = lowerBound(refT, queryStart);
+  while (i < targetT.length || j < refT.length) {
+    const nextTarget = i < targetT.length ? targetT[i] : Infinity;
+    const nextRef = j < refT.length
+      ? refT0 + (refT[j] - refT0) * timeScale + timeShiftSec
+      : Infinity;
+    const next = Math.min(nextTarget, nextRef);
+    if (!(next < commonEnd)) break;
+    append(next);
+    const tol = Math.max(1e-14, 4 * Number.EPSILON * Math.max(Math.abs(next), 1));
+    if (Number.isFinite(nextTarget) && Math.abs(nextTarget - next) <= tol) i++;
+    if (Number.isFinite(nextRef) && Math.abs(nextRef - next) <= tol) j++;
+  }
+  append(commonEnd);
+  const metricT = merged.slice(0, count);
+  if (metricT.length < 2) return null;
+
+  const targetMean = targetCh.coupling === 'AC' ? computeChannelMean(targetCh) : 0;
+  const refMean = refCh.coupling === 'AC' ? computeChannelMean(refCh) : 0;
+  const metricTargetV = new Float64Array(metricT.length);
+  const metricRefV = new Float64Array(metricT.length);
+  metricTargetV.fill(Number.NaN);
+  metricRefV.fill(Number.NaN);
+
+  // The union grid is sorted, so monotonic cursors keep interpolation O(N), rather than
+  // performing a binary search for every knot in both channels and again at every midpoint.
+  const makeSequentialSampler = (
+    times: Float64Array,
+    ch: WaveformChannel,
+    mean: number,
+    gapThresholdSec: number
+  ) => {
+    let cursor = 0;
+    return (qTime: number): { value: number; reason: 'ok' | 'out-of-range' | 'gap' | 'nan' | 'invalid' } => {
+      const n = times.length;
+      if (!Number.isFinite(qTime) || n === 0) return { value: Number.NaN, reason: 'invalid' };
+      if (qTime < times[0] || qTime > times[n - 1]) return { value: Number.NaN, reason: 'out-of-range' };
+      if (n === 1) {
+        const value = getChannelDisplayValue(ch, 0, mean);
+        return Number.isFinite(value) ? { value, reason: 'ok' } : { value: Number.NaN, reason: 'nan' };
+      }
+      while (cursor < n - 2 && times[cursor + 1] < qTime) cursor++;
+      const t0 = times[cursor], t1 = times[cursor + 1];
+      const tol = 1e-15 * Math.max(1, Math.abs(qTime));
+      if (Math.abs(qTime - t0) <= tol) {
+        const value = getChannelDisplayValue(ch, cursor, mean);
+        return Number.isFinite(value) ? { value, reason: 'ok' } : { value: Number.NaN, reason: 'nan' };
+      }
+      if (Math.abs(qTime - t1) <= tol) {
+        const value = getChannelDisplayValue(ch, cursor + 1, mean);
+        return Number.isFinite(value) ? { value, reason: 'ok' } : { value: Number.NaN, reason: 'nan' };
+      }
+      const dt = t1 - t0;
+      if (!(dt > 0) || !Number.isFinite(dt)) return { value: Number.NaN, reason: 'invalid' };
+      if (dt > gapThresholdSec) return { value: Number.NaN, reason: 'gap' };
+      const v0 = getChannelDisplayValue(ch, cursor, mean);
+      const v1 = getChannelDisplayValue(ch, cursor + 1, mean);
+      if (!Number.isFinite(v0) || !Number.isFinite(v1)) return { value: Number.NaN, reason: 'nan' };
+      const frac = (qTime - t0) / dt;
+      return { value: v0 + frac * (v1 - v0), reason: 'ok' };
+    };
+  };
+  const sampleTarget = makeSequentialSampler(targetT, targetCh, targetMean, targetGapSec);
+  const sampleRef = makeSequentialSampler(refT, refCh, refMean, refGapSec);
+  const sampleBoth = (time: number) => {
+    const targetSample = sampleTarget(time);
+    const refQuery = refT0 + (time - timeShiftSec - refT0) / timeScale;
+    const refSample = sampleRef(refQuery);
+    return {
+      target: targetSample.value,
+      reference: Number.isFinite(refSample.value) ? refSample.value * refScaleToTarget : Number.NaN,
+      valid: targetSample.reason === 'ok' && refSample.reason === 'ok' &&
+        Number.isFinite(targetSample.value) && Number.isFinite(refSample.value),
+    };
+  };
+
+  for (let k = 0; k < metricT.length; k++) {
+    const sampled = sampleBoth(metricT[k]);
+    if (sampled.valid) {
+      metricTargetV[k] = sampled.target;
+      metricRefV[k] = sampled.reference;
+    }
+  }
+
+  const metricIntervalValid = new Uint8Array(metricT.length - 1);
+  const sampleTargetMid = makeSequentialSampler(targetT, targetCh, targetMean, targetGapSec);
+  const sampleRefMid = makeSequentialSampler(refT, refCh, refMean, refGapSec);
+  for (let k = 0; k < metricIntervalValid.length; k++) {
+    const dt = metricT[k + 1] - metricT[k];
+    if (!(dt > 0) || !Number.isFinite(dt) ||
+        !Number.isFinite(metricTargetV[k]) || !Number.isFinite(metricTargetV[k + 1]) ||
+        !Number.isFinite(metricRefV[k]) || !Number.isFinite(metricRefV[k + 1])) continue;
+    // Midpoint validation is deliberate: finite endpoints do not prove that the segment
+    // between them is valid if the original capture contains a dropped-sample gap.
+    const mid = (metricT[k] + metricT[k + 1]) / 2;
+    const targetMid = sampleTargetMid(mid);
+    const refQuery = refT0 + (mid - timeShiftSec - refT0) / timeScale;
+    const refMid = sampleRefMid(refQuery);
+    if (targetMid.reason === 'ok' && refMid.reason === 'ok') metricIntervalValid[k] = 1;
+  }
+
+  return { metricT, metricTargetV, metricRefV, metricIntervalValid };
+}
+
 /**
  * Aligns refCh onto targetCh.t grid with optional timeShiftSec (ref shifted forward by +timeShiftSec),
  * optional timeScale (scales ref relative to refCh.t[0], e.g. 0.001 for ms->s), SI unit normalization,
@@ -242,6 +420,8 @@ export function alignAndInterpolateReference(
       invalidCount: tgtIntegrity.valid ? nT : 0,
       gapSkippedCount: 0,
       coveragePct: 0,
+      coveredDurationSec: 0,
+      targetDurationSec: nT >= 2 ? Math.max(0, targetCh.t[nT - 1] - targetCh.t[0]) : 0,
       unitScaleApplied: 1,
       targetMeanApplied: 0,
       refMeanApplied: 0,
@@ -261,6 +441,8 @@ export function alignAndInterpolateReference(
       invalidCount: nT,
       gapSkippedCount: 0,
       coveragePct: 0,
+      coveredDurationSec: 0,
+      targetDurationSec: nT >= 2 ? Math.max(0, targetCh.t[nT - 1] - targetCh.t[0]) : 0,
       unitScaleApplied: 1,
       targetMeanApplied: 0,
       refMeanApplied: 0,
@@ -277,8 +459,6 @@ export function alignAndInterpolateReference(
   let overlapCount = 0;
   let invalidCount = 0;
   let gapSkippedCount = 0;
-  let sumT = 0;
-  let sumR = 0;
 
   for (let i = 0; i < nT; i++) {
     const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
@@ -288,19 +468,39 @@ export function alignAndInterpolateReference(
     if (sampled.isGap) gapSkippedCount++;
     if (isFinite(tv) && isFinite(rv)) {
       alignedRefV[i] = rv;
-      sumT += tv;
-      sumR += rv;
       overlapCount++;
     } else {
       invalidCount++;
     }
   }
 
+  const validMask = new Uint8Array(nT);
+  for (let i = 0; i < nT; i++) {
+    const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
+    validMask[i] = Number.isFinite(tv) && Number.isFinite(alignedRefV[i]) ? 1 : 0;
+  }
+  const temporalCoverage = computeTemporalCoverage(
+    targetCh.t,
+    validMask,
+    tgtIntegrity.timebase.gapThresholdSec
+  );
+
   let targetShift = 0;
   let refShift = 0;
-  if (removeDcOffset && overlapCount > 0) {
-    targetShift = sumT / overlapCount;
-    refShift = sumR / overlapCount;
+  if (removeDcOffset && temporalCoverage.coveredDurationSec > 0) {
+    let targetIntegral = 0;
+    let refIntegral = 0;
+    for (const i of temporalCoverage.intervalIndices) {
+      const dt = targetCh.t[i + 1] - targetCh.t[i];
+      const tv0 = getChannelDisplayValue(targetCh, i, targetAcMean);
+      const tv1 = getChannelDisplayValue(targetCh, i + 1, targetAcMean);
+      const rv0 = alignedRefV[i];
+      const rv1 = alignedRefV[i + 1];
+      targetIntegral += dt * (tv0 + tv1) / 2;
+      refIntegral += dt * (rv0 + rv1) / 2;
+    }
+    targetShift = targetIntegral / temporalCoverage.coveredDurationSec;
+    refShift = refIntegral / temporalCoverage.coveredDurationSec;
   }
 
   for (let i = 0; i < nT; i++) {
@@ -308,19 +508,43 @@ export function alignAndInterpolateReference(
     if (!isFinite(rv)) continue;
     const tv = getChannelDisplayValue(targetCh, i, targetAcMean) - targetShift;
     const adjR = rv - refShift;
-    if (removeDcOffset) {
-      alignedRefV[i] = adjR + targetShift;
-    }
+    if (removeDcOffset) alignedRefV[i] = adjR + targetShift;
     diffV[i] = tv - adjR;
   }
-
-  const coveragePct = nT > 0 ? (overlapCount / nT) * 100 : 0;
-  const hasEnough = overlapCount >= 2 || (nT === 1 && overlapCount === 1);
+  const metricGridLimitExceeded = targetCh.t.length + refCh.t.length + 2 > 2_500_000;
+  const metricGrid = metricGridLimitExceeded ? null : buildCompareMetricGrid(
+    targetCh, refCh, timeShiftSec, safeScale, refScaleToTarget,
+    tgtIntegrity.timebase.gapThresholdSec, refIntegrity.timebase.gapThresholdSec
+  );
+  let coveredDurationSec = temporalCoverage.coveredDurationSec;
+  let coveragePct = temporalCoverage.coveragePct;
+  let hasEnough = coveredDurationSec > 0 && overlapCount >= 2;
+  if (metricGrid) {
+    coveredDurationSec = 0;
+    let validMetricIntervals = 0;
+    for (let i = 0; i < metricGrid.metricIntervalValid.length; i++) {
+      if (!metricGrid.metricIntervalValid[i]) continue;
+      const dt = metricGrid.metricT[i + 1] - metricGrid.metricT[i];
+      if (dt > 0 && Number.isFinite(dt)) {
+        coveredDurationSec += dt;
+        validMetricIntervals++;
+      }
+    }
+    const targetDuration = Math.max(0, targetCh.t[nT - 1] - targetCh.t[0]);
+    coveragePct = targetDuration > 0 ? Math.max(0, Math.min(100, coveredDurationSec / targetDuration * 100)) : 0;
+    // A shorter, faster reference may overlap between two coarse target samples. The
+    // union-grid interval is still a legitimate comparison interval even when no target
+    // sample lands inside it; acceptance is separately controlled by Golden minCoverage.
+    hasEnough = coveredDurationSec > 0 && validMetricIntervals > 0;
+  }
+  if (metricGridLimitExceeded) hasEnough = false;
 
   return {
     valid: hasEnough,
     status: hasEnough ? 'OK' : 'INSUFFICIENT_DATA',
-    invalidReason: hasEnough ? null : 'No sufficient finite overlapping points between target and reference.',
+    invalidReason: hasEnough ? null : metricGridLimitExceeded
+      ? '目标与参考数据合计超过 250 万联合时间节点上限。为避免高采样率参考中的窄脉冲被漏检，已阻止本次 Compare/Golden 判定；请缩小分析时间窗后重试。'
+      : '没有足够的连续、共同有效时间区间可进行比较（孤立点或采样缺口不计入有效覆盖）。',
     alignedRefV,
     diffV,
     overlapCount,
@@ -328,9 +552,15 @@ export function alignAndInterpolateReference(
     invalidCount,
     gapSkippedCount,
     coveragePct,
+    coveredDurationSec,
+    targetDurationSec: temporalCoverage.totalDurationSec,
     unitScaleApplied: refScaleToTarget,
     targetMeanApplied: targetShift,
     refMeanApplied: refShift,
+    ...(metricGrid || {}),
+    ...(!metricGrid && targetCh.t.length + refCh.t.length > 2_500_000
+      ? { metricGridWarning: '目标与参考数据合计超过 250 万联合时间节点上限；本次 Compare/Golden 定量判定已阻止，请缩小分析时间窗后重试。' }
+      : {}),
   };
 }
 
@@ -602,7 +832,7 @@ export function computeWaveformCompareMetrics(
   targetCh: WaveformChannel,
   alignedRefV: Float32Array,
   removeDcOffset: boolean = false,
-  alignedContext?: Pick<AlignedCompareResult, 'valid' | 'status' | 'invalidReason'>
+  alignedContext?: Pick<AlignedCompareResult, 'valid' | 'status' | 'invalidReason' | 'metricT' | 'metricTargetV' | 'metricRefV' | 'metricIntervalValid'>
 ): WaveformCompareMetrics {
   const mkEmpty = (status: CompareStatus, invalidReason?: string | null, total = 0, invalidCnt = total): WaveformCompareMetrics => ({
     valid: false,
@@ -612,6 +842,8 @@ export function computeWaveformCompareMetrics(
     totalSamples: total,
     invalidCount: invalidCnt,
     coveragePct: 0,
+    coveredDurationSec: 0,
+    targetDurationSec: total >= 2 && targetCh?.t?.length === total ? Math.max(0, targetCh.t[total - 1] - targetCh.t[0]) : 0,
     rmse: null,
     mae: null,
     maxAbsDiff: null,
@@ -623,108 +855,224 @@ export function computeWaveformCompareMetrics(
     refVpp: null,
   });
 
+  const metricT = alignedContext?.metricT;
+  const metricTargetV = alignedContext?.metricTargetV;
+  const metricRefV = alignedContext?.metricRefV;
+  const metricIntervalValid = alignedContext?.metricIntervalValid;
+  if (metricT && metricTargetV && metricRefV && metricIntervalValid &&
+      metricT.length >= 2 && metricTargetV.length === metricT.length &&
+      metricRefV.length === metricT.length && metricIntervalValid.length === metricT.length - 1) {
+    const targetDurationSec = targetCh?.t?.length >= 2
+      ? Math.max(0, targetCh.t[targetCh.t.length - 1] - targetCh.t[0])
+      : 0;
+    const usedMask = new Uint8Array(metricT.length);
+    const validIntervals: number[] = [];
+    let duration = 0;
+    for (let i = 0; i < metricIntervalValid.length; i++) {
+      const dt = metricT[i + 1] - metricT[i];
+      if (!metricIntervalValid[i] || !(dt > 0) ||
+          !Number.isFinite(metricTargetV[i]) || !Number.isFinite(metricTargetV[i + 1]) ||
+          !Number.isFinite(metricRefV[i]) || !Number.isFinite(metricRefV[i + 1])) continue;
+      validIntervals.push(i);
+      duration += dt;
+      usedMask[i] = 1;
+      usedMask[i + 1] = 1;
+    }
+    if (!(duration > 0) || validIntervals.length === 0) {
+      return {
+        ...mkEmpty('INSUFFICIENT_DATA', '两份记录没有连续、共同有效的时间区间；孤立点和采样缺口不参与比较。', metricT.length, metricT.length),
+        targetDurationSec,
+      };
+    }
+
+    let intT = 0, intR = 0, intT2 = 0, intR2 = 0, intTR = 0;
+    let minT = Infinity, maxT = -Infinity, minR = Infinity, maxR = -Infinity;
+    let comparedSamples = 0;
+    for (let i = 0; i < metricT.length; i++) {
+      if (!usedMask[i]) continue;
+      comparedSamples++;
+      minT = Math.min(minT, metricTargetV[i]); maxT = Math.max(maxT, metricTargetV[i]);
+      minR = Math.min(minR, metricRefV[i]); maxR = Math.max(maxR, metricRefV[i]);
+    }
+    for (const i of validIntervals) {
+      const dt = metricT[i + 1] - metricT[i];
+      const x0 = metricTargetV[i], x1 = metricTargetV[i + 1];
+      const y0 = metricRefV[i], y1 = metricRefV[i + 1];
+      intT += dt * (x0 + x1) / 2;
+      intR += dt * (y0 + y1) / 2;
+      intT2 += dt * (x0 * x0 + x0 * x1 + x1 * x1) / 3;
+      intR2 += dt * (y0 * y0 + y0 * y1 + y1 * y1) / 3;
+      intTR += dt * (2 * x0 * y0 + x0 * y1 + x1 * y0 + 2 * x1 * y1) / 6;
+    }
+    const meanT = intT / duration;
+    const meanR = intR / duration;
+    const dcShift = removeDcOffset ? meanT - meanR : 0;
+    let errorSqIntegral = 0, absErrorIntegral = 0, maxAbs = -1, maxAbsTime: number | null = null;
+    let maxAbsIndex: number | null = null;
+    const nearestTargetIndex = (time: number): number => {
+      let lo = 0, hi = targetCh.t.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (targetCh.t[mid] < time) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo <= 0) return 0;
+      if (lo >= targetCh.t.length) return targetCh.t.length - 1;
+      return Math.abs(targetCh.t[lo] - time) < Math.abs(targetCh.t[lo - 1] - time) ? lo : lo - 1;
+    };
+    for (const i of validIntervals) {
+      const dt = metricT[i + 1] - metricT[i];
+      const x0 = metricTargetV[i], x1 = metricTargetV[i + 1];
+      const y0 = metricRefV[i] + dcShift, y1 = metricRefV[i + 1] + dcShift;
+      const d0 = x0 - y0, d1 = x1 - y1;
+      errorSqIntegral += dt * (d0 * d0 + d0 * d1 + d1 * d1) / 3;
+      const a0 = Math.abs(d0), a1 = Math.abs(d1);
+      absErrorIntegral += d0 * d1 < 0
+        ? dt * (d0 * d0 + d1 * d1) / (2 * (a0 + a1))
+        : dt * (a0 + a1) / 2;
+      if (a0 > maxAbs) {
+        maxAbs = a0; maxAbsTime = metricT[i]; maxAbsIndex = nearestTargetIndex(metricT[i]);
+      }
+      if (a1 > maxAbs) {
+        maxAbs = a1; maxAbsTime = metricT[i + 1]; maxAbsIndex = nearestTargetIndex(metricT[i + 1]);
+      }
+    }
+    const cov = intTR - intT * intR / duration;
+    const varT = Math.max(0, intT2 - intT * intT / duration);
+    const varR = Math.max(0, intR2 - intR * intR / duration);
+    const corrDenom = Math.sqrt(varT * varR);
+    const targetVpp = Number.isFinite(maxT - minT) ? maxT - minT : null;
+    const refVpp = Number.isFinite(maxR - minR) ? maxR - minR : null;
+    const refScale = Math.max(targetVpp || 0, refVpp || 0, 1e-12);
+    const rmse = Math.sqrt(Math.max(0, errorSqIntegral / duration));
+    const mae = absErrorIntegral / duration;
+    return {
+      valid: true,
+      status: 'OK',
+      invalidReason: null,
+      comparedSamples,
+      totalSamples: metricT.length,
+      invalidCount: metricT.length - comparedSamples,
+      coveragePct: targetDurationSec > 0 ? Math.max(0, Math.min(100, duration / targetDurationSec * 100)) : 0,
+      coveredDurationSec: duration,
+      targetDurationSec,
+      rmse,
+      mae,
+      maxAbsDiff: maxAbs >= 0 ? maxAbs : null,
+      maxAbsDiffTime: maxAbsTime,
+      maxAbsDiffIndex: maxAbsIndex,
+      correlation: corrDenom > 1e-18 ? Math.max(-1, Math.min(1, cov / corrDenom)) : null,
+      similarityPct: targetVpp !== null && refScale > 1e-12 ? Math.max(0, Math.min(100, (1 - rmse / refScale) * 100)) : null,
+      targetVpp,
+      refVpp,
+    };
+  }
+
   if (alignedContext && !alignedContext.valid && alignedContext.status === 'INVALID') {
     return mkEmpty('INVALID', alignedContext.invalidReason, targetCh?.t?.length || 0);
   }
-
   const tgtInt = validateChannelIntegrity(targetCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
-  if (!tgtInt.valid) {
-    return mkEmpty('INVALID', tgtInt.invalidReason);
-  }
+  if (!tgtInt.valid) return mkEmpty('INVALID', tgtInt.invalidReason);
 
   const n = targetCh.t.length;
   if (alignedRefV.length !== n) {
-    return mkEmpty(
-      'INVALID',
-      `Aligned reference length (${alignedRefV.length}) does not match target length (${n}).`,
-      n
-    );
+    return mkEmpty('INVALID', `Aligned reference length (${alignedRefV.length}) does not match target length (${n}).`, n);
   }
 
   const targetAcMean = targetCh.coupling === 'AC' ? computeChannelMean(targetCh) : 0;
-  let count = 0;
-  let invalidCount = 0;
-  let sumT = 0;
-  let sumR = 0;
-  let minT = Infinity;
-  let maxT = -Infinity;
-  let minR = Infinity;
-  let maxR = -Infinity;
-
+  const targetValues = new Float64Array(n);
+  const refValues = new Float64Array(n);
+  const validMask = new Uint8Array(n);
+  let finitePointCount = 0;
   for (let i = 0; i < n; i++) {
     const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
     const rv = alignedRefV[i];
-    if (!isFinite(tv) || !isFinite(rv)) {
-      invalidCount++;
-      continue;
+    targetValues[i] = tv;
+    refValues[i] = rv;
+    if (Number.isFinite(tv) && Number.isFinite(rv)) {
+      validMask[i] = 1;
+      finitePointCount++;
     }
-    sumT += tv;
-    sumR += rv;
-    if (tv < minT) minT = tv;
-    if (tv > maxT) maxT = tv;
-    if (rv < minR) minR = rv;
-    if (rv > maxR) maxR = rv;
-    count++;
   }
 
-  if (count === 0) {
-    return mkEmpty('INSUFFICIENT_DATA', 'No finite overlapping samples to compare.', n, invalidCount);
+  const temporal = computeTemporalCoverage(targetCh.t, validMask, tgtInt.timebase.gapThresholdSec);
+  const duration = temporal.coveredDurationSec;
+  if (!(duration > 0) || temporal.intervalIndices.length === 0) {
+    return {
+      ...mkEmpty('INSUFFICIENT_DATA', '没有连续有效时间区间；仅有孤立重叠点不能计算有工程意义的 RMSE/MAE。', n, n - finitePointCount),
+      coveragePct: temporal.coveragePct,
+      coveredDurationSec: 0,
+      targetDurationSec: temporal.totalDurationSec,
+    };
   }
 
-  const meanT = sumT / count;
-  const meanR = sumR / count;
+  // Integrate piecewise-linear signals over time. This prevents densely sampled
+  // regions from dominating metrics merely because they contain more samples.
+  let intT = 0, intR = 0, intT2 = 0, intR2 = 0, intTR = 0;
+  let minT = Infinity, maxT = -Infinity, minR = Infinity, maxR = -Infinity;
+  const usedMask = temporal.coveredSampleMask;
+  let comparedSamples = 0;
+  for (let i = 0; i < n; i++) {
+    if (!usedMask[i]) continue;
+    comparedSamples++;
+    minT = Math.min(minT, targetValues[i]); maxT = Math.max(maxT, targetValues[i]);
+    minR = Math.min(minR, refValues[i]); maxR = Math.max(maxR, refValues[i]);
+  }
+  for (const i of temporal.intervalIndices) {
+    const dt = targetCh.t[i + 1] - targetCh.t[i];
+    const x0 = targetValues[i], x1 = targetValues[i + 1];
+    const y0 = refValues[i], y1 = refValues[i + 1];
+    intT += dt * (x0 + x1) / 2;
+    intR += dt * (y0 + y1) / 2;
+    intT2 += dt * (x0 * x0 + x0 * x1 + x1 * x1) / 3;
+    intR2 += dt * (y0 * y0 + y0 * y1 + y1 * y1) / 3;
+    intTR += dt * (2 * x0 * y0 + x0 * y1 + x1 * y0 + 2 * x1 * y1) / 6;
+  }
+  const meanT = intT / duration;
+  const meanR = intR / duration;
   const dcShift = removeDcOffset ? meanT - meanR : 0;
-
-  let sumSqErr = 0;
-  let sumAbsErr = 0;
+  let errorSqIntegral = 0;
+  let absErrorIntegral = 0;
   let maxAbs = -1;
   let maxIdx = 0;
-  let cov = 0;
-  let varT = 0;
-  let varR = 0;
-
-  for (let i = 0; i < n; i++) {
-    const tv = getChannelDisplayValue(targetCh, i, targetAcMean);
-    const rv = alignedRefV[i];
-    if (!isFinite(tv) || !isFinite(rv)) continue;
-
-    const adjR = rv + dcShift;
-    const err = tv - adjR;
-    const absErr = Math.abs(err);
-    sumSqErr += err * err;
-    sumAbsErr += absErr;
-    if (absErr > maxAbs) {
-      maxAbs = absErr;
-      maxIdx = i;
-    }
-
-    const dtVal = tv - meanT;
-    const drVal = rv - meanR;
-    cov += dtVal * drVal;
-    varT += dtVal * dtVal;
-    varR += drVal * drVal;
+  for (const i of temporal.intervalIndices) {
+    const dt = targetCh.t[i + 1] - targetCh.t[i];
+    const x0 = targetValues[i], x1 = targetValues[i + 1];
+    const y0 = refValues[i] + dcShift, y1 = refValues[i + 1] + dcShift;
+    const d0 = x0 - y0, d1 = x1 - y1;
+    errorSqIntegral += dt * (d0 * d0 + d0 * d1 + d1 * d1) / 3;
+    const a0 = Math.abs(d0), a1 = Math.abs(d1);
+    absErrorIntegral += d0 * d1 < 0
+      ? dt * (d0 * d0 + d1 * d1) / (2 * (a0 + a1))
+      : dt * (a0 + a1) / 2;
+    if (a0 > maxAbs) { maxAbs = a0; maxIdx = i; }
+    if (a1 > maxAbs) { maxAbs = a1; maxIdx = i + 1; }
   }
 
-  const rmse = Math.sqrt(sumSqErr / count);
-  const mae = sumAbsErr / count;
+  const rmse = Math.sqrt(Math.max(0, errorSqIntegral / duration));
+  const mae = absErrorIntegral / duration;
+  const cov = intTR - (intT * intR / duration);
+  const varT = Math.max(0, intT2 - (intT * intT / duration));
+  const varR = Math.max(0, intR2 - (intR * intR / duration));
   const denomCorr = Math.sqrt(varT * varR);
   const correlation = denomCorr > 1e-18 ? Math.max(-1, Math.min(1, cov / denomCorr)) : null;
-  const targetVpp = isFinite(maxT - minT) ? maxT - minT : null;
-  const refVpp = isFinite(maxR - minR) ? maxR - minR : null;
+  const targetVpp = Number.isFinite(maxT - minT) ? maxT - minT : null;
+  const refVpp = Number.isFinite(maxR - minR) ? maxR - minR : null;
   const refScale = Math.max(targetVpp || 0, refVpp || 0, 1e-12);
-  const similarityPct =
-    targetVpp !== null && refScale > 1e-12
-      ? Math.max(0, Math.min(100, (1 - rmse / refScale) * 100))
-      : null;
+  const similarityPct = targetVpp !== null && refScale > 1e-12
+    ? Math.max(0, Math.min(100, (1 - rmse / refScale) * 100))
+    : null;
 
   return {
     valid: true,
     status: 'OK',
     invalidReason: null,
-    comparedSamples: count,
+    comparedSamples,
     totalSamples: n,
-    invalidCount,
-    coveragePct: n > 0 ? (count / n) * 100 : 0,
+    invalidCount: n - comparedSamples,
+    coveragePct: temporal.coveragePct,
+    coveredDurationSec: duration,
+    targetDurationSec: temporal.totalDurationSec,
     rmse,
     mae,
     maxAbsDiff: maxAbs >= 0 ? maxAbs : null,

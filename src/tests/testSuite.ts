@@ -56,6 +56,8 @@ import {
   detectRecommendedTimeScale,
 } from '../modules/waveformCompare';
 import { serializeSession, deserializeSession } from '../engine/session';
+import { mergeExcelChannelsByTime } from '../modules/excelTimeAlignment';
+import { excelSerialDateToEpochSec, parseExcelDateTimeText } from '../parsers/excelParser';
 import { escapeHtml, escapeCsvCell } from '../utils/html';
 import {
   analyzeThreePhaseBalance,
@@ -2854,7 +2856,101 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 43: Channel Δt Time Shift Isolation & Reset
+  // Test 43: Excel 1900/1904 date systems and timezone-neutral date strings
+  try {
+    const serial1900 = excelSerialDateToEpochSec(25569, false);
+    const serial1904 = excelSerialDateToEpochSec(24107, true);
+    const naiveDate = parseExcelDateTimeText('1970-01-01 00:00:00');
+    const zonedDate = parseExcelDateTimeText('1970-01-01T08:00:00+08:00');
+    const fractionalDate = parseExcelDateTimeText('1970-01-01 00:00:01.250');
+    const passed = serial1900 === 0 && serial1904 === 0 && naiveDate === 0 && zonedDate === 0 && Math.abs((fractionalDate || 0) - 1.25) < 1e-9;
+    results.push({
+      name: 'Excel Date Base: 1900/1904 Systems / ISO Wall-Clock Alignment',
+      passed,
+      message: `1900=${serial1900}, 1904=${serial1904}, naive=${naiveDate}, zoned=${zonedDate}, fractional=${fractionalDate}`,
+    });
+  } catch (err: any) {
+    results.push({ name: 'Excel Date Base: 1900/1904 Systems / ISO Wall-Clock Alignment', passed: false, message: `Exception: ${err.message}` });
+  }
+
+  // Test 44: Multi-Workbook Excel Merge Preserves Independent Time Axes
+  try {
+    const makeChannel = (id: string, tValues: number[]): WaveformChannel => {
+      const t = new Float64Array(tValues);
+      return {
+        id,
+        name: id,
+        unit: 'A',
+        color: '#facc15',
+        visible: true,
+        t,
+        v: new Float32Array(tValues.map((_, i) => i + 1)),
+        rawT: new Float64Array(tValues),
+        fs: 1 / (tValues[1] - tValues[0]),
+        dt: tValues[1] - tValues[0],
+        metadata: analyzeSamplingQuality(t),
+        isMath: false,
+        sourceChannelIds: [],
+        vMin: 0,
+        vMax: 5,
+      };
+    };
+    const a = makeChannel('Ia', [10, 10.1, 10.2]);
+    const b = makeChannel('Ib', [10.02, 10.12, 10.22]);
+    const date = makeChannel('Vbus', [0, 0.05, 0.1]);
+    const merged = mergeExcelChannelsByTime([
+      { fileName: 'run-a.xlsx', sheetName: 'Data', channels: { Ia: a }, drawOrder: ['Ia'], timeOriginKind: 'numeric' },
+      { fileName: 'run-b.xlsx', sheetName: 'Data', channels: { Ib: b }, drawOrder: ['Ib'], timeOriginKind: 'numeric' },
+      { fileName: 'run-c.xlsx', sheetName: 'Data', channels: { Vbus: date }, drawOrder: ['Vbus'], timeOriginSec: 1_800_000_000, timeOriginKind: 'absolute-date' },
+    ], ['#facc15', '#22d3ee'], 'preserve');
+    const preservedIndependentAxes =
+      merged.drawOrder.length === 3 &&
+      Math.abs(merged.channels[merged.drawOrder[0]].t[0] - 10) < 1e-12 &&
+      Math.abs(merged.channels[merged.drawOrder[1]].t[0] - 10.02) < 1e-12 &&
+      Math.abs(merged.channels[merged.drawOrder[2]].t[0] - 1_800_000_000) < 1e-6 &&
+      Math.abs((merged.channels[merged.drawOrder[2]].rawT?.[0] || 0) - 1_800_000_000) < 1e-6 &&
+      Math.abs(merged.channels[merged.drawOrder[1]].t[1] - merged.channels[merged.drawOrder[1]].t[0] - 0.1) < 1e-12;
+    const overlapOk = merged.hasCommonOverlap === false; // Different coordinate domains must not be falsely aligned.
+    const numericOverlap = mergeExcelChannelsByTime([
+      { fileName: 'run-a.xlsx', sheetName: 'Data', channels: { Ia: a }, drawOrder: ['Ia'], timeOriginKind: 'numeric' },
+      { fileName: 'run-b.xlsx', sheetName: 'Data', channels: { Ib: b }, drawOrder: ['Ib'], timeOriginKind: 'numeric' },
+    ], ['#facc15'], 'preserve');
+    const numericOverlapOk =
+      numericOverlap.hasCommonOverlap &&
+      Math.abs(numericOverlap.commonOverlapSec - 0.18) < 1e-9 &&
+      Math.abs(numericOverlap.minimumOverlapPct - 90) < 1e-6;
+    const clockA = makeChannel('ClockA', [0, 10]);
+    const clockB = makeChannel('ClockB', [0, 10]);
+    const clockOverlap = mergeExcelChannelsByTime([
+      { fileName: 'clock-a.xlsx', sheetName: 'Data', channels: { ClockA: clockA }, drawOrder: ['ClockA'], timeOriginSec: 3600, timeOriginKind: 'clock-of-day' },
+      { fileName: 'clock-b.xlsx', sheetName: 'Data', channels: { ClockB: clockB }, drawOrder: ['ClockB'], timeOriginSec: 3602, timeOriginKind: 'clock-of-day' },
+    ], ['#22d3ee'], 'preserve');
+    const clockOverlapOk = Math.abs(clockOverlap.commonOverlapSec - 8) < 1e-9 && clockOverlap.warnings.some((w) => w.includes('没有日期'));
+    const aligned = mergeExcelChannelsByTime([
+      { fileName: 'run-a.xlsx', sheetName: 'Data', channels: { Ia: a }, drawOrder: ['Ia'] },
+      { fileName: 'run-b.xlsx', sheetName: 'Data', channels: { Ib: b }, drawOrder: ['Ib'] },
+    ], ['#facc15'], 'align-start');
+    const startAlignOk =
+      Math.abs(aligned.channels[aligned.drawOrder[0]].t[0]) < 1e-12 &&
+      Math.abs(aligned.channels[aligned.drawOrder[1]].t[0]) < 1e-12 &&
+      Math.abs(aligned.channels[aligned.drawOrder[1]].t[1] - 0.1) < 1e-12 &&
+      Math.abs((aligned.channels[aligned.drawOrder[1]].rawT?.[0] || 0)) < 1e-12 &&
+      Math.abs(b.t[0] - 10.02) < 1e-12 &&
+      Math.abs((b.rawT?.[0] || 0) - 10.02) < 1e-12; // source buffers must remain untouched
+    results.push({
+      name: 'Excel Multi-Workbook Merge: Independent Time Axes / Absolute Date Restore / Start-Only Alignment',
+      passed: preservedIndependentAxes && overlapOk && numericOverlapOk && clockOverlapOk && startAlignOk,
+      message: `preserve=${preservedIndependentAxes}, noFalseOverlap=${overlapOk}, numericOverlap=${numericOverlapOk}, clockOverlap=${clockOverlapOk}, alignStart=${startAlignOk}, warnings=${merged.warnings.length}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Excel Multi-Workbook Merge: Independent Time Axes / Absolute Date Restore / Start-Only Alignment',
+      passed: false,
+      message: `Exception: ${err.message}`,
+    });
+  }
+
+  // Test 45: Channel Δt Time Shift Isolation & Reset
   try {
     const sharedT = new Float64Array([0, 0.1, 0.2, 0.3]);
     const ch1: WaveformChannel = {
@@ -2906,7 +3002,7 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 44: FOC DynoLab SI Inverse/Forward Parity, 4-Quadrant Handoff & Scope Unit Bridge
+  // Test 46: FOC DynoLab SI Inverse/Forward Parity, 4-Quadrant Handoff & Scope Unit Bridge
   try {
     const invMotor = solveSinglePoint(13.5, 2.2, 1000, DEMO_MOTOR_PARAMS);
     const fwdMotor = forwardVerifyPoint(invMotor.iqA, 1000, 13.5, DEMO_MOTOR_PARAMS);
@@ -2978,7 +3074,7 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 45: Circuit & DSP Waveform Filtering (RC R*C, Partial Slice Isolation & 50 Hz Notch)
+  // Test 47: Circuit & DSP Waveform Filtering (RC R*C, Partial Slice Isolation & 50 Hz Notch)
   try {
     const fs = 10000;
     const n = 4000;
@@ -3053,7 +3149,7 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 46: Cauer Deconvolution Orders 1..8 & Negative-Power Thermal Conservation
+  // Test 48: Cauer Deconvolution Orders 1..8 & Negative-Power Thermal Conservation
   try {
     const n = 2000;
     const t = new Float64Array(n);
@@ -3138,7 +3234,7 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 47: Math Parser Lexer (1+2, 5-2), NaN Safety (/0, sqrt(-1)), Timebase Interpolation & Unit Derivation
+  // Test 49: Math Parser Lexer (1+2, 5-2), NaN Safety (/0, sqrt(-1)), Timebase Interpolation & Unit Derivation
   try {
     const tA = new Float64Array([0, 0.1, 0.2, 0.3, 0.4]);
     const vA = new Float32Array([0, 2, 4, 6, 8]);
@@ -3192,7 +3288,7 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 48: Non-Power-of-2 Bluestein FFT + Unit Preservation & Idempotent Filter from refV
+  // Test 50: Non-Power-of-2 Bluestein FFT + Unit Preservation & Idempotent Filter from refV
   try {
     const fs = 10000;
     const n = 5000; // Non-power-of-2 (previously truncated to 4096)
@@ -3238,7 +3334,7 @@ export function runAllTests(): TestResult[] {
     });
   }
 
-  // Test 49: Trapezoidal |V|avg, Variable-Duty Max/Min Duty Cycle & Extensible Custom Metrics
+  // Test 51: Trapezoidal |V|avg, Variable-Duty Max/Min Duty Cycle & Extensible Custom Metrics
   try {
     // 25% duty cycle period 1, 75% duty cycle period 2, 50% duty cycle period 3 at 1 kHz (fs=100kHz)
     const fs = 100000;

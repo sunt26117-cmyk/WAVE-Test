@@ -161,6 +161,12 @@ export interface GoldenBandConfig {
   minCoveragePct?: number;
   refT?: Float64Array;
   refV?: Float32Array;
+  /** Optional exact union-of-source-knots grid for cross-rate golden tolerance evaluation. */
+  metricT?: Float64Array;
+  metricTargetV?: Float64Array;
+  metricRefV?: Float64Array;
+  metricIntervalValid?: Uint8Array;
+  removeDcOffset?: boolean;
 }
 
 export interface AnomalyEvent {

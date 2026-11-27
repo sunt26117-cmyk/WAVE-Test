@@ -102,6 +102,17 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
     [onNotify]
   );
 
+  const modelAssumptionWarnings = useMemo(() => {
+    const warnings: string[] = [];
+    if (params.betaSat <= 0) {
+      warnings.push('β=0：当前未计入磁饱和修正；评估高电流区转矩/限扭能力时，应通过多电流点台架数据辨识 β。');
+    }
+    if (params.p0A <= 0 && params.p0B <= 0) {
+      warnings.push('P0(a/b)=0：当前未计入铁耗与风摩随速损；高速轻载效率和反推扭矩可能偏乐观。');
+    }
+    return warnings;
+  }, [params.betaSat, params.p0A, params.p0B]);
+
   const { calibReport, normWarnings } = useMemo(() => {
     void calibTrigger;
     const olRes = normalizeDynoDataset(openLoopRaw, openLoopMap, 'Nm', '0-1', { requireTorque: false });
@@ -348,7 +359,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               rsFitMode={rsFitMode}
               openLoopModDepth={openLoopModDepth}
               report={calibReport}
-              warnings={normWarnings}
+              warnings={[...normWarnings, ...modelAssumptionWarnings]}
               onUpdateOpenLoop={(ds, map) => {
                 setOpenLoopRaw(ds);
                 setOpenLoopMap(map);

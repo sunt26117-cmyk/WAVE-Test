@@ -54,6 +54,40 @@ class MotorParams:
     v_sd: float = 0.85          # Body diode forward voltage [V]
 
 
+def validate_motor_params(params: MotorParams) -> None:
+    """Keep Python input constraints identical to the TypeScript solver."""
+    finite_fields = {
+        "pole_pairs": params.pole_pairs, "ke_prime": params.ke_prime,
+        "r_ll_25": params.r_ll_25, "t_coil": params.t_coil,
+        "l_ll_mh": params.l_ll_mh, "n0_rpm": params.n0_rpm,
+        "beta_sat": params.beta_sat, "p0_a": params.p0_a, "p0_b": params.p0_b,
+        "i_idle": params.i_idle, "eta_inv": params.eta_inv,
+        "i_deadband": params.i_deadband, "r_line": params.r_line,
+        "rds_on_mohm": params.rds_on_mohm, "t_dead_ns": params.t_dead_ns,
+        "f_sw_khz": params.f_sw_khz, "v_sd": params.v_sd,
+    }
+    for label, value in finite_fields.items():
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{label} must be a finite number")
+    if isinstance(params.pole_pairs, bool) or int(params.pole_pairs) != params.pole_pairs or not (1 <= params.pole_pairs <= 100):
+        raise ValueError("pole_pairs must be an integer in [1, 100]")
+    if params.ke_prime <= 0 or params.r_ll_25 <= 0 or params.n0_rpm <= 0:
+        raise ValueError("ke_prime, r_ll_25 and n0_rpm must be > 0")
+    if params.t_coil <= -273.15 or params.l_ll_mh < 0:
+        raise ValueError("t_coil must be above absolute zero and l_ll_mh must be >= 0")
+    if min(params.beta_sat, params.p0_a, params.p0_b) < 0:
+        raise ValueError("beta_sat and P0 coefficients must be >= 0")
+    if params.rs_eff_override is not None and (not math.isfinite(params.rs_eff_override) or params.rs_eff_override <= 0):
+        raise ValueError("rs_eff_override must be None or > 0")
+    if min(params.i_idle, params.i_deadband, params.r_line, params.rds_on_mohm,
+           params.t_dead_ns, params.f_sw_khz, params.v_sd) < 0:
+        raise ValueError("drive parameters must be >= 0")
+    if not (math.isfinite(params.eta_inv) and 0.0 < params.eta_inv <= 1.0):
+        raise ValueError("eta_inv must satisfy 0 < eta_inv <= 1.0; 1.0 disables inverter-efficiency correction")
+    if params.t_dead_ns > 0 and params.f_sw_khz <= 0:
+        raise ValueError("f_sw_khz must be > 0 when deadtime correction is enabled; set t_dead_ns to 0 to disable it")
+
+
 def calc_omega_m(n_rpm: float) -> float:
     return (2.0 * math.pi * n_rpm) / 60.0
 
@@ -128,6 +162,9 @@ def calc_phi_deg(vq: float, vd: float, iq: float) -> float:
 
 
 def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorParams) -> dict:
+    validate_motor_params(params)
+    if not math.isfinite(v_meas) or not math.isfinite(n_rpm) or math.isinf(i_bus):
+        raise ValueError("v_meas and n_rpm must be finite; i_bus may be NaN only for invalid samples")
     omega_m = calc_omega_m(n_rpm)
     omega_e = calc_omega_e(n_rpm, params.pole_pairs)
     fe_hz = calc_fe_hz(n_rpm, params.pole_pairs)
@@ -145,7 +182,7 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
     p_in = v_meas * i_bus
 
     i_net = i_bus - params.i_idle
-    eta_inv = min(0.999, max(0.1, params.eta_inv))
+    eta_inv = params.eta_inv
     deadband = max(0.0, params.i_deadband)
 
     if invalid_bus:
@@ -213,7 +250,8 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
         else:
             sign_eq = 1.0 if eq0 >= 0.0 else -1.0
             beta = max(0.0, params.beta_sat)
-            iq = (-eq0 + sign_eq * math.sqrt(delta)) / (2.0 * rs)
+            # Rationalized root avoids catastrophic cancellation near zero load.
+            iq = sign_eq * (4.0 / 3.0) * p_elec / (math.sqrt(delta) + abs(eq0))
             if beta > 0.0 and math.isfinite(iq):
                 hit_regen_limit = False
                 for _ in range(30):
@@ -241,7 +279,8 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
                             delta = d_iter
                             hit_regen_limit = True
                             break
-                        fp = (-eq_cur + sign_eq * math.sqrt(d_iter)) / (2.0 * rs)
+                        stable_denom = math.sqrt(d_iter) + abs(eq_cur)
+                        fp = sign_eq * (4.0 / 3.0) * p_elec / stable_denom if stable_denom > 0.0 else 0.0
                         next_iq = 0.5 * iq + 0.5 * fp
                     iq = next_iq
                 ks_final = calc_ksat(iq, beta)
@@ -336,6 +375,9 @@ def solve_single_point(v_meas: float, i_bus: float, n_rpm: float, params: MotorP
 
 
 def forward_verify_point(iq: float, n_rpm: float, v_meas: float, params: MotorParams) -> dict:
+    validate_motor_params(params)
+    if not math.isfinite(iq) or not math.isfinite(n_rpm) or not math.isfinite(v_meas):
+        raise ValueError("iq, n_rpm and v_meas must be finite")
     omega_m = calc_omega_m(n_rpm)
     omega_e = calc_omega_e(n_rpm, params.pole_pairs)
     rs = get_effective_rs(params)
@@ -343,7 +385,7 @@ def forward_verify_point(iq: float, n_rpm: float, v_meas: float, params: MotorPa
     k_sat = calc_ksat(iq, params.beta_sat)
     eq = params.ke_prime * omega_m * k_sat
     p_elec = 1.5 * (eq * iq + rs * iq * iq)
-    eta_inv = min(0.999, max(0.1, params.eta_inv))
+    eta_inv = params.eta_inv
     p_dc = p_elec / eta_inv if p_elec >= 0 else p_elec * eta_inv
 
     r_line = max(0.0, params.r_line)
@@ -361,7 +403,12 @@ def forward_verify_point(iq: float, n_rpm: float, v_meas: float, params: MotorPa
         if disc < 0.0 or not math.isfinite(disc):
             line_collapse = True
         else:
-            i_bus_est = (-b - math.sqrt(disc)) / (2.0 * r_line)
+            # Stable low-current root; avoid cancellation for small electrical power.
+            stable_denom = -b + math.sqrt(disc)
+            if stable_denom > 0.0:
+                i_bus_est = (2.0 * c) / stable_denom
+            else:
+                line_collapse = True
 
     v_bus_cap_raw = float("nan") if line_collapse else (v_meas - i_bus_est * r_line)
     invalid_bus = line_collapse or (not math.isfinite(v_bus_cap_raw)) or (v_bus_cap_raw <= 0.1)
@@ -2672,12 +2719,12 @@ with st.sidebar:
     p.p0_a = st.number_input("铁损线性系数 a (W/RPM)", 0.0, 1.0, float(p.p0_a), format="%.6f")
     p.p0_b = st.number_input("风摩二次系数 b (W/RPM²)", 0.0, 0.01, float(p.p0_b), format="%.8f")
     p.i_idle = st.number_input("逆变器静态电流 I_idle (A)", 0.0, 5.0, float(p.i_idle), format="%.3f")
-    p.eta_inv = st.number_input("逆变级效率 η_inv", 0.5, 0.999, float(p.eta_inv), format="%.3f")
+    p.eta_inv = st.number_input("逆变级效率 η_inv（0<η≤1；1=不修正）", 0.001, 1.0, float(p.eta_inv), format="%.3f")
     p.i_deadband = st.number_input("零漂死区 |I_net| < (A)", 0.0, 0.2, float(p.i_deadband), format="%.3f")
     p.r_line = st.number_input("母线线阻 R_line (Ω)", 0.0, 1.0, float(p.r_line), format="%.4f")
     p.rds_on_mohm = st.number_input("MOSFET Rds(on) (mΩ)", 0.5, 200.0, float(p.rds_on_mohm), format="%.1f")
     p.t_dead_ns = st.number_input("死区时间 t_dead (ns)", 0.0, 3000.0, float(p.t_dead_ns), format="%.0f")
-    p.f_sw_khz = st.number_input("开关频率 f_sw (kHz)", 1.0, 200.0, float(p.f_sw_khz), format="%.1f")
+    p.f_sw_khz = st.number_input("开关频率 f_sw (kHz；t_dead>0 时必需)", 0.0, 200.0, float(p.f_sw_khz), format="%.1f")
     p.v_sd = st.number_input("体二极管压降 V_SD (V)", 0.2, 2.5, float(p.v_sd), format="%.2f")
 
 tab1, tab2, tab3, tab4 = st.tabs([

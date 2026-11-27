@@ -146,6 +146,8 @@ export interface DptLutInterpolationResult {
   iRange: [number, number];
   tjRange: [number, number];
   rgRange: [number, number];
+  rgOnRange: [number, number];
+  rgOffRange: [number, number];
   activeDimensions: DptAxisName[];
   collapsedDimensions: DptAxisName[];
   outOfRangeAxes: DptAxisName[];
@@ -420,15 +422,16 @@ export function interpolateDptSwitchingLoss(
 ): DptLutInterpolationResult | null {
   if (!lut || lut.length === 0) return null;
 
-  const cond: DptOperatingCondition =
-    typeof vBusOrCond === 'object' && vBusOrCond !== null
-      ? vBusOrCond
-      : {
-          vBusV: vBusOrCond,
-          iLoadA: iLoadTargetA ?? 0,
-          tjProvenance: 'assumed',
-          rgProvenance: 'assumed',
-        };
+  // Use an explicit numeric/object branch so TS 7's stricter union narrowing
+  // does not retain DptOperatingCondition in the numeric vBusV assignment.
+  const cond: DptOperatingCondition = typeof vBusOrCond === 'number'
+    ? {
+        vBusV: vBusOrCond,
+        iLoadA: iLoadTargetA ?? 0,
+        tjProvenance: 'assumed',
+        rgProvenance: 'assumed',
+      }
+    : vBusOrCond;
 
   const vSafe = Math.max(0, Number.isFinite(cond.vBusV) ? cond.vBusV : 0);
   const iSafe = Math.max(0, Number.isFinite(cond.iLoadA) ? cond.iLoadA : 0);
@@ -471,6 +474,8 @@ export function interpolateDptSwitchingLoss(
         iRange: [0, 0],
         tjRange: [0, 0],
         rgRange: [0, 0],
+        rgOnRange: [0, 0],
+        rgOffRange: [0, 0],
         activeDimensions: [],
         collapsedDimensions: ['Vbus', 'Iload', 'Tj', 'Rg'],
         outOfRangeAxes: [],
@@ -511,25 +516,30 @@ export function interpolateDptSwitchingLoss(
   rgMax = Math.max(rgOnMax, rgOffMax);
 
   const tjTarget = tjKnown ? cond.tjC! : 0.5 * (tjMin + tjMax);
-  const rgDefaultMid = 0.5 * (rgMin + rgMax);
-  const rgOnTarget = rgOnKnown ? Math.max(0, (cond.rgOnOhm ?? cond.rgOhm)!) : rgDefaultMid;
-  const rgOffTarget = rgOffKnown ? Math.max(0, (cond.rgOffOhm ?? cond.rgOhm)!) : rgDefaultMid;
+  // Rg_on and Rg_off are independent physical coordinates. Do not use the
+  // difference between a fixed Rg_on and a fixed Rg_off to invent an active axis.
+  const rgOnDefaultMid = 0.5 * (rgOnMin + rgOnMax);
+  const rgOffDefaultMid = 0.5 * (rgOffMin + rgOffMax);
+  const rgOnTarget = rgOnKnown ? Math.max(0, (cond.rgOnOhm ?? cond.rgOhm)!) : rgOnDefaultMid;
+  const rgOffTarget = rgOffKnown ? Math.max(0, (cond.rgOffOhm ?? cond.rgOhm)!) : rgOffDefaultMid;
 
   const axisNames: DptAxisName[] = ['Vbus', 'Iload', 'Tj', 'Rg'];
-  const axisRanges: Array<[number, number]> = [
-    [vMin, vMax],
-    [iMin, iMax],
-    [tjMin, tjMax],
-    [rgMin, rgMax],
-  ];
-  const activeIdx: number[] = [];
+  const baseAxisRanges: Array<[number, number]> = [[vMin, vMax], [iMin, iMax], [tjMin, tjMax]];
+  const axisRangesOn: Array<[number, number]> = [...baseAxisRanges, [rgOnMin, rgOnMax]];
+  const axisRangesOff: Array<[number, number]> = [...baseAxisRanges, [rgOffMin, rgOffMax]];
+  const baseActiveIdx: number[] = [];
   const collapsedDimensions: DptAxisName[] = [];
-  axisRanges.forEach(([mn, mx], idx) => {
-    const tol = idx === 2 ? 0.5 : idx === 3 ? 0.05 : 1e-4;
-    if (mx - mn > tol) activeIdx.push(idx);
+  baseAxisRanges.forEach(([mn, mx], idx) => {
+    const tol = idx === 2 ? 0.5 : 1e-4;
+    if (mx - mn > tol) baseActiveIdx.push(idx);
     else collapsedDimensions.push(axisNames[idx]);
   });
-  const activeDimensions = activeIdx.map((idx) => axisNames[idx]);
+  const rgOnActive = rgOnMax - rgOnMin > 0.05;
+  const rgOffActive = rgOffMax - rgOffMin > 0.05;
+  const activeIdxOn = [...baseActiveIdx, ...(rgOnActive ? [3] : [])];
+  const activeIdxOff = [...baseActiveIdx, ...(rgOffActive ? [3] : [])];
+  const activeDimensions = [...baseActiveIdx.map((idx) => axisNames[idx]), ...(rgOnActive || rgOffActive ? ['Rg' as const] : [])];
+  if (!rgOnActive && !rgOffActive) collapsedDimensions.push('Rg');
 
   const outOfRangeAxes: DptAxisName[] = [];
   if (vSafe < vMin - 1e-6 || vSafe > vMax + 1e-6) outOfRangeAxes.push('Vbus');
@@ -554,7 +564,10 @@ export function interpolateDptSwitchingLoss(
     warnings.push('DPT LUT 查询中的结温 Tj 未由闭环求解器或传感器实测提供，当前按默认假设中值代入。');
   }
   if (rgProvenance === 'assumed' && activeDimensions.includes('Rg')) {
-    warnings.push('DPT LUT 查询中的门极电阻 Rg 未显式输入，当前按 LUT 范围默认假设中值代入。');
+    warnings.push('DPT LUT 查询中的门极电阻 Rg 未显式输入，当前分别按 Rg_on / Rg_off 各自范围中值代入。');
+  }
+  if (rgOnActive !== rgOffActive) {
+    warnings.push(`DPT LUT 的 Rg_on 与 Rg_off 变化维度不对称：Rg_on ${rgOnActive ? '有变化' : '为单值轴'}，Rg_off ${rgOffActive ? '有变化' : '为单值轴'}；两者将分别插值，单值侧只适用于对应实测电阻。`);
   }
 
   if (lut.length === 1) {
@@ -580,7 +593,9 @@ export function interpolateDptSwitchingLoss(
       vRange: [p.vBusV, p.vBusV],
       iRange: [p.iLoadA, p.iLoadA],
       tjRange: [p.tjC, p.tjC],
-      rgRange: [p.rgOnOhm ?? p.rgOhm, p.rgOffOhm ?? p.rgOhm],
+      rgRange: [Math.min(p.rgOnOhm ?? p.rgOhm, p.rgOffOhm ?? p.rgOhm), Math.max(p.rgOnOhm ?? p.rgOhm, p.rgOffOhm ?? p.rgOhm)],
+      rgOnRange: [p.rgOnOhm ?? p.rgOhm, p.rgOnOhm ?? p.rgOhm],
+      rgOffRange: [p.rgOffOhm ?? p.rgOhm, p.rgOffOhm ?? p.rgOhm],
       activeDimensions,
       collapsedDimensions,
       outOfRangeAxes,
@@ -613,16 +628,16 @@ export function interpolateDptSwitchingLoss(
   const vClamped = Math.max(vMin, Math.min(vMax, vSafe));
   const iClamped = Math.max(iMin, Math.min(iMax, iEval));
   const tjClamped = Math.max(tjMin, Math.min(tjMax, tjTarget));
-  const rgOnClamped = Math.max(rgMin, Math.min(rgMax, rgOnTarget));
-  const rgOffClamped = Math.max(rgMin, Math.min(rgMax, rgOffTarget));
+  const rgOnClamped = Math.max(rgOnMin, Math.min(rgOnMax, rgOnTarget));
+  const rgOffClamped = Math.max(rgOffMin, Math.min(rgOffMax, rgOffTarget));
 
   const qOn: [number, number, number, number] = [vClamped, iClamped, tjClamped, rgOnClamped];
   const qOff: [number, number, number, number] = [vClamped, iClamped, tjClamped, rgOffClamped];
 
-  const onRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdx, axisRanges, (p) => p.eOnUj);
-  const onSansRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdx, axisRanges, (p) => p.eOnSansQrrUj);
-  const qrrRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdx, axisRanges, (p) => p.qRrNc);
-  const offRes = evaluate4DScalarChannel(ptsOff, qOff, activeIdx, axisRanges, (p) => p.eOffUj);
+  const onRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdxOn, axisRangesOn, (p) => p.eOnUj);
+  const onSansRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdxOn, axisRangesOn, (p) => p.eOnSansQrrUj);
+  const qrrRes = evaluate4DScalarChannel(ptsOn, qOn, activeIdxOn, axisRangesOn, (p) => p.qRrNc);
+  const offRes = evaluate4DScalarChannel(ptsOff, qOff, activeIdxOff, axisRangesOff, (p) => p.eOffUj);
 
   // If strictly above Vmax or Imax (non-zero side out-of-range), gently scale beyond boundary by V/I ratio vs boundary evaluation
   const vHiScale = vSafe > vMax && vMax > 1e-6 ? vSafe / vMax : 1;
@@ -645,8 +660,9 @@ export function interpolateDptSwitchingLoss(
   }
 
   let method: DptLutInterpolationResult['method'] = '4d_simplex_barycentric';
-  if (activeIdx.length < 4 && (onRes.method === 'grid' || onRes.method === 'simplex')) {
-    method = activeIdx.length <= 2 ? 'reduced_dim_interpolated' : onRes.method === 'grid' ? '4d_multilinear_grid' : '4d_simplex_barycentric';
+  const maxActiveDimensionCount = Math.max(activeIdxOn.length, activeIdxOff.length);
+  if (maxActiveDimensionCount < 4 && (onRes.method === 'grid' || onRes.method === 'simplex')) {
+    method = maxActiveDimensionCount <= 2 ? 'reduced_dim_interpolated' : onRes.method === 'grid' ? '4d_multilinear_grid' : '4d_simplex_barycentric';
   } else if (onRes.method === 'grid' && offRes.method === 'grid') {
     method = '4d_multilinear_grid';
   }
@@ -675,6 +691,8 @@ export function interpolateDptSwitchingLoss(
     iRange: [iMin, iMax],
     tjRange: [tjMin, tjMax],
     rgRange: [rgMin, rgMax],
+    rgOnRange: [rgOnMin, rgOnMax],
+    rgOffRange: [rgOffMin, rgOffMax],
     activeDimensions,
     collapsedDimensions,
     outOfRangeAxes,

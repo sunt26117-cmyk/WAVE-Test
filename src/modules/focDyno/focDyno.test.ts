@@ -18,6 +18,7 @@ import {
   processRuntimeLog,
   processRuntimeLogWithAudit,
   solveSinglePoint,
+  validateMotorParams,
 } from './motorPhysics';
 import {
   analyzeDynamicIdentifiability,
@@ -503,6 +504,50 @@ test('4-Quadrant solveSinglePoint <-> forwardVerifyPoint exact parity, beta ener
   assert.ok(Math.abs(SVPWM_LINEAR_LIMIT - 2 / Math.sqrt(3)) < 1e-12);
 });
 
+test('FOC solver: stable low-power roots, eta=1.0 neutral mode and strict physical parameter contract', () => {
+  const idealParams = {
+    ...DEMO_MOTOR_PARAMS,
+    etaInv: 1,
+    iIdleA: 0,
+    iDeadbandA: 0,
+    rLineOhm: 0,
+  };
+  validateMotorParams(idealParams);
+
+  // At this power level, adding the discriminant increment to Eq^2 is below
+  // or near one floating-point ULP. The rationalized root must still preserve
+  // the small non-zero Iq instead of rounding it to zero.
+  const tiny = solveSinglePoint(13.5, 1e-16, 1000, idealParams);
+  assert.equal(tiny.mode, 'motoring');
+  assert.ok(tiny.iqA > 0, `near-zero load current was lost: ${tiny.iqA}`);
+  const tinyFwd = forwardVerifyPoint(tiny.iqA, 1000, 13.5, idealParams);
+  assert.ok(Math.abs(tinyFwd.iBusEstA - 1e-16) < 1e-29, `stable bus root mismatch: ${tinyFwd.iBusEstA}`);
+
+  const ordinary = solveSinglePoint(13.5, 1.25, 800, idealParams);
+  assert.equal(ordinary.mode, 'motoring');
+  const ordinaryFwd = forwardVerifyPoint(ordinary.iqA, 800, 13.5, idealParams);
+  assert.ok(Math.abs(ordinaryFwd.iBusEstA - 1.25) < 1e-10);
+
+  assert.throws(
+    () => solveSinglePoint(13.5, 1, 1000, { ...DEMO_MOTOR_PARAMS, etaInv: 1.01 }),
+    /η_inv.*0 < η_inv ≤ 1/
+  );
+  // Efficiency is physically bounded above by 1, but 10% was an arbitrary software floor.
+  validateMotorParams({ ...DEMO_MOTOR_PARAMS, etaInv: 0.05 });
+  assert.throws(() => validateMotorParams({ ...DEMO_MOTOR_PARAMS, etaInv: 0 }), /0 < η_inv ≤ 1/);
+  // Switching frequency is only required when a non-zero deadtime correction is active.
+  validateMotorParams({ ...DEMO_MOTOR_PARAMS, tDeadNs: 0, fSwKhz: 0 });
+  assert.throws(
+    () => validateMotorParams({ ...DEMO_MOTOR_PARAMS, tDeadNs: 500, fSwKhz: 0 }),
+    /t_dead > 0.*f_sw.*大于 0/
+  );
+  assert.throws(
+    () => solveSinglePoint(13.5, 1, 1000, { ...DEMO_MOTOR_PARAMS, rLineOhm: -0.01 }),
+    /不能为负数/
+  );
+  assert.equal(solveSinglePoint(13.5, Number.NaN, 1000, DEMO_MOTOR_PARAMS).mode, 'invalid_bus');
+});
+
 test('Stepwise calibration recovers Ke, P0(n), betaSat and masks unreachable 2D map cells', () => {
   const ol = buildDemoOpenLoopDataset();
   const cl = buildDemoClosedLoopDataset();
@@ -574,6 +619,10 @@ test('6-MOS synthesis rejects over-modulation & preserves valid handoff + time-a
   assert.ok(reimportSynth.fileName !== '');
   const handoffDuty = buildThermalHandoffFromSixMos(synthWithDuty, DEMO_MOTOR_PARAMS, 1000, 25)!;
   assert.equal(handoffDuty.modulation, 'DPWM1');
+  assert.equal(handoffDuty.steadyOperatingPoint.mode, 'rotating');
+  assert.ok(Math.abs(handoffDuty.steadyOperatingPoint.iqPeakA - synthWithDuty.summary.iqPeakA) < 1e-9);
+  assert.equal(handoffDuty.steadyOperatingPoint.idPeakA, 0);
+  assert.ok(Math.abs(handoffDuty.steadyOperatingPoint.electricalFrequencyHz - synthWithDuty.summary.feHz) < 1e-9);
   assert.equal(handoffDuty.daChannelId, 'ch_da');
   assert.equal(handoffDuty.dbChannelId, 'ch_db');
   assert.equal(handoffDuty.dcChannelId, 'ch_dc');
@@ -586,6 +635,10 @@ test('6-MOS synthesis rejects over-modulation & preserves valid handoff + time-a
   );
   assert.equal(stallSynth.summary.isStall, true);
   assert.ok(Math.abs(stallSynth.samples[10].iaA + 2 * stallSynth.samples[10].ibA) < 1e-6);
+  const stallHandoff = buildThermalHandoffFromSixMos(stallSynth, DEMO_MOTOR_PARAMS, 0, 25)!;
+  assert.equal(stallHandoff.steadyOperatingPoint.mode, 'locked_rotor');
+  assert.equal(stallHandoff.steadyOperatingPoint.electricalFrequencyHz, 0);
+  assert.equal(stallHandoff.steadyOperatingPoint.electricalAngleDeg, 90);
 
   const scopeTab = buildOscilloscopeTabFromSixMos(synth, 1000)!;
   assert.ok(scopeTab);
@@ -598,6 +651,9 @@ test('6-MOS synthesis rejects over-modulation & preserves valid handoff + time-a
   assert.ok(handoff);
   assert.ok(Math.abs(handoff.modDepthM - synth.summary.mCmd) < 1e-3);
   assert.ok(Math.abs(handoff.pfAngleDeg - synth.summary.phiCmdDeg) < 0.05);
+  assert.equal(handoff.steadyOperatingPoint.mode, 'rotating');
+  assert.equal(handoff.steadyOperatingPoint.idPeakA, 0);
+  assert.ok(Math.abs(handoff.steadyOperatingPoint.iqPeakA - synth.pointResult.iqA) < 1e-9);
 
   const demoLog = buildDemoRuntimeLog();
   assert.equal(demoLog.length, 1200);
@@ -990,6 +1046,9 @@ for c in cases:
     r = ns["solve_single_point"](c["vMeas"], c["iBus"], c["nRpm"], p)
     fwd = ns["forward_verify_point"](r["iq"], c["nRpm"], c["vMeas"], p) if (r["iq"] == r["iq"]) else None
     out.append({"point": r, "fwd": fwd})
+p_tiny = MP(**{**p.__dict__, "i_idle": 0.0, "eta_inv": 1.0, "i_deadband": 0.0, "r_line": 0.0})
+tiny = ns["solve_single_point"](13.5, 1e-16, 1000.0, p_tiny)
+tiny_fwd = ns["forward_verify_point"](tiny["iq"], 1000.0, 13.5, p_tiny)
 def sanitize(obj):
     if isinstance(obj, float):
         return None if not math.isfinite(obj) else obj
@@ -1004,6 +1063,8 @@ print(json.dumps(sanitize({
     "vq_cmd": ns["calc_vq_cmd"](5.0, 10.0, 13.4, p),
     "phi_deg": ns["calc_phi_deg"](5.0, -0.5, 10.0),
     "results": out,
+    "tiny_iq": tiny["iq"],
+    "tiny_i_bus_est": tiny_fwd["i_bus_est"],
 }), allow_nan=False))
 `;
 
@@ -1013,6 +1074,12 @@ print(json.dumps(sanitize({
   });
   assert.equal(proc.status, 0, `python3 execution failed: ${proc.stderr}`);
   const pyData = JSON.parse(proc.stdout);
+  const tinyParams = { ...DEMO_MOTOR_PARAMS, iIdleA: 0, etaInv: 1, iDeadbandA: 0, rLineOhm: 0 };
+  const tinyTs = solveSinglePoint(13.5, 1e-16, 1000, tinyParams);
+  const tinyTsFwd = forwardVerifyPoint(tinyTs.iqA, 1000, 13.5, tinyParams);
+  assert.ok(tinyTs.iqA > 0);
+  assert.ok(Math.abs(pyData.tiny_iq - tinyTs.iqA) < 1e-29, `tiny Iq parity: Python=${pyData.tiny_iq}, TS=${tinyTs.iqA}`);
+  assert.ok(Math.abs(pyData.tiny_i_bus_est - tinyTsFwd.iBusEstA) < 1e-29, `tiny bus current parity: Python=${pyData.tiny_i_bus_est}, TS=${tinyTsFwd.iBusEstA}`);
 
   assert.ok(Math.abs(pyData.ke_kv - calcKeFromKv(107.4)) < 1e-12);
   assert.ok(Math.abs(pyData.ke_n0 - calcKeFromNoLoad(13.5, 1450)) < 1e-12);

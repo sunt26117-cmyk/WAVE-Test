@@ -367,6 +367,25 @@ test('Golden: never returns PASS on zero overlap, low coverage, all-NaN, or inva
   assert.notEqual(allNan.status, 'PASS');
 });
 
+// 12b. Golden defaults to 80% duration coverage; sample ratio is intentionally not used
+test('Golden: default minimum coverage uses elapsed-time support, not raw sample ratio', () => {
+  const t = new Float64Array(Array.from({ length: 10 }, (_, i) => i * 0.01));
+  const v = new Float32Array(10).fill(1);
+  const ref = new Float32Array(10).fill(1);
+  for (let i = 7; i < 10; i++) ref[i] = Number.NaN;
+  const result = evaluateGoldenTolerance(makeChannel('g80', t, v, 'V'), {
+    enabled: true,
+    channelId: 'g80',
+    mode: 'absolute',
+    tolerance: 0.1,
+    refV: ref,
+    refLabel: '70-percent-coverage',
+  });
+  assert.ok(Math.abs(result.coveragePct - (2 / 3) * 100) < 1e-9, `Expected time coverage 66.67%, got ${result.coveragePct}`);
+  assert.equal(result.status, 'INSUFFICIENT_DATA');
+  assert.equal(result.pass, false);
+});
+
 // 13. XY: cross-rate alignment & signed lead vs lag phase
 test('XY: aligns cross-rate X/Y channels by time and distinguishes lead vs lag sign', () => {
   // X sampled at 500 Hz, Y sampled at 2000 Hz over 0.1s @ 50 Hz
@@ -868,3 +887,84 @@ test('AN-01: coarse edge dt and sync-cap downsampling downgrade PWM deadTimeQual
 });
 
 
+
+
+test('Compare metrics use elapsed-time weighting instead of sample-count weighting on irregular clocks', () => {
+  const t = new Float64Array([0, 0.001, 0.002, 1, 2]);
+  const target = makeChannel('weighted_target', t, new Float32Array([0, 0, 0, 0, 0]), 'V');
+  const alignedRef = new Float32Array([10, 10, 10, 0, 0]);
+  const metrics = computeWaveformCompareMetrics(target, alignedRef, false);
+  assert.equal(metrics.valid, true);
+  // Integral of |error|: 0.002*10 + 0.998*5 = 5.01 V·s; divide by 2 s.
+  assert.ok(metrics.mae !== null && Math.abs(metrics.mae - 2.505) < 0.01, `Expected time-weighted MAE 2.505, got ${metrics.mae}`);
+  assert.ok(metrics.coveragePct > 99.9);
+});
+
+test('Compare union grid catches a fast reference pulse between coarse target samples and blocks false Golden PASS', () => {
+  const target = makeChannel('coarse_target', new Float64Array([0, 1]), new Float32Array([0, 0]), 'V');
+  const reference = makeChannel(
+    'fast_reference',
+    new Float64Array([0, 0.25, 0.5, 0.75, 1]),
+    new Float32Array([0, 1, 0, 1, 0]),
+    'V'
+  );
+  const aligned = alignAndInterpolateReference(target, reference, 0, false, 1);
+  assert.equal(aligned.valid, true);
+  assert.ok(aligned.metricT && aligned.metricT.length === 5, 'union grid must retain all faster reference knots');
+  assert.ok(aligned.metricIntervalValid && aligned.metricIntervalValid.every((v) => v === 1));
+
+  const metrics = computeWaveformCompareMetrics(target, aligned.alignedRefV, false, aligned);
+  assert.equal(metrics.valid, true);
+  assert.ok(metrics.rmse !== null && Math.abs(metrics.rmse - Math.sqrt(1 / 3)) < 1e-6,
+    `fast reference pulse must contribute to RMSE; got ${metrics.rmse}`);
+  assert.ok(metrics.mae !== null && Math.abs(metrics.mae - 0.5) < 1e-6,
+    `fast reference pulse must contribute to MAE; got ${metrics.mae}`);
+  assert.ok(metrics.maxAbsDiff !== null && Math.abs(metrics.maxAbsDiff - 1) < 1e-6);
+
+  const golden = evaluateGoldenTolerance(target, {
+    enabled: true,
+    channelId: target.id,
+    mode: 'absolute',
+    tolerance: 0.5,
+    refT: target.t,
+    refV: aligned.alignedRefV,
+    refUnit: target.unit,
+    metricT: aligned.metricT,
+    metricTargetV: aligned.metricTargetV,
+    metricRefV: aligned.metricRefV,
+    metricIntervalValid: aligned.metricIntervalValid,
+    minCoveragePct: 80,
+  });
+  assert.equal(golden.status, 'FAIL', 'Golden must not pass just because target sampling missed the fast pulse');
+  assert.ok(golden.maxDeviation >= 1 - 1e-6);
+});
+
+test('Compare accepts an overlap that exists between coarse target samples, but Golden coverage still gates PASS', () => {
+  const target = makeChannel('coarse_only_target', new Float64Array([0, 1]), new Float32Array([0, 0]), 'V');
+  const reference = makeChannel('short_fast_reference', new Float64Array([0.4, 0.5, 0.6]), new Float32Array([0, 1, 0]), 'V');
+  const aligned = alignAndInterpolateReference(target, reference, 0, false, 1);
+  assert.equal(aligned.valid, true, 'union-grid overlap must not be rejected because target has no sample inside it');
+  assert.ok(Math.abs(aligned.coveragePct - 20) < 1e-6, `expected 20% duration coverage, got ${aligned.coveragePct}`);
+  const metrics = computeWaveformCompareMetrics(target, aligned.alignedRefV, false, aligned);
+  assert.equal(metrics.valid, true);
+  assert.ok(metrics.maxAbsDiff !== null && Math.abs(metrics.maxAbsDiff - 1) < 1e-6);
+  const golden = evaluateGoldenTolerance(target, {
+    enabled: true, channelId: target.id, mode: 'absolute', tolerance: 2,
+    refT: target.t, refV: aligned.alignedRefV, refUnit: target.unit,
+    metricT: aligned.metricT, metricTargetV: aligned.metricTargetV,
+    metricRefV: aligned.metricRefV, metricIntervalValid: aligned.metricIntervalValid,
+    minCoveragePct: 80,
+  });
+  assert.equal(golden.status, 'INSUFFICIENT_DATA', 'low actual time coverage must not be promoted to PASS');
+});
+
+test('Compare temporal coverage penalizes a long uncovered tail despite a high sample-count ratio', () => {
+  const t = new Float64Array([0, 0.001, 0.002, 0.003, 0.004, 1.004]);
+  const target = makeChannel('coverage_target', t, new Float32Array([1, 1, 1, 1, 1, 1]), 'V');
+  const reference = makeChannel('coverage_reference', t, new Float32Array([1, 1, 1, 1, 1, Number.NaN]), 'V');
+  const aligned = alignAndInterpolateReference(target, reference, 0, false, 1);
+  assert.equal(aligned.overlapCount, 5); // 83.3% by count would incorrectly pass an 80% gate.
+  assert.ok(aligned.coveragePct < 1, `Expected duration coverage below 1%, got ${aligned.coveragePct}`);
+  const metrics = computeWaveformCompareMetrics(target, aligned.alignedRefV, false, aligned);
+  assert.ok(metrics.coveragePct < 1);
+});

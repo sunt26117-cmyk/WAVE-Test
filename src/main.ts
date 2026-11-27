@@ -1478,6 +1478,7 @@ function bindModals() {
   document.getElementById('cmpRemoveDcChk')?.addEventListener('change', refreshCompare);
   document.getElementById('cmpTolModeSelect')?.addEventListener('change', refreshCompare);
   document.getElementById('cmpTolValueInput')?.addEventListener('input', refreshCompare);
+  document.getElementById('cmpMinCoverageSelect')?.addEventListener('change', refreshCompare);
 
   const ensureQueueHasItem = (tab: TabState): boolean => {
     if (compareQueue.length > 0) return true;
@@ -1558,6 +1559,7 @@ function bindModals() {
     const enableGolden = !!(document.getElementById('cmpEnableGoldenChk') as HTMLInputElement)?.checked;
     const tolMode = ((document.getElementById('cmpTolModeSelect') as HTMLSelectElement)?.value || 'percent') as 'percent' | 'absolute';
     const tolVal = parseFloat((document.getElementById('cmpTolValueInput') as HTMLInputElement)?.value || '5');
+    const minCoveragePct = Math.max(0, Math.min(100, parseFloat((document.getElementById('cmpMinCoverageSelect') as HTMLSelectElement)?.value || '80') || 80));
 
     const theme = COMPARE_GROUP_THEMES.find((t) => t.id === selectedCompareThemeId) || COMPARE_GROUP_THEMES[0];
     const groupId = editingCompareGroupId || `grp_${groupNameRaw.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now().toString(36)}`;
@@ -1601,6 +1603,7 @@ function bindModals() {
         enableGoldenBand: opts.overlayRefs && enableGolden,
         goldenMode: tolMode,
         goldenTolerance: isFinite(tolVal) && tolVal > 0 ? tolVal : 5,
+        minCoveragePct,
         addDiffChannels: opts.addDiffs,
       },
       payloadItems
@@ -3050,17 +3053,17 @@ function renderComparePreviewCanvas(
   });
 
   if (banner) {
-    banner.innerText = `Preview: Base "${targetCh.name}" + ${compareQueue.length} ref(s) · Span ${formatEng(tSpan, 's', 2)} (${formatEng(tStart, 's', 2)} ~ ${formatEng(tEnd, 's', 2)})${extendedByCompare ? ' [Auto-Extended]' : ''}`;
+    banner.innerText = `预览：目标「${targetCh.name}」+ ${compareQueue.length} 条参考 · 时间窗 ${formatEng(tSpan, 's', 2)}（${formatEng(tStart, 's', 2)} ~ ${formatEng(tEnd, 's', 2)}）${extendedByCompare ? '（按参考波形扩展）' : ''}`;
   }
   if (warnBanner) {
     if (unscaledMismatchCount > 0) {
       warnBanner.classList.remove('hidden');
       warnBanner.className = 'text-amber-300 font-semibold';
-      warnBanner.innerText = `⚠ ${unscaledMismatchCount} trace(s) have ≥10× time-span difference — click "Match Span (ms↔s)"`;
+      warnBanner.innerText = `⚠ ${unscaledMismatchCount} 条波形的时间跨度相差 ≥10 倍；请先使用「自动匹配时长/单位」检查 ms、s、µs 单位`;
     } else if (scaledCount > 0) {
       warnBanner.classList.remove('hidden');
       warnBanner.className = 'text-emerald-300';
-      warnBanner.innerText = `✓ Auto Time-Scaled (${scaledCount} trace${scaledCount > 1 ? 's' : ''}) & t0 aligned`;
+      warnBanner.innerText = `✓ 已缩放 ${scaledCount} 条参考波形并按首样本对齐；仅修正时间单位/跨度，不证明采集同步`;
     } else {
       warnBanner.classList.add('hidden');
     }
@@ -3083,13 +3086,13 @@ function recomputeComparePanel(tab: TabState) {
   const colorOffset = tagTarget ? 1 : 0;
 
   if (countBadge) {
-    countBadge.innerText = `${compareQueue.length} waveform(s) in [${groupName}]`;
+    countBadge.innerText = `${compareQueue.length} 条参考波形 · [${groupName}]`;
     countBadge.style.color = theme.badgeColor;
   }
 
   if (!targetCh || compareQueue.length === 0) {
     wrap.innerHTML =
-      '<div class="p-4 text-xs font-mono text-slate-400">Click <span class="text-cyan-300 font-semibold">+ Load File(s)...</span> (可多选 CSV/WFM 文件，同文件自动跳过) or <span class="text-cyan-300 font-semibold">+ Add Channel</span> to build a comparison group.</div>';
+      '<div class="p-4 text-xs text-slate-400">先选择目标波形，再点击 <span class="text-cyan-300 font-semibold">＋导入文件</span>（支持多选）或 <span class="text-cyan-300 font-semibold">＋添加通道</span>。同一文件/通道会自动去重。</div>';
     renderComparePreviewCanvas(targetCh, paletteMode, theme.id, colorOffset);
     return;
   }
@@ -3098,6 +3101,8 @@ function recomputeComparePanel(tab: TabState) {
   const tolMode = ((document.getElementById('cmpTolModeSelect') as HTMLSelectElement)?.value || 'percent') as 'percent' | 'absolute';
   const tolVal = parseFloat((document.getElementById('cmpTolValueInput') as HTMLInputElement)?.value || '5');
   const tolLimit = isFinite(tolVal) && tolVal > 0 ? tolVal : 5;
+  const minCoverageRaw = parseFloat((document.getElementById('cmpMinCoverageSelect') as HTMLSelectElement)?.value || '80');
+  const minCoveragePct = Number.isFinite(minCoverageRaw) ? Math.max(0, Math.min(100, minCoverageRaw)) : 80;
 
   const u = targetCh.unit || 'V';
   const fmt = (val: number | null, unitStr: string) =>
@@ -3108,15 +3113,15 @@ function recomputeComparePanel(tab: TabState) {
   table.innerHTML = `
     <thead class="bg-[#161b22] text-slate-300 sticky top-0 z-10">
       <tr>
-        <th class="p-2 border-b border-[#222933] text-left">Color</th>
-        <th class="p-2 border-b border-[#222933] text-left">Group Waveform</th>
-        <th class="p-2 border-b border-[#222933] text-left">Time Scale</th>
-        <th class="p-2 border-b border-[#222933] text-left">Shift Δt (s)</th>
-        <th class="p-2 border-b border-[#222933] text-right">Sim % / r</th>
-        <th class="p-2 border-b border-[#222933] text-right">RMSE / MAE</th>
-        <th class="p-2 border-b border-[#222933] text-right">Max |Δ|</th>
-        <th class="p-2 border-b border-[#222933] text-center">Tol</th>
-        <th class="p-2 border-b border-[#222933] text-right">Actions</th>
+        <th class="p-2 border-b border-[#222933] text-left">颜色</th>
+        <th class="p-2 border-b border-[#222933] text-left">参考波形</th>
+        <th class="p-2 border-b border-[#222933] text-left" title="只缩放时间坐标，不改变采样数据；匹配时长不等于同步。">时间比例</th>
+        <th class="p-2 border-b border-[#222933] text-left" title="参考波形相对于目标波形的时间平移量；正值表示参考波形向后移动。可直接输入秒，也可用小步进微调。">时间偏移 Δt(s)</th>
+        <th class="p-2 border-b border-[#222933] text-right">相似度 / r</th>
+        <th class="p-2 border-b border-[#222933] text-right" title="按两份记录时间节点的并集进行分段线性积分；不会因采样点密集获得额外权重，也不会漏掉只出现在较快通道节点上的脉冲。">RMSE / MAE</th>
+        <th class="p-2 border-b border-[#222933] text-right">最大偏差 |Δ|</th>
+        <th class="p-2 border-b border-[#222933] text-center">容差状态</th>
+        <th class="p-2 border-b border-[#222933] text-right">操作</th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -3148,6 +3153,12 @@ function recomputeComparePanel(tab: TabState) {
       refV: aligned.alignedRefV,
       refUnit: targetCh.unit,
       refLabel: entry.label,
+      minCoveragePct,
+      metricT: aligned.metricT,
+      metricTargetV: aligned.metricTargetV,
+      metricRefV: aligned.metricRefV,
+      metricIntervalValid: aligned.metricIntervalValid,
+      removeDcOffset: removeDc,
     });
     const cmpValid = aligned.valid && metrics.valid;
     const cmpStatus = !aligned.valid
@@ -3155,7 +3166,18 @@ function recomputeComparePanel(tab: TabState) {
       : !metrics.valid
       ? metrics.status
       : golden.status;
-    const cmpReason = aligned.invalidReason || metrics.invalidReason || golden.invalidReason;
+    const cmpReason = aligned.invalidReason || metrics.invalidReason || golden.invalidReason || aligned.metricGridWarning || null;
+    const cmpStatusLabel = cmpValid
+      ? golden.status === 'PASS'
+        ? '合格 PASS'
+        : golden.status === 'FAIL'
+        ? `超差 FAIL（${golden.violationCount} 点）`
+        : golden.status === 'INSUFFICIENT_DATA'
+        ? '覆盖不足'
+        : '数据无效'
+      : cmpStatus === 'INVALID'
+      ? '数据无效'
+      : '无连续有效区间';
 
     entry.computed = {
       alignedRefV: aligned.alignedRefV,
@@ -3176,6 +3198,18 @@ function recomputeComparePanel(tab: TabState) {
     const refDt =
       entry.channel.dt ||
       (entry.channel.t.length >= 2 ? Math.abs(entry.channel.t[1] - entry.channel.t[0]) : 0);
+    const targetDt =
+      targetCh.dt ||
+      (targetCh.t.length >= 2 ? Math.abs(targetCh.t[1] - targetCh.t[0]) : 0);
+    const scaledRefDt = refDt * scale;
+    const fineShiftStep = Math.max(
+      1e-12,
+      Math.min(
+        targetDt > 0 ? targetDt / 10 : Infinity,
+        scaledRefDt > 0 ? scaledRefDt / 10 : Infinity,
+        (tgtDur || refDur || 1) * 0.001
+      )
+    );
     const fitRatio = tgtDur > 1e-18 && refDur > 1e-18 ? tgtDur / refDur : 1;
     const presetScales = [1, 0.001, 1e-6, 1000, 1e6];
     const matchedPreset = presetScales.find((p) => Math.abs(scale - p) / p < 1e-4);
@@ -3186,8 +3220,8 @@ function recomputeComparePanel(tab: TabState) {
     tr.innerHTML = `
       <td class="p-1.5">
         <div class="flex items-center gap-1">
-          <span class="w-1 h-5 rounded-xs shrink-0" style="background:${escapeHtml(theme.badgeColor)}" title="Group [${escapeHtml(groupName)}]"></span>
-          <input type="color" class="cmp-row-color w-6 h-5 bg-transparent border border-[#2c3543] rounded-xs cursor-pointer p-0" value="${escapeHtml(assignedColor)}" title="Trace color in group [${escapeHtml(groupName)}]" />
+          <span class="w-1 h-5 rounded-xs shrink-0" style="background:${escapeHtml(theme.badgeColor)}" title="比较组 [${escapeHtml(groupName)}]"></span>
+          <input type="color" class="cmp-row-color w-6 h-5 bg-transparent border border-[#2c3543] rounded-xs cursor-pointer p-0" value="${escapeHtml(assignedColor)}" title="[${escapeHtml(groupName)}] 参考波形颜色" />
         </div>
       </td>
       <td class="p-1.5 max-w-[180px]">
@@ -3196,7 +3230,7 @@ function recomputeComparePanel(tab: TabState) {
           <span class="truncate text-slate-100">${escapeHtml(entry.label)}</span>
         </div>
         <div class="text-[9px] text-slate-400 truncate">
-          Span ${formatEng(refDur, 's', 2)} · dt ${formatEng(refDt, 's', 1)} · t0=${formatEng(entry.channel.t[0] || 0, 's', 1)}
+          时长 ${formatEng(refDur * scale, 's', 2)} · 当前采样间隔 ${formatEng(scaledRefDt, 's', 3)} · 源间隔 ${formatEng(refDt, 's', 3)} · 起点 ${formatEng(entry.channel.t[0] || 0, 's', 3)}
         </div>
       </td>
       <td class="p-1.5">
@@ -3206,17 +3240,19 @@ function recomputeComparePanel(tab: TabState) {
           <option value="0.000001" ${matchedPreset === 1e-6 ? 'selected' : ''}>×1e-6 (µs→s)</option>
           <option value="1000" ${matchedPreset === 1000 ? 'selected' : ''}>×1000 (s→ms)</option>
           <option value="1000000" ${matchedPreset === 1e6 ? 'selected' : ''}>×1e6 (s→µs)</option>
-          <option value="fit">Fit Span (×${Number(fitRatio.toPrecision(3))})</option>
+          <option value="fit">匹配时长（×${Number(fitRatio.toPrecision(3))}）</option>
           ${!matchedPreset ? `<option value="${scale}" selected>×${Number(scale.toPrecision(3))}</option>` : ''}
         </select>
       </td>
       <td class="p-1.5">
         <div class="flex items-center gap-1">
-          <button type="button" class="cmp-row-dt-dec px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-bold rounded-xs cursor-pointer select-none" title="Shift Δt −0.1% span (Shift+Click: −1%)">−</button>
-          <span class="text-slate-300 tabular-nums min-w-[58px] text-center">${formatEng(entry.timeShiftSec || 0, 's', 2)}</span>
-          <button type="button" class="cmp-row-dt-inc px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-bold rounded-xs cursor-pointer select-none" title="Shift Δt +0.1% span (Shift+Click: +1%)">+</button>
-          <button type="button" class="cmp-row-xcorr px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-amber-300 rounded-xs cursor-pointer" title="Auto XCorr align this trace">Auto</button>
+          <button type="button" class="cmp-row-dt-dec px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-bold rounded-xs cursor-pointer select-none" title="按较小的有效采样间隔的 1/10 微调；按住 Shift 点击为 10 倍步长">−</button>
+          <input type="number" class="cmp-row-dt-input w-[92px] min-w-0 bg-[#0c0f13] border border-cyan-700/60 rounded-xs px-1 py-0.5 text-cyan-100 text-right font-mono tabular-nums" step="${fineShiftStep.toExponential(3)}" value="${Number((entry.timeShiftSec || 0).toPrecision(10))}" title="输入参考波形时间平移 Δt，单位秒；正值向后移动。微调步长按缩放后的参考与目标采样间隔估算。" />
+          <button type="button" class="cmp-row-dt-inc px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 font-bold rounded-xs cursor-pointer select-none" title="按较小的有效采样间隔的 1/10 微调；按住 Shift 点击为 10 倍步长">+</button>
+          <button type="button" class="cmp-row-t0 px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-emerald-300 rounded-xs cursor-pointer" title="仅将参考波形首样本与目标首样本对齐；不改变时间比例，也不证明两次采集真实同步">t0</button>
+          <button type="button" class="cmp-row-xcorr px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-amber-300 rounded-xs cursor-pointer" title="根据两条波形的形状相关性估算最佳时间平移；仅适用于具有共同变化特征的信号">XCorr</button>
         </div>
+        <div class="mt-0.5 text-[9px] text-slate-500">${`Δt ${formatEng(entry.timeShiftSec || 0, 's', 3)} · 有效时间覆盖 ${metrics.coveragePct.toFixed(1)}%（${formatEng(metrics.coveredDurationSec, 's', 2)} / ${formatEng(metrics.targetDurationSec, 's', 2)}）`}</div>
       </td>
       <td class="p-1.5 text-right">
         <div class="text-cyan-300 font-semibold">${cmpValid && metrics.similarityPct !== null ? metrics.similarityPct.toFixed(1) + '%' : '--'}</div>
@@ -3238,16 +3274,12 @@ function recomputeComparePanel(tab: TabState) {
             ? 'text-amber-300'
             : 'text-red-400'
         }">${
-          cmpValid && golden.status === 'PASS'
-            ? 'PASS'
-            : cmpValid && golden.status === 'FAIL'
-            ? `FAIL(${golden.violationCount})`
-            : cmpStatus
+          cmpStatusLabel
         }</span>
       </td>
       <td class="p-1.5 text-right whitespace-nowrap">
-        <button type="button" class="cmp-row-jump px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-amber-600/50 text-amber-300 rounded-xs cursor-pointer mr-1" title="Jump to Max |Δ|">Jump</button>
-        <button type="button" class="cmp-row-del px-1.5 py-0.5 bg-[#161b22] hover:bg-red-950/60 border border-[#222933] text-red-300 rounded-xs cursor-pointer" title="Remove from group">✕</button>
+        <button type="button" class="cmp-row-jump px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-amber-600/50 text-amber-300 rounded-xs cursor-pointer mr-1" title="定位目标波形最大偏差时间点">定位</button>
+        <button type="button" class="cmp-row-del px-1.5 py-0.5 bg-[#161b22] hover:bg-red-950/60 border border-[#222933] text-red-300 rounded-xs cursor-pointer" title="从比较组移除此参考波形">移除</button>
       </td>
     `;
 
@@ -3266,16 +3298,27 @@ function recomputeComparePanel(tab: TabState) {
       }
       recomputeComparePanel(tab);
     });
+    tr.querySelector('.cmp-row-dt-input')?.addEventListener('change', (ev: any) => {
+      const value = Number.parseFloat(String(ev.target?.value ?? ''));
+      if (!Number.isFinite(value)) {
+        ev.target.value = String(Number((entry.timeShiftSec || 0).toPrecision(10)));
+        return;
+      }
+      entry.timeShiftSec = value;
+      recomputeComparePanel(tab);
+    });
+    tr.querySelector('.cmp-row-t0')?.addEventListener('click', () => {
+      entry.timeShiftSec = computeAutoTimeAlignShift(targetCh, entry.channel, 'start', entry.timeScale || 1);
+      recomputeComparePanel(tab);
+    });
     tr.querySelector('.cmp-row-dt-dec')?.addEventListener('click', (ev) => {
-      const stepSpan = tgtDur > 1e-18 ? tgtDur : refDur;
-      const frac = (ev as MouseEvent).shiftKey ? 0.01 : 0.001;
-      entry.timeShiftSec = (entry.timeShiftSec || 0) - stepSpan * frac;
+      const nudge = fineShiftStep * ((ev as MouseEvent).shiftKey ? 10 : 1);
+      entry.timeShiftSec = (entry.timeShiftSec || 0) - nudge;
       recomputeComparePanel(tab);
     });
     tr.querySelector('.cmp-row-dt-inc')?.addEventListener('click', (ev) => {
-      const stepSpan = tgtDur > 1e-18 ? tgtDur : refDur;
-      const frac = (ev as MouseEvent).shiftKey ? 0.01 : 0.001;
-      entry.timeShiftSec = (entry.timeShiftSec || 0) + stepSpan * frac;
+      const nudge = fineShiftStep * ((ev as MouseEvent).shiftKey ? 10 : 1);
+      entry.timeShiftSec = (entry.timeShiftSec || 0) + nudge;
       recomputeComparePanel(tab);
     });
     tr.querySelector('.cmp-row-xcorr')?.addEventListener('click', () => {
@@ -3298,6 +3341,10 @@ function recomputeComparePanel(tab: TabState) {
 
   wrap.innerHTML = '';
   wrap.appendChild(table);
+  const legend = document.createElement('div');
+  legend.className = 'px-2 py-1.5 text-[9px] text-slate-500 border-t border-[#222933]';
+  legend.textContent = '指标口径：RMSE/MAE 按时间积分（非均匀采样不按点数加权）；时间覆盖率按连续有效时长计算；PASS 需满足最低覆盖率且全部有效比较点落在容差带内。匹配时长或首样本对齐不代表采集同步。';
+  wrap.appendChild(legend);
   renderComparePreviewCanvas(targetCh, paletteMode, theme.id, colorOffset);
 }
 
@@ -3357,6 +3404,20 @@ function openCompareModal(tab: TabState, editGroupId?: string) {
 
   renderCompareGroupSwatches();
   const defKey = populateCompareDropdowns(tab);
+  if (editGroupId) {
+    const targetId = (document.getElementById('cmpTargetSelect') as HTMLSelectElement | null)?.value;
+    const existingBand = tab.goldenBand;
+    if (existingBand?.enabled && (!targetId || existingBand.channelId === targetId)) {
+      const tolModeEl = document.getElementById('cmpTolModeSelect') as HTMLSelectElement | null;
+      const tolValueEl = document.getElementById('cmpTolValueInput') as HTMLInputElement | null;
+      const minCoverageEl = document.getElementById('cmpMinCoverageSelect') as HTMLSelectElement | null;
+      const enableGoldenEl = document.getElementById('cmpEnableGoldenChk') as HTMLInputElement | null;
+      if (tolModeEl) tolModeEl.value = existingBand.mode;
+      if (tolValueEl) tolValueEl.value = String(existingBand.tolerance);
+      if (minCoverageEl) minCoverageEl.value = String(existingBand.minCoveragePct ?? 80);
+      if (enableGoldenEl) enableGoldenEl.checked = true;
+    }
+  }
   if (compareQueue.length === 0 && defKey && !editGroupId) {
     const resolved = resolveRefSourceByKey(defKey);
     if (resolved) {

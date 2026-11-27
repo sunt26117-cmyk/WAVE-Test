@@ -681,8 +681,6 @@ export function computeXYAlignedTrajectory(
 
   if (!useUniformFallbackWeights && xSpan > 1e-12 && ySpan > 1e-12 && validCount >= 6) {
     const activeTimeSpanSec = totalWeight;
-    // TimebaseCheckResult exposes the median sample interval as `dtMedian`
-    // (there is no `medianDtSec` field); the old name silently read undefined.
     const medianDtSec = tb.dtMedian > 0 ? tb.dtMedian : activeTimeSpanSec / Math.max(1, validCount - 1);
     const estX = detectFundamentalFreqWeighted(segments, (seg, idx) => seg.xs[idx], activeTimeSpanSec, medianDtSec);
     const estY = detectFundamentalFreqWeighted(segments, (seg, idx) => seg.ys[idx], activeTimeSpanSec, medianDtSec);

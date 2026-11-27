@@ -700,6 +700,14 @@
               <button id="xlsTabMergeBtn" type="button" class="px-2.5 py-1 rounded-xs text-slate-300 hover:text-white cursor-pointer">Merge Tab</button>
             </div>
             <span id="xlsFooterContextHint" class="text-[11px] text-slate-400">每个勾选的 Sheet 将打开为独立标签页</span>
+            <div id="xlsMergeTimeModeWrap" class="hidden flex items-center gap-1.5">
+              <label for="xlsMergeTimeModeSelect" class="text-[10px] text-slate-400">合并时间轴</label>
+              <select id="xlsMergeTimeModeSelect" class="bg-[#12161c] border border-[#2c3543] rounded-xs px-2 py-1 text-[10px] text-cyan-200">
+                <option value="preserve" selected>保留原始时间坐标</option>
+                <option value="align-start">各通道首样本对齐 t=0</option>
+              </select>
+              <span class="text-[9px] text-slate-500" title="只平移时间轴，不插值、不改变原始样本和采样间隔。">不重采样</span>
+            </div>
           </div>
           <div class="flex items-center gap-2">
             <button id="xlsCancelBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Cancel</button>
@@ -1353,8 +1361,8 @@
       <div class="bg-[#12161c] border border-[#2c3543] rounded-sm shadow-2xl max-w-5xl w-full p-5 flex flex-col max-h-[94vh]">
         <div class="flex justify-between items-center pb-2.5 border-b border-[#222933] mb-3">
           <div>
-            <h2 class="text-sm font-semibold text-emerald-300 uppercase tracking-wider">Multi-Waveform Compare Group (Align, Scale &amp; Overlay)</h2>
-            <div class="text-[11px] font-mono text-slate-400 mt-0.5">Load CSV/WFM/LTspice files (auto-skips identical duplicates), align start/ms-vs-s step differences, and preview live.</div>
+            <h2 class="text-sm font-semibold text-emerald-300 tracking-wider">多波形对比 · 时间对齐、误差评估与叠加</h2>
+            <div class="text-[11px] text-slate-400 mt-0.5">按流程操作：①选择目标波形并添加参考 → ②先处理时间单位/起点，再精调 Δt → ③检查时间覆盖率与误差 → ④应用到 Scope。重复文件会自动跳过。</div>
           </div>
           <button id="compareCloseTopBtn" class="text-slate-400 hover:text-white text-base cursor-pointer">✕</button>
         </div>
@@ -1363,24 +1371,24 @@
           <!-- Group Identity & Visual Binding Bar -->
           <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 grid grid-cols-1 md:grid-cols-12 gap-2.5 items-end">
             <div class="md:col-span-3">
-              <label class="block text-[10px] text-slate-400 uppercase mb-1">Group Name / Tag</label>
+              <label class="block text-[10px] text-slate-400 uppercase mb-1">比较组名称 / 标签</label>
               <input id="cmpGroupNameInput" type="text" value="CMP1" maxlength="20" placeholder="e.g. CMP1, MotorA" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2.5 py-1 text-white font-mono" />
             </div>
             <div class="md:col-span-3">
-              <label class="block text-[10px] text-slate-400 uppercase mb-1">Group Badge Color</label>
+              <label class="block text-[10px] text-slate-400 uppercase mb-1">比较组标识颜色</label>
               <div id="cmpGroupColorSwatches" class="flex items-center gap-1.5 h-[28px]"></div>
             </div>
             <div class="md:col-span-4">
-              <label class="block text-[10px] text-slate-400 uppercase mb-1">Trace Color Mode</label>
+              <label class="block text-[10px] text-slate-400 uppercase mb-1">波形颜色模式</label>
               <select id="cmpPaletteModeSelect" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-slate-200 font-mono">
-                <option value="family">Same-Hue Shades (同色系渐变 · 整组一眼认出)</option>
-                <option value="distinct">Distinct Colors + Group Badge (高区分彩线 + 组徽章)</option>
+                <option value="family">同色系渐变（便于识别同一组）</option>
+                <option value="distinct">高区分彩线（便于识别多条参考）</option>
               </select>
             </div>
             <div class="md:col-span-2 flex items-center h-[28px]">
-              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer" title="Tag the Target baseline channel with the same Group Name and Color">
+              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer" title="将目标基准通道标记为相同组名和组颜色">
                 <input id="cmpTagTargetChk" type="checkbox" class="accent-emerald-400 cursor-pointer" checked />
-                <span class="text-[11px]">Bind Target</span>
+                <span class="text-[11px]">目标也加入组标记</span>
               </label>
             </div>
           </div>
@@ -1388,18 +1396,18 @@
           <!-- Target + Multi-File / Channel Adder -->
           <div class="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-end">
             <div class="md:col-span-4">
-              <label class="block text-[11px] text-slate-400 mb-1">Target Baseline (Current Tab)</label>
+              <label class="block text-[11px] text-slate-400 mb-1">① 目标基准波形（当前 Scope）</label>
               <select id="cmpTargetSelect" class="w-full bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono"></select>
             </div>
             <div class="md:col-span-8">
               <div class="flex items-center justify-between mb-1">
-                <label class="text-[11px] text-slate-400">Add Waveforms (Multi-File or Any Tab/Channel)</label>
+                <label class="text-[11px] text-slate-400">添加参考波形（可多选文件或其他通道）</label>
                 <span id="cmpQueueCountBadge" class="text-[11px] font-mono text-emerald-300">0 waveform(s) in group</span>
               </div>
               <div class="flex flex-wrap items-center gap-1.5">
                 <select id="cmpRefSelect" class="flex-1 min-w-[180px] bg-[#0c0f13] border border-[#222933] rounded-sm px-2.5 py-1.5 text-white font-mono"></select>
-                <button id="cmpAddRefBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Add Channel</button>
-                <button id="cmpLoadFileBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">+ Load File(s)...</button>
+                <button id="cmpAddRefBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-cyan-600/60 text-cyan-200 font-semibold rounded-sm cursor-pointer whitespace-nowrap">＋添加通道</button>
+                <button id="cmpLoadFileBtn" type="button" class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer whitespace-nowrap">＋导入文件</button>
                 <input type="file" id="cmpRefFileInput" multiple class="hidden" accept=".csv,.wfm,.raw,.txt,.xlsx,.xls,.xlsm,.xlsb" />
               </div>
             </div>
@@ -1408,7 +1416,7 @@
           <!-- Live Mini Oscilloscope Comparison Preview -->
           <div class="bg-[#080b0f] border border-[#222933] rounded-sm overflow-hidden">
             <div class="flex items-center justify-between px-2.5 py-1 bg-[#0c0f13] border-b border-[#1b222c] font-mono text-[10px]">
-              <span id="cmpPreviewBanner" class="text-slate-300 truncate">Live Overlay Preview (Base + Group Waveforms)</span>
+              <span id="cmpPreviewBanner" class="text-slate-300 truncate">实时叠加预览（目标 + 参考组）</span>
               <span id="cmpScaleWarnBanner" class="text-amber-300 hidden"></span>
             </div>
             <canvas id="cmpPreviewCanvas" class="w-full h-[155px] block"></canvas>
@@ -1417,35 +1425,42 @@
           <!-- Batch Alignment, Time-Scale & Conditioning -->
           <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-2.5 flex flex-wrap items-center justify-between gap-2">
             <div class="flex flex-wrap items-center gap-1.5">
-              <span class="text-slate-400 font-semibold mr-0.5">Align All:</span>
-              <button id="cmpAlignStartBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-emerald-300 rounded-sm cursor-pointer" title="Align starting timestamp t[0] of all waveforms to Target t[0]">Align Start (t0)</button>
-              <button id="cmpAlignEdgeBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Align Edge</button>
-              <button id="cmpAlignPeakBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Align Peak</button>
-              <button id="cmpAlignXCorrBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-300 rounded-sm cursor-pointer">Auto XCorr</button>
-              <button id="cmpMatchSpanBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-amber-500/50 text-amber-200 rounded-sm cursor-pointer" title="Auto-scale ms vs s time steps to match Target span and align start">Match Span (ms↔s)</button>
-              <button id="cmpAlignResetBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Reset 1× / Δt=0</button>
+              <span class="text-slate-400 font-semibold mr-0.5">② 时间对齐（先选方法，再逐条微调）：</span>
+              <button id="cmpAlignStartBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-emerald-300 rounded-sm cursor-pointer" title="将所有参考波形的首样本时间戳与目标首样本对齐；不证明采集设备同时触发">首样本对齐</button>
+              <button id="cmpAlignEdgeBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">上升沿对齐</button>
+              <button id="cmpAlignPeakBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">峰值对齐</button>
+              <button id="cmpAlignXCorrBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-300 rounded-sm cursor-pointer">互相关自动对齐</button>
+              <button id="cmpMatchSpanBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-amber-500/50 text-amber-200 rounded-sm cursor-pointer" title="Auto-scale ms vs s time steps to match Target span and align start">自动匹配时长/单位</button>
+              <button id="cmpAlignResetBtn" type="button" class="px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">重置 1× / Δt=0</button>
             </div>
 
             <div class="flex flex-wrap items-center gap-3">
-              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer" title="Automatically align start t0 and match ms/s span difference when adding files">
+              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer" title="添加文件时，自动对齐首样本并尝试识别 ms/s 时间尺度差异；不证明采集同步">
                 <input id="cmpAutoFitOnAddChk" type="checkbox" class="accent-emerald-400 cursor-pointer" checked />
-                <span>Auto-Align on Add</span>
+                <span>添加时自动首样本对齐（假设首样本同一时刻）</span>
               </label>
               <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer">
                 <input id="cmpRemoveDcChk" type="checkbox" class="accent-cyan-400 cursor-pointer" />
-                <span>Remove DC</span>
+                <span>去除 DC 分量</span>
               </label>
               <div class="flex items-center gap-1.5">
-                <span class="text-slate-400">Tol:</span>
+                <span class="text-slate-400">容差：</span>
                 <select id="cmpTolModeSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 font-mono text-slate-200">
-                  <option value="percent">% Vpp</option>
-                  <option value="absolute">± Abs</option>
+                  <option value="percent">% 满幅 Vpp</option>
+                  <option value="absolute">± 绝对值</option>
                 </select>
                 <input id="cmpTolValueInput" type="number" step="0.5" min="0.01" value="5" class="w-14 bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 font-mono text-white" />
+                <span class="text-slate-500" title="按连续有效时间长度计算，不按样本数量计算；时间缺口不计入覆盖。">最低有效时间覆盖</span>
+                <select id="cmpMinCoverageSelect" class="bg-[#12161c] border border-[#222933] rounded-sm px-1.5 py-1 font-mono text-slate-200" title="覆盖率低于该值时禁止 PASS 判定">
+                  <option value="50">50%</option>
+                  <option value="80" selected>80%</option>
+                  <option value="95">95%</option>
+                  <option value="99">99%</option>
+                </select>
               </div>
-              <label class="flex items-center gap-1.5 text-emerald-300 cursor-pointer">
+              <label class="flex items-center gap-1.5 text-emerald-300 cursor-pointer" title="对比表中的容差 PASS/FAIL 始终按当前设置计算；此复选框只控制是否将容差带绘制到 Scope。">
                 <input id="cmpEnableGoldenChk" type="checkbox" class="accent-emerald-400 cursor-pointer" checked />
-                <span>Tol Band</span>
+                <span>将容差带应用到 Scope</span>
               </label>
             </div>
           </div>
@@ -1456,13 +1471,13 @@
 
         <div class="flex flex-wrap items-center justify-between gap-2 pt-3 mt-3 border-t border-[#222933] text-xs">
           <div class="flex flex-wrap items-center gap-2">
-            <button id="cmpClearQueueBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-red-950/50 border border-[#222933] text-slate-300 hover:text-red-300 rounded-sm cursor-pointer">Clear Queue</button>
-            <button id="cmpClearBandBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Clear Band</button>
+            <button id="cmpClearQueueBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-red-950/50 border border-[#222933] text-slate-300 hover:text-red-300 rounded-sm cursor-pointer">清空参考队列</button>
+            <button id="cmpClearBandBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">清除容差带</button>
           </div>
           <div class="flex flex-wrap items-center gap-2">
-            <button id="cmpAddDiffBtn" type="button" class="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900/70 border border-rose-600/60 text-rose-200 font-semibold rounded-sm cursor-pointer">+ Diff Traces (All)</button>
-            <button id="cmpApplyOverlayBtn" type="button" class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold rounded-sm cursor-pointer">Overlay Group onto Scope</button>
-            <button id="cmpCloseBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">Close</button>
+            <button id="cmpAddDiffBtn" type="button" class="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900/70 border border-rose-600/60 text-rose-200 font-semibold rounded-sm cursor-pointer">＋生成全部差值通道</button>
+            <button id="cmpApplyOverlayBtn" type="button" class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold rounded-sm cursor-pointer">④ 应用到 Scope</button>
+            <button id="cmpCloseBtn" type="button" class="px-3 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">关闭</button>
           </div>
         </div>
       </div>
@@ -1930,8 +1945,9 @@
             <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2.5">
               <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[#222933]">
                 <span class="text-slate-200 font-semibold">Active Cauer Network:</span>
-                <span id="thermLossCauerSummary" class="font-mono text-emerald-300 text-[11px] tabular-nums">Default 3-Stage</span>
+                <span id="thermLossCauerSummary" class="font-mono text-amber-300 text-[11px] tabular-nums" title="软件回退 RC 网络，不对应任何具体 MOSFET。仅作计算链路演示，不可用于真实 Tj、热设计裕量或器件选型。">软件回退三阶热网络（非器件数据）</span>
               </div>
+              <p class="text-[10px] leading-relaxed text-amber-200 bg-amber-950/30 border border-amber-800/50 rounded-xs px-2 py-1.5">重要：初始三阶 Cauer 网络是软件回退假设（总 Rth=1.22 °C/W），不是通用 MOSFET 参数。此网络下的 Tj* 仅用于演示计算流程；实际热设计必须先导入目标器件 ZthJC(t)/数据手册热参数，或用可信测温数据反演，并确认热路径确为 Junction→Ambient。</p>
               <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-1">Drain Voltage Vds (V)</label>
@@ -1950,7 +1966,7 @@
                   </select>
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-1">T_amb / Base (°C)</label>
+                  <label class="block text-[10px] text-slate-400 mb-1" title="环境温度/基准温度；必须与当前热网络的参考节点一致，不得用壳温代替环境温度">T_amb / Base (°C)</label>
                   <input id="thermLossTambInput" type="number" step="0.5" value="25" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
                 </div>
                 <div>
@@ -1974,20 +1990,21 @@
                 </div>
                 <div class="sm:col-span-2">
                   <label class="block text-[10px] text-slate-400 mb-1">Eoss (µJ)</label>
-                  <input id="thermLossEossInput" type="number" step="0.5" min="0" value="12" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+                  <input id="thermLossEossInput" type="number" step="0.5" min="0" placeholder="留空：不做标量 Eoss 修正" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+                  <p class="mt-1 text-[9px] text-slate-500">单值仅适用于对应电压条件；母线电压变化时优先导入 Eoss(V)/Qoss(V) 曲线。</p>
                 </div>
                 <div class="sm:col-span-2">
                   <label class="block text-[10px] text-slate-400 mb-1">Rds25 (mΩ)</label>
-                  <input id="thermLossRdsInput" type="number" step="0.1" min="0.1" value="4.5" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+                  <input id="thermLossRdsInput" type="number" step="0.1" min="0.1" placeholder="器件资料 / 25°C" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
                 </div>
                 <div class="sm:col-span-2">
                   <label class="block text-[10px] text-slate-400 mb-1">α (%/°C)</label>
-                  <input id="thermLossAlphaInput" type="number" step="0.05" value="0.45" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
+                  <input id="thermLossAlphaInput" type="number" step="0.05" placeholder="器件曲线拟合值" class="w-full bg-[#12161c] border border-[#222933] rounded-sm px-2 py-1 text-white font-mono" />
                 </div>
               </div>
 
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#1b222c]">
-                <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer" title="默认关闭：Vds×Ids 已直接计入实测导通损耗。只有当 Vds 是 25°C 参考态/模型波形且未包含当前结温增阻时，才勾选叠加 Rds(on)(Tj)。">
+                <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer" title="默认关闭：Vds×Ids 已直接计入实测导通损耗。只有当 Vds 是 25°C 参考态/模型波形且未包含当前结温增阻时，才勾选；勾选后必须输入本器件 Rds25 与 α。">
                   <input id="thermLossRdsFeedbackChk" type="checkbox" class="accent-cyan-400 cursor-pointer" />
                   <span>叠加 Rds(on)(Tj) 温升修正（默认关闭；仅适用于 25°C 参考态/模型 Vds）</span>
                 </label>
@@ -2003,8 +2020,8 @@
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">E_deskewed</div><div id="thermLossDeskewE" class="text-cyan-300 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">E_stripped</div><div id="thermLossStrippedE" class="text-emerald-300 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">P_loss Mean</div><div id="thermLossPmean" class="text-amber-300 font-semibold mt-0.5">--</div></div>
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermLossTjMaxLabel" class="text-[10px] text-slate-400">Tj Max</div><div id="thermLossTjMax" class="text-pink-300 font-semibold mt-0.5">--</div></div>
-              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermLossDeltaTjLabel" class="text-[10px] text-slate-400">ΔTj Peak</div><div id="thermLossDeltaTj" class="text-slate-100 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermLossTjMaxLabel" class="text-[10px] text-amber-300">Tj* Max（回退估算）</div><div id="thermLossTjMax" class="text-pink-300 font-semibold mt-0.5">--</div></div>
+              <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div id="thermLossDeltaTjLabel" class="text-[10px] text-amber-300">ΔTj* Peak（回退估算）</div><div id="thermLossDeltaTj" class="text-slate-100 font-semibold mt-0.5">--</div></div>
               <div class="bg-[#0c0f13] border border-[#222933] p-2 rounded-sm"><div class="text-[10px] text-slate-400">SW Events</div><div id="thermLossSwCount" class="text-slate-300 font-semibold mt-0.5">--</div></div>
             </div>
 
@@ -2129,9 +2146,18 @@
             <!-- Card 1: 3-Phase Inputs & Control Strategy -->
             <div class="bg-[#0c0f13] border border-[#222933] rounded-sm p-3 space-y-2.5">
               <div class="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-[#222933]">
-                <span class="text-[11px] font-semibold text-amber-300 uppercase tracking-wider">FOC 3-Phase Inputs, Modulation &amp; MOSFET Params</span>
-                <button id="focLoadDemoBtn" type="button" class="px-2.5 py-0.5 bg-[#162229] hover:bg-[#1d303a] border border-cyan-600/50 text-cyan-200 font-mono text-[10px] rounded-xs cursor-pointer">Load FOC 3-Ph Demo</button>
+                <div class="min-w-0">
+                  <span class="text-[11px] font-semibold text-amber-300 uppercase tracking-wider">FOC 3-Phase Inputs, Modulation &amp; MOSFET Params</span>
+                  <p class="mt-0.5 text-[10px] text-slate-500">空白 Esw / Qrr / Rg 表示不计入该项；器件参数须按具体 MOS、驱动和测试条件填写。</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <button id="focApplyStarterBtn" type="button" class="px-2.5 py-0.5 bg-[#162229] hover:bg-[#1d303a] border border-amber-600/50 text-amber-200 font-mono text-[10px] rounded-xs cursor-pointer" title="应用 12V 汽车供电起算工况；不自动填充或伪造器件损耗与热参数。">应用 12V 汽车供电起算值</button>
+                  <button id="focApplyBuk7ProfileBtn" type="button" class="px-2.5 py-0.5 bg-[#17251e] hover:bg-[#20382a] border border-emerald-600/60 text-emerald-200 font-mono text-[10px] rounded-xs cursor-pointer" title="载入 Nexperia BUK7Q6R0-40H 数据手册有明确依据的参数；不伪造 Eon/Eoff。">应用 BUK7Q6R0-40H 数据手册</button>
+                  <a href="https://www.nexperia.com/interactive-datasheet?id=BUK7Q6R0-40H" target="_blank" rel="noopener noreferrer" class="px-2.5 py-0.5 bg-[#17212a] hover:bg-[#20303e] border border-cyan-700/60 text-cyan-200 font-mono text-[10px] rounded-xs" title="打开 Nexperia 对该精确料号提供的官方精密电热交互数据手册；需要网络。">官方 Interactive Datasheet ↗</a>
+                  <button id="focLoadDemoBtn" type="button" class="px-2.5 py-0.5 bg-[#162229] hover:bg-[#1e303a] border border-cyan-600/50 text-cyan-200 font-mono text-[10px] rounded-xs cursor-pointer">Load FOC 3-Ph Demo</button>
+                </div>
               </div>
+              <div id="focBuk7ProfileNote" class="hidden rounded border border-emerald-800/70 bg-emerald-950/20 px-2 py-2 text-[10px] leading-relaxed text-emerald-100"></div>
 
               <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 <div>
@@ -2184,8 +2210,8 @@
                   </select>
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">Vbus (V)</label>
-                  <input id="focVbusConstInput" type="number" step="1" min="1" value="48" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="12V 汽车供电常用范围 9～16V；13.5V 作为典型工作电压。输入框仍允许输入范围外电压做特殊工况分析。">Vbus (V) · 9～16V</label>
+                  <input id="focVbusConstInput" type="number" step="0.1" min="1" value="13.5" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">T_amb (°C)</label>
@@ -2209,21 +2235,29 @@
                 </div>
               </div>
 
-              <div class="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-11 gap-1.5 pt-1 border-t border-[#1b222c]">
+              <div class="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-12 gap-1.5 pt-1 border-t border-[#1b222c]">
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">f_sw (kHz)</label>
-                  <input id="focFswKhzInput" type="number" step="1" min="1" value="20" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="实际 PWM 载波频率，需与控制器配置一致；不是可省略的物理参数。">f_sw (kHz) *</label>
+                  <input id="focFswKhzInput" type="number" step="1" min="0.1" value="20" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">t_dead (ns)</label>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="平均损耗模型按每个 PWM 周期的两个死区边沿分别处理：高、低侧沟道各扣除一个 t_dead；体二极管损耗按相电流方向分配。指令脉冲宽度不超过单边死区时，因 MCU/驱动器的脉冲删除行为依赖实际配置，模型拒绝输出该工作点。">t_dead (ns)</label>
                   <input id="focTdeadNsInput" type="number" step="20" min="0" value="500" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">Rds25 (mΩ)</label>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="4.5 mΩ 仅为示例起点，不是通用推荐；未勾选器件参数确认时仍用于趋势估算，但输出会标记为 Tj*，不可用于器件热设计签核。">Rds25 (mΩ) *</label>
                   <input id="focRdsInput" type="number" step="0.1" min="0.1" value="4.5" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">α (%/°C)</label>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="实际 MOS 导通期间栅源电压；使用 Rds(on)-Tj 曲线时必须与曲线测试 Vgs 一致，允许偏差 ±0.10V。">Vgs,on (V)</label>
+                  <input id="focRdsOperatingVgsInput" type="number" step="0.1" min="0.1" max="30" value="" placeholder="曲线使用时必填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="Rds(on)@25°C 绝对值在数据手册或实测中对应的 Vgs；使用归一化温度曲线时必须与曲线参考 Vgs 匹配。">Rds25 测试 Vgs (V)</label>
+                  <input id="focRds25ReferenceVgsInput" type="number" step="0.1" min="0.1" max="30" value="" placeholder="曲线使用时必填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="0.45%/°C 为硅 MOS 的简化起算系数；优先使用目标器件 Rds(on)-Tj 曲线。使用曲线时本 α 不参与计算。">α (%/°C)</label>
                   <input id="focAlphaInput" type="number" step="0.05" value="0.45" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
@@ -2232,42 +2266,78 @@
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">Esw (µJ)</label>
-                  <input id="focEswInput" type="number" step="1" min="0" value="35" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <input id="focEswInput" type="number" step="1" min="0" value="" placeholder="选填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5" title="零电流 Coss 电容充放电损耗 Eoss (µJ @ Vref)，按 (Vbus/Vref)² 计入每次硬开关主导通管（钳位时不计）；默认 0 µJ 以避免与数据手册 Eon 重复计算；忽略非线性 Coss(V) 电压依赖差异。">Eoss (µJ)</label>
-                  <input id="focEossInput" type="number" step="0.5" min="0" value="0" title="零电流 Coss 电容损耗 (µJ @ Vref)，默认 0 避免与 Eon 重复计算，按 (Vbus/Vref)² 缩放（标称近似，非非线性 Coss(V) 积分）。" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <input id="focEossInput" type="number" step="0.5" min="0" value="" placeholder="选填（未计入）" title="零电流 Coss 电容损耗 (µJ @ Vref)，未填写时按 0 处理；若 Eon 已包含 Eoss，请勿重复计入。按 (Vbus/Vref)² 缩放（标称近似，非非线性 Coss(V) 积分）。" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">Qrr (nC)</label>
-                  <input id="focQrrInput" type="number" step="5" min="0" value="60" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="输入对应 Iref 和测试条件下的 Qrr/Qr。Nexperia BUK7Q6R0-40H 的 datasheet Qr 脚注包含 capacitive recovery（Qr=Qs+Qoss）。">Qrr / Qr (nC)</label>
+                  <input id="focQrrInput" type="number" step="5" min="0" value="" placeholder="选填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">Vref (V)</label>
-                  <input id="focVrefInput" type="number" step="1" min="1" value="48" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="单点 Eon/Eoff/Eoss 的参考母线电压；Qr 的数据手册测试 VDS 单独记录在器件说明中，不使用此字段。">Esw/Eoss Vref (V)</label>
+                  <input id="focVrefInput" type="number" step="0.1" min="1" value="13.5" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5">Iref (A)</label>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="单点 Eon/Eoff 的参考电流，仅用于 Eon/Eoff 能量缩放。Qr 使用下方独立 Qr Iref。">Esw Iref (A)</label>
                   <input id="focIrefInput" type="number" step="1" min="1" value="30" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="数据手册 Qr 或实测 Qrr 的独立测试电流。BUK7Q6R0-40H 的 Qr=13nC 测试条件为 Is=16A；与 Eon/Eoff 的 Iref 完全分开。">Qr Iref (A)</label>
+                  <input id="focQrrIrefInput" type="number" step="0.5" min="0.1" value="" placeholder="同 Esw Iref" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="Qr/Qrr 参考数据测量时的 VDS，不是 Esw 的 Vref；只记录测试条件，不代表软件已建立 Qr(VDS) 修正曲线。">Qr test VDS (V)</label>
+                  <input id="focQrrReferenceVdsInput" type="number" step="0.1" min="0.1" value="" placeholder="数据手册条件" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="Qr/Qrr 测量时的电流变化率，单位 A/µs；负值表示反向变化。仅记录测试条件，不对实际换流斜率做线性修正。">Qr test di/dt (A/µs)</label>
+                  <input id="focQrrReferenceDiDtInput" type="number" step="1" max="0" value="" placeholder="数据手册条件" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="Qr/Qrr 数据手册/实测时的结温；只记录条件，不对 Qr 做温度修正。">Qr test Tj (°C)</label>
+                  <input id="focQrrReferenceTjInput" type="number" step="1" min="-100" max="250" value="" placeholder="数据手册条件" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="Qr/Qrr 测试时 MOSFET 栅源电压，体二极管反向恢复通常为 VGS=0V；仅记录测试条件。">Qr test Vgs (V)</label>
+                  <input id="focQrrReferenceVgsInput" type="number" step="0.1" min="-20" max="20" value="" placeholder="数据手册条件" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-white font-mono text-[11px]" />
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 mb-0.5">τ_split (ms)</label>
                   <input id="focTauSplitMsInput" type="number" step="5" min="0.5" value="50" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-300 font-mono text-[11px]" />
                 </div>
               </div>
+              <div class="flex flex-wrap items-center gap-3 text-[10px] pt-1">
+                <label class="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer" title="确认 Rds25 已按目标 MOS 型号、Vgs 和所需结温条件核对；此勾选进入计算指纹、结果来源分类和 Tj* 标记；勾选不等于验证热模型或完成安全签核。">
+                  <input id="focRdsConfirmedChk" type="checkbox" class="accent-emerald-400 cursor-pointer" />
+                  <span>Rds25 已按目标器件数据手册/实测核对</span>
+                </label>
+                <span class="text-slate-500">Esw、Qrr、Eoss、Rg 为选填；未填写时不臆造损耗项。</span>
+              </div>
+              <details class="rounded border border-[#26313d] bg-[#10151b] p-2 mt-1">
+                <summary class="cursor-pointer text-[10px] text-emerald-200">导入目标 MOS 的 Rds(on)-Tj 归一化曲线（优先于 α；六管共用）</summary>
+                <div class="flex flex-wrap items-center gap-2 my-2">
+                  <input id="focRdsTempCurveJsonFileInput" type="file" accept=".json,application/json" class="text-[10px] text-slate-300" />
+                  <button id="focRdsTempCurveTemplateBtn" type="button" class="rounded border border-emerald-700 px-2 py-1 text-[10px] text-emerald-200">生成 JSON 模板</button>
+                </div>
+                <textarea id="focRdsTempCurveJsonInput" rows="4" spellcheck="false" placeholder='{"schema":"wave-test-rdson-temperature","schemaVersion":1,"referenceTemperatureC":25,"referenceGateVoltageV":10,"provenance":"datasheet","partNumber":"目标器件型号","points":[]}' class="mt-1 w-full rounded border border-[#283340] bg-[#0b1016] p-2 font-mono text-[10px] text-slate-200"></textarea>
+                <p class="mt-1 text-[10px] text-slate-500">数据点格式：Tj(°C) 与 Rds(on)(Tj)/Rds(on)(25°C)。必须包含 25°C=1.0 基准点，曲线参考 Vgs、Rds25 数据测试 Vgs、实际 Vgs,on 三者必须一致（各自偏差不超过 ±0.10V）；温度轴严格递增，曲线外禁止外推。导入曲线后优先于 α 生效；留空则继续使用 α 线性近似。曲线只用于同型号六管，不产生六套器件参数。</p>
+              </details>
 
               <div class="grid grid-cols-2 sm:grid-cols-6 gap-2 pt-1 border-t border-[#1b222c]">
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5" title="可选：输入器件数据手册 RθJC (Ω=°C/W) 约束 JC 与 Board 的物理拆分边界；留空则按 τ_split 自动拆分。">手册 RθJC 约束 (Ω)</label>
-                  <input id="focRjcOverrideInput" type="number" step="0.02" min="0.01" placeholder="Auto (τ_split)" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="输入目标器件结到封装安装基准面的热阻，单位 °C/W。BUK7Q6R0-40H 手册给出 Rth(j-mb)，仅当热网络 JC 端节点确实对应器件 mounting base 时才可作为该边界锚点；不可把它当作 PCB-to-ambient 热阻。">手册 RθJC / Rth(j-mb) (°C/W)</label>
+                  <input id="focRjcOverrideInput" type="number" step="0.02" min="0.01" placeholder="导入 Cauer 时必填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-emerald-200 font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5" title="开通驱动电阻 Rg_on (Ω)，用于 4D DPT LUT 开通能量 Eon/Qrr 插值。">Rg_on (Ω)</label>
-                  <input id="focRgonInput" type="number" step="0.5" min="0" value="4.7" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="选填。用于 4D DPT LUT 开通能量 Eon/Qrr 插值；留空时不允许使用依赖 Rg 的 LUT 维度。">Rg_on (Ω)</label>
+                  <input id="focRgonInput" type="number" step="0.5" min="0" value="" placeholder="选填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-cyan-200 font-mono text-[11px]" />
                 </div>
                 <div>
-                  <label class="block text-[10px] text-slate-400 mb-0.5" title="关断驱动电阻 Rg_off (Ω)，用于 4D DPT LUT 关断能量 Eoff 插值。">Rg_off (Ω)</label>
-                  <input id="focRgoffInput" type="number" step="0.5" min="0" value="4.7" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-amber-200 font-mono text-[11px]" />
+                  <label class="block text-[10px] text-slate-400 mb-0.5" title="选填。用于 4D DPT LUT 关断能量 Eoff 插值；留空时不允许使用依赖 Rg 的 LUT 维度。">Rg_off (Ω)</label>
+                  <input id="focRgoffInput" type="number" step="0.5" min="0" value="" placeholder="选填" class="w-full bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-1 text-amber-200 font-mono text-[11px]" />
                 </div>
                 <div class="sm:col-span-2 flex items-center pt-3">
                   <label class="flex items-start gap-1.5 text-[10px] text-slate-300 cursor-pointer" title="仅当 Rg_on/Rg_off 已按实际原理图或 BOM 核实后勾选。默认 4.7Ω 不是实测数据；未确认时，四维 DPT 计算不得把 Rg 当作已知工况。">
@@ -2359,13 +2429,17 @@
                     <input id="focEossIncludedChk" type="checkbox" class="accent-sky-400 cursor-pointer" />
                     <span>Esw 已含 Eoss 电容损耗（防重复计损）</span>
                   </label>
+                  <label class="inline-flex items-center gap-1.5 text-[11px] text-amber-200 cursor-pointer" title="Nexperia 的 Qr 定义包含存储电荷 Qs 和输出电荷 Qoss。若当前 Qr 输入采用该定义，软件会禁止再独立叠加 Eoss，防止同一电容性恢复被重复计量。">
+                    <input id="focQrrIncludesQossChk" type="checkbox" class="accent-amber-400 cursor-pointer" />
+                    <span>Qr 已包含 Qoss（Nexperia：Qr=Qs+Qoss）</span>
+                  </label>
                 </div>
               </div>
 
               <!-- Action Row + Locked-Rotor Stall Sweep Inline -->
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1b222c]">
                 <div class="flex flex-wrap items-center gap-1.5">
-                  <button id="focRunSimBtn" type="button" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Run 6-MOS Coupled Tj(t)</button>
+                  <button id="focRunSimBtn" type="button" class="px-3.5 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-100 font-semibold rounded-sm cursor-pointer">波形瞬态 6-MOS Tj(t)</button>
                   <button id="focInjectBtn" type="button" class="px-2.5 py-1.5 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-600/60 text-emerald-200 rounded-sm text-[11px] cursor-pointer">注入 Tj_AH..CL 到示波器</button>
                   <button id="focRunSweepBtn" type="button" class="px-2.5 py-1.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-amber-200 rounded-sm text-[11px] cursor-pointer">SVPWM vs DPWM1 扫频</button>
                 </div>
@@ -2376,6 +2450,22 @@
                 </div>
               </div>
               <div id="focSingleStageWarning" class="hidden bg-amber-950/50 border border-amber-500/60 text-amber-200 px-2.5 py-1.5 rounded-xs font-mono text-[10px]">▲ 当前为单阶 Cauer 模型经验拆分（R 40%/60%、C 25%/75%），JC 与 Board 参数无独立物理反演依据，建议反演 ≥2 阶热模型。</div>
+
+              <!-- Fixed operating-point calculation: no synthetic transient waveform is used. -->
+              <div class="border border-cyan-700/50 bg-cyan-950/15 rounded-sm p-2.5 space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="min-w-0 flex-1">
+                    <div class="text-[11px] font-semibold text-cyan-200">恒定工况 · 平均损耗 / 六管稳态结温</div>
+                    <div id="focSteadyOperatingPointHint" class="text-[10px] text-slate-300 mt-1">等待从 FOC DynoLab 导入固定 Id/Iq 工作点。</div>
+                  </div>
+                  <label id="focSteadyAngleWrap" class="hidden items-center gap-1 text-[10px] text-amber-200" title="零速时转子电角度决定三相直流电流分配；必须按实际转子位置输入，90°仅为默认相位约定。">
+                    锁定转子 θe
+                    <input id="focSteadyAngleInput" type="number" min="0" max="360" step="1" value="90" class="w-16 bg-[#12161c] border border-[#46515f] rounded-xs px-1.5 py-1 text-white font-mono" />°
+                  </label>
+                  <div class="flex flex-wrap gap-1.5"><button id="focRunSteadyBtn" type="button" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">计算恒定工况损耗 / Tj</button><button id="focRunVoltageEnvelopeBtn" type="button" class="px-3 py-1.5 bg-amber-800/70 hover:bg-amber-700 border border-amber-600/60 text-amber-100 font-semibold rounded-sm cursor-pointer text-[11px]">9 / 13.5 / 16V 边界评估</button></div>
+                </div>
+                <div class="text-[10px] text-slate-400">12V 汽车供电边界：典型 13.5V，常用工作范围 9～16V。固定 Vbus、Id/Iq、PWM 频率、调制度、功率因数角、死区及环境温度；旋转工况按完整电周期平均，零速按固定电角度计算。六颗 MOS 默认同一型号、共用一套电气参数；六个开关位置仍分别计算损耗与结温。</div>
+              </div>
 
               <div class="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1b222c]">
                 <div class="flex flex-wrap items-center gap-2 text-[11px]">
@@ -2406,6 +2496,35 @@
             </div>
 
             <div id="focSimWarningsBox" class="hidden bg-amber-950/45 border border-amber-500/50 text-amber-200 px-2.5 py-2 rounded-xs font-mono text-[10px] space-y-1"></div>
+
+            <div id="focSteadyResultBox" class="hidden bg-[#0c0f13] border border-cyan-700/40 rounded-sm p-2.5 space-y-2">
+              <div class="text-[11px] font-semibold text-cyan-200">恒定工况稳态计算结果</div>
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px] tabular-nums">
+                <div class="bg-[#111821] border border-[#26313d] p-2 rounded-sm"><div class="text-[9px] text-slate-400">模型状态</div><div id="focSteadyQualification" class="text-amber-300 font-semibold mt-0.5">--</div></div>
+                <div class="bg-[#111821] border border-[#26313d] p-2 rounded-sm"><div class="text-[9px] text-slate-400">六颗 MOS 合计损耗</div><div id="focSteadyPower" class="text-amber-200 font-semibold mt-0.5">--</div></div>
+                <div class="bg-[#111821] border border-[#26313d] p-2 rounded-sm"><div class="text-[9px] text-slate-400">PCB Board 稳态温度</div><div id="focSteadyBoard" class="text-emerald-200 font-semibold mt-0.5">--</div></div>
+                <div class="bg-[#111821] border border-[#26313d] p-2 rounded-sm"><div class="text-[9px] text-slate-400">最高 MOS 稳态结温</div><div id="focSteadyTjMax" class="text-pink-200 font-semibold mt-0.5">--</div></div>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="w-full text-[10px] font-mono text-left whitespace-nowrap">
+                  <thead class="text-slate-400"><tr><th class="px-2 py-1">MOS</th><th class="px-2 py-1">Pcond(W)</th><th class="px-2 py-1">Psw(W)</th><th class="px-2 py-1">Pdead(W)</th><th class="px-2 py-1">Ptotal(W)</th><th class="px-2 py-1">Tboard(°C)</th><th class="px-2 py-1">Tj(°C)</th></tr></thead>
+                  <tbody id="focSteadySwitchTableBody"><tr><td colspan="7" class="px-2 py-2 text-slate-500">暂无恒定工况结果。</td></tr></tbody>
+                </table>
+              </div>
+              <pre id="focSteadyDetail" class="whitespace-pre-wrap text-[10px] text-slate-400 font-mono leading-relaxed"></pre>
+            </div>
+
+            <div id="focVoltageEnvelopeBox" class="hidden bg-[#0c0f13] border border-amber-700/40 rounded-sm p-2.5 space-y-2">
+              <div class="text-[11px] font-semibold text-amber-200">12V 汽车供电电压边界评估 · 9 / 13.5 / 16V</div>
+              <div class="overflow-x-auto">
+                <table class="w-full text-[10px] font-mono text-left whitespace-nowrap">
+                  <thead class="text-slate-400"><tr><th class="px-2 py-1">Vdc</th><th class="px-2 py-1">Required m</th><th class="px-2 py-1">Pcond(W)</th><th class="px-2 py-1">Psw(W)</th><th class="px-2 py-1">Pdead(W)</th><th class="px-2 py-1">P6MOS(W)</th><th class="px-2 py-1">Tj max(°C)</th><th class="px-2 py-1">状态</th></tr></thead>
+                  <tbody id="focVoltageEnvelopeBody"><tr><td colspan="8" class="px-2 py-2 text-slate-500">暂无电压边界结果。</td></tr></tbody>
+                </table>
+              </div>
+              <div id="focVoltageEnvelopeNote" class="text-[10px] text-slate-400 leading-relaxed"></div>
+              <pre id="focVoltageEnvelopeDetails" class="whitespace-pre-wrap text-[10px] text-slate-300 font-mono leading-relaxed"></pre>
+            </div>
 
             <!-- Card 2: KPI Bar -->
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px] tabular-nums">
@@ -2538,17 +2657,21 @@
               <div class="flex flex-wrap items-center justify-between gap-2">
                 <span class="text-[11px] font-semibold text-cyan-300">多工况 4D DPT 查找表矩阵 (Vbus, Iload, Tj, Rg_on/off → Eon / Eoff / Qrr LUT)</span>
                 <div class="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
-                  <label class="flex items-center gap-1 text-slate-400">
+                  <label class="flex items-center gap-1 text-slate-400" title="填 DPT 测试时的器件实际结温或经验证的等效结温；不能直接把环境温度当作结温。">
                     <span>Tj(°C)</span>
-                    <input id="dptMatrixTjInput" type="number" step="5" value="25" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" />
+                    <input id="dptMatrixTjInput" type="number" step="5" placeholder="必填" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-white" />
                   </label>
-                  <label class="flex items-center gap-1 text-slate-400">
+                  <label class="flex items-center gap-1 text-slate-400" title="DPT 测试时的实际开通门极回路总电阻（含驱动器等效输出阻抗与外置电阻）。4.7Ω 不是默认通用值。">
                     <span>Rg_on(Ω)</span>
-                    <input id="dptMatrixRgonInput" type="number" step="0.5" min="0" value="4.7" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-cyan-200" />
+                    <input id="dptMatrixRgonInput" type="number" step="0.5" min="0" placeholder="必填" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-cyan-200" />
                   </label>
-                  <label class="flex items-center gap-1 text-slate-400">
+                  <label class="flex items-center gap-1 text-slate-400" title="DPT 测试时的实际关断门极回路总电阻（含驱动器等效输出阻抗与外置电阻）。4.7Ω 不是默认通用值。">
                     <span>Rg_off(Ω)</span>
-                    <input id="dptMatrixRgoffInput" type="number" step="0.5" min="0" value="4.7" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200" />
+                    <input id="dptMatrixRgoffInput" type="number" step="0.5" min="0" placeholder="必填" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1.5 py-0.5 text-amber-200" />
+                  </label>
+                  <label class="flex items-center gap-1 text-amber-200" title="保存 DPT 工况点前，确认 Tj 与 Rg_on/off 是该次测试的实际工况，而不是占位默认值。任一输入变化后需重新确认。">
+                    <input id="dptMatrixConditionConfirmedChk" type="checkbox" class="accent-amber-400" />
+                    <span>测试 Tj/Rg 已核实</span>
                   </label>
                   <button id="dptAddToMatrixBtn" type="button" class="px-2 py-0.5 bg-cyan-950/60 hover:bg-cyan-900/70 border border-cyan-500/60 text-cyan-200 rounded-xs cursor-pointer">+ 保存当前点到矩阵</button>
                   <button id="dptApplyMatrixToFocBtn" type="button" disabled class="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-40 border border-emerald-500/60 text-emerald-200 rounded-xs cursor-pointer disabled:cursor-not-allowed">4D LUT 插值注入 FOC</button>

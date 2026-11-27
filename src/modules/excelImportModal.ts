@@ -18,6 +18,7 @@ import {
 import { WaveformChannel, SamplingMetadata } from '../types/models';
 import { formatEng } from '../engine/canvasRenderer';
 import { escapeHtml } from '../utils/html';
+import type { ExcelMergeTimeMode } from './excelTimeAlignment';
 
 export type ExcelImportMode = 'main' | 'compare' | 'batch';
 
@@ -32,11 +33,14 @@ export interface ExcelImportedSheetPayload {
   drawOrder: string[];
   quality: SamplingMetadata;
   skippedEmptyColumns: string[];
+  timeOriginSec: number | null;
+  timeOriginKind: 'absolute-date' | 'clock-of-day' | 'numeric' | 'synthetic';
 }
 
 export interface ExcelModalConfirmResult {
   mode: ExcelImportMode;
   tabDisposition: 'separate' | 'merge';
+  timeAlignment: ExcelMergeTimeMode;
   resample: boolean;
   items: ExcelImportedSheetPayload[];
 }
@@ -55,6 +59,7 @@ class ExcelImportModalController {
   private activeSessionIndex: number = 0;
   private mode: ExcelImportMode = 'main';
   private tabDisposition: 'separate' | 'merge' = 'separate';
+  private timeAlignment: ExcelMergeTimeMode = 'preserve';
   private colors: string[] = ['#facc15', '#22d3ee', '#f472b6', '#4ade80'];
   private onConfirmCb: ((res: ExcelModalConfirmResult) => Promise<void> | void) | null = null;
   private onCancelCb: (() => void) | null = null;
@@ -66,6 +71,7 @@ class ExcelImportModalController {
 
     this.mode = opts.mode;
     this.tabDisposition = 'separate';
+    this.timeAlignment = 'preserve';
     this.colors = opts.colors.length > 0 ? opts.colors : ['#facc15', '#22d3ee', '#f472b6', '#4ade80'];
     this.onConfirmCb = opts.onConfirm;
     this.onCancelCb = opts.onCancel || null;
@@ -206,6 +212,12 @@ class ExcelImportModalController {
       this.renderModeFooter();
     });
 
+    document.getElementById('xlsMergeTimeModeSelect')?.addEventListener('change', (e: any) => {
+      const value = String(e.target?.value || 'preserve');
+      this.timeAlignment = value === 'align-start' ? 'align-start' : 'preserve';
+      this.renderModeFooter();
+    });
+
     document.getElementById('xlsHeaderNoneChk')?.addEventListener('change', (e: any) => {
       const s = this.getActiveSession();
       const sh = this.getActiveSheet();
@@ -335,6 +347,8 @@ class ExcelImportModalController {
             drawOrder: parsed.drawOrder,
             quality: parsed.quality,
             skippedEmptyColumns: parsed.skippedEmptyColumns,
+            timeOriginSec: parsed.timeOriginSec,
+            timeOriginKind: parsed.timeOriginKind,
           });
         } catch (err: any) {
           errors.push(`${session.fileName} [${sh.sheetName}]: ${err?.message || err}`);
@@ -358,6 +372,7 @@ class ExcelImportModalController {
     const result: ExcelModalConfirmResult = {
       mode: this.mode,
       tabDisposition: this.tabDisposition,
+      timeAlignment: this.timeAlignment,
       resample,
       items,
     };
@@ -713,16 +728,22 @@ class ExcelImportModalController {
     const hintEl = document.getElementById('xlsFooterContextHint');
     const origBtn = document.getElementById('xlsLoadOriginalBtn');
     const primaryBtn = document.getElementById('xlsPrimaryConfirmBtn');
+    const timeModeWrap = document.getElementById('xlsMergeTimeModeWrap');
+    const timeModeSelect = document.getElementById('xlsMergeTimeModeSelect') as HTMLSelectElement | null;
 
     if (this.mode === 'main') {
       toggleWrap?.classList.remove('hidden');
       origBtn?.classList.remove('hidden');
       if (primaryBtn) primaryBtn.innerText = 'Load + Resample';
+      timeModeWrap?.classList.toggle('hidden', this.tabDisposition !== 'merge');
+      if (timeModeSelect) timeModeSelect.value = this.timeAlignment;
       if (hintEl) {
         hintEl.innerText =
           this.tabDisposition === 'separate'
             ? '每个勾选的 Sheet 将打开为独立标签页'
-            : '所有勾选的 Sheet 通道将合并到同一标签页';
+            : this.timeAlignment === 'align-start'
+            ? '合并通道；每条波形仅平移首样本到 t=0，不插值、不改采样值'
+            : '合并通道；保留原始时间坐标和每条通道独立采样点，不强制重采样';
       }
       if (sepBtn && mergeBtn) {
         sepBtn.className =
@@ -735,11 +756,13 @@ class ExcelImportModalController {
             : 'px-2.5 py-1 rounded-xs text-slate-300 hover:text-white cursor-pointer';
       }
     } else if (this.mode === 'compare') {
+      timeModeWrap?.classList.add('hidden');
       toggleWrap?.classList.add('hidden');
       origBtn?.classList.add('hidden');
       if (primaryBtn) primaryBtn.innerText = 'Add Selected to Compare Group';
       if (hintEl) hintEl.innerText = '所选 Sheet 通道将直接加入当前 Compare Group 队列';
     } else {
+      timeModeWrap?.classList.add('hidden');
       toggleWrap?.classList.add('hidden');
       origBtn?.classList.add('hidden');
       if (primaryBtn) primaryBtn.innerText = 'Confirm & Run Batch';

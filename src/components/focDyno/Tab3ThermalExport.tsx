@@ -119,6 +119,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
     { key: 'ic', label: 'Phase Ic (or -Ia-Ib)', value: 'Ic', hint: 'Auto: Ic = -(Ia + Ib)' },
     { key: 'vbus', label: 'Vbus (V)', value: fmt(summary.vBusCapV, 3), hint: '自动映射 Vbus_cap 通道与常值备选' },
     { key: 'tamb', label: 'T_amb (°C)', value: summary.tAmbC.toFixed(1) },
+    { key: 'fsw', label: 'MOS PWM 开关频率 Fsw (kHz)', value: fmt(params.fSwKhz, 2), hint: '此值来自电机/逆变器参数，直接用于六管稳态开关损耗；与下方辅助波形导出采样率 fs 不同。' },
     { key: 'mod', label: 'Modulation', value: includeDuty ? `${modulation} (含 Duty_A/B/C)` : modulation, hint: summary.modulationNote },
     {
       key: 'm_cmd',
@@ -150,9 +151,9 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
       <div className="dyno-card space-y-4 rounded-sm border p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-sm font-semibold dyno-text-primary">6-MOS 瞬态结温波形合成 &amp; 一键联合仿真导出</h3>
+            <h3 className="text-sm font-semibold dyno-text-primary">固定工况稳态损耗 / 结温评估 &amp; 辅助波形导出</h3>
             <p className="text-xs dyno-text-muted">
-              可直接推入主示波器观察三相电流，或一键触发「MOS Thermal → 4. BLDC FOC 6-MOS」耦合结温仿真
+              热评估按固定 Id/Iq、Vdc、PWM 条件直接计算周期平均损耗与稳态 Tj；示波器合成波形仅为辅助显示，不作为稳态求解输入
             </p>
           </div>
 
@@ -184,7 +185,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
               className="dyno-btn-primary inline-flex items-center gap-1.5 rounded-sm px-3.5 py-1.5 text-xs font-semibold whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
             >
               <Flame className="h-3.5 w-3.5" />
-              {synth.error ? '工况无解' : '一键导入 6-MOS 热评估'}
+              {synth.error ? '工况无解' : '导入恒定工况到 MOS Thermal'}
             </button>
           </div>
         </div>
@@ -231,7 +232,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
             />
           </label>
           <label className="block text-xs">
-            <span className="mb-1 block dyno-text-muted">采样率 f_s (Hz)</span>
+            <span className="mb-1 block dyno-text-muted" title="仅控制导出/预览 CSV 的采样率，不是 MOS 损耗模型中的 PWM 开关频率">波形导出采样率 f_s (Hz)</span>
             <SmoothNumberInput
               step={1000}
               min={1000}
@@ -243,7 +244,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
             />
           </label>
           <label className="block text-xs">
-            <span className="mb-1 block dyno-text-muted">导出时长 (s)</span>
+            <span className="mb-1 block dyno-text-muted" title="仅控制合成波形导出的记录长度，不影响恒定工况平均损耗与稳态热平衡">辅助波形导出时长 (s)</span>
             <SmoothNumberInput
               step={0.05}
               min={0.05}
@@ -331,7 +332,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
                 onChange={(e) => setIncludeDuty(e.target.checked)}
                 className="accent-cyan-500 cursor-pointer"
               />
-              <span>导出 Duty_A/B/C</span>
+              <span title="仅把理想周期平均 Duty 导出到 Scope；恒定损耗求解会由 Vdc、m、PF 和调制方式独立重建平均 Duty">导出辅助 Duty_A/B/C</span>
             </label>
           </div>
           <div className="font-mono text-[11px] tabular-nums dyno-text-muted">
@@ -379,7 +380,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
         </div>
 
         <div className="dyno-alert-info rounded-sm border px-3.5 py-2 text-xs">
-          ⓘ 合成波形边界提示：此处生成的 Ia/Ib/Ic 与 Duty 为理想对称稳态正弦/直流偏置合成信号，不含死区开关纹波、MOS 寄生振铃与三相不平衡，仅用于 6-MOS 热预估，不可替代实测示波器电流探头采集。
+          ⓘ 恒定工况边界：MOS Thermal 稳态求解使用 FOC 固定工作点、Vdc、实际 PWM 开关频率（来自电机参数 Fsw）、调制度、功率因数角及死区；这里的波形采样率/导出时长只影响辅助 CSV/Scope 预览，不影响稳态损耗。辅助 Ia/Ib/Ic 与 Duty 为理想模型，不含 PWM 载波纹波、寄生振铃及实测不平衡。
         </div>
 
         {synth.error && <div className="dyno-alert-danger rounded-sm border px-3.5 py-2 text-xs">✖ {synth.error}</div>}

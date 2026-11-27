@@ -56,15 +56,24 @@ import {
   FocSimulationResult,
   FocStallSweepResult,
   FocControlSweepResult,
+  FocSteadyOperatingPoint,
+  FocSteadyStateResult,
+  FocVoltageEnvelopeRow,
+  RdsOnTempCurve,
+  parseRdsOnTempCurveImportJson,
+  createRdsOnTempCurveImportTemplate,
   splitCauerToFocModel,
   focModelToSpice,
   validateFocSpiceNetlist,
   parsePcbSpatialImportJson,
   createPcbSpatialImportTemplate,
   simulateFoc6Mos,
+  simulateFoc6MosSteadyState,
+  simulateFoc6MosVoltageEnvelope,
   runFocStallSweep,
   runFocControlSweep,
 } from './focThermal';
+import { BUK7Q6R0_40H_PROFILE, createBuk7Q6R0_40HRdsCurveJson } from './focMosDeviceProfiles';
 import {
   DptAnalysisResult,
   DptOperatingPoint,
@@ -168,7 +177,7 @@ export class ThermalWorkbenchController {
   private lastDeconv: ThermalDeconvResult | null = null;
   private activeCauerStages: CauerStage[] = DEFAULT_FALLBACK_CAUER.map((s) => ({ ...s }));
   private activePathMode: ThermalPathMode = 'junction_ambient';
-  private cauerSourceLabel: string = 'Default 3-Stage MOSFET Fallback (1.22 °C/W)';
+  private cauerSourceLabel: string = '软件回退 3 阶热网络（1.22 °C/W；非器件数据）';
   private focModelSource: 'fallback_default' | 'default_demo' | 'tab1_extracted' = 'fallback_default';
   private activeTambC: number = 25;
 
@@ -190,6 +199,9 @@ export class ThermalWorkbenchController {
   private lastFocStall: FocStallSweepResult | null = null;
   private lastFocSweep: FocControlSweepResult | null = null;
   private activeFocHandoffNote: string | null = null;
+  private activeFocSteadyPoint: FocSteadyOperatingPoint | null = null;
+  private lastFocSteadyResult: FocSteadyStateResult | null = null;
+  private lastFocVoltageEnvelope: FocVoltageEnvelopeRow[] | null = null;
 
   // P1: DPT State
   private lastDptResult: DptAnalysisResult | null = null;
@@ -461,14 +473,17 @@ export class ThermalWorkbenchController {
     const deltaLbl = document.getElementById('thermLossDeltaTjLabel');
     const titleEl = document.getElementById('thermLossPlotTitle');
     const legendEl = document.getElementById('thermLossTjLegend');
-    if (maxLbl) maxLbl.innerText = isPad ? 'Tpad Max (Equiv)' : 'Tj Max';
-    if (deltaLbl) deltaLbl.innerText = isPad ? 'ΔTpad Peak' : 'ΔTj Peak';
+    const isFallback = this.focModelSource === 'fallback_default';
+    if (maxLbl) maxLbl.innerText = isPad ? (isFallback ? 'Tpad* Max（回退估算）' : 'Tpad Max (Equiv)') : isFallback ? 'Tj* Max（回退估算）' : 'Tj Max';
+    if (deltaLbl) deltaLbl.innerText = isPad ? (isFallback ? 'ΔTpad* Peak（回退估算）' : 'ΔTpad Peak') : isFallback ? 'ΔTj* Peak（回退估算）' : 'ΔTj Peak';
     if (titleEl) {
       titleEl.innerText = isPad
         ? 'Stripped Switching Power P_loss(t) & Pad-Equivalent Temp Tpad(t)'
         : 'Stripped Switching Power P_loss(t) & Closed-Loop Junction Temp Tj(t)';
     }
-    if (legendEl) legendEl.innerText = isPad ? '■ Tpad (°C)' : '■ Tj (°C)';
+    if (legendEl) legendEl.innerText = isPad ? '■ Tpad (°C)' : isFallback ? '■ Tj*（回退假设，非器件实测）' : '■ Tj (°C)';
+    if (titleEl && isFallback && !isPad) titleEl.title = '当前使用软件回退 Cauer 网络，不对应特定 MOSFET；输出 Tj* 仅用于算法连通性/演示，不可用于器件热设计或 SOA 定型。';
+    else if (titleEl) titleEl.title = isPad ? '焊盘到环境的等效热网络，输出为 Tpad，不是真实芯片结温。' : '基于已导入/反演热网络的结温估算；仍需器件数据与实测验证。';
   }
 
   private syncConstViInputsUI(): void {
@@ -1014,7 +1029,30 @@ export class ThermalWorkbenchController {
 
     // Tab 4 controls (BLDC FOC 6-MOS)
     document.getElementById('focLoadDemoBtn')?.addEventListener('click', () => this.loadFoc3PhDemoTab());
+    document.getElementById('focApplyStarterBtn')?.addEventListener('click', () => {
+      const starterValues: Record<string, string> = {
+        focVbusSelect: '__const__',
+        focVbusConstInput: '13.5',
+        focTambInput: '25',
+        focModSelect: 'SVPWM',
+        focModDepthInput: '0.85',
+        focPfAngleInput: '0',
+        focFswKhzInput: '20',
+        focTdeadNsInput: '500',
+        focAlphaInput: '0.45',
+        focVsdInput: '0.9',
+      };
+      for (const [id, value] of Object.entries(starterValues)) {
+        const input = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+        if (input) input.value = value;
+      }
+      this.invalidateFocCaches(true);
+      this.refreshFocModelAndSpice();
+      this.app.showToast('已应用 12V 汽车供电起算工况（标称 13.5V，常用边界 9～16V）；器件损耗与热参数仍须按实际 MOS/DPT/PCB 数据填写。', 'warn');
+    });
     document.getElementById('focRunSimBtn')?.addEventListener('click', () => this.runFocSimulation());
+    document.getElementById('focRunSteadyBtn')?.addEventListener('click', () => this.runFocSteadyState());
+    document.getElementById('focRunVoltageEnvelopeBtn')?.addEventListener('click', () => this.runFocVoltageEnvelope());
     document.getElementById('focInjectBtn')?.addEventListener('click', () => this.injectFocTracesToScope());
     document.getElementById('focRunSweepBtn')?.addEventListener('click', () => this.runFocControlSweepAnalysis());
     document.getElementById('focRunStallBtn')?.addEventListener('click', () => this.runFocStallAnalysis());
@@ -1037,7 +1075,7 @@ export class ThermalWorkbenchController {
         const target = document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null;
         if (target) target.value = raw;
         this.refreshFocModelAndSpice();
-        this.app.showToast(`已导入 PCB 热网络：${file.name}`, 'success');
+        this.app.showToast(`已导入 PCB 热网络：${file.name}`, 'info');
       } catch (err) {
         const target = document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null;
         if (target) target.value = '';
@@ -1050,6 +1088,79 @@ export class ThermalWorkbenchController {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a'); a.href = url; a.download = 'wave-test-pcb-thermal-template.json';
       document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    });
+    document.getElementById('focApplyBuk7ProfileBtn')?.addEventListener('click', () => {
+      const setValue = (id: string, value: string) => {
+        const input = document.getElementById(id) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
+        if (input) input.value = value;
+      };
+      const setChecked = (id: string, checked: boolean) => {
+        const input = document.getElementById(id) as HTMLInputElement | null;
+        if (input) input.checked = checked;
+      };
+      setValue('focRdsInput', String(BUK7Q6R0_40H_PROFILE.rdsOn.typicalMohm));
+      setValue('focRds25ReferenceVgsInput', String(BUK7Q6R0_40H_PROFILE.rdsOn.referenceGateVoltageV));
+      // 10 V is only the datasheet's RDS(on) test condition. The profile deliberately
+      // leaves the user's confirmation unchecked until the actual gate waveform is verified.
+      setValue('focRdsOperatingVgsInput', String(BUK7Q6R0_40H_PROFILE.rdsOn.referenceGateVoltageV));
+      setValue('focRdsTempCurveJsonInput', createBuk7Q6R0_40HRdsCurveJson());
+      setValue('focVsdInput', String(BUK7Q6R0_40H_PROFILE.bodyDiode.vsdTypicalV));
+      setValue('focEswInput', '');
+      setValue('focEossInput', '');
+      setValue('focQrrInput', String(BUK7Q6R0_40H_PROFILE.recoveredCharge.qrNc));
+      // Esw/Eoss reference conditions are independent from the datasheet Qr test conditions.
+      setValue('focVrefInput', '13.5');
+      setValue('focQrrIrefInput', String(BUK7Q6R0_40H_PROFILE.recoveredCharge.referenceCurrentA));
+      setValue('focQrrReferenceVdsInput', String(BUK7Q6R0_40H_PROFILE.recoveredCharge.testVdsV));
+      setValue('focQrrReferenceDiDtInput', String(BUK7Q6R0_40H_PROFILE.recoveredCharge.testDiDtAperUs));
+      setValue('focQrrReferenceTjInput', String(BUK7Q6R0_40H_PROFILE.recoveredCharge.testJunctionTemperatureC));
+      setValue('focQrrReferenceVgsInput', String(BUK7Q6R0_40H_PROFILE.recoveredCharge.testGateVoltageV));
+      setValue('focRjcOverrideInput', String(BUK7Q6R0_40H_PROFILE.thermal.rthJunctionToMountingBaseMaxCPerW));
+      setValue('focEossCurveModeSelect', 'scalar');
+      setValue('focEossCurveInput', '');
+      setValue('focEossCurveJsonInput', '');
+      setValue('focEossCurveCsvInput', '');
+      setChecked('focRdsConfirmedChk', false);
+      setChecked('focEonIncludesQrrChk', false);
+      setChecked('focEossIncludedChk', false);
+      setChecked('focQrrIncludesQossChk', true);
+      const profileNote = document.getElementById('focBuk7ProfileNote');
+      if (profileNote) {
+        profileNote.classList.remove('hidden');
+        profileNote.innerHTML = [
+          `<b>${BUK7Q6R0_40H_PROFILE.manufacturer} ${BUK7Q6R0_40H_PROFILE.partNumber}</b> 已载入：RDS(on)=${BUK7Q6R0_40H_PROFILE.rdsOn.typicalMohm.toFixed(1)}mΩ typ（25°C、VGS=10V、ID=20A；max=${BUK7Q6R0_40H_PROFILE.rdsOn.maxMohm.toFixed(1)}mΩ）；VSD=${BUK7Q6R0_40H_PROFILE.bodyDiode.vsdTypicalV.toFixed(1)}V typ；Qr=${BUK7Q6R0_40H_PROFILE.recoveredCharge.qrNc}nC（Is=16A、VDS=20V、di/dt=−100A/µs、VGS=0V、Tj=25°C，包含电容性恢复）；Rθ(j-mb)=${BUK7Q6R0_40H_PROFILE.thermal.rthJunctionToMountingBaseTypicalCPerW.toFixed(2)}°C/W typ / ${BUK7Q6R0_40H_PROFILE.thermal.rthJunctionToMountingBaseMaxCPerW.toFixed(2)}°C/W max。`,
+          `<b>重要：</b>Esw/Eon/Eoff 数据手册未给出，保持空白；不要从 td(on)/tr/td(off)/tf 推算能量。Qr=13nC 的参考电流独立设为 16A；其测试 VDS=20V、di/dt=−100A/µs、VGS=0V、Tj=25°C。Esw/Eoss 的 Vref 仍设为 13.5V，绝不复用 Qr 测试 VDS。Qr 已按 Nexperia 定义包含 Qoss，本标量路径禁止再叠加独立 Eoss。温度曲线的表格锚点为精确典型值，其他点为 Fig.12 图线数字化近似。`,
+          `<b>必须核实：</b>当前 Vgs,on 暂以 10V（数据手册测试条件）起算，必须与实际 MOS Gate-Source 导通波形核对；Rds 确认框保持未勾选。Rth(j-mb) 使用数据手册最大值 2.3°C/W 作保守的结到安装基准面热阻锚点；只有当热网络 JC 端确实对应器件 mounting base 时才可这样映射，绝不代表 PCB 到环境热阻。`,
+          `<b>40V 额定值：</b>9–16V 是直流母线范围，不代表 VDS 峰值一定安全；还必须检查换流尖峰和线束/布局寄生造成的 VDS 过冲。`
+        ].map((line) => `<div class="mb-1">${line}</div>`).join('');
+      }
+      this.activeFocHandoffNote = '已载入 Nexperia BUK7Q6R0-40H 数据手册预设；六管共用该器件参数。DPT LUT 若已启用，请确认其器件型号和测试口径一致。';
+      this.invalidateFocCaches(true);
+      this.refreshFocModelAndSpice();
+      this.renderFocWarnings();
+      this.app.showToast('已载入 BUK7Q6R0-40H 数据手册参数；Eon/Eoff 未伪造，仍需实际 DPT 数据。', 'success');
+    });
+
+    document.getElementById('focRdsTempCurveJsonInput')?.addEventListener('input', () => this.invalidateFocCaches(true));
+    document.getElementById('focRdsTempCurveTemplateBtn')?.addEventListener('click', () => {
+      const target = document.getElementById('focRdsTempCurveJsonInput') as HTMLTextAreaElement | null;
+      if (target) target.value = JSON.stringify(createRdsOnTempCurveImportTemplate(), null, 2);
+      this.invalidateFocCaches(true);
+      this.app.showToast('已生成 Rds(on)-Tj JSON 模板；请替换为目标 MOS 数据手册/实测曲线，不能直接把空模板作为计算输入。', 'info');
+    });
+    document.getElementById('focRdsTempCurveJsonFileInput')?.addEventListener('change', async (ev) => {
+      const file = (ev.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      try {
+        const raw = await file.text();
+        parseRdsOnTempCurveImportJson(raw);
+        const target = document.getElementById('focRdsTempCurveJsonInput') as HTMLTextAreaElement | null;
+        if (target) target.value = raw;
+        this.invalidateFocCaches(true);
+        this.app.showToast(`已载入 Rds(on)-Tj 曲线：${file.name}`, 'info');
+      } catch (err) {
+        this.app.showToast(`Rds(on)-Tj 曲线导入失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
     });
     document.getElementById('focEonIncludesQrrChk')?.addEventListener('change', () => this.invalidateFocCaches(true));
     document.getElementById('focEossCurveJsonInput')?.addEventListener('change', () => this.invalidateFocCaches(true));
@@ -1072,7 +1183,7 @@ export class ThermalWorkbenchController {
         const target = document.getElementById('focEossCurveJsonInput') as HTMLTextAreaElement | null;
         if (target) target.value = raw;
         this.invalidateFocCaches(true);
-        this.app.showToast(`已载入器件 Eoss JSON：${file.name}`, 'success');
+        this.app.showToast(`已载入器件 Eoss JSON：${file.name}`, 'info');
       } catch (err) {
         const target = document.getElementById('focEossCurveJsonInput') as HTMLTextAreaElement | null;
         if (target) target.value = '';
@@ -1092,7 +1203,7 @@ export class ThermalWorkbenchController {
         const target = document.getElementById('focEossCurveCsvInput') as HTMLTextAreaElement | null;
         if (target) target.value = text;
         this.invalidateFocCaches(true);
-        this.app.showToast(`已载入 Eoss CSV：${file.name}；请核对曲线类型和单位后运行。`, 'success');
+        this.app.showToast(`已载入 Eoss CSV：${file.name}；请核对曲线类型和单位后运行。`, 'info');
       } catch (err) {
         this.app.showToast(`Eoss CSV 读取失败：${err instanceof Error ? err.message : String(err)}`, 'error');
       }
@@ -1118,10 +1229,20 @@ export class ThermalWorkbenchController {
 
     // Tab 5 controls (DPT & multi-point LUT matrix)
     document.getElementById('dptLoadDemoBtn')?.addEventListener('click', () => this.loadDptDemoTab());
-    document.getElementById('dptRunBtn')?.addEventListener('click', () => this.runDptAnalysis());
+    document.getElementById('dptRunBtn')?.addEventListener('click', () => {
+      const confirmation = document.getElementById('dptMatrixConditionConfirmedChk') as HTMLInputElement | null;
+      if (confirmation) confirmation.checked = false;
+      this.runDptAnalysis();
+    });
     document.getElementById('dptApplyToFocBtn')?.addEventListener('click', () => this.applyDptResultsToFoc());
     document.getElementById('dptAddToMatrixBtn')?.addEventListener('click', () => this.addCurrentDptPointToMatrix());
     document.getElementById('dptApplyMatrixToFocBtn')?.addEventListener('click', () => this.applyDptMatrixToFoc());
+    for (const id of ['dptMatrixTjInput', 'dptMatrixRgonInput', 'dptMatrixRgoffInput']) {
+      document.getElementById(id)?.addEventListener('input', () => {
+        const confirmation = document.getElementById('dptMatrixConditionConfirmedChk') as HTMLInputElement | null;
+        if (confirmation) confirmation.checked = false;
+      });
+    }
     document.getElementById('dptClearMatrixBtn')?.addEventListener('click', () => {
       this.dptMatrix = [];
       this.useDptMatrixInFoc = false;
@@ -1134,7 +1255,7 @@ export class ThermalWorkbenchController {
       'focStallRsInput',
       'focStallDutyModeSelect',
     ]);
-    const manualEswIds = new Set(['focEswInput', 'focQrrInput', 'focVrefInput', 'focIrefInput']);
+    const manualEswIds = new Set(['focEswInput', 'focQrrInput', 'focVrefInput', 'focIrefInput', 'focQrrIrefInput', 'focQrrReferenceVdsInput', 'focQrrReferenceDiDtInput', 'focQrrReferenceTjInput', 'focQrrReferenceVgsInput']);
     const handleFocPanelMutation = (ev: Event) => {
       const target = ev.target as HTMLElement | null;
       if (!target || !target.id) return;
@@ -1142,11 +1263,20 @@ export class ThermalWorkbenchController {
         this.useDptMatrixInFoc = false;
         this.activeFocHandoffNote = '已手动修改单点 Esw/Qrr 参数，当前切换回单点标量 V/I 缩放模式。';
       }
+      if (target.id === 'focRdsInput' || target.id === 'focRdsOperatingVgsInput' || target.id === 'focRds25ReferenceVgsInput' || target.id === 'focRdsTempCurveJsonInput') {
+        const confirmed = document.getElementById('focRdsConfirmedChk') as HTMLInputElement | null;
+        if (confirmed) confirmed.checked = false;
+      }
+      if (target.id === 'focRgonInput' || target.id === 'focRgoffInput') {
+        const confirmed = document.getElementById('focRgDesignConfirmedChk') as HTMLInputElement | null;
+        if (confirmed) confirmed.checked = false;
+      }
       if (stallOnlyInputIds.has(target.id)) {
         this.invalidateFocCaches(false);
       } else {
         this.invalidateFocCaches(true);
       }
+      this.renderFocSteadyOperatingPoint();
     };
     const focPanel = document.getElementById('thermalPanelFoc');
     focPanel?.addEventListener('input', handleFocPanelMutation);
@@ -1880,7 +2010,13 @@ export class ThermalWorkbenchController {
     const el = document.getElementById('thermLossCauerSummary');
     if (!el) return;
     const rTot = this.activeCauerStages.reduce((s, st) => s + st.r, 0);
-    el.innerText = `${this.cauerSourceLabel} | Stages=${this.activeCauerStages.length} | Rth=${rTot.toFixed(4)} °C/W`;
+    el.innerText = `${this.cauerSourceLabel} | 阶数=${this.activeCauerStages.length} | Rth=${rTot.toFixed(4)} °C/W`;
+    const isFallback = this.focModelSource === 'fallback_default';
+    el.classList.toggle('text-amber-300', isFallback);
+    el.classList.toggle('text-emerald-300', !isFallback);
+    el.title = isFallback
+      ? '软件回退 RC 参数，不对应任何具体 MOSFET 或 PCB。仅用于演示和验证计算链路，不可将结果作为真实 Tj、热设计裕量或器件选型结论。请先导入/反演目标器件的 ZthJC(t) 或已验证 Cauer 网络。'
+      : '当前网络来源于 Tab 1 热阻抗反演；请确认热路径与测温位置匹配。焊盘到环境模型输出为 Tpad 等效温度，不是芯片真实 Tj。';
   }
 
   private runLossAndTjSimulation(): void {
@@ -1895,25 +2031,45 @@ export class ThermalWorkbenchController {
     }
 
     const gate = ((document.getElementById('thermLossGateSelect') as HTMLSelectElement)?.value || 'view') as 'entire' | 'view' | 'cursors';
-    const tAmbC = parseFloat((document.getElementById('thermLossTambInput') as HTMLInputElement)?.value || String(this.activeTambC));
+    const tAmbRaw = (document.getElementById('thermLossTambInput') as HTMLInputElement)?.value?.trim() || '';
+    const tAmbC = tAmbRaw === '' ? this.activeTambC : Number(tAmbRaw);
     const initTjRaw = (document.getElementById('thermLossInitTjInput') as HTMLInputElement)?.value?.trim() || '';
-    const initTjParsed = parseFloat(initTjRaw);
-    const deskewNs = parseFloat((document.getElementById('thermLossDeskewInput') as HTMLInputElement)?.value || '0');
-    const eossUj = parseFloat((document.getElementById('thermLossEossInput') as HTMLInputElement)?.value || '12');
-    const rdsOn25Mohm = parseFloat((document.getElementById('thermLossRdsInput') as HTMLInputElement)?.value || '4.5');
-    const alphaPct = parseFloat((document.getElementById('thermLossAlphaInput') as HTMLInputElement)?.value || '0.45');
+    const initTjParsed = initTjRaw === '' ? undefined : Number(initTjRaw);
+    const deskewRaw = (document.getElementById('thermLossDeskewInput') as HTMLInputElement)?.value?.trim() || '';
+    const deskewNs = deskewRaw === '' ? 0 : Number(deskewRaw);
+    const eossRaw = (document.getElementById('thermLossEossInput') as HTMLInputElement)?.value?.trim() || '';
+    const rdsRaw = (document.getElementById('thermLossRdsInput') as HTMLInputElement)?.value?.trim() || '';
+    const alphaRaw = (document.getElementById('thermLossAlphaInput') as HTMLInputElement)?.value?.trim() || '';
+    const eossUj = eossRaw === '' ? 0 : Number(eossRaw);
+    const rdsOn25Mohm = rdsRaw === '' ? 0 : Number(rdsRaw);
+    const alphaPct = alphaRaw === '' ? 0 : Number(alphaRaw);
     const rdsFeedbackEnabled = (document.getElementById('thermLossRdsFeedbackChk') as HTMLInputElement)?.checked ?? false;
 
     const rng = getChannelGateRange(tab, vdsCh, gate);
     try {
+      if (!Number.isFinite(tAmbC) || tAmbC <= -273.15 || tAmbC > 1000) {
+        throw new Error('环境/基准温度必须高于绝对零度且不超过 1000°C；不会在输入无效时静默回退到 25°C。');
+      }
+      if (initTjRaw !== '' && (initTjParsed === undefined || !Number.isFinite(initTjParsed) || initTjParsed <= -273.15 || initTjParsed > 1000)) {
+        throw new Error('初始结温 Tj(0) 必须高于绝对零度且不超过 1000°C；留空表示采用 T_amb 冷启动。');
+      }
+      if (!Number.isFinite(deskewNs)) {
+        throw new Error('探头 Deskew 必须为有限数值（ns）；留空表示 0 ns。');
+      }
+      if (rdsFeedbackEnabled && (!(rdsOn25Mohm > 0) || !(alphaPct > 0) || !Number.isFinite(rdsOn25Mohm) || !Number.isFinite(alphaPct))) {
+        throw new Error('已启用 Rds(on)(Tj) 反馈，但 Rds25 或 α 为空/无效。请填入对应器件在 25°C 的 Rds(on) 与温度系数；不得使用通用默认值代替。');
+      }
+      if (eossRaw !== '' && (!Number.isFinite(eossUj) || eossUj < 0)) {
+        throw new Error('Eoss 必须是非负有限值（µJ）；不使用 Eoss 修正时请留空。');
+      }
       const res = computeLossWithDeskewAndEoss(vdsCh, idsCh, this.activeCauerStages, {
-        deskewNs: isFinite(deskewNs) ? deskewNs : 0,
-        eossUj: isFinite(eossUj) ? eossUj : 0,
-        rdsOn25Mohm: isFinite(rdsOn25Mohm) && rdsOn25Mohm > 0 ? rdsOn25Mohm : 5,
-        tempCoeffAlphaPerC: isFinite(alphaPct) ? alphaPct / 100 : 0.0045,
+        deskewNs,
+        eossUj: Number.isFinite(eossUj) ? eossUj : 0,
+        rdsOn25Mohm: Number.isFinite(rdsOn25Mohm) && rdsOn25Mohm > 0 ? rdsOn25Mohm : 0,
+        tempCoeffAlphaPerC: Number.isFinite(alphaPct) && alphaPct > 0 ? alphaPct / 100 : 0,
         rdsFeedbackEnabled,
-        tAmbC: isFinite(tAmbC) ? tAmbC : 25,
-        initialTjC: initTjRaw && isFinite(initTjParsed) ? initTjParsed : undefined,
+        tAmbC,
+        initialTjC: initTjParsed,
         pathMode: this.activePathMode,
         tStart: rng.tStart,
         tEnd: rng.tEnd,
@@ -2784,13 +2940,22 @@ export class ThermalWorkbenchController {
       'focFswKhzInput',
       'focTdeadNsInput',
       'focRdsInput',
+      'focRdsOperatingVgsInput',
+      'focRds25ReferenceVgsInput',
+      'focRdsConfirmedChk',
       'focAlphaInput',
+      'focRdsTempCurveJsonInput',
       'focVsdInput',
       'focEswInput',
       'focEossInput',
       'focQrrInput',
       'focVrefInput',
       'focIrefInput',
+      'focQrrIrefInput',
+      'focQrrReferenceVdsInput',
+      'focQrrReferenceDiDtInput',
+      'focQrrReferenceTjInput',
+      'focQrrReferenceVgsInput',
       'focTauSplitMsInput',
       'focRjcOverrideInput',
       'focRgonInput',
@@ -2814,6 +2979,12 @@ export class ThermalWorkbenchController {
     ];
     const eonInclQrr = (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ? '1' : '0';
     const eossIncl = (document.getElementById('focEossIncludedChk') as HTMLInputElement | null)?.checked ? '1' : '0';
+    const qrrInclQoss = (document.getElementById('focQrrIncludesQossChk') as HTMLInputElement | null)?.checked ? '1' : '0';
+    const qrrIref = (document.getElementById('focQrrIrefInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const qrrReferenceVds = (document.getElementById('focQrrReferenceVdsInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const qrrReferenceDiDt = (document.getElementById('focQrrReferenceDiDtInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const qrrReferenceTj = (document.getElementById('focQrrReferenceTjInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const qrrReferenceVgs = (document.getElementById('focQrrReferenceVgsInput') as HTMLInputElement | null)?.value?.trim() || '';
     return JSON.stringify({
       tabId: tab?.id || '',
       view: tab?.view ? `${tab.view.startIndex}:${tab.view.endIndex}` : '',
@@ -2826,6 +2997,12 @@ export class ThermalWorkbenchController {
       cauerSig,
       eonInclQrr,
       eossIncl,
+      qrrInclQoss,
+      qrrIref,
+      qrrReferenceVds,
+      qrrReferenceDiDt,
+      qrrReferenceTj,
+      qrrReferenceVgs,
       useDptMatrix: this.useDptMatrixInFoc,
       dptMatrixLen: this.dptMatrix.length,
       params: paramIds.map((id) => valOf(id)),
@@ -2845,6 +3022,12 @@ export class ThermalWorkbenchController {
       this.lastFocSim = null;
       this.lastFocSimFingerprint = null;
       this.lastFocSweep = null;
+      this.lastFocSteadyResult = null;
+      this.lastFocVoltageEnvelope = null;
+      const voltageBox = document.getElementById('focVoltageEnvelopeBox');
+      if (voltageBox) voltageBox.classList.add('hidden');
+      const steadyBox = document.getElementById('focSteadyResultBox');
+      if (steadyBox) steadyBox.classList.add('hidden');
       const hotEl = document.getElementById('focKpiHottest');
       const pwrEl = document.getElementById('focKpiPower');
       if (hotEl) hotEl.innerText = '--';
@@ -2859,6 +3042,12 @@ export class ThermalWorkbenchController {
     if (this.activeTab === 'foc') {
       this.drawFocCanvas();
     }
+  }
+
+  private parseFocRdsOnTempCurve(): RdsOnTempCurve | undefined {
+    const raw = (document.getElementById('focRdsTempCurveJsonInput') as HTMLTextAreaElement | null)?.value?.trim() || '';
+    if (!raw) return undefined;
+    return parseRdsOnTempCurveImportJson(raw);
   }
 
   private parseFocNonlinearEossCurve(): NonlinearEossCurve | undefined {
@@ -2928,9 +3117,19 @@ export class ThermalWorkbenchController {
   }
 
   private readFocParams(): { mos: FocMosParams; ctrl: FocControlParams; model: FocThermalModel } {
+    const fieldLabels: Record<string, string> = {
+      focRdsInput: 'Rds(on)@25°C', focAlphaInput: 'Rds 温度系数 α', focVsdInput: '体二极管压降 Vsd',
+      focEswInput: 'Eon+Eoff', focEossInput: 'Eoss', focQrrInput: 'Qrr', focVrefInput: '开关能量参考电压 Vref',
+      focIrefInput: 'Eon/Eoff 参考电流 Iref', focQrrIrefInput: 'Qr/Qrr 参考电流', focQrrReferenceVdsInput: 'Qr/Qrr 测试 VDS', focQrrReferenceDiDtInput: 'Qr/Qrr 测试 di/dt', focQrrReferenceTjInput: 'Qr/Qrr 测试结温', focQrrReferenceVgsInput: 'Qr/Qrr 测试 Vgs', focFswKhzInput: 'PWM 频率 Fsw', focTdeadNsInput: '死区时间',
+      focModDepthInput: '调制度 m', focPfAngleInput: '功率因数角', focTambInput: '环境温度 Tamb',
+      focVbusConstInput: '母线电压 Vdc',
+    };
     const num = (id: string, fallback: number) => {
-      const v = parseFloat((document.getElementById(id) as HTMLInputElement)?.value || '');
-      return isFinite(v) ? v : fallback;
+      const raw = (document.getElementById(id) as HTMLInputElement | null)?.value?.trim() ?? '';
+      if (!raw) return fallback;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) throw new Error(`${fieldLabels[id] ?? id} 必须填写有限数值，当前输入为“${raw}”。`);
+      return value;
     };
     const mod = ((document.getElementById('focModSelect') as HTMLSelectElement)?.value || 'SVPWM') as FocModulationMode;
     const rgOnRaw = (document.getElementById('focRgonInput') as HTMLInputElement | null)?.value?.trim() || '';
@@ -2939,17 +3138,31 @@ export class ThermalWorkbenchController {
     const rgOffParsed = parseFloat(rgOffRaw);
     const rgDesignConfirmed = (document.getElementById('focRgDesignConfirmedChk') as HTMLInputElement | null)?.checked ?? false;
     const eossCurve = this.parseFocNonlinearEossCurve();
+    const rdsOnTempCurve = this.parseFocRdsOnTempCurve();
+    const rdsOperatingVgsRaw = (document.getElementById('focRdsOperatingVgsInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const rdsOperatingVgsV = rdsOperatingVgsRaw ? Number(rdsOperatingVgsRaw) : undefined;
+    const rds25ReferenceVgsRaw = (document.getElementById('focRds25ReferenceVgsInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const rds25ReferenceVgsV = rds25ReferenceVgsRaw ? Number(rds25ReferenceVgsRaw) : undefined;
     const mos: FocMosParams = {
-      rdsOn25Mohm: Math.max(0.1, num('focRdsInput', 4.5)),
+      rdsOn25Mohm: num('focRdsInput', 4.5),
+      rdsDataConfirmed: (document.getElementById('focRdsConfirmedChk') as HTMLInputElement | null)?.checked ?? false,
       tempCoeffAlphaPerC: num('focAlphaInput', 0.45) / 100,
-      vsdV: Math.max(0, num('focVsdInput', 0.9)),
-      eonPlusEoffUj: Math.max(0, num('focEswInput', 35)),
-      eossUj: Math.max(0, num('focEossInput', 0)),
+      rdsOnTempCurve,
+      rdsOperatingVgsV,
+      rds25ReferenceVgsV,
+      vsdV: num('focVsdInput', 0.9),
+      eonPlusEoffUj: num('focEswInput', 0),
+      eossUj: num('focEossInput', 0),
       eossCurve,
       eossAlreadyIncludedInEsw: (document.getElementById('focEossIncludedChk') as HTMLInputElement | null)?.checked ?? false,
-      qrrNc: Math.max(0, num('focQrrInput', 60)),
-      vRefV: Math.max(1, num('focVrefInput', 48)),
-      iRefA: Math.max(1, num('focIrefInput', 30)),
+      qrrNc: num('focQrrInput', 0),
+      vRefV: num('focVrefInput', 13.5),
+      iRefA: num('focIrefInput', 30),
+      qrrIrefA: num('focQrrIrefInput', num('focIrefInput', 30)),
+      qrrReferenceVdsV: (() => { const raw = (document.getElementById('focQrrReferenceVdsInput') as HTMLInputElement | null)?.value?.trim() || ''; return raw ? num('focQrrReferenceVdsInput', 0) : undefined; })(),
+      qrrReferenceDiDtAperUs: (() => { const raw = (document.getElementById('focQrrReferenceDiDtInput') as HTMLInputElement | null)?.value?.trim() || ''; return raw ? num('focQrrReferenceDiDtInput', 0) : undefined; })(),
+      qrrReferenceTjC: (() => { const raw = (document.getElementById('focQrrReferenceTjInput') as HTMLInputElement | null)?.value?.trim() || ''; return raw ? num('focQrrReferenceTjInput', 25) : undefined; })(),
+      qrrReferenceVgsV: (() => { const raw = (document.getElementById('focQrrReferenceVgsInput') as HTMLInputElement | null)?.value?.trim() || ''; return raw ? num('focQrrReferenceVgsInput', 0) : undefined; })(),
       rgOnOhm: rgOnRaw && Number.isFinite(rgOnParsed) && rgOnParsed >= 0 ? rgOnParsed : undefined,
       rgOffOhm: rgOffRaw && Number.isFinite(rgOffParsed) && rgOffParsed >= 0 ? rgOffParsed : undefined,
       // Gate resistors entered in the workbench are design/configuration values,
@@ -2960,16 +3173,17 @@ export class ThermalWorkbenchController {
           ? 'design_specified'
           : 'assumed',
       eonIncludesQrr: (document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked ?? false,
+      qrrIncludesQoss: (document.getElementById('focQrrIncludesQossChk') as HTMLInputElement | null)?.checked ?? false,
       dptLut: this.useDptMatrixInFoc && this.dptMatrix.length > 0 ? this.dptMatrix.map((pt) => ({ ...pt })) : undefined,
     };
     const ctrl: FocControlParams = {
       modulation: mod,
-      fswHz: Math.max(100, num('focFswKhzInput', 20) * 1e3),
-      tDeadNs: Math.max(0, num('focTdeadNsInput', 500)),
-      modDepthM: Math.max(0, Math.min(1.2, num('focModDepthInput', 0.85))),
+      fswHz: num('focFswKhzInput', 20) * 1e3,
+      tDeadNs: num('focTdeadNsInput', 500),
+      modDepthM: num('focModDepthInput', 0.85),
       pfAngleDeg: num('focPfAngleInput', 0),
       tAmbC: num('focTambInput', 25),
-      vBusConstV: Math.max(1, num('focVbusConstInput', 48)),
+      vBusConstV: num('focVbusConstInput', 13.5),
     };
     return { mos, ctrl, model: this.getActiveFocModel() };
   }
@@ -3014,6 +3228,42 @@ export class ThermalWorkbenchController {
     if (this.activeFocHandoffNote) {
       pushUnique(`ℹ DynoLab 数据传递边界: ${this.activeFocHandoffNote}`);
     }
+    const rdsConfirmed = (document.getElementById('focRdsConfirmedChk') as HTMLInputElement | null)?.checked ?? false;
+    if (!rdsConfirmed) {
+      pushUnique('▲ Rds25 尚未确认为目标器件数据：当前数值 4.5 mΩ 只是界面示例起点，结温结果不能视为器件级已标定结果。');
+    }
+    const rdsCurveRaw = (document.getElementById('focRdsTempCurveJsonInput') as HTMLTextAreaElement | null)?.value?.trim() || '';
+    if (rdsCurveRaw) {
+      try {
+        const curve = parseRdsOnTempCurveImportJson(rdsCurveRaw);
+        const operatingVgs = (document.getElementById('focRdsOperatingVgsInput') as HTMLInputElement | null)?.value?.trim() || '未填写';
+        pushUnique(`ℹ Rds(Tj) 使用归一化器件曲线，曲线测试 Vgs=${curve.referenceGateVoltageV.toFixed(2)}V，当前 MOS Vgs,on=${operatingVgs}V；两者必须匹配 ±0.10V。温度范围 ${curve.points[0].tjC}～${curve.points[curve.points.length - 1].tjC}°C，超出范围拒绝计算。${curve.sourceNote ? `曲线来源说明：${curve.sourceNote}` : ''}`);
+      } catch (err) {
+        pushUnique(`✖ Rds(Tj) 曲线无效：${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      pushUnique('ℹ Rds(Tj) 当前采用常数线性 α 模型；优先使用目标 MOS 在实际 Vgs 条件下的 Rds(on)-Tj 曲线。');
+    }
+    const eossCurveModeForWarning = (document.getElementById('focEossCurveModeSelect') as HTMLSelectElement | null)?.value || 'scalar';
+    if (eossCurveModeForWarning === 'preset_si_80v' || eossCurveModeForWarning === 'preset_sic_650v') {
+      pushUnique('▲ 当前选用的是示例 Eoss/Qoss/Coss 曲线，不代表目标器件；工程结论请替换为同型号、对应 Vds 条件的器件曲线。');
+    }
+    const eswRaw = (document.getElementById('focEswInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const eossRaw = (document.getElementById('focEossInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const qrrRaw = (document.getElementById('focQrrInput') as HTMLInputElement | null)?.value?.trim() || '';
+    const qrrIncludesQoss = (document.getElementById('focQrrIncludesQossChk') as HTMLInputElement | null)?.checked ?? false;
+    if (qrrIncludesQoss && qrrRaw) pushUnique('ℹ 当前 Qr 定义包含 Qoss/电容性恢复（Nexperia: Qr=Qs+Qoss）；已禁止再独立添加 Eoss。当前仍以 Qr×Vbus 估算总恢复能量，不等于 DPT 能量积分。');
+    const eossCurveMode = (document.getElementById('focEossCurveModeSelect') as HTMLSelectElement | null)?.value || 'scalar';
+    const hasEossCurve = eossCurveMode !== 'scalar';
+    if (!this.useDptMatrixInFoc && !eswRaw && !qrrRaw && !eossRaw && !hasEossCurve) {
+      pushUnique('▲ Esw/Qrr/Eoss 均未提供：当前排除开关能量、反向恢复与零电流 Coss 损耗，只保留导通及已启用的死区修正；结温可能明显偏低。');
+    } else {
+      if (!this.useDptMatrixInFoc && !eswRaw) pushUnique('▲ Esw 未输入：标量开关能量项为 0；若开关损耗不可忽略，请导入覆盖 Vds/Id/Rg/Tj 工况的 DPT LUT 或填写对应工况 Eon+Eoff。');
+      if (!eossRaw && !hasEossCurve && !this.useDptMatrixInFoc && !qrrIncludesQoss) pushUnique('ℹ Eoss 未输入：零电流 Coss 充放电项按 0 处理；只有在 Esw 已含该项或确认该损耗可忽略时才保持空白。');
+      if (!qrrRaw && !this.useDptMatrixInFoc && !(document.getElementById('focEonIncludesQrrChk') as HTMLInputElement | null)?.checked) {
+        pushUnique('ℹ Qrr 未输入：额外反向恢复损耗按 0 处理；仅当 Esw 已包含 Qrr 或确认该项可忽略时才应保持空白。');
+      }
+    }
     for (const m of extra) {
       const formatted = m.startsWith('▲') || m.startsWith('ℹ') || m.startsWith('✖') ? m : `▲ ${m}`;
       pushUnique(formatted);
@@ -3029,7 +3279,6 @@ export class ThermalWorkbenchController {
 
   private refreshFocModelAndSpice(): void {
     const model = this.getActiveFocModel();
-    const tAmb = this.readFiniteInput('focTambInput', 25);
     const rJc = model.zthJC.reduce((s, c) => s + c.r, 0);
     const rBrd = model.zthBoard.reduce((s, c) => s + c.r, 0);
 
@@ -3097,6 +3346,7 @@ export class ThermalWorkbenchController {
       return;
     }
 
+    const tAmb = this.readFiniteInput('focTambInput', 25);
     const netlist = focModelToSpice(model, tAmb, 'INV_6MOS_THERM');
     const val = validateFocSpiceNetlist(netlist, model);
     if (box) box.value = netlist;
@@ -3164,6 +3414,235 @@ export class ThermalWorkbenchController {
     return { tab, iaCh, ibCh, icCh, vbusCh, daCh, dbCh, dcCh, gateThermalMode, rng };
   }
 
+  private renderFocSteadyOperatingPoint(): void {
+    const hint = document.getElementById('focSteadyOperatingPointHint');
+    if (!hint) return;
+    const point = this.activeFocSteadyPoint;
+    const angleWrap = document.getElementById('focSteadyAngleWrap');
+    if (angleWrap) angleWrap.classList.toggle('hidden', point?.mode !== 'locked_rotor');
+    if (!point) {
+      hint.textContent = '尚未从 FOC DynoLab 导入固定工况。请先在 DynoLab Tab 3 计算并发送一个稳态工作点。';
+      return;
+    }
+    const modeLabel = point.mode === 'locked_rotor' ? '零速固定电角度' : '恒定 dq 旋转工况';
+    const angleInput = document.getElementById('focSteadyAngleInput') as HTMLInputElement | null;
+    const electricalAngleDeg = point.mode === 'locked_rotor'
+      ? (angleInput && Number.isFinite(Number(angleInput.value)) ? Number(angleInput.value) : (point.electricalAngleDeg ?? 90))
+      : point.electricalAngleDeg;
+    const read = (id: string, fallback: string): string => {
+      const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+      return el?.value || fallback;
+    };
+    const conditions = [
+      `Vdc=${read('focVbusConstInput', '--')} V`,
+      `${read('focModSelect', 'SVPWM')} m=${read('focModDepthInput', '--')}`,
+      `φ=${read('focPfAngleInput', '--')}°`,
+      `fsw=${read('focFswKhzInput', '--')} kHz`,
+      `td=${read('focTdeadNsInput', '--')} ns`,
+      `Tamb=${read('focTambInput', '--')}°C`,
+    ];
+    const mechanics = Number.isFinite(point.mechanicalSpeedRpm) && Number.isFinite(point.torqueNm)
+      ? ` · n=${point.mechanicalSpeedRpm!.toFixed(0)} rpm · T=${point.torqueNm!.toFixed(3)} N·m`
+      : '';
+    hint.textContent = `${modeLabel} · Id=${(point.idPeakA ?? 0).toFixed(3)} A(pk) · Iq=${point.iqPeakA.toFixed(3)} A(pk) · fe=${point.electricalFrequencyHz.toFixed(3)} Hz${mechanics} · ${conditions.join(' · ')}${point.mode === 'locked_rotor' ? ` · θe=${(electricalAngleDeg ?? 90).toFixed(1)}°` : ''}`;
+  }
+
+  private renderFocSteadyResult(result: FocSteadyStateResult): void {
+    const box = document.getElementById('focSteadyResultBox');
+    if (!box) return;
+    const qualified = result.resultQualification === 'DEVICE_PARAMETERIZED' && result.steadyConverged && !result.thermalRunaway && result.powerBalanceStatus !== 'EXCEEDS_BUDGET';
+    const qualificationEl = document.getElementById('focSteadyQualification');
+    const powerEl = document.getElementById('focSteadyPower');
+    const boardEl = document.getElementById('focSteadyBoard');
+    const tjEl = document.getElementById('focSteadyTjMax');
+    if (qualificationEl) {
+      qualificationEl.textContent = `${result.resultQualification}${result.steadyConverged ? '' : ' · 未收敛'}${result.thermalRunaway ? ' · 热失控' : ''}`;
+      qualificationEl.className = `font-semibold mt-0.5 ${qualified ? 'text-emerald-300' : 'text-amber-300'}`;
+    }
+    const thermalPointUsable = result.steadyConverged && !result.thermalRunaway;
+    if (powerEl) powerEl.textContent = thermalPointUsable ? `${result.pInverterTotalW.toFixed(3)} W` : '--（热稳态无效）';
+    if (boardEl) boardEl.textContent = thermalPointUsable ? `${result.tBoardSteadyC.toFixed(2)} °C` : '--（热稳态无效）';
+    if (tjEl) tjEl.textContent = thermalPointUsable ? `${result.tjMaxSteadyC.toFixed(2)} °C · ${result.hottestKey}` : '--（不得作为稳态结温）';
+
+    const tbody = document.getElementById('focSteadySwitchTableBody');
+    if (tbody) {
+      tbody.innerHTML = '';
+      for (const row of result.perSwitch) {
+        const tr = document.createElement('tr');
+        tr.className = `border-t border-[#222933] ${thermalPointUsable && row.key === result.hottestKey ? 'bg-rose-950/25' : ''}`;
+        const cells = [
+          `${row.key}${thermalPointUsable && row.key === result.hottestKey ? ' ★' : ''}`,
+          thermalPointUsable ? row.pCondW.toFixed(4) : '--',
+          thermalPointUsable ? row.pSwitchingW.toFixed(4) : '--',
+          thermalPointUsable ? row.pDeadTimeW.toFixed(4) : '--',
+          thermalPointUsable ? row.pTotalW.toFixed(4) : '--',
+          thermalPointUsable ? row.boardSteadyC.toFixed(2) : '--',
+          thermalPointUsable ? row.tjSteadyC.toFixed(2) : '--',
+        ];
+        cells.forEach((value, index) => {
+          const td = document.createElement('td');
+          td.className = `px-2 py-1 ${index === 0 ? 'font-semibold text-cyan-300' : index === 4 ? 'text-amber-300' : index === 6 ? 'text-pink-300' : 'text-slate-200'}`;
+          td.textContent = value;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      }
+    }
+    const detail = document.getElementById('focSteadyDetail');
+    if (detail) {
+      const lines = [
+        `固定工况：Vdc=${result.vBusConstV.toFixed(3)} V · ${result.modulation} m=${result.modDepthM.toFixed(4)} · φ=${result.pfAngleDeg.toFixed(2)}° · fsw=${(result.fswHz / 1000).toFixed(3)} kHz · td=${result.tDeadNs.toFixed(1)} ns · Tamb=${result.tAmbC.toFixed(1)}°C`,
+        `工作点：Id=${result.idPeakA.toFixed(3)} A(pk) · Iq=${result.iqPeakA.toFixed(3)} A(pk) · fe=${result.electricalFrequencyHz.toFixed(3)} Hz${result.mechanicalSpeedRpm === null ? '' : ` · n=${result.mechanicalSpeedRpm.toFixed(0)} rpm`}${result.torqueNm === null ? '' : ` · T=${result.torqueNm.toFixed(3)} N·m`}`,
+        `按 ${result.integrationSamples} 个电角度点计算${result.mode === 'rotating' ? '完整电周期平均损耗' : `固定电角度 ${result.electricalAngleDeg?.toFixed(1)}°`}`,
+        thermalPointUsable
+          ? `Pcond=${result.pCondTotalW.toFixed(3)} W · Psw=${result.pSwitchingTotalW.toFixed(3)} W · Pdead=${result.pDeadTimeTotalW.toFixed(3)} W`
+          : 'Pcond/Psw/Pdead/P6MOS：--（热稳态无效；当前内部值仅为迭代诊断，不作为结果）',
+        result.busInputPowerW === null ? '' : `FOC 母线输入功率=${result.busInputPowerW.toFixed(3)} W`,
+        result.mechanicalPowerW === null ? '' : `FOC 机械输出功率=${result.mechanicalPowerW.toFixed(3)} W`,
+        result.dcLinkPowerW === null ? '' : `DC 链路功率=${result.dcLinkPowerW.toFixed(3)} W · 电机端电功率=${result.motorElectricalPowerW?.toFixed(3) ?? '--'} W`,
+        !thermalPointUsable ? '热稳态无效：跳过六管损耗与 FOC 逆变器损耗预算比较。' : result.impliedInverterLossW === null ? '无可用 FOC 逆变器损耗预算，跳过功率平衡校验。' : `FOC 效率模型隐含逆变器损耗预算=${result.impliedInverterLossW.toFixed(3)} W · 六管损耗预算余量=${result.inverterLossBudgetMarginW?.toFixed(3) ?? '--'} W · ${result.powerBalanceStatus}`,
+        result.integrationErrorPct === null ? '堵转点计算，不涉及电周期积分误差。' : `粗/细积分差异估计 ${result.integrationErrorPct.toFixed(4)}%。`,
+        result.pwmCyclesPerElectricalCycle === null ? '静止转子，无电周期 PWM 比值。' : `fsw/fe=${result.pwmCyclesPerElectricalCycle.toFixed(1)} PWM 周期/电周期。`,
+        ...result.qualificationReasons,
+        ...result.warnings,
+      ];
+      detail.textContent = lines.join('\n');
+    }
+    box.classList.remove('hidden');
+  }
+
+  private renderFocVoltageEnvelope(rows: FocVoltageEnvelopeRow[], referenceVoltageV: number): void {
+    const box = document.getElementById('focVoltageEnvelopeBox');
+    const tbody = document.getElementById('focVoltageEnvelopeBody');
+    const note = document.getElementById('focVoltageEnvelopeNote');
+    const details = document.getElementById('focVoltageEnvelopeDetails');
+    if (!box || !tbody) return;
+    tbody.innerHTML = '';
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      const result = row.result;
+      const thermalFailure = row.status === 'THERMAL_NOT_CONVERGED' || row.status === 'THERMAL_RUNAWAY';
+      const resultUsable = row.status === 'CALCULATED' && Boolean(result?.steadyConverged) && !result?.thermalRunaway;
+      tr.className = `border-t border-[#222933] ${row.status === 'VOLTAGE_LIMITED' || row.status === 'THERMAL_RUNAWAY' ? 'bg-rose-950/20' : row.status === 'MODEL_OUT_OF_RANGE' || row.status === 'INVALID_INPUT' || thermalFailure ? 'bg-amber-950/20' : ''}`;
+      const values = [
+        `${row.vBusV.toFixed(1)} V`,
+        row.requiredModDepthM.toFixed(4),
+        resultUsable ? result!.pCondTotalW.toFixed(3) : '--',
+        resultUsable ? result!.pSwitchingTotalW.toFixed(3) : '--',
+        resultUsable ? result!.pDeadTimeTotalW.toFixed(3) : '--',
+        resultUsable ? result!.pInverterTotalW.toFixed(3) : '--',
+        resultUsable ? `${result!.tjMaxSteadyC.toFixed(2)} °C` : '--（无有效稳态 Tj）',
+        row.status === 'VOLTAGE_LIMITED' ? '电压能力不足' : row.status === 'MODEL_OUT_OF_RANGE'
+          ? '模型数据越界' : row.status === 'THERMAL_RUNAWAY' ? '热失控'
+            : row.status === 'THERMAL_NOT_CONVERGED' ? '热稳态未收敛'
+              : row.status === 'INVALID_INPUT' ? '输入/热模型错误' : `${result!.resultQualification}`, 
+      ];
+      values.forEach((value, index) => {
+        const td = document.createElement('td');
+        td.className = `px-2 py-1 ${index === 0 ? 'font-semibold text-cyan-300' : index === 5 ? 'text-amber-300' : index === 6 ? 'text-pink-300' : index === 7 ? (resultUsable ? 'text-emerald-300' : 'text-rose-300') : 'text-slate-200'}`;
+        td.textContent = value;
+        if (index === 7) td.title = row.note;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    }
+    if (note) {
+      note.textContent = `参考母线 ${referenceVoltageV.toFixed(2)}V、参考调制度按 m·Vdc 恒定换算。Id/Iq、fe、Fsw、PF、死区、Tamb、MOS 共用器件参数和热网络保持不变。该评估用于电压边界敏感度；若低压点超过线性调制上限则标记电压能力不足，不伪造该点的损耗/结温。DPT/Eoss 数据超出 9～16V 覆盖范围时对应点会拒绝计算。`;
+    }
+    if (details) {
+      details.textContent = rows.map((row) => `${row.vBusV.toFixed(1)}V · m_required=${row.requiredModDepthM.toFixed(4)} · ${row.note}`).join('\n');
+    }
+    box.classList.remove('hidden');
+  }
+
+  private runFocVoltageEnvelope(): void {
+    const sourcePoint = this.activeFocSteadyPoint;
+    if (!sourcePoint) {
+      this.app.showToast('请先从 FOC DynoLab Tab 3 导入固定工况，再执行 9/13.5/16V 电压边界评估。', 'warn');
+      return;
+    }
+    let point: FocSteadyOperatingPoint = sourcePoint;
+    if (sourcePoint.mode === 'locked_rotor') {
+      const angleRaw = (document.getElementById('focSteadyAngleInput') as HTMLInputElement | null)?.value.trim() ?? '';
+      const angle = Number(angleRaw);
+      if (!angleRaw || !Number.isFinite(angle) || angle < 0 || angle > 360) {
+        this.app.showToast('零速堵转电压边界评估必须输入实际转子电角度 θe（0°～360°）。', 'error');
+        return;
+      }
+      point = { ...sourcePoint, electricalAngleDeg: angle };
+    }
+    try {
+      this.refreshFocModelAndSpice();
+      const { mos, ctrl, model } = this.readFocParams();
+      const rows = simulateFoc6MosVoltageEnvelope({
+        model, mos, ctrl, operatingPoint: point,
+        voltagePoints: [9, 13.5, 16],
+        referenceVoltageV: ctrl.vBusConstV,
+        integrationSamples: 1440,
+      });
+      this.lastFocVoltageEnvelope = rows;
+      this.renderFocVoltageEnvelope(rows, ctrl.vBusConstV);
+      const limited = rows.filter((row) => row.status === 'VOLTAGE_LIMITED').map((row) => `${row.vBusV}V`);
+      const failed = rows.filter((row) => ['MODEL_OUT_OF_RANGE', 'INVALID_INPUT', 'THERMAL_NOT_CONVERGED', 'THERMAL_RUNAWAY'].includes(row.status)).map((row) => `${row.vBusV}V(${row.status})`);
+      const calculated = rows.filter((row) => row.status === 'CALCULATED');
+      this.app.showToast(
+        `电压边界评估完成：收敛计算 ${calculated.length}/3；电压能力不足 ${limited.join(', ') || '无'}；模型/热求解异常 ${failed.join(', ') || '无'}。`,
+        limited.length || failed.length ? 'warn' : 'info'
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.lastFocVoltageEnvelope = null;
+      this.renderFocWarnings([`电压边界评估失败：${message}`]);
+      this.app.showToast(`电压边界评估失败：${message}`, 'error');
+    }
+  }
+
+  private runFocSteadyState(): void {
+    const sourcePoint = this.activeFocSteadyPoint;
+    if (!sourcePoint) {
+      this.app.showToast('请先从 FOC DynoLab Tab 3 导入固定工况；恒定稳态计算不从瞬态波形反推 Id/Iq。', 'warn');
+      this.renderFocSteadyOperatingPoint();
+      return;
+    }
+    const angleInput = document.getElementById('focSteadyAngleInput') as HTMLInputElement | null;
+    let point: FocSteadyOperatingPoint = sourcePoint;
+    if (sourcePoint.mode === 'locked_rotor') {
+      const angleRaw = angleInput?.value.trim() ?? '';
+      if (!angleRaw) {
+        this.app.showToast('零速堵转必须输入实际转子电角度 θe，不能留空。', 'error');
+        return;
+      }
+      const angle = Number(angleRaw);
+      if (!Number.isFinite(angle) || angle < 0 || angle > 360) {
+        this.app.showToast('转子电角度 θe 必须是 0°～360° 的有限数值。', 'error');
+        return;
+      }
+      point = { ...sourcePoint, electricalAngleDeg: angle };
+    }
+    try {
+      this.refreshFocModelAndSpice();
+      const { mos, ctrl, model } = this.readFocParams();
+      const result = simulateFoc6MosSteadyState({ model, mos, ctrl, operatingPoint: point, integrationSamples: 1440 });
+      this.lastFocSteadyResult = result;
+      this.renderFocSteadyOperatingPoint();
+      this.renderFocSteadyResult(result);
+      this.renderFocWarnings(result.warnings);
+      const thermalPointUsable = result.steadyConverged && !result.thermalRunaway;
+      const isQualified = result.resultQualification === 'DEVICE_PARAMETERIZED' && thermalPointUsable && result.powerBalanceStatus !== 'EXCEEDS_BUDGET';
+      const toastMessage = !thermalPointUsable
+        ? `恒定工况已执行，但未得到有效热稳态（${result.thermalRunaway ? '热失控' : '热稳态未收敛'}）；不显示中间迭代功耗/结温。`
+        : `恒定工况计算完成：P6MOS=${result.pInverterTotalW.toFixed(3)}W，Tj_max=${result.tjMaxSteadyC.toFixed(2)}°C（${result.resultQualification}${result.powerBalanceStatus === 'EXCEEDS_BUDGET' ? ' · 超出逆变器损耗预算' : ''}）`;
+      this.app.showToast(toastMessage, isQualified ? 'info' : 'warn');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.lastFocSteadyResult = null;
+      this.renderFocWarnings([`恒定工况计算失败：${message}`]);
+      const box = document.getElementById('focSteadyResultBox');
+      if (box) box.classList.add('hidden');
+      this.app.showToast(`恒定工况计算失败：${message}`, 'error');
+    }
+  }
+
   private runFocSimulation(): void {
     const sel = this.getFocSelectedChannels();
     if (!sel) {
@@ -3204,15 +3683,17 @@ export class ThermalWorkbenchController {
       }
       this.renderFocWarnings(extraMsgs);
 
+      const resultIsQualified = res.resultQualification === 'DEVICE_PARAMETERIZED';
+      const resultPrefix = resultIsQualified ? '' : res.resultQualification === 'INCOMPLETE_LOSS_MODEL' ? '不完整模型估算* · ' : '假设模型估算* · ';
       const hotEl = document.getElementById('focKpiHottest');
       if (hotEl) {
-        hotEl.innerText = `${res.hottestKey}: ${res.tjMaxGlobalC.toFixed(2)}°C (${
+        hotEl.innerText = `${resultPrefix}${res.hottestKey}: ${res.tjMaxGlobalC.toFixed(2)}°C (${
           res.steadyThermalRunaway ? '稳态热失控!' : `稳态~${res.tjSteadyMaxEstC.toFixed(1)}°C`
         })`;
       }
       const pwrEl = document.getElementById('focKpiPower');
       if (pwrEl) {
-        pwrEl.innerText = `${res.pInvMeanW.toFixed(2)} W / ${res.tBoardFinalC.toFixed(1)}°C (${
+        pwrEl.innerText = `${res.pInvMeanW.toFixed(2)}${resultIsQualified ? '' : '*'} W / ${res.tBoardFinalC.toFixed(1)}${resultIsQualified ? '' : '*'}°C (${
           res.steadyThermalRunaway ? '热失控' : `稳态~${res.tBoardSteadyEstC.toFixed(1)}°C`
         }, 保守收敛 ${res.thermalConvergencePct.toFixed(0)}% / 六结 ${res.junctionConvergencePct.toFixed(0)}%)`;
       }
@@ -3226,13 +3707,13 @@ export class ThermalWorkbenchController {
           tr.className = `border-t border-[#222933] ${isHot ? 'bg-rose-950/25' : ''}`;
           tr.innerHTML = `
             <td class="px-2 py-1 font-semibold ${isHot ? 'text-rose-300' : 'text-cyan-300'}">${s.key}${isHot ? ' ★' : ''}</td>
-            <td class="px-2 py-1">${s.tjAvgC.toFixed(2)} °C</td>
-            <td class="px-2 py-1 text-pink-300">${s.tjPeakC.toFixed(2)} °C</td>
-            <td class="px-2 py-1">${s.tjRippleC.toFixed(2)} °C</td>
-            <td class="px-2 py-1 text-amber-300">${s.pAvgW.toFixed(2)} W</td>
-            <td class="px-2 py-1">${s.pCondAvgW.toFixed(2)} W</td>
-            <td class="px-2 py-1">${s.pSwAvgW.toFixed(2)} W</td>
-            <td class="px-2 py-1">${s.pDeadAvgW.toFixed(2)} W</td>
+            <td class="px-2 py-1" title="${resultIsQualified ? '参数化模型输出；仍需实际 PCB/器件数据验证' : '带 * 表示假设或不完整损耗模型估算，不可作为热设计签核值'}">${s.tjAvgC.toFixed(2)}${resultIsQualified ? '' : '*'} °C</td>
+            <td class="px-2 py-1 text-pink-300" title="${resultIsQualified ? '参数化模型输出；仍需实际 PCB/器件数据验证' : '带 * 表示假设或不完整损耗模型估算，不可作为热设计签核值'}">${s.tjPeakC.toFixed(2)}${resultIsQualified ? '' : '*'} °C</td>
+            <td class="px-2 py-1">${s.tjRippleC.toFixed(2)}${resultIsQualified ? '' : '*'} °C</td>
+            <td class="px-2 py-1 text-amber-300">${s.pAvgW.toFixed(2)}${resultIsQualified ? '' : '*'} W</td>
+            <td class="px-2 py-1">${s.pCondAvgW.toFixed(2)}${resultIsQualified ? '' : '*'} W</td>
+            <td class="px-2 py-1">${s.pSwAvgW.toFixed(2)}${resultIsQualified ? '' : '*'} W</td>
+            <td class="px-2 py-1">${s.pDeadAvgW.toFixed(2)}${resultIsQualified ? '' : '*'} W</td>
           `;
           tbody.appendChild(tr);
         });
@@ -3242,7 +3723,7 @@ export class ThermalWorkbenchController {
       const dutyNote = res.dutySource === 'external' ? '外部 Duty_A/B/C' : ctrl.modulation;
       const steadyNote = res.steadyThermalRunaway ? '稳态热失控!' : `稳态~${res.tjSteadyMaxEstC.toFixed(1)}°C`;
       this.app.showToast(
-        `6-MOS FOC (${dutyNote}): ${res.hottestKey} Peak=${res.tjMaxGlobalC.toFixed(2)}°C (${steadyNote}), P_inv=${res.pInvMeanW.toFixed(2)}W`,
+        `6-MOS FOC (${dutyNote})${resultIsQualified ? ' [PARAMETERIZED]' : ` [${res.resultQualification}*]`}: ${res.hottestKey} Peak=${res.tjMaxGlobalC.toFixed(2)}°C (${steadyNote}), P_inv=${res.pInvMeanW.toFixed(2)}W`,
         res.overmodulatedCount > 0 || res.warnings.length > 0 ? 'warn' : 'info'
       );
     } catch (err: any) {
@@ -3261,12 +3742,12 @@ export class ThermalWorkbenchController {
     const colors = ['#f472b6', '#fb7185', '#22d3ee', '#38bdf8', '#4ade80', '#facc15'];
     const specs = MOS_SWITCH_KEYS.map((key, idx) => ({
       replaceKey: `foc_tj_${key.toLowerCase()}`,
-      name: `Tj_${key}`,
+      name: `${sim.resultQualification === 'DEVICE_PARAMETERIZED' ? 'Tj' : 'Tj*'}_${key}`,
       unit: '°C',
       t: sim.time,
       values: sim.tj[key],
       color: colors[idx],
-      badge: 'FOC',
+      badge: sim.resultQualification === 'DEVICE_PARAMETERIZED' ? 'FOC' : 'FOC*',
       expr: `6MOS(${key})`,
       sourceIds: iaId ? [iaId] : [],
       baseChannelId: iaId,
@@ -3274,12 +3755,12 @@ export class ThermalWorkbenchController {
     }));
     specs.push({
       replaceKey: 'foc_pinv_total',
-      name: 'P_inv_total',
+      name: sim.resultQualification === 'DEVICE_PARAMETERIZED' ? 'P_inv_total' : 'P_inv_total*',
       unit: 'W',
       t: sim.time,
       values: sim.pInvTotal,
       color: '#fb923c',
-      badge: 'INV',
+      badge: sim.resultQualification === 'DEVICE_PARAMETERIZED' ? 'INV' : 'INV*',
       expr: 'Sum(P_Q1..Q6)',
       sourceIds: iaId ? [iaId] : [],
       baseChannelId: iaId,
@@ -3371,24 +3852,28 @@ export class ThermalWorkbenchController {
       const safeEl = document.getElementById('focKpiStallSafe');
       if (safeEl) {
         safeEl.innerText = res.tSafeSec !== null
-          ? `t_safe=${res.tSafeSec.toFixed(2)}s @ θ=${res.tSafeAngleDeg}°/${res.transientWorstSwitch} · 正弦等效 I²t:${res.i2tRmsA2s?.toFixed(0)} / 最不利相 I²t:${res.i2tWorstLegA2s?.toFixed(0)} A²s${res.stallVoltageLimited ? ' · 请求电流超出线性调制电压能力（条件估算）' : ''}`
+          ? `${res.resultQualification !== 'DEVICE_PARAMETERIZED' ? `仅估算(${res.resultQualification}) · ` : ''}t_safe=${res.tSafeSec.toFixed(2)}s @ θ=${res.tSafeAngleDeg}°/${res.transientWorstSwitch} · 正弦等效 I²t:${res.i2tRmsA2s?.toFixed(0)} / 最不利相 I²t:${res.i2tWorstLegA2s?.toFixed(0)} A²s${res.stallVoltageLimited ? ' · 请求电流超出线性调制电压能力（条件估算）' : ''}`
           : !res.stallSteadyConverged
           ? '稳态求解未收敛（不可判 SAFE）'
           : res.stallThermalRunaway
           ? '热失控（不可判 SAFE）'
           : res.stallVoltageLimited
           ? '请求电流超出线性调制电压能力；热结果仅为强制电流假设，不可判 SAFE'
+          : res.resultQualification !== 'DEVICE_PARAMETERIZED'
+          ? `模型输入等级 ${res.resultQualification}；仅估算，不可判 SAFE`
           : res.steadySafe
           ? `稳态安全；本时域 ${res.transientTime[res.transientTime.length - 1].toFixed(0)}s 未越限`
           : `稳态超限；本时域未越限`;
         const transientThermalLimitCrossed = res.tSafeSec !== null;
-        safeEl.className = res.steadySafe && !transientThermalLimitCrossed ? 'text-emerald-300 font-semibold' : 'text-rose-300 font-semibold';
+        safeEl.className = res.steadySafe && !transientThermalLimitCrossed
+          ? 'text-emerald-300 font-semibold'
+          : res.resultQualification !== 'DEVICE_PARAMETERIZED' ? 'text-amber-300 font-semibold' : 'text-rose-300 font-semibold';
       }
 
       this.drawFocCanvas();
       this.app.showToast(
-        `Stall Sweep (${res.effectiveStallModulation}, m=${res.effectiveStallModDepthM.toFixed(3)}, R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω, init=${res.inheritedBoardTempC.toFixed(1)}°C): Worst ${res.worstSwitch} @ θ=${res.worstAngleDeg}° (${res.stallThermalRunaway ? '热失控' : `${res.worstSteadyTjC.toFixed(1)}°C steady`})`,
-        res.steadySafe && res.tSafeSec === null && !res.stallVoltageLimited ? 'info' : 'warn'
+        `Stall Sweep [${res.resultQualification}] (${res.effectiveStallModulation}, m=${res.effectiveStallModDepthM.toFixed(3)}, R_s=${res.rPhaseUsedOhm.toFixed(3)}Ω, init=${res.inheritedBoardTempC.toFixed(1)}°C): Worst ${res.worstSwitch} @ θ=${res.worstAngleDeg}° (${res.stallThermalRunaway ? '热失控' : `${res.worstSteadyTjC.toFixed(1)}°C steady`})`,
+        res.steadySafe && res.tSafeSec === null && !res.stallVoltageLimited && res.resultQualification === 'DEVICE_PARAMETERIZED' ? 'info' : 'warn'
       );
     } catch (err: any) {
       this.app.showToast(`Stall sweep failed: ${err?.message || err}`, 'error');
@@ -3422,7 +3907,11 @@ export class ThermalWorkbenchController {
       this.focCanvasMode = 'sweep';
       this.syncFocViewButtons();
 
-      const extraNotes = [...res.svpwm.alignmentWarnings];
+      const extraNotes = [
+        ...res.svpwm.warnings.map((w) => `SVPWM：${w}`),
+        ...res.dpwm1.warnings.map((w) => `DPWM1：${w}`),
+        ...res.spwm.warnings.map((w) => `SPWM：${w}`),
+      ];
       if (sel.daCh && sel.dbCh && sel.dcCh) {
         extraNotes.push('调制策略扫频仅比较理论重构波形 (SVPWM vs DPWM1 vs SPWM)，已忽略外部 Duty_A/B/C 选择。');
       }
@@ -3431,8 +3920,8 @@ export class ThermalWorkbenchController {
 
       const pSave = res.svpwm.pInvMeanW - res.dpwm1.pInvMeanW;
       this.app.showToast(
-        `SVPWM (${res.svpwm.pInvMeanW.toFixed(2)}W, ${res.svpwm.tjMaxGlobalC.toFixed(2)}°C) vs DPWM1 (${res.dpwm1.pInvMeanW.toFixed(2)}W, ${res.dpwm1.tjMaxGlobalC.toFixed(2)}°C) -> Saves ${pSave.toFixed(2)} W`,
-        'info'
+        `${[res.svpwm, res.dpwm1, res.spwm].some((r) => r.resultQualification !== 'DEVICE_PARAMETERIZED') ? '[ESTIMATE*] ' : '[PARAMETERIZED] '}SVPWM (${res.svpwm.pInvMeanW.toFixed(2)}W, ${res.svpwm.tjMaxGlobalC.toFixed(2)}°C) vs DPWM1 (${res.dpwm1.pInvMeanW.toFixed(2)}W, ${res.dpwm1.tjMaxGlobalC.toFixed(2)}°C) -> Saves ${pSave.toFixed(2)} W`,
+        [res.svpwm, res.dpwm1, res.spwm].some((r) => r.resultQualification !== 'DEVICE_PARAMETERIZED') ? 'warn' : 'info'
       );
     } catch (err: any) {
       this.app.showToast(`FOC control sweep failed: ${err?.message || err}`, 'error');
@@ -3742,6 +4231,9 @@ export class ThermalWorkbenchController {
     // Do NOT wipe Tab 2's activeCauerStages when loading FOC Demo!
     this.focModelSource = 'default_demo';
     this.activeFocHandoffNote = null;
+    this.activeFocSteadyPoint = null;
+    this.lastFocSteadyResult = null;
+    this.renderFocSteadyOperatingPoint();
     this.updateCauerSummaryBox();
     this.invalidateFocCaches(true);
     this.populateChannelSelectors();
@@ -3779,15 +4271,22 @@ export class ThermalWorkbenchController {
     setVal('focTdeadNsInput', payload.tDeadNs);
     setVal('focRdsInput', payload.rdsOnMOhm);
     setVal('focVsdInput', payload.vsdV);
+    // External handoff values may be useful starting points, but do not inherit a
+    // previous panel's manual confirmation for a different device.
+    const rdsConfirmed = document.getElementById('focRdsConfirmedChk') as HTMLInputElement | null;
+    if (rdsConfirmed) rdsConfirmed.checked = false;
     if (typeof payload.rsPhaseOhm === 'number' && Number.isFinite(payload.rsPhaseOhm) && payload.rsPhaseOhm > 0) {
       setVal('focStallRsInput', payload.rsPhaseOhm.toFixed(4));
     }
 
     this.activeFocHandoffNote =
       payload.handoffNote ||
-      '已从外部导入波形与基本参数；开关/热系数 α、Esw、Eoss、Qrr、Vref、Iref 仍采用当前 MOS Thermal 面板数值。';
-
-    this.runFocSimulation();
+      '已从外部导入固定 FOC 工况；开关/热系数 α、Esw、Eoss、Qrr、Vref、Iref 仍采用当前 MOS Thermal 面板数值。';
+    this.activeFocSteadyPoint = payload.steadyOperatingPoint;
+    this.renderFocSteadyOperatingPoint();
+    // This workflow is explicitly constant-condition: calculate average losses and
+    // coupled steady Tj directly. The waveform transient remains an explicit action.
+    this.runFocSteadyState();
   }
 
   // ==================== P1: Double Pulse Test (DPT) Methods ====================
@@ -3956,16 +4455,29 @@ export class ThermalWorkbenchController {
       this.app.showToast('请先在 Tab 5 运行一次有效的 DPT 分析，再保存到矩阵。', 'warn');
       return;
     }
-    const tjVal = parseFloat((document.getElementById('dptMatrixTjInput') as HTMLInputElement)?.value || '25');
-    const rgOnVal = parseFloat((document.getElementById('dptMatrixRgonInput') as HTMLInputElement)?.value || '4.7');
-    const rgOffVal = parseFloat((document.getElementById('dptMatrixRgoffInput') as HTMLInputElement)?.value || '4.7');
-    const rgOnOhm = Number.isFinite(rgOnVal) && rgOnVal >= 0 ? rgOnVal : 4.7;
-    const rgOffOhm = Number.isFinite(rgOffVal) && rgOffVal >= 0 ? rgOffVal : rgOnOhm;
+    const readRequired = (id: string): number | null => {
+      const raw = (document.getElementById(id) as HTMLInputElement | null)?.value?.trim() || '';
+      if (!raw) return null;
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const tjVal = readRequired('dptMatrixTjInput');
+    const rgOnOhm = readRequired('dptMatrixRgonInput');
+    const rgOffOhm = readRequired('dptMatrixRgoffInput');
+    const conditionConfirmed = (document.getElementById('dptMatrixConditionConfirmedChk') as HTMLInputElement | null)?.checked ?? false;
+    if (tjVal === null || tjVal < -100 || tjVal > 300 || rgOnOhm === null || rgOnOhm < 0 || rgOffOhm === null || rgOffOhm < 0) {
+      this.app.showToast('保存 DPT 点前必须填写有效的测试结温 Tj、Rg_on 和 Rg_off；不再自动填入 25°C / 4.7Ω。', 'error');
+      return;
+    }
+    if (!conditionConfirmed) {
+      this.app.showToast('请先确认 Tj、Rg_on、Rg_off 是本次 DPT 测试的实际工况，不是猜测或占位值。', 'warn');
+      return;
+    }
     this.dptMatrix.push({
       id: `dpt_${Date.now()}_${this.dptMatrix.length}`,
       vBusV: res.vBusSteadyV,
       iLoadA: res.iLoadA,
-      tjC: Number.isFinite(tjVal) ? tjVal : 25,
+      tjC: tjVal,
       rgOhm: 0.5 * (rgOnOhm + rgOffOhm),
       rgOnOhm,
       rgOffOhm,
@@ -3976,7 +4488,7 @@ export class ThermalWorkbenchController {
     });
     this.renderDptMatrixTable();
     this.app.showToast(
-      `已保存工况点到 4D DPT LUT (Vbus=${res.vBusSteadyV.toFixed(1)}V, I=${res.iLoadA.toFixed(1)}A, Tj=${(Number.isFinite(tjVal) ? tjVal : 25).toFixed(0)}°C, Rg=${rgOnOhm.toFixed(1)}/${rgOffOhm.toFixed(1)}Ω)。`,
+      `已保存已确认的 DPT 工况点到 4D LUT (Vbus=${res.vBusSteadyV.toFixed(1)}V, I=${res.iLoadA.toFixed(1)}A, Tj=${tjVal.toFixed(0)}°C, Rg=${rgOnOhm.toFixed(1)}/${rgOffOhm.toFixed(1)}Ω)。`,
       'info'
     );
   }
@@ -4026,25 +4538,35 @@ export class ThermalWorkbenchController {
       this.app.showToast('DPT 查找表矩阵为空，请先保存至少 1 个工况点。', 'warn');
       return;
     }
-    const vTarget = Math.max(1, this.readFiniteInput('focVbusConstInput', 48));
+    const vTarget = Math.max(1, this.readFiniteInput('focVbusConstInput', 13.5));
     const iTarget = Math.max(1, this.readFiniteInput('focIrefInput', 30));
-    const tAmb = this.readFiniteInput('focTambInput', 25);
-    const rgOnTarget = Math.max(0, this.readFiniteInput('focRgonInput', 4.7));
-    const rgOffTarget = Math.max(0, this.readFiniteInput('focRgoffInput', 4.7));
+    const parseOptionalNonNegative = (id: string): number | undefined => {
+      const raw = (document.getElementById(id) as HTMLInputElement | null)?.value?.trim() || '';
+      if (!raw) return undefined;
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+    };
+    const rgOnTarget = parseOptionalNonNegative('focRgonInput');
+    const rgOffTarget = parseOptionalNonNegative('focRgoffInput');
+    const hasKnownRg = rgOnTarget !== undefined && rgOffTarget !== undefined;
     const rgDesignConfirmed = (document.getElementById('focRgDesignConfirmedChk') as HTMLInputElement | null)?.checked ?? false;
     const interp = interpolateDptSwitchingLoss(this.dptMatrix, {
       vBusV: vTarget,
       iLoadA: iTarget,
-      tjC: tAmb,
+      // Leave Tj unspecified here: interpolation uses the LUT midpoint only for
+      // preflight coverage validation. The coupled FOC solver uses its own
+      // per-device model-estimated Tj at every switching-loss evaluation.
       rgOnOhm: rgOnTarget,
       rgOffOhm: rgOffTarget,
       tjProvenance: 'assumed',
-      rgProvenance: rgDesignConfirmed ? 'design_specified' : 'assumed',
+      rgProvenance: hasKnownRg && rgDesignConfirmed ? 'design_specified' : 'assumed',
     });
-    if (!interp || interp.status !== 'VALID' || (interp.activeDimensions.includes('Rg') && !rgDesignConfirmed)) {
+    const rgDimensionNeedsConfirmation = !!interp?.activeDimensions.includes('Rg') &&
+      (!hasKnownRg || !rgDesignConfirmed || interp.rgProvenance === 'assumed');
+    if (!interp || interp.status !== 'VALID' || rgDimensionNeedsConfirmation) {
       const status = interp?.status ?? 'NO_LUT_RESULT';
-      const reason = interp?.activeDimensions.includes('Rg') && !rgDesignConfirmed
-        ? '尚未确认 Rg_on/Rg_off 与实际原理图或 BOM 一致；默认 4.7Ω 不能冒充已知驱动条件。'
+      const reason = rgDimensionNeedsConfirmation
+        ? 'DPT LUT 的 Rg 轴存在变化；请填写实际 Rg_on/Rg_off 并确认与本机原理图/BOM 一致，禁止使用 4.7Ω 隐式默认值。'
         : '请补齐 Vbus/Iload/Tj/Rg 四维数据覆盖，并确保查询点位于实测凸包内。';
       this.app.showToast(
         `DPT LUT 当前状态为 ${status}，不能激活为 FOC 正式热模型：${reason}`,
@@ -4067,10 +4589,14 @@ export class ThermalWorkbenchController {
       ? `（注：参考点超出 LUT 范围 [${interp.outOfRangeAxes.join('/') || 'V/I'}], status=${interp.status}）`
       : `（status=${interp.status}）`;
     const dimNote = `有效维度=[${interp.activeDimensions.join(',') || '无'}]${interp.collapsedDimensions.length > 0 ? `, 退化维度=[${interp.collapsedDimensions.join(',')}]` : ''}`;
-    this.activeFocHandoffNote = `已激活 Tab 5 的 ${this.dptMatrix.length} 点 4D DPT LUT 用于 6-MOS 闭环 (Vbus, |I_phase|, Tj, Rg_on/off) 插值${extrapNote}；${dimNote}；参考标量 @ (${vTarget.toFixed(1)}V, ${iTarget.toFixed(1)}A, Rg=${rgOnTarget.toFixed(1)}/${rgOffTarget.toFixed(1)}Ω): Esw=${interp.eSwTotalUj.toFixed(2)}µJ, Qrr=${interp.qRrNc.toFixed(1)}nC。`;
+    const tjNote = interp.activeDimensions.includes('Tj')
+      ? '预检查 Tj 使用 LUT 范围中值；实际运行逐 MOS 使用热模型迭代 Tj，超出 LUT 范围将拒绝计算'
+      : 'Tj 为单值轴，不具备温度依赖性';
+    const rgTargetNote = hasKnownRg ? `${rgOnTarget!.toFixed(1)}/${rgOffTarget!.toFixed(1)}Ω` : '未指定（仅单值轴时采用 LUT 中值）';
+    this.activeFocHandoffNote = `已激活 Tab 5 的 ${this.dptMatrix.length} 点 DPT LUT 用于 6-MOS 闭环 (Vbus, |I_phase|, Tj, Rg_on/off) 插值${extrapNote}；${dimNote}；${tjNote}；预检查参考标量 @ (${vTarget.toFixed(1)}V, ${iTarget.toFixed(1)}A, Rg=${rgTargetNote}): Esw=${interp.eSwTotalUj.toFixed(2)}µJ, Qrr=${interp.qRrNc.toFixed(1)}nC。`;
     this.invalidateFocCaches(true);
     this.switchTab('foc');
-    this.app.showToast(`Activated ${this.dptMatrix.length}-point 4D DPT LUT (${interp.status}) -> FOC Tab 4.`, interp.extrapolated ? 'warn' : 'info');
+    this.app.showToast(`已激活 ${this.dptMatrix.length} 点 DPT LUT (${interp.status})；运行时按六管热模型估算 Tj 查询，超出实测范围会拒绝计算。`, interp.extrapolated ? 'warn' : 'info');
   }
 
   private drawDptCanvas(): void {

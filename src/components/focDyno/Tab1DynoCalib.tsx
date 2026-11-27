@@ -346,7 +346,10 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
                       onChange={(v) => onChangeManualKe(v, manualVTestV, manualKv)}
                       className="dyno-input w-20 rounded-sm border px-2 py-1 text-right tabular-nums"
                     />
-                    <span className="dyno-text-muted">V_test:</span>
+                    <span
+                      className="dyno-text-muted"
+                      title="这里输入 Vdc×m_norm 等效电压，不是任意相电压或线电压 RMS。软件按线性 SVPWM 近似 E_phase,peak = V_test/√3。"
+                    >Vdc×m_norm:</span>
                     <SmoothNumberInput
                       value={manualVTestV}
                       min={0.5}
@@ -360,7 +363,10 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
 
                 {keSource === 'manual_kv' && (
                   <div className="flex items-center gap-2 font-mono text-xs">
-                    <span className="dyno-text-muted">KV (RPM/V):</span>
+                    <span
+                      className="dyno-text-muted"
+                      title="当前 Ke 换算使用本软件约定 Ke'=60/(2π√3·KV)。厂家 KV 若使用不同母线电压、调制方式、线电压 RMS/峰值或测量方法，不能直接照搬。建议用实测空载转速与有效基波电压交叉核验。"
+                    >KV (RPM/V):</span>
                     <SmoothNumberInput
                       value={manualKv}
                       min={1}
@@ -370,6 +376,16 @@ export const Tab1DynoCalib: React.FC<Tab1Props> = ({
                       className="dyno-input w-24 rounded-sm border px-2 py-1 text-right tabular-nums"
                     />
                   </div>
+                )}
+                {keSource === 'manual_kv' && (
+                  <p className="w-full text-[10px] leading-relaxed dyno-text-muted">
+                    注意：厂家 KV 的测试电压、PWM 调制和线电压定义可能不同；当前换算仅适用于本软件约定。未确认 KV 定义时，应把 Ke 标记为估计值，并用实测空载点复核。
+                  </p>
+                )}
+                {keSource === 'manual_n0_vtest' && (
+                  <p className="w-full text-[10px] leading-relaxed dyno-text-muted">
+                    Vdc×m_norm 为等效母线调制电压；若只知道 DC 母线电压，还必须确认空载点调制深度，不能默认一定达到线性 SVPWM 上限。
+                  </p>
                 )}
               </div>
             </div>

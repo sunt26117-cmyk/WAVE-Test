@@ -520,6 +520,19 @@ test('FOC 6-MOS: strict alignment, non-uniform time-weighted mean, gate preheat,
   const ibExactAtTa = Float32Array.from({ length: nA }, (_, i) => 20 * Math.cos(2 * Math.PI * 5 * tA[i] - (2 * Math.PI) / 3));
   const ibAtTbShift = Float32Array.from({ length: nA }, (_, i) => 20 * Math.cos(2 * Math.PI * 5 * tBShift[i] - (2 * Math.PI) / 3));
   const rExact = simulateFoc6Mos(makeChannel('ia0', 'Ia', 'A', tA, iaShift), makeChannel('ib0', 'Ib', 'A', tA, ibExactAtTa), DEFAULT_FOC_MODEL, mos, ctrl);
+  assert.equal(rExact.resultQualification, 'INCOMPLETE_LOSS_MODEL');
+  assert.ok(rExact.qualificationReasons.some((reason) => reason.includes('Eoss')));
+  assert.ok(rExact.qualificationReasons.some((reason) => reason.includes('Rds(on)@25°C')));
+  assert.ok(rExact.warnings.some((warning) => warning.includes('损耗模型输入不完整')));
+  const scalarCompleteInputs = simulateFoc6Mos(
+    makeChannel('ia-scalar-complete', 'Ia', 'A', tA, iaShift),
+    makeChannel('ib-scalar-complete', 'Ib', 'A', tA, ibExactAtTa),
+    DEFAULT_FOC_MODEL,
+    { ...mos, eossUj: 2, rdsDataConfirmed: false },
+    ctrl
+  );
+  assert.equal(scalarCompleteInputs.resultQualification, 'ASSUMPTION_BASED');
+  assert.ok(scalarCompleteInputs.qualificationReasons.some((reason) => reason.includes('单点 Eon+Eoff')));
   const rResamp = simulateFoc6Mos(makeChannel('ia1', 'Ia', 'A', tA, iaShift), makeChannel('ib1', 'Ib', 'A', tBShift, ibAtTbShift), DEFAULT_FOC_MODEL, mos, ctrl);
   // Strict time-interpolation keeps power error tiny despite interior shift
   assert.ok(Math.abs(rResamp.pInvMeanW - rExact.pInvMeanW) < 0.08);
@@ -1527,11 +1540,40 @@ test('Round-2 P0/P1: timeSync fail-closed, SOA INDETERMINATE, Loss INCOMPLETE/pr
   assert.ok(Number.isNaN(underResolved.tjMaxC));
 
   assert.throws(() => computeLossWithDeskewAndEoss(
+    makeChannel('v_bad_initial_tj', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('i_bad_initial_tj', 'Ids', 'A', tLoss, iLoss),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25, initialTjC: -300 }
+  ), /初始结温.*绝对零度/);
+  assert.throws(() => computeLossWithDeskewAndEoss(
+    makeChannel('v_bad_node_t', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('i_bad_node_t', 'Ids', 'A', tLoss, iLoss),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25, initialNodeT: [25, -300, 25] }
+  ), /initialNodeT.*绝对零度/);
+
+  assert.throws(() => computeLossWithDeskewAndEoss(
     makeChannel('v_no_rc', 'Vds', 'V', tLoss, vLoss),
     makeChannel('i_no_rc', 'Ids', 'A', tLoss, iLoss),
     [],
     { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25 }
   ), /缺少 Cauer 热网络/);
+
+
+  assert.throws(() => computeLossWithDeskewAndEoss(
+    makeChannel('v_rds_required', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('i_rds_required', 'Ids', 'A', tLoss, iLoss),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25, rdsFeedbackEnabled: true }
+  ), /缺少有效的 Rds\(on\)@25°C/);
+
+  const noEossCorrection = computeLossWithDeskewAndEoss(
+    makeChannel('v_no_eoss', 'Vds', 'V', tLoss, vLoss),
+    makeChannel('i_no_eoss', 'Ids', 'A', tLoss, iLoss),
+    stages,
+    { deskewNs: 0, eossUj: 0, rdsOn25Mohm: 0, tempCoeffAlphaPerC: 0, tAmbC: 25, rdsFeedbackEnabled: false }
+  );
+  assert.ok(noEossCorrection.warnings.some((warning) => warning.includes('未提供 Eoss')));
 
   const tLossGap = Float64Array.from({ length: 30 }, (_, i) => (i < 15 ? i * 1e-4 : 0.005 + (i - 15) * 1e-4));
   const lossGap = computeLossWithDeskewAndEoss(
@@ -1974,6 +2016,83 @@ test('MT-01: True 4D DPT LUT interpolation across (Vbus, Iload, Tj, Rg_on/off) w
     ),
     /Rg_on\/Rg_off 实际输入/
   );
+});
+
+test('MT-01b: DPT LUT treats Rg_on and Rg_off as independent axes', () => {
+  const lut = [];
+  for (const v of [40, 80]) {
+    for (const i of [0, 30]) {
+      for (const tj of [25, 125]) {
+        for (const rgOn of [2, 10]) {
+          const rgOff = 6; // Deliberately constant while Rg_on changes.
+          const eOn = 0.4 * v + 0.8 * i + 0.1 * (tj - 25) + 3 * rgOn;
+          const eOff = 0.25 * v + 0.5 * i + 0.08 * (tj - 25) + 2 * rgOff;
+          lut.push({
+            id: `asym_${v}_${i}_${tj}_${rgOn}`,
+            vBusV: v,
+            iLoadA: i,
+            tjC: tj,
+            rgOhm: 0.5 * (rgOn + rgOff),
+            rgOnOhm: rgOn,
+            rgOffOhm: rgOff,
+            eOnUj: eOn,
+            eOffUj: eOff,
+            eOnSansQrrUj: eOn - 2,
+            qRrNc: 20 + 2 * i + 0.5 * (tj - 25) + 1.5 * rgOn,
+          });
+        }
+      }
+    }
+  }
+
+  const res = interpolateDptSwitchingLoss(lut, {
+    vBusV: 60,
+    iLoadA: 20,
+    tjC: 75,
+    rgOnOhm: 6,
+    rgOffOhm: 6,
+    tjProvenance: 'measured',
+    rgProvenance: 'design_specified',
+  });
+  assert.ok(res);
+  assert.equal(res!.status, 'VALID');
+  assert.deepEqual(res!.activeDimensions, ['Vbus', 'Iload', 'Tj', 'Rg']);
+  assert.deepEqual(res!.rgOnRange, [2, 10]);
+  assert.deepEqual(res!.rgOffRange, [6, 6]);
+  assert.ok(res!.warnings.some((warning) => warning.includes('变化维度不对称')));
+  assert.ok(Math.abs(res!.eOnUj - (0.4 * 60 + 0.8 * 20 + 0.1 * 50 + 3 * 6)) < 1e-6);
+  assert.ok(Math.abs(res!.eOffUj - (0.25 * 60 + 0.5 * 20 + 0.08 * 50 + 2 * 6)) < 1e-6);
+
+  const offOutside = interpolateDptSwitchingLoss(lut, {
+    vBusV: 60,
+    iLoadA: 20,
+    tjC: 75,
+    rgOnOhm: 6,
+    rgOffOhm: 8,
+    tjProvenance: 'measured',
+    rgProvenance: 'design_specified',
+  });
+  assert.equal(offOutside!.status, 'OUT_OF_RANGE');
+  assert.ok(offOutside!.outOfRangeAxes.includes('Rg'));
+
+  // Different fixed Rg_on/Rg_off values must not manufacture a varying Rg axis.
+  const fixedRg = lut.map((pt) => ({
+    ...pt,
+    rgOhm: 4,
+    rgOnOhm: 2,
+    rgOffOhm: 6,
+  }));
+  const fixedRes = interpolateDptSwitchingLoss(fixedRg, {
+    vBusV: 60,
+    iLoadA: 20,
+    tjC: 75,
+    rgOnOhm: 2,
+    rgOffOhm: 6,
+    tjProvenance: 'measured',
+    rgProvenance: 'design_specified',
+  });
+  assert.equal(fixedRes!.status, 'INSUFFICIENT_LUT');
+  assert.ok(fixedRes!.collapsedDimensions.includes('Rg'));
 });
 
 test('MT-02: Adaptive step-doubling Cauer solver removes 32/64 cap and converges on stiff dt >> tau_min', () => {

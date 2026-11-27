@@ -18,6 +18,21 @@ export type ScopeCurrentUnit = 'A' | 'mA';
 
 export interface FocThermalHandoffPayload {
   tab: TabState;
+  /** Fixed FOC dq operating point used by the direct steady-state loss/thermal solver. */
+  steadyOperatingPoint: {
+    iqPeakA: number;
+    idPeakA: number;
+    electricalFrequencyHz: number;
+    mode: 'rotating' | 'locked_rotor';
+    electricalAngleDeg: number;
+    mechanicalSpeedRpm?: number;
+    torqueNm?: number;
+    mechanicalPowerW?: number;
+    busInputPowerW?: number;
+    dcLinkPowerW?: number;
+    motorElectricalPowerW?: number;
+    impliedInverterLossW?: number;
+  };
   iaChannelId: string;
   ibChannelId: string;
   icChannelId: string;
@@ -361,6 +376,23 @@ export function buildThermalHandoffFromSixMos(
 
   return {
     tab,
+    steadyOperatingPoint: {
+      iqPeakA: synth.summary.iqPeakA,
+      idPeakA: 0,
+      electricalFrequencyHz: Math.max(0, synth.summary.feHz),
+      mode: synth.summary.isStall ? 'locked_rotor' : 'rotating',
+      // The current DynoLab steady operating point is Id=0 / Iq-only. At standstill
+      // the rotor electrical angle is not inferable from scalar bus power; 90° is
+      // the same explicit phase convention used by thermalExporter (Ia=Iq).
+      electricalAngleDeg: 90,
+      mechanicalSpeedRpm: synth.pointResult.nRpm,
+      torqueNm: synth.pointResult.tEstNm,
+      mechanicalPowerW: synth.pointResult.pOutW,
+      busInputPowerW: synth.pointResult.pInW,
+      dcLinkPowerW: synth.pointResult.vBusCapV * synth.pointResult.iNetA,
+      motorElectricalPowerW: synth.pointResult.pElecW,
+      impliedInverterLossW: synth.pointResult.vBusCapV * synth.pointResult.iNetA - synth.pointResult.pElecW,
+    },
     iaChannelId: 'ch_ia',
     ibChannelId: 'ch_ib',
     icChannelId: 'ch_ic',

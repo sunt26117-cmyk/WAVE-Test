@@ -23,6 +23,7 @@ const TIME_HEADER_REGEX = /^(time|t|timestamp|date|datetime|time_s|time_ms|time_
 const UNIT_TOKEN_REGEX = /^[\[\(]?(s|sec|ms|us|µs|ns|ps|v|mv|uv|µv|kv|a|ma|ua|µa|ka|hz|khz|mhz|w|mw|kw|°c|℃|°f|k|deg|rad|rpm|%|n·m|nm)[\]\)]?$/i;
 
 export type ExcelTimeSourceKind = 'numeric' | 'excel-date' | 'clock-string' | 'none';
+export type ExcelTimeOriginKind = 'absolute-date' | 'clock-of-day' | 'numeric' | 'synthetic';
 
 export interface ExcelColumnMapping {
   index: number;
@@ -89,6 +90,48 @@ export function isExcelFileName(fileName: string): boolean {
   return /\.(xlsx|xls|xlsm|xlsb)$/i.test((fileName || '').trim());
 }
 
+/** Converts an Excel serial date to Unix seconds for either the 1900 or 1904 workbook date system. */
+export function excelSerialDateToEpochSec(serial: number, date1904 = false): number {
+  if (!Number.isFinite(serial)) return Number.NaN;
+  return (serial - (date1904 ? 24107 : 25569)) * 86400;
+}
+
+/**
+ * Parses an ISO-like Excel date/time text as a timezone-neutral wall-clock timestamp.
+ * Text without an explicit zone is interpreted in UTC so it aligns with Excel serial dates;
+ * an explicit Z / ±HH:MM zone is respected as an absolute instant.
+ */
+export function parseExcelDateTimeText(raw: string): number | null {
+  const value = String(raw || '').trim();
+  const match = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$/i.exec(value);
+  if (!match) return null;
+  if (match[8]) {
+    const epochMs = Date.parse(value);
+    return Number.isFinite(epochMs) ? epochMs / 1000 : null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4] || 0);
+  const minute = Number(match[5] || 0);
+  const secondValue = Number(`${match[6] || 0}${match[7] || ''}`);
+  if (
+    month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 ||
+    !Number.isFinite(secondValue) || secondValue < 0 || secondValue >= 60
+  ) return null;
+  const wholeSecond = Math.floor(secondValue);
+  const fraction = secondValue - wholeSecond;
+  const epochMs = Date.UTC(year, month - 1, day, hour, minute, wholeSecond);
+  const check = new Date(epochMs);
+  if (
+    check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day || check.getUTCHours() !== hour || check.getUTCMinutes() !== minute ||
+    check.getUTCSeconds() !== wholeSecond
+  ) return null;
+  return epochMs / 1000 + fraction;
+}
+
 /**
  * Checks whether a SheetJS cell uses an explicit Excel date/time format
  * (prioritizing cell.t === 'd' and SSF.is_date(cell.z) to avoid misclassifying ordinary index columns).
@@ -120,7 +163,7 @@ function formatCellDisplay(cell: XLSX.CellObject | undefined): string {
   return String(cell.v).trim();
 }
 
-function inspectCellForPreview(cell: XLSX.CellObject | undefined): PreviewCellMeta {
+function inspectCellForPreview(cell: XLSX.CellObject | undefined, date1904 = false): PreviewCellMeta {
   if (!cell || cell.t === 'z' || cell.v === undefined || cell.v === null) {
     return {
       display: '',
@@ -170,7 +213,7 @@ function inspectCellForPreview(cell: XLSX.CellObject | undefined): PreviewCellMe
       isClockString: false,
       isNumeric: finite,
       numericValue: finite ? cell.v : NaN,
-      timeSecondsValue: finite ? (isDate ? (cell.v - 25569) * 86400 : cell.v) : NaN,
+      timeSecondsValue: finite ? (isDate ? excelSerialDateToEpochSec(cell.v, date1904) : cell.v) : NaN,
     };
   }
 
@@ -565,7 +608,8 @@ function computePreviewQualityFromMeta(
 function buildSheetPreview(
   ws: XLSX.WorkSheet | undefined,
   sheetName: string,
-  sheetIndex: number
+  sheetIndex: number,
+  date1904 = false
 ): ExcelSheetPreview {
   if (!ws || !ws['!ref']) {
     const empty: ExcelSheetPreview = {
@@ -611,7 +655,7 @@ function buildSheetPreview(
       const c = range.s.c + cOffset;
       const addr = XLSX.utils.encode_cell({ r, c });
       const cell = ws[addr] as XLSX.CellObject | undefined;
-      const meta = inspectCellForPreview(cell);
+      const meta = inspectCellForPreview(cell, date1904);
       mRow.push(meta);
       sRow.push(meta.display);
     }
@@ -690,8 +734,9 @@ export function createExcelWorkbookSessionFromBuffer(
 
   // Explicit parameter types keep this file type-clean even when the `xlsx`
   // module's own declarations are unavailable (e.g. dependency not installed yet).
+  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);
   const sheets = workbook.SheetNames.map((name: string, idx: number) =>
-    buildSheetPreview(workbook.Sheets[name], name, idx)
+    buildSheetPreview(workbook.Sheets[name], name, idx, date1904)
   );
   const firstNumericSheet = sheets.findIndex((s: { selected: boolean }) => s.selected);
   const activeSheetIndex = firstNumericSheet >= 0 ? firstNumericSheet : 0;
@@ -965,6 +1010,8 @@ export function parseExcelSheetToChannels(
   drawOrder: string[];
   quality: SamplingMetadata;
   skippedEmptyColumns: string[];
+  timeOriginSec: number | null;
+  timeOriginKind: ExcelTimeOriginKind;
 } {
   if (session.released || !session.workbook) {
     throw new Error('Excel workbook session has been released.');
@@ -1005,6 +1052,10 @@ export function parseExcelSheetToChannels(
   let validCount = 0;
   let invalidRows = 0;
   let baseClockSec: number | null = null;
+  let timeOriginKind: ExcelTimeOriginKind = hasExplicitTime ? 'numeric' : 'synthetic';
+  let observedTimeKind: ExcelTimeOriginKind | null = null;
+  let clockDayOffsetSec = 0;
+  let previousClockRawSec: number | null = null;
   let needsSort = false;
   let prevTime = -Infinity;
 
@@ -1047,20 +1098,33 @@ export function parseExcelSheetToChannels(
 
       let tRaw = NaN;
       let isDateOrClock = false;
+      let isAbsoluteDateTime = false;
       if (tCell.t === 'd' && tCell.v instanceof Date) {
         tRaw = tCell.v.getTime() / 1000;
         isDateOrClock = true;
+        isAbsoluteDateTime = true;
       } else if (tCell.t === 'n' && typeof tCell.v === 'number') {
         if (isExcelDateFormattedCell(tCell)) {
-          tRaw = (tCell.v - 25569) * 86400;
+          const date1904 = Boolean((session.workbook as any)?.Workbook?.WBProps?.date1904);
+          tRaw = excelSerialDateToEpochSec(tCell.v, date1904);
           isDateOrClock = true;
+          isAbsoluteDateTime = true;
         } else {
           tRaw = tCell.v;
         }
       } else {
-        const parsedT = parseTimeCell(formatCellDisplay(tCell));
-        tRaw = parsedT.value;
-        isDateOrClock = parsedT.isClock;
+        const displayTime = formatCellDisplay(tCell);
+        const parsedDateEpoch = parseExcelDateTimeText(displayTime);
+        if (parsedDateEpoch !== null) {
+          tRaw = parsedDateEpoch;
+          isDateOrClock = true;
+          isAbsoluteDateTime = true;
+        } else {
+          const parsedT = parseTimeCell(displayTime);
+          tRaw = parsedT.value;
+          isDateOrClock = parsedT.isClock;
+          isAbsoluteDateTime = false;
+        }
       }
 
       if (isNaN(tRaw) || !isFinite(tRaw)) {
@@ -1068,8 +1132,32 @@ export function parseExcelSheetToChannels(
         continue;
       }
 
-      if (isDateOrClock) {
+      const rowTimeKind: ExcelTimeOriginKind = isAbsoluteDateTime
+        ? 'absolute-date'
+        : isDateOrClock
+        ? 'clock-of-day'
+        : 'numeric';
+      if (observedTimeKind === null) {
+        observedTimeKind = rowTimeKind;
+        timeOriginKind = rowTimeKind;
+      } else if (rowTimeKind !== observedTimeKind) {
+        // Do not silently combine epoch, clock-of-day, and unit-scaled numeric values
+        // inside one time column. Skip inconsistent rows and report them as invalid.
+        if (rowHasAnyValue) invalidRows++;
+        continue;
+      }
+
+      if (rowTimeKind === 'absolute-date' || rowTimeKind === 'clock-of-day') {
         if (baseClockSec === null) baseClockSec = tRaw;
+        if (rowTimeKind === 'clock-of-day') {
+          // A clock-only recording may cross midnight. Unwrap a large 24 h rollover
+          // inside this sheet, but do not invent a calendar date across workbooks.
+          if (previousClockRawSec !== null && previousClockRawSec - tRaw > 12 * 3600) {
+            clockDayOffsetSec += 86400;
+          }
+          previousClockRawSec = tRaw;
+          tRaw += clockDayOffsetSec;
+        }
         rowT = tRaw - baseClockSec;
       } else {
         rowT = tRaw * timeMult;
@@ -1272,6 +1360,8 @@ export function parseExcelSheetToChannels(
     drawOrder,
     quality,
     skippedEmptyColumns,
+    timeOriginSec: timeOriginKind === 'absolute-date' || timeOriginKind === 'clock-of-day' ? baseClockSec : null,
+    timeOriginKind,
   };
 }
 
