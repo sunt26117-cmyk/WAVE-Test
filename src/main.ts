@@ -11,7 +11,7 @@ import { TabState, WaveformChannel, CursorMode, MeasurementGate, MeasurementMetr
 import { formatEng, formatMeasurementMetricValue, getTimeBoundsForView, isComputedChannel } from './engine/canvasRenderer';
 import { getSavedThemeId, resolveChannelTextColor, THEME_PRESETS } from './modules/themeManager';
 import { LtspiceFileWatcher } from './modules/ltspiceWatcher';
-import { setupToolDrawer } from './modules/toolDrawer';
+import { setupToolDrawer, isToolPanelVisible } from './modules/toolDrawer';
 import { fitChannelTo125, getTimebaseInfo } from './modules/oscilloscopeScale';
 import { MEASUREMENT_DEFINITIONS, CUSTOM_MEASUREMENT_PRESETS } from './modules/measurements';
 import { estimateSpeedFromSignal, computeTwoChannelPhaseDiff } from './modules/motorAnalysis';
@@ -42,7 +42,7 @@ import {
   WaveformCompareMetrics,
 } from './modules/waveformCompare';
 import { previewMathExpression } from './modules/mathParser';
-import { FocMissionStage } from './modules/focThermal';
+import type { FocMissionStage } from './modules/focThermal';
 import { evaluateGoldenTolerance } from './modules/anomalyScanner';
 import { setupDraggableModals } from './modules/draggableModals';
 import {
@@ -56,13 +56,10 @@ import {
   PwmHighSignalRole,
 } from './modules/bldcAnalysis';
 import { reconstructSingleShuntPhaseCurrents } from './modules/singleShuntRecon';
-import { initThermalWorkbench, ThermalWorkbenchController } from './modules/thermalWorkbench';
+import type { ThermalWorkbenchController } from './modules/thermalWorkbench';
 import { FilterWorkbenchController } from './modules/filterWorkbench';
 import { isExcelFileName } from './parsers/excelParser';
 import { excelImportModal } from './modules/excelImportModal';
-import React from 'react';
-import { createRoot } from 'react-dom/client';
-import { FocDynoLabApp } from './components/focDyno/FocDynoLabApp';
 
 let batchQueuedFiles: File[] = [];
 let lastBatchRows: BatchFileRow[] = [];
@@ -102,8 +99,76 @@ let editingCompareGroupId: string | null = null;
 let app: OscilloscopeApp;
 let ltspiceWatcher: LtspiceFileWatcher | null = null;
 let thermalCtrl: ThermalWorkbenchController | null = null;
+let thermalCtrlPromise: Promise<ThermalWorkbenchController> | null = null;
+let focDynoMounted = false;
+let focDynoMountPromise: Promise<void> | null = null;
 let filterCtrl: FilterWorkbenchController | null = null;
 let activeWorkspace: 'scope' | 'focDyno' = 'scope';
+
+function ensureThermalWorkbench(): Promise<ThermalWorkbenchController> {
+  if (thermalCtrl) return Promise.resolve(thermalCtrl);
+  if (!thermalCtrlPromise) {
+    thermalCtrlPromise = import('./modules/thermalWorkbench')
+      .then(({ initThermalWorkbench }) => {
+        thermalCtrl = initThermalWorkbench(app, false);
+        return thermalCtrl;
+      })
+      .catch((err) => {
+        thermalCtrlPromise = null;
+        throw err;
+      });
+  }
+  return thermalCtrlPromise;
+}
+
+function ensureFocDynoMounted(): Promise<void> {
+  if (focDynoMounted) return Promise.resolve();
+  if (!focDynoMountPromise) {
+    const dynoRootEl = document.getElementById('focDynoLabView');
+    if (!dynoRootEl) return Promise.resolve();
+    dynoRootEl.innerHTML =
+      '<div class="flex items-center justify-center h-full w-full text-xs text-fg-muted font-mono">正在加载 FOC 测功台模块...</div>';
+    focDynoMountPromise = Promise.all([
+      import('react'),
+      import('react-dom/client'),
+      import('./components/focDyno/FocDynoLabApp'),
+    ])
+      .then(([ReactMod, ReactDomClient, { FocDynoLabApp }]) => {
+        const React = ReactMod.default;
+        const reactRoot = ReactDomClient.createRoot(dynoRootEl);
+        reactRoot.render(
+          React.createElement(FocDynoLabApp, {
+            getActiveScopeTab: () => app.getActiveTab(),
+            onSendTabToScope: (tab) => {
+              app.addTab(tab);
+              switchWorkspace('scope');
+            },
+            onSendToSixMosThermal: (payload) => {
+              switchWorkspace('scope');
+              requestAnimationFrame(() => {
+                void ensureThermalWorkbench().then((ctrl) => ctrl.loadExternalFocAnalysis(payload));
+              });
+            },
+            onAppendMissionStage: (stage: FocMissionStage) => {
+              switchWorkspace('scope');
+              requestAnimationFrame(() => {
+                void ensureThermalWorkbench().then((ctrl) => ctrl.appendMissionStageFromDyno(stage, true));
+              });
+            },
+            onNotify: (msg, level = 'info') => app.showToast(msg, level),
+          })
+        );
+        focDynoMounted = true;
+      })
+      .catch((err) => {
+        focDynoMountPromise = null;
+        dynoRootEl.innerHTML =
+          '<div class="flex items-center justify-center h-full w-full text-xs text-red-500 font-mono">FOC 测功台模块加载失败，请重试。</div>';
+        throw err;
+      });
+  }
+  return focDynoMountPromise;
+}
 
 function switchWorkspace(target: 'scope' | 'focDyno') {
   activeWorkspace = target;
@@ -125,7 +190,9 @@ function switchWorkspace(target: 'scope' | 'focDyno') {
   if (isScope) {
     requestAnimationFrame(() => app?.handleResize());
   } else {
-    window.dispatchEvent(new CustomEvent('wvp-workspace-shown'));
+    void ensureFocDynoMounted().then(() => {
+      window.dispatchEvent(new CustomEvent('wvp-workspace-shown'));
+    });
   }
 }
 
@@ -246,41 +313,38 @@ window.addEventListener('DOMContentLoaded', () => {
   bindToolbarActions();
   bindFrontPanelControls();
   bindModals();
-  thermalCtrl = initThermalWorkbench(app);
   filterCtrl = new FilterWorkbenchController(app);
   setupDraggableModals();
 
-  // Workspace switcher buttons
+  // Lazy-load MOS Thermal Workbench on first click
+  document.getElementById('openThermalModalBtn')?.addEventListener('click', () => {
+    void ensureThermalWorkbench()
+      .then((ctrl) => ctrl.openModal())
+      .catch((err) => app.showToast(`MOS 热仿真模块加载失败：${err instanceof Error ? err.message : String(err)}`, 'error'));
+  });
+
+  // Workspace switcher buttons (FOC DynoLab mounts lazily on first switch)
   document.getElementById('wsScopeBtn')?.addEventListener('click', () => switchWorkspace('scope'));
   document.getElementById('wsFocDynoBtn')?.addEventListener('click', () => switchWorkspace('focDyno'));
 
-  // Mount embedded FOC DynoLab V2 workspace
-  const dynoRootEl = document.getElementById('focDynoLabView');
-  if (dynoRootEl) {
-    const reactRoot = createRoot(dynoRootEl);
-    reactRoot.render(
-      React.createElement(FocDynoLabApp, {
-        getActiveScopeTab: () => app.getActiveTab(),
-        onSendTabToScope: (tab) => {
-          app.addTab(tab);
-          switchWorkspace('scope');
-        },
-        onSendToSixMosThermal: (payload) => {
-          switchWorkspace('scope');
-          requestAnimationFrame(() => {
-            thermalCtrl?.loadExternalFocAnalysis(payload);
-          });
-        },
-        onAppendMissionStage: (stage: FocMissionStage) => {
-          switchWorkspace('scope');
-          requestAnimationFrame(() => {
-            thermalCtrl?.appendMissionStageFromDyno(stage, true);
-          });
-        },
-        onNotify: (msg, level = 'info') => app.showToast(msg, level),
-      })
-    );
-  }
+  // Live-sync open analysis panels (Measurement Modal, Filter, LTspice badge) when active tab, viewport, or cursors change
+  let lastSyncedTabId: string | null = null;
+  window.addEventListener('wvp-scope-hud-sync', (ev: Event) => {
+    const tab = (ev as CustomEvent<{ tab?: TabState | null }>).detail?.tab ?? app.getActiveTab();
+    const tabId = tab?.id ?? null;
+    if (tabId !== lastSyncedTabId) {
+      lastSyncedTabId = tabId;
+      syncLtspiceWatchUI();
+      filterCtrl?.syncIfOpen();
+    }
+    syncMeasureModalIfOpen(tab);
+  });
+  window.addEventListener('wvp-drawer-panel-shown', (ev: Event) => {
+    const id = (ev as CustomEvent<{ id?: string }>).detail?.id;
+    if (id === 'measureModal') {
+      syncMeasureModalIfOpen(app.getActiveTab(), true);
+    }
+  });
 
   syncLtspiceWatchUI();
 });
@@ -331,6 +395,7 @@ function bindToolbarActions() {
     requestAnimationFrame(() => {
       syncLtspiceWatchUI();
       filterCtrl?.syncIfOpen();
+      syncMeasureModalIfOpen(app.getActiveTab(), true);
     });
   });
 
@@ -339,14 +404,10 @@ function bindToolbarActions() {
     const themeId = e.target.value as ThemeId;
     app.setTheme(themeId, true);
     const tab = app.getActiveTab();
-    const cmpModal = document.getElementById('compareModal');
-    if (cmpModal && cmpModal.style.display === 'flex' && tab) {
+    if (isToolPanelVisible('compareModal') && tab) {
       recomputeComparePanel(tab);
     }
-    const measModal = document.getElementById('measureModal');
-    if (measModal && measModal.style.display === 'flex' && tab) {
-      renderMeasureModalCheckboxes(tab);
-    }
+    syncMeasureModalIfOpen(tab, true);
     filterCtrl?.syncIfOpen();
   });
 
@@ -440,14 +501,7 @@ function bindToolbarActions() {
   document.getElementById('stripMeasGateSelect')?.addEventListener('change', (e: any) => {
     const tab = app.getActiveTab();
     if (tab) {
-      tab.measurementGate = e.target.value as MeasurementGate;
-      const modalGate = document.getElementById('measureModalGateSelect') as HTMLSelectElement | null;
-      if (modalGate) modalGate.value = tab.measurementGate;
-      app.renderMeasurementStrip(tab);
-      const measModal = document.getElementById('measureModal');
-      if (measModal && measModal.style.display === 'flex') {
-        renderMeasureModalCheckboxes(tab);
-      }
+      applyMeasurementGate(tab, e.target.value as MeasurementGate);
     }
   });
 
@@ -574,17 +628,14 @@ function bindFrontPanelControls() {
       ch.color = colorInp.value;
       app.renderSidebar();
       app.renderMeasurementStrip(tab);
-      const measModal = document.getElementById('measureModal');
-      if (measModal && measModal.style.display === 'flex') {
-        renderMeasureModalCheckboxes(tab);
-      }
+      syncMeasureModalIfOpen(tab, true);
       app.draw();
     }
   });
 
   document.getElementById('activeChVisibleBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
-    if (tab?.activeChannelId) app.toggleChannelVisible(tab.activeChannelId);
+    if (tab?.activeChannelId) app.toggleChannelVisible(tab.activeChannelId, { preserveActiveSelection: true });
   });
 
   document.getElementById('activeChCouplingBtn')?.addEventListener('click', () => {
@@ -1026,16 +1077,12 @@ function bindModals() {
   document.getElementById('measureModalDoneBtn')?.addEventListener('click', closeMeasureModal);
   document.getElementById('measureModalChannelSelect')?.addEventListener('change', () => {
     const tab = app.getActiveTab();
-    if (tab) renderMeasureModalCheckboxes(tab);
+    if (tab) syncMeasureModalIfOpen(tab, true);
   });
   document.getElementById('measureModalGateSelect')?.addEventListener('change', (e: any) => {
     const tab = app.getActiveTab();
     if (tab) {
-      tab.measurementGate = e.target.value as MeasurementGate;
-      const stripGate = document.getElementById('stripMeasGateSelect') as HTMLSelectElement | null;
-      if (stripGate) stripGate.value = tab.measurementGate;
-      app.renderMeasurementStrip(tab);
-      renderMeasureModalCheckboxes(tab);
+      applyMeasurementGate(tab, e.target.value as MeasurementGate);
     }
   });
   document.getElementById('measureSelectAllChBtn')?.addEventListener('click', () => {
@@ -2496,34 +2543,123 @@ function openTestSuiteModal() {
   modal.style.display = 'flex';
 }
 
+let lastMeasureModalTabId: string | null = null;
+let lastMeasureModalChannelsKey: string = '';
+let lastMeasureModalRenderKey: string = '';
+
+function applyMeasurementGate(tab: TabState, gate: MeasurementGate) {
+  tab.measurementGate = gate;
+  if (
+    gate === 'cursors' &&
+    (!tab.cursors.enabled || tab.cursors.mode === 'off' || tab.cursors.mode === 'y')
+  ) {
+    // Automatically enable X cursors so cursor-gated measurements immediately have a valid [X1, X2] interval
+    app.setCursorMode('x');
+  }
+  const stripGate = document.getElementById('stripMeasGateSelect') as HTMLSelectElement | null;
+  if (stripGate) stripGate.value = tab.measurementGate;
+  const modalGate = document.getElementById('measureModalGateSelect') as HTMLSelectElement | null;
+  if (modalGate) modalGate.value = tab.measurementGate;
+  app.renderMeasurementStrip(tab);
+  syncMeasureModalIfOpen(tab, true);
+}
+
+function populateMeasureModalChannelSelect(tab: TabState, forceSelectActive: boolean) {
+  const chSel = document.getElementById('measureModalChannelSelect') as HTMLSelectElement | null;
+  if (!chSel) return;
+  const prevVal = chSel.value;
+  chSel.innerHTML = '';
+  const preferredId =
+    !forceSelectActive && prevVal && tab.channels[prevVal]
+      ? prevVal
+      : tab.activeChannelId && tab.channels[tab.activeChannelId]
+      ? tab.activeChannelId
+      : tab.drawOrder[0] || '';
+  tab.drawOrder.forEach((id, idx) => {
+    const ch = tab.channels[id];
+    if (!ch) return;
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.innerText = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
+    if (id === preferredId) opt.selected = true;
+    chSel.appendChild(opt);
+  });
+  if (preferredId && tab.channels[preferredId]) {
+    chSel.value = preferredId;
+  }
+}
+
+function syncMeasureModalIfOpen(tab: TabState | null, force: boolean = false) {
+  if (!isToolPanelVisible('measureModal')) return;
+
+  const chSel = document.getElementById('measureModalChannelSelect') as HTMLSelectElement | null;
+  const gateSel = document.getElementById('measureModalGateSelect') as HTMLSelectElement | null;
+  const voltageBox = document.getElementById('measureVoltageList');
+  const timingBox = document.getElementById('measureTimingList');
+  if (!tab || tab.drawOrder.length === 0) {
+    lastMeasureModalTabId = null;
+    lastMeasureModalChannelsKey = '';
+    lastMeasureModalRenderKey = 'empty';
+    if (chSel) chSel.innerHTML = '';
+    if (voltageBox) {
+      voltageBox.innerHTML = '<div class="text-xs text-fg-muted py-2">当前无活动波形窗口</div>';
+    }
+    if (timingBox) {
+      timingBox.innerHTML = '<div class="text-xs text-fg-muted py-2">请先打开或切换到包含波形的标签页</div>';
+    }
+    return;
+  }
+
+  const tabSwitched = lastMeasureModalTabId !== tab.id;
+  const channelsKey = `${tab.id}::${tab.drawOrder.map((id) => `${id}:${tab.channels[id]?.name || ''}`).join('|')}`;
+  if (tabSwitched || channelsKey !== lastMeasureModalChannelsKey) {
+    lastMeasureModalTabId = tab.id;
+    lastMeasureModalChannelsKey = channelsKey;
+    populateMeasureModalChannelSelect(tab, tabSwitched);
+  }
+  if (gateSel && gateSel.value !== tab.measurementGate) {
+    gateSel.value = tab.measurementGate;
+  }
+
+  const chId = chSel?.value || tab.activeChannelId || tab.drawOrder[0];
+  const ch = chId ? tab.channels[chId] : null;
+  const curKey =
+    tab.measurementGate === 'cursors'
+      ? `${tab.cursors.enabled ? 1 : 0}_${tab.cursors.mode}_${tab.cursors.x1}_${tab.cursors.x2}`
+      : '';
+  const selKey = (tab.selectedMeasurements || []).map((m) => m.id).join(',');
+  const custKey = (tab.customMeasurements || []).map((c) => `${c.id}:${c.expression}:${c.label}`).join(';');
+  const renderKey = `${tab.id}|${chId}|${ch?.color || ''}|${ch?.coupling || ''}|${ch?.inverted ? 1 : 0}|${ch?.timeShiftSec || 0}|${tab.measurementGate}|${tab.view.startIndex}|${tab.view.endIndex}|${curKey}|${selKey}|${custKey}|${app.getThemeId()}|${app.getEditVersion()}`;
+
+  if (!force && !tabSwitched && renderKey === lastMeasureModalRenderKey) {
+    return;
+  }
+  lastMeasureModalRenderKey = renderKey;
+  renderMeasureModalCheckboxes(tab);
+}
+
 function openMeasureModal(tab: TabState) {
   const modal = document.getElementById('measureModal');
   if (!modal) return;
 
-  const chSel = document.getElementById('measureModalChannelSelect') as HTMLSelectElement;
-  if (chSel) {
-    chSel.innerHTML = '';
-    tab.drawOrder.forEach((id, idx) => {
-      const ch = tab.channels[id];
-      if (!ch) return;
-      const opt = document.createElement('option');
-      opt.value = id;
-      opt.innerText = ch.isMath ? `[M] ${ch.name}` : `CH${idx + 1}: ${ch.name}`;
-      if (id === (tab.activeChannelId || tab.drawOrder[0])) opt.selected = true;
-      chSel.appendChild(opt);
-    });
-  }
+  lastMeasureModalTabId = tab.id;
+  lastMeasureModalChannelsKey = `${tab.id}::${tab.drawOrder.map((id) => `${id}:${tab.channels[id]?.name || ''}`).join('|')}`;
+  populateMeasureModalChannelSelect(tab, true);
 
   const gateSel = document.getElementById('measureModalGateSelect') as HTMLSelectElement;
   if (gateSel) gateSel.value = tab.measurementGate;
 
+  lastMeasureModalRenderKey = '';
   renderMeasureModalCheckboxes(tab);
   modal.style.display = 'flex';
 }
 
 function renderMeasureModalCheckboxes(tab: TabState) {
   const chSel = document.getElementById('measureModalChannelSelect') as HTMLSelectElement;
-  const chId = chSel?.value || tab.activeChannelId || tab.drawOrder[0];
+  const chId =
+    (chSel?.value && tab.channels[chSel.value] ? chSel.value : '') ||
+    tab.activeChannelId ||
+    tab.drawOrder[0];
   const voltageBox = document.getElementById('measureVoltageList');
   const timingBox = document.getElementById('measureTimingList');
   if (!voltageBox || !timingBox || !chId) return;
@@ -2548,9 +2684,9 @@ function renderMeasureModalCheckboxes(tab: TabState) {
           ? formatMeasurementMetricValue(liveMeas, def, ch.unit)
           : '--';
       const label = document.createElement('label');
-      label.className = 'flex items-center justify-between gap-2 px-2 py-1 bg-[#12161c] hover:bg-[#1a222d] border border-[#222933] rounded-sm cursor-pointer';
+      label.className = 'flex items-center justify-between gap-2 px-2 py-1 bg-well hover:bg-hover border border-line rounded-sm cursor-pointer';
       label.innerHTML = `
-        <span class="flex items-center gap-2 text-slate-200 min-w-0">
+        <span class="flex items-center gap-2 text-fg min-w-0">
           <input type="checkbox" class="accent-cyan-400 cursor-pointer shrink-0" ${selectedSet.has(id) ? 'checked' : ''} />
           <span class="truncate">${escapeHtml(def.label)}</span>
         </span>

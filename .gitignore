@@ -6,3 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+wvp-ui-review-pack.zip
+public/wvp-ui-review-pack.zip

@@ -705,6 +705,12 @@ html.dark .wvp-dropdown-menu {
 }
 
 /* ==================== Dark & Midnight Theme Surface Mapping ==================== */
+html.dark,
+html.dark body {
+  background-color: var(--bg-chassis);
+  color: var(--text-primary);
+}
+
 html.dark .bg-\[\#12161c\],
 html.dark .bg-\[\#12161c\]\/95 {
   background-color: var(--bg-panel);

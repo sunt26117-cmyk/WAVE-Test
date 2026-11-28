@@ -5515,9 +5515,14 @@ export class ThermalWorkbenchController {
   }
 }
 
-export function initThermalWorkbench(app: OscilloscopeApp): ThermalWorkbenchController {
+export function initThermalWorkbench(
+  app: OscilloscopeApp,
+  bindOpenButton: boolean = true
+): ThermalWorkbenchController {
   const ctrl = new ThermalWorkbenchController(app);
-  document.getElementById('openThermalModalBtn')?.addEventListener('click', () => ctrl.openModal());
+  if (bindOpenButton) {
+    document.getElementById('openThermalModalBtn')?.addEventListener('click', () => ctrl.openModal());
+  }
   return ctrl;
 }
 

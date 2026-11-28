@@ -119,6 +119,23 @@ class ToolDrawerController {
     this.observeAllManagedModals();
   }
 
+  public isPanelVisible(id: string): boolean {
+    if (this.openIds.includes(id)) {
+      if (id === this.activeId) return true;
+      if (this.splitMode && this.openIds.length >= 2) {
+        const second =
+          this.secondaryId && this.secondaryId !== this.activeId && this.openIds.includes(this.secondaryId)
+            ? this.secondaryId
+            : this.openIds.find((item) => item !== this.activeId);
+        if (id === second) return true;
+      }
+      return false;
+    }
+    const el = document.getElementById(id) as HTMLElement | null;
+    if (!el) return false;
+    return !el.classList.contains('hidden') && getComputedStyle(el).display !== 'none';
+  }
+
   private bindResizeHandle(): void {
     if (!this.resizeHandle || !this.container) return;
     this.resizeHandle.addEventListener('mousedown', (e: MouseEvent) => {
@@ -537,6 +554,10 @@ export function setupToolDrawer(onLayoutChange?: () => void): void {
 
 export function hasOpenToolDrawer(): boolean {
   return drawerController.hasOpenTabs();
+}
+
+export function isToolPanelVisible(id: string): boolean {
+  return drawerController.isPanelVisible(id);
 }
 
 export function closeActiveToolDrawerItem(): boolean {

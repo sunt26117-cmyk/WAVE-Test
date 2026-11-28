@@ -44,6 +44,7 @@ import {
   drawGndMarkers,
   drawAnnotations,
   drawAxisLabels,
+  resolveVisibleYAxisChannel,
   drawOverlapTraceLegend,
   drawCompareGroupLegend,
   drawXYPlot,
@@ -606,6 +607,10 @@ export class OscilloscopeApp {
     if (rBtn) rBtn.disabled = this.redoStack.length === 0;
   }
 
+  public getEditVersion(): number {
+    return this.editVersion;
+  }
+
   public addTab(tab: TabState): void {
     this.ensureTabDefaults(tab);
     this.tabs.push(tab);
@@ -738,13 +743,37 @@ export class OscilloscopeApp {
     );
   }
 
-  public toggleChannelVisible(chId: string): void {
+  private syncActiveChannelAfterVisibilityChange(tab: TabState, preserveActiveSelection = false): boolean {
+    if (preserveActiveSelection) return false;
+    const visibleChs = tab.drawOrder
+      .map((id) => tab.channels[id])
+      .filter((c): c is WaveformChannel => !!c && c.visible);
+    if (visibleChs.length === 0) return false;
+
+    const currentActive = tab.activeChannelId ? tab.channels[tab.activeChannelId] : undefined;
+    if (visibleChs.length === 1) {
+      if (tab.activeChannelId !== visibleChs[0].id) {
+        tab.activeChannelId = visibleChs[0].id;
+        return true;
+      }
+      return false;
+    }
+
+    if (!currentActive || !currentActive.visible) {
+      tab.activeChannelId = visibleChs[0].id;
+      return true;
+    }
+    return false;
+  }
+
+  public toggleChannelVisible(chId: string, opts?: { preserveActiveSelection?: boolean }): void {
     const tab = this.getActiveTab();
     if (!tab || !tab.channels[chId]) return;
     this.pushUndoSnapshot('切换通道显示');
     tab.channels[chId].visible = !tab.channels[chId].visible;
     this.soloPrevVisibility = null;
     this.soloChannelId = null;
+    this.syncActiveChannelAfterVisibilityChange(tab, Boolean(opts?.preserveActiveSelection));
     this.renderSidebar();
     this.draw();
   }
@@ -1771,6 +1800,7 @@ export class OscilloscopeApp {
     pool.forEach((c) => {
       c.visible = targetVis;
     });
+    this.syncActiveChannelAfterVisibilityChange(tab);
     this.renderSidebar();
     this.draw();
   }
@@ -1900,6 +1930,7 @@ export class OscilloscopeApp {
       if (tab) {
         this.renderMeasurementStrip(tab);
       }
+      window.dispatchEvent(new CustomEvent('wvp-scope-hud-sync', { detail: { tab } }));
     };
 
     if (immediate) {
@@ -1927,6 +1958,7 @@ export class OscilloscopeApp {
       if (latestTab && latestTab.drawOrder.length > 0) {
         this.renderMeasurementStrip(latestTab);
       }
+      window.dispatchEvent(new CustomEvent('wvp-scope-hud-sync', { detail: { tab: latestTab } }));
     }, this.hudSettleDelayMs);
   }
 
@@ -2541,7 +2573,8 @@ export class OscilloscopeApp {
     const visibleChs = tab.drawOrder.map((id) => tab.channels[id]).filter((c) => c && c.visible);
     if (visibleChs.length === 0) return null;
     if (!tab.separateView || visibleChs.length === 1) {
-      const activeCh = tab.channels[tab.activeChannelId || ''] || visibleChs[0];
+      const activeCh = resolveVisibleYAxisChannel(tab, visibleChs);
+      if (!activeCh) return null;
       return { channel: activeCh, area: p };
     }
     const rects = getSubplotRects(p, visibleChs, true);
@@ -2577,9 +2610,9 @@ export class OscilloscopeApp {
     // 2b. Check Left Y-Axis Gutter for direct Vertical Offset dragging (push undo only after >2px movement)
     if (e.button === 0 && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
       const hit = this.findSubplotAtPoint(tab, p, y);
-      const targetCh = tab.separateView && hit ? hit.channel : tab.channels[tab.activeChannelId || ''] || hit?.channel;
+      const targetCh = hit?.channel;
       if (targetCh) {
-        const area = hit ? hit.area : p;
+        const area = hit.area;
         const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(targetCh);
         if (tab.separateView && targetCh.id !== tab.activeChannelId) {
           this.selectActiveChannel(targetCh.id);
@@ -3013,13 +3046,18 @@ export class OscilloscopeApp {
           }
         } else {
           const hit = this.findSubplotAtPoint(tab, p, y);
+          const el = document.getElementById('hoverInfoReadout');
           if (hit) {
             const dataPt = screenToData({ x, y }, tab, hit.channel.id, hit.area);
-            const el = document.getElementById('hoverInfoReadout');
             if (el) {
               const chColor = resolveChannelTextColor(hit.channel.color, Boolean(this.theme.isLight));
               el.innerHTML = `<span style="color:${chColor};font-weight:600">${escapeHtml(hit.channel.name)}</span> · T = ${escapeHtml(formatEng(dataPt.time, 's', 4))} · <span style="color:${chColor};font-weight:600">V = ${escapeHtml(formatEng(dataPt.voltage, hit.channel.unit, 3))}</span>`;
             }
+          } else if (el) {
+            const primaryCh = tab.channels[tab.drawOrder[0]];
+            const { tStart, tSpan } = getTimeBoundsForView(tab, primaryCh);
+            const tVal = tStart + ((x - p.x) / p.width) * tSpan;
+            el.textContent = `T = ${formatEng(tVal, 's', 4)} · V = --`;
           }
         }
       }
@@ -3118,7 +3156,7 @@ export class OscilloscopeApp {
     // Wheel on Left Y-Axis gutter OR Shift+Wheel OR Alt+Wheel -> 1-2-5 Vertical V/div step
     if (tab.plotMode === 'time' && (x < p.x || e.shiftKey || e.altKey)) {
       const hit = this.findSubplotAtPoint(tab, p, y);
-      const targetId = tab.separateView && hit ? hit.channel.id : tab.activeChannelId || tab.drawOrder[0];
+      const targetId = hit?.channel.id;
       if (targetId && tab.channels[targetId]) {
         const dir: 1 | -1 = e.deltaY < 0 ? -1 : 1; // Scroll up = finer V/div (zoom in vertically)
         this.stepChannelScale(targetId, dir);
@@ -3906,28 +3944,35 @@ export class OscilloscopeApp {
 
     const previewContainer = document.getElementById('csvPreviewContainer');
     if (previewContainer) {
-      let tableHtml = '<table class="min-w-full text-xs font-mono border-collapse">';
-      tableHtml += '<thead class="bg-[#161b22] text-slate-300"><tr>';
+      let tableHtml = '<table class="min-w-full text-xs font-mono border-collapse tabular-nums text-fg">';
+      tableHtml += '<thead class="bg-elevated text-fg sticky top-0 z-10"><tr>';
       p.headers.forEach((h: string, idx: number) => {
         const isTime = idx === p.timeColIndex;
         const role = p.columnMappings[idx]?.role || (isTime ? 'time' : 'channel');
-        tableHtml += `<th class="p-2 border border-[#222933] text-left ${isTime ? 'text-amber-300 font-semibold' : ''}">
+        const isIgnored = role === 'ignore';
+        const thCls = isTime
+          ? 'wvp-alert-warn font-semibold'
+          : isIgnored
+          ? 'text-fg-muted bg-well'
+          : 'text-accent font-medium';
+        tableHtml += `<th class="p-2 border border-line text-left ${thCls}">
           <div class="flex flex-col gap-1">
             <span>${escapeHtml(h)}</span>
-            <select class="col-role-select text-xs bg-[#0c0f13] border border-[#2c3543] rounded-sm px-1 text-white" data-col="${idx}">
-              <option value="time" ${role === 'time' ? 'selected' : ''}>Time</option>
-              <option value="channel" ${role === 'channel' ? 'selected' : ''}>Channel</option>
-              <option value="ignore" ${role === 'ignore' ? 'selected' : ''}>Ignore</option>
+            <select class="col-role-select text-xs bg-input border border-line-strong rounded-xs px-1 py-0.5 text-fg cursor-pointer" data-col="${idx}">
+              <option value="time" ${role === 'time' ? 'selected' : ''}>时间</option>
+              <option value="channel" ${role === 'channel' ? 'selected' : ''}>通道</option>
+              <option value="ignore" ${role === 'ignore' ? 'selected' : ''}>忽略</option>
             </select>
           </div>
         </th>`;
       });
-      tableHtml += '</tr></thead><tbody>';
+      tableHtml += '</tr></thead><tbody class="text-fg">';
 
       p.rows.slice(0, 8).forEach((r: string[]) => {
-        tableHtml += '<tr class="border-b border-[#222933] hover:bg-[#161b22]">';
-        r.forEach((c: string) => {
-          tableHtml += `<td class="p-2 border-r border-[#222933] whitespace-nowrap">${escapeHtml(c)}</td>`;
+        tableHtml += '<tr class="border-b border-line hover:bg-hover/60">';
+        r.forEach((c: string, colIdx: number) => {
+          const isIgnored = p.columnMappings[colIdx]?.role === 'ignore';
+          tableHtml += `<td class="p-2 border-r border-line/60 whitespace-nowrap ${isIgnored ? 'text-fg-muted' : 'text-fg'}">${escapeHtml(c)}</td>`;
         });
         tableHtml += '</tr>';
       });
@@ -5626,7 +5671,9 @@ export class OscilloscopeApp {
             `;
             row.querySelector('.cmp-m-vis')?.addEventListener('change', (e: any) => {
               ch.visible = !!e.target.checked;
-              this.renderSoftkeysOnly(tab);
+              const activeChanged = this.syncActiveChannelAfterVisibilityChange(tab);
+              if (activeChanged) this.renderSidebar();
+              else this.renderSoftkeysOnly(tab);
               this.draw();
             });
             row.querySelector('.cmp-m-del')?.addEventListener('click', () => {
@@ -5705,7 +5752,9 @@ export class OscilloscopeApp {
 
           row.querySelector('.ch-vis-chk')?.addEventListener('change', (e: any) => {
             ch.visible = e.target.checked;
-            this.renderSoftkeysOnly(tab);
+            const activeChanged = this.syncActiveChannelAfterVisibilityChange(tab);
+            if (activeChanged) this.renderSidebar();
+            else this.renderSoftkeysOnly(tab);
             this.draw();
           });
 
@@ -5777,7 +5826,10 @@ export class OscilloscopeApp {
   }
 
   private getCachedMeasurements(tab: TabState, ch: WaveformChannel): ChannelMeasurements {
-    const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const curKey =
+      tab.measurementGate === 'cursors'
+        ? `${tab.cursors.enabled ? 1 : 0}_${tab.cursors.mode}_${tab.cursors.x1}_${tab.cursors.x2}`
+        : '';
     const key = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${ch.timeShiftSec || 0}_${this.editVersion}`;
     const existing = this.measCache[ch.id];
     if (existing && existing.key === key) {
@@ -5807,7 +5859,10 @@ export class OscilloscopeApp {
     customDef: CustomMeasurementDefinition,
     meas: ChannelMeasurements
   ): CustomMeasurementDetailedResult {
-    const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const curKey =
+      tab.measurementGate === 'cursors'
+        ? `${tab.cursors.enabled ? 1 : 0}_${tab.cursors.mode}_${tab.cursors.x1}_${tab.cursors.x2}`
+        : '';
     const cacheKey = `${tab.id}_${ch.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${ch.coupling}_${ch.inverted}_${ch.timeShiftSec || 0}_${this.editVersion}`;
     let entry = this.customMeasCache[ch.id];
     if (!entry || entry.key !== cacheKey) {
@@ -5921,7 +5976,10 @@ export class OscilloscopeApp {
       return;
     }
 
-    const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
+    const curKey =
+      tab.measurementGate === 'cursors'
+        ? `${tab.cursors.enabled ? 1 : 0}_${tab.cursors.mode}_${tab.cursors.x1}_${tab.cursors.x2}`
+        : '';
     const customDefsKey = (tab.customMeasurements || []).map((c) => `${c.id}:${c.expression}:${c.shortLabel}`).join(';');
     const itemsKey = items.map((i) => `${i.id}:${i.channelId}:${i.metric}:${tab.channels[i.channelId]?.color || ''}`).join('|');
     const stripKey = `${tab.id}_${this.themeId}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${this.editVersion}_${this.showMeasurementStats ? 1 : 0}_${itemsKey}_${customDefsKey}`;

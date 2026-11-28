@@ -1,10 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+
+const PYTHON_UTF8_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  PYTHONUTF8: '1',
+  PYTHONIOENCODING: 'utf-8',
+};
 
 function resolvePythonExecutable(): string | null {
   for (const candidate of ['python3', 'python']) {
-    const probe = spawnSync(candidate, ['--version'], { encoding: 'utf8' });
+    const probe = spawnSync(candidate, ['--version'], {
+      encoding: 'utf8',
+      env: PYTHON_UTF8_ENV,
+    });
     if (!probe.error && probe.status === 0) {
       return candidate;
     }
@@ -12,13 +23,19 @@ function resolvePythonExecutable(): string | null {
   return null;
 }
 
-// Windows consoles default to a legacy codepage (GBK / cp936). The embedded
-// Python sources carry Chinese comments, so child-process output would be
-// decoded into lone surrogates and Python would then fail to re-encode it
-// ("UnicodeEncodeError: surrogates not allowed"). Force UTF-8 for every child.
-const PY_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
-
 const PYTHON_EXECUTABLE = resolvePythonExecutable();
+
+function runPythonUtf8(pyScript: string, input?: string): SpawnSyncReturns<string> {
+  if (!PYTHON_EXECUTABLE) {
+    throw new Error('Python executable not available');
+  }
+  return spawnSync(PYTHON_EXECUTABLE, ['-X', 'utf8', '-c', pyScript], {
+    input,
+    encoding: 'utf8',
+    env: PYTHON_UTF8_ENV,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+}
 import {
   SVPWM_LINEAR_LIMIT,
   calcKeFromKv,
@@ -1091,11 +1108,7 @@ print(json.dumps(sanitize({
 }), allow_nan=False))
 `;
 
-  const proc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], {
-    input: motorPhysicsPy,
-    encoding: 'utf8',
-    env: PY_ENV,
-  });
+  const proc = runPythonUtf8(pyScript, motorPhysicsPy);
   assert.equal(proc.status, 0, `${PYTHON_EXECUTABLE} execution failed: ${proc.stderr}`);
   const pyData = JSON.parse(proc.stdout);
   const tinyParams = { ...DEMO_MOTOR_PARAMS, iIdleA: 0, etaInv: 1, iDeadbandA: 0, rLineOhm: 0 };
@@ -1271,17 +1284,16 @@ segs, gaps, med_dt, thresh = ns["partition_continuous_time_segments"](${JSON.str
 print(json.dumps({"segs": [list(s) for s in segs], "gaps": gaps, "med_dt": med_dt}))
 `;
   if (PYTHON_EXECUTABLE) {
-    const proc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyCheck], {
-      input: JSON.stringify({
+    const proc = runPythonUtf8(
+      pyCheck,
+      JSON.stringify({
         'motor_physics.py': motorPy,
         'dyno_calibrator.py': dynoPy,
         'thermal_exporter.py': thermPy,
         'dynamic_pmsm.py': dynPy,
         'app.py': appPy,
-      }),
-      encoding: 'utf8',
-      env: PY_ENV,
-    });
+      })
+    );
     assert.equal(proc.status, 0, `Python AST/parity check failed: ${proc.stderr}`);
     const pyRes = JSON.parse(proc.stdout);
     assert.deepEqual(pyRes.gaps, segDiag.gapIndices);
@@ -1541,7 +1553,7 @@ print(json.dumps({
 }))
 `;
   if (PYTHON_EXECUTABLE) {
-    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyParityScript], { input: dynPy, encoding: 'utf8', env: PY_ENV });
+    const pyProc = runPythonUtf8(pyParityScript, dynPy);
     assert.equal(pyProc.status, 0, `Python dynamic_pmsm execution failed: ${pyProc.stderr}`);
     const pyOut = JSON.parse(pyProc.stdout);
     assert.equal(pyOut.provenance, 'synthetic_assumed_uncalibrated');
@@ -1604,7 +1616,7 @@ r = ns['simulate_dynamic_pmsm'](p,cfg)
 print(json.dumps({'source_model':r['source_model'],'last_id':r['id_a'][-1],'last_iq':r['iq_a'][-1],'last_te':r['te_nm'][-1],'max_e_res':max(abs(x) for x in r['p_electrical_balance_residual_w']),'max_m_res':max(abs(x) for x in r['p_mechanical_balance_residual_w'])}))
 `;
   if (PYTHON_EXECUTABLE) {
-    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8', env: PY_ENV });
+    const pyProc = runPythonUtf8(pyScript, dynPy);
     assert.equal(pyProc.status, 0, `Python flux-map parity failed: ${pyProc.stderr}`);
     const pyOut = JSON.parse(pyProc.stdout);
     assert.equal(pyOut.source_model, result.sourceModel);
@@ -1622,8 +1634,7 @@ test('P3: Python dyno_calibrator.py emits >5% Vbus spread warning before 2D map 
   assert.ok(dynoPy.includes('vbus_spread_warn = _check_vbus_spread_warning('));
   assert.ok(dynoPy.includes('"z_extrap_mask": z_extrap_mask'));
 
-  const pyExe = resolvePythonExecutable();
-  if (pyExe) {
+  if (PYTHON_EXECUTABLE) {
     const runner = [
       'import ast, json, math, sys',
       'from typing import Optional',
@@ -1640,7 +1651,7 @@ test('P3: Python dyno_calibrator.py emits >5% Vbus spread warning before 2D map 
       '  "single": fn([13.5]),',
       '}, ensure_ascii=False))',
     ].join('\n');
-    const res = spawnSync(pyExe, ['-c', runner], { input: dynoPy, encoding: 'utf8', env: PY_ENV });
+    const res = runPythonUtf8(runner, dynoPy);
     assert.equal(res.status, 0, res.stderr || res.stdout);
     const out = JSON.parse(res.stdout.trim());
     assert.ok(typeof out.wide === 'string' && out.wide.includes('>5%') && out.wide.includes('9.00V') && out.wide.includes('16.00V'));
@@ -1750,13 +1761,30 @@ p_id0 = ns['DynamicPmsmParams'](pole_pairs=4,rs_ohm=0.12,ld_h=0.2e-3,lq_h=0.5e-3
 t_id0 = ns['compute_mtpa_and_fw_target'](8.0, 600.0, 24.0, p_id0)
 print(json.dumps({'last_id': r['id_a'][-1], 'last_iq': r['iq_a'][-1], 'id0_id': t_id0['id_ref_a'], 'id0_iq': t_id0['iq_ref_a']}))
 `;
-    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8', env: PY_ENV });
+    const pyProc = runPythonUtf8(pyScript, dynPy);
     assert.equal(pyProc.status, 0, pyProc.stderr || pyProc.stdout);
     const pyOut = JSON.parse(pyProc.stdout.trim());
     assert.equal(pyOut.id0_id, 0);
     assert.equal(pyOut.id0_iq, 8);
     assert.ok(Math.abs(pyOut.last_id - resTempScaled.idA[last]) < 1e-6);
     assert.ok(Math.abs(pyOut.last_iq - resTempScaled.iqA[last]) < 1e-6);
+  }
+});
+
+test('Python bundle stays byte-identical to editable .py source files on disk', () => {
+  const pyDir = path.resolve('src/modules/focDyno/python');
+  for (const file of PYTHON_BUNDLE_FILES) {
+    const diskPath = path.join(pyDir, file.name);
+    assert.ok(fs.existsSync(diskPath), `Missing Python source file on disk: ${diskPath}`);
+    const diskContent = fs.readFileSync(diskPath, 'utf8').replace(/\r\n/g, '\n');
+    assert.equal(
+      file.content.replace(/\r\n/g, '\n'),
+      diskContent,
+      `PYTHON_BUNDLE_FILES[${file.name}] drifted from ${diskPath}; run "npm run sync:python"`
+    );
+  }
+  if (process.env.CI === 'true') {
+    assert.ok(PYTHON_EXECUTABLE, 'Python must be installed in CI to execute TS/Python parity tests');
   }
 });
 

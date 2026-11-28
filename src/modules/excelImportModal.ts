@@ -584,7 +584,7 @@ class ExcelImportModalController {
       return;
     }
 
-    let html = '<table class="min-w-full text-[11px] font-mono border-collapse tabular-nums">';
+    let html = '<table class="min-w-full text-[11px] font-mono border-collapse tabular-nums text-fg">';
     html += '<thead class="bg-elevated text-fg sticky top-0 z-10"><tr>';
     html += '<th class="px-2 py-1.5 border border-line text-fg-muted text-center w-12">行</th>';
 
@@ -613,7 +613,7 @@ class ExcelImportModalController {
         </div>
       </th>`;
     });
-    html += '</tr></thead><tbody>';
+    html += '</tr></thead><tbody class="text-fg">';
 
     const maxRenderRows = Math.min(sh.previewRowCount, 100);
     for (let r = 0; r < maxRenderRows; r++) {
@@ -639,7 +639,7 @@ class ExcelImportModalController {
       for (let c = 0; c < sh.totalCols; c++) {
         const val = escapeHtml(rowCells[c] ?? '');
         const isIgnoredCol = sh.columnMappings[c]?.role === 'ignore';
-        html += `<td class="px-2 py-1 border-r border-line/60 whitespace-nowrap max-w-[200px] truncate ${isIgnoredCol && !isHeader ? 'text-fg-muted' : ''}" title="${val}">${val}</td>`;
+        html += `<td class="px-2 py-1 border-r border-line/60 whitespace-nowrap max-w-[200px] truncate ${isIgnoredCol && !isHeader ? 'text-fg-muted' : isHeader || isUnit || isPreamble ? '' : 'text-fg'}" title="${val}">${val}</td>`;
       }
       html += '</tr>';
     }

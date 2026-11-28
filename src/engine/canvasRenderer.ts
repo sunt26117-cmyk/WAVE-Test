@@ -166,6 +166,34 @@ export function applyLeftMarginHysteresis(
 }
 
 /**
+ * Resolves the single Y-axis channel to display in Time-domain Overlap mode
+ * (or Separate mode when only one visible channel remains).
+ * - Never returns a hidden channel (returns null when all channels are hidden).
+ * - When only one visible channel remains, automatically returns that channel.
+ * - Otherwise prefers activeChannelId -> selectedMeasurementChannelId -> first visible channel.
+ */
+export function resolveVisibleYAxisChannel(
+  tab: TabState,
+  visibleChs?: WaveformChannel[]
+): WaveformChannel | null {
+  const vis =
+    visibleChs ??
+    tab.drawOrder
+      .map((id) => tab.channels[id])
+      .filter((c): c is WaveformChannel => !!c && c.visible);
+  if (vis.length === 0) return null;
+  if (vis.length === 1) return vis[0];
+
+  const active = tab.activeChannelId ? tab.channels[tab.activeChannelId] : undefined;
+  if (active && active.visible) return active;
+
+  const meas = tab.selectedMeasurementChannelId ? tab.channels[tab.selectedMeasurementChannelId] : undefined;
+  if (meas && meas.visible) return meas;
+
+  return vis[0];
+}
+
+/**
  * Computes the unquantized minimum left gutter width required so Y-axis ticks,
  * GND flags, and the leftmost X-axis tick never clip on the left canvas boundary.
  * In Time Separate mode, evaluates ALL visible channels to compute a single global maximum.
@@ -260,12 +288,7 @@ export function computeRequiredLeftMargin(
           }
         }
       } else {
-        const targetId =
-          tab.activeChannelId ||
-          tab.selectedMeasurementChannelId ||
-          visibleChs[0]?.id ||
-          tab.drawOrder[0];
-        const activeCh = tab.channels[targetId] || visibleChs[0] || primaryCh;
+        const activeCh = resolveVisibleYAxisChannel(tab, visibleChs);
         if (activeCh) {
           ensureChannelScaleOffset(activeCh);
           syncChannelBoundsFromScaleOffset(activeCh);
@@ -985,8 +1008,11 @@ export function drawGndMarkers(
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
 
+  const yAxisCh = resolveVisibleYAxisChannel(tab);
+
   for (const h of handles) {
-    const isActive = h.channelId === tab.activeChannelId;
+    const isActive =
+      h.channelId === (tab.separateView && handles.length > 1 ? tab.activeChannelId : yAxisCh?.id ?? tab.activeChannelId);
     const w = 15;
     const halfH = 6.5;
 
@@ -1787,13 +1813,9 @@ export function drawAxisLabels(
       ctx.fillText(header, hx + 6, hy + 11);
     });
   } else {
-    // Overlap mode: Y-axis graduation corresponds to active channel
-    const targetId =
-      tab.activeChannelId ||
-      tab.selectedMeasurementChannelId ||
-      visibleChs[0]?.id ||
-      tab.drawOrder[0];
-    const activeCh = tab.channels[targetId] || visibleChs[0] || primaryCh;
+    // Overlap / single-visible-channel mode: never display a hidden channel's Y-axis;
+    // automatically display the sole remaining visible channel's Y-axis.
+    const activeCh = resolveVisibleYAxisChannel(tab, visibleChs);
 
     if (activeCh) {
       ensureChannelScaleOffset(activeCh);
@@ -2217,12 +2239,7 @@ export function generateWaveformSVG(
     }
 
     if (!tab.separateView || visibleChs.length <= 1) {
-      const targetId =
-        tab.activeChannelId ||
-        tab.selectedMeasurementChannelId ||
-        visibleChs[0]?.id ||
-        tab.drawOrder[0];
-      const activeCh = tab.channels[targetId] || visibleChs[0] || primaryCh;
+      const activeCh = resolveVisibleYAxisChannel(tab, visibleChs);
       if (activeCh) {
         ensureChannelScaleOffset(activeCh);
         syncChannelBoundsFromScaleOffset(activeCh);
