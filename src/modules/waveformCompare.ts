@@ -683,8 +683,15 @@ export function buildMappedReferenceTrace(
 
 /**
  * Determines whether a queued Compare entry can be overlaid onto Scope or used for Diff traces.
- * When `overlayRefs` is true, differing/disjoint time axes or different units are allowed
- * as long as `fullRefT` has at least 2 samples.
+ *
+ * `overlayRefs` relaxes only the *time-axis* requirement: with it, a reference whose time
+ * axis differs from or does not overlap the target is still allowed, because the full
+ * reference trace is mapped onto the target axis (status is then `INSUFFICIENT_DATA`).
+ *
+ * An `INVALID` status means the two channels are fundamentally incompatible (e.g. V vs A
+ * units, or a reference whose length cannot be reconciled) and must block the overlay
+ * regardless of `overlayRefs` — otherwise a current trace could be drawn on a voltage
+ * axis with a meaningless shared Y scale.
  */
 export function canApplyCompareOverlay(
   alignedStatus: CompareStatus | undefined,
@@ -693,8 +700,8 @@ export function canApplyCompareOverlay(
   alignedValid: boolean
 ): boolean {
   if (!fullRefT || fullRefT.length < 2) return false;
-  if (overlayRefs) return true;
   if (alignedStatus === 'INVALID') return false;
+  if (overlayRefs) return true;
   return alignedValid;
 }
 

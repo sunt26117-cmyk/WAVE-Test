@@ -12,6 +12,12 @@ function resolvePythonExecutable(): string | null {
   return null;
 }
 
+// Windows consoles default to a legacy codepage (GBK / cp936). The embedded
+// Python sources carry Chinese comments, so child-process output would be
+// decoded into lone surrogates and Python would then fail to re-encode it
+// ("UnicodeEncodeError: surrogates not allowed"). Force UTF-8 for every child.
+const PY_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+
 const PYTHON_EXECUTABLE = resolvePythonExecutable();
 import {
   SVPWM_LINEAR_LIMIT,
@@ -1088,6 +1094,7 @@ print(json.dumps(sanitize({
   const proc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], {
     input: motorPhysicsPy,
     encoding: 'utf8',
+    env: PY_ENV,
   });
   assert.equal(proc.status, 0, `${PYTHON_EXECUTABLE} execution failed: ${proc.stderr}`);
   const pyData = JSON.parse(proc.stdout);
@@ -1273,6 +1280,7 @@ print(json.dumps({"segs": [list(s) for s in segs], "gaps": gaps, "med_dt": med_d
         'app.py': appPy,
       }),
       encoding: 'utf8',
+      env: PY_ENV,
     });
     assert.equal(proc.status, 0, `Python AST/parity check failed: ${proc.stderr}`);
     const pyRes = JSON.parse(proc.stdout);
@@ -1533,7 +1541,7 @@ print(json.dumps({
 }))
 `;
   if (PYTHON_EXECUTABLE) {
-    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyParityScript], { input: dynPy, encoding: 'utf8' });
+    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyParityScript], { input: dynPy, encoding: 'utf8', env: PY_ENV });
     assert.equal(pyProc.status, 0, `Python dynamic_pmsm execution failed: ${pyProc.stderr}`);
     const pyOut = JSON.parse(pyProc.stdout);
     assert.equal(pyOut.provenance, 'synthetic_assumed_uncalibrated');
@@ -1596,7 +1604,7 @@ r = ns['simulate_dynamic_pmsm'](p,cfg)
 print(json.dumps({'source_model':r['source_model'],'last_id':r['id_a'][-1],'last_iq':r['iq_a'][-1],'last_te':r['te_nm'][-1],'max_e_res':max(abs(x) for x in r['p_electrical_balance_residual_w']),'max_m_res':max(abs(x) for x in r['p_mechanical_balance_residual_w'])}))
 `;
   if (PYTHON_EXECUTABLE) {
-    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8' });
+    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8', env: PY_ENV });
     assert.equal(pyProc.status, 0, `Python flux-map parity failed: ${pyProc.stderr}`);
     const pyOut = JSON.parse(pyProc.stdout);
     assert.equal(pyOut.source_model, result.sourceModel);
@@ -1632,7 +1640,7 @@ test('P3: Python dyno_calibrator.py emits >5% Vbus spread warning before 2D map 
       '  "single": fn([13.5]),',
       '}, ensure_ascii=False))',
     ].join('\n');
-    const res = spawnSync(pyExe, ['-c', runner], { input: dynoPy, encoding: 'utf8' });
+    const res = spawnSync(pyExe, ['-c', runner], { input: dynoPy, encoding: 'utf8', env: PY_ENV });
     assert.equal(res.status, 0, res.stderr || res.stdout);
     const out = JSON.parse(res.stdout.trim());
     assert.ok(typeof out.wide === 'string' && out.wide.includes('>5%') && out.wide.includes('9.00V') && out.wide.includes('16.00V'));
@@ -1742,7 +1750,7 @@ p_id0 = ns['DynamicPmsmParams'](pole_pairs=4,rs_ohm=0.12,ld_h=0.2e-3,lq_h=0.5e-3
 t_id0 = ns['compute_mtpa_and_fw_target'](8.0, 600.0, 24.0, p_id0)
 print(json.dumps({'last_id': r['id_a'][-1], 'last_iq': r['iq_a'][-1], 'id0_id': t_id0['id_ref_a'], 'id0_iq': t_id0['iq_ref_a']}))
 `;
-    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8' });
+    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8', env: PY_ENV });
     assert.equal(pyProc.status, 0, pyProc.stderr || pyProc.stdout);
     const pyOut = JSON.parse(pyProc.stdout.trim());
     assert.equal(pyOut.id0_id, 0);
