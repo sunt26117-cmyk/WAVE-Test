@@ -6,6 +6,12 @@
 
 import { WaveformChannel } from '../types/models';
 
+export function bumpChannelDataVersion(ch: WaveformChannel): number {
+  const next = (ch.dataVersion ?? 0) + 1;
+  ch.dataVersion = next;
+  return next;
+}
+
 export type GlobalEditOp =
   | { type: 'offset'; value: number }
   | { type: 'gain'; value: number }
@@ -70,6 +76,7 @@ export function applyGlobalEdit(ch: WaveformChannel, op: GlobalEditOp): void {
   }
 
   ch.hasEdits = true;
+  bumpChannelDataVersion(ch);
 }
 
 /**
@@ -125,6 +132,7 @@ export function applyLocalEdit(
   }
 
   ch.hasEdits = true;
+  bumpChannelDataVersion(ch);
   return count;
 }
 
@@ -136,6 +144,7 @@ export function revertChannelToReference(ch: WaveformChannel): boolean {
   ch.v = new Float32Array(ch.refV);
   ch.hasEdits = false;
   ch.showDiff = false;
+  bumpChannelDataVersion(ch);
   return true;
 }
 
@@ -169,6 +178,7 @@ export function applyChannelTimeShift(ch: WaveformChannel, totalShiftSec: number
   }
   ch.t = nextT;
   ch.timeShiftSec = totalShiftSec;
+  bumpChannelDataVersion(ch);
 }
 
 /**
@@ -184,6 +194,7 @@ export function resetChannelTimeShift(ch: WaveformChannel): boolean {
   }
   ch.timeShiftSec = 0;
   delete ch.timeShiftBaseT;
+  if (hadShift) bumpChannelDataVersion(ch);
   return hadShift;
 }
 

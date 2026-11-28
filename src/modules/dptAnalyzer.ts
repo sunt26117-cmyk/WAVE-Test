@@ -1350,3 +1350,453 @@ export function generateDptDemoChannels(): {
     idsCh: make('dpt_demo_ids', 'Ids_Demo', 'A', '#fb7185', ids),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Hardware Measured-Data 4D DPT LUT Template, Validation & Serialization
+// ---------------------------------------------------------------------------
+
+export interface DptLutTemplatePoint {
+  vBusV: number | null;
+  iLoadA: number | null;
+  tjC: number | null;
+  rgOnOhm: number | null;
+  rgOffOhm: number | null;
+  eOnUj: number | null;
+  eOffUj: number | null;
+  qRrNc: number | null;
+  eOnSansQrrUj?: number | null;
+}
+
+export interface DptLutTemplateDocument {
+  schema: 'wave-test-dpt-4d-lut';
+  schemaVersion: 1;
+  devicePartNumber: string;
+  provenance: 'measured';
+  note: string;
+  units: {
+    vBusV: 'V';
+    iLoadA: 'A';
+    tjC: 'degC';
+    rgOnOhm: 'Ohm';
+    rgOffOhm: 'Ohm';
+    eOnUj: 'uJ';
+    eOffUj: 'uJ';
+    qRrNc: 'nC';
+  };
+  points: DptLutTemplatePoint[];
+}
+
+export interface DptLutCoverageSummary {
+  pointCount: number;
+  uniqueVbusCount: number;
+  uniqueIloadCount: number;
+  uniqueTjCount: number;
+  uniqueRgCount: number;
+  vBusRangeV: [number, number] | null;
+  iLoadRangeA: [number, number] | null;
+  tjRangeC: [number, number] | null;
+  rgRangeOhm: [number, number] | null;
+  coversAutomotive9to16V: boolean;
+  statusGlyph: '●' | '▲' | '✖';
+  statusText: string;
+}
+
+export interface DptLutImportResult {
+  points: DptOperatingPoint[];
+  summary: DptLutCoverageSummary;
+  devicePartNumber?: string;
+  format: 'json' | 'csv';
+}
+
+export function createDptLutImportTemplate(devicePartNumber: string = 'BUK7Q6R0-40H'): DptLutTemplateDocument {
+  const voltages = [9, 13.5, 16];
+  const currents = [10, 30, 60];
+  const temps = [25, 125];
+  const points: DptLutTemplatePoint[] = [];
+
+  for (const vBusV of voltages) {
+    for (const iLoadA of currents) {
+      for (const tjC of temps) {
+        points.push({
+          vBusV,
+          iLoadA,
+          tjC,
+          rgOnOhm: null,
+          rgOffOhm: null,
+          eOnUj: null,
+          eOffUj: null,
+          qRrNc: null,
+          eOnSansQrrUj: null,
+        });
+      }
+    }
+  }
+
+  return {
+    schema: 'wave-test-dpt-4d-lut',
+    schemaVersion: 1,
+    devicePartNumber,
+    provenance: 'measured',
+    note: '双脉冲实测 4D 开关损耗模板（覆盖 9/13.5/16V 车用边界）。请填入真实 DPT 实测数据；禁止使用数据手册开关时间推算伪造 Eon/Eoff，未填写的 null 占位行将被导入器拦截。',
+    units: {
+      vBusV: 'V',
+      iLoadA: 'A',
+      tjC: 'degC',
+      rgOnOhm: 'Ohm',
+      rgOffOhm: 'Ohm',
+      eOnUj: 'uJ',
+      eOffUj: 'uJ',
+      qRrNc: 'nC',
+    },
+    points,
+  };
+}
+
+export function createDptLutImportCsvTemplate(devicePartNumber: string = 'BUK7Q6R0-40H'): string {
+  const doc = createDptLutImportTemplate(devicePartNumber);
+  const lines: string[] = [
+    `# WAVE-Test 4D DPT LUT Measured Template | Device=${devicePartNumber} | Provenance=measured`,
+    '# Fill measured values for rgOnOhm, rgOffOhm, eOnUj, eOffUj, qRrNc (blank cells are rejected on import)',
+    'vBusV,iLoadA,tjC,rgOnOhm,rgOffOhm,eOnUj,eOffUj,qRrNc,eOnSansQrrUj',
+  ];
+  for (const pt of doc.points) {
+    lines.push(`${pt.vBusV},${pt.iLoadA},${pt.tjC},,,,,,`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+export function summarizeDptLutCoverage(points: DptOperatingPoint[]): DptLutCoverageSummary {
+  if (!points || points.length === 0) {
+    return {
+      pointCount: 0,
+      uniqueVbusCount: 0,
+      uniqueIloadCount: 0,
+      uniqueTjCount: 0,
+      uniqueRgCount: 0,
+      vBusRangeV: null,
+      iLoadRangeA: null,
+      tjRangeC: null,
+      rgRangeOhm: null,
+      coversAutomotive9to16V: false,
+      statusGlyph: '✖',
+      statusText: '暂无实测 DPT 矩阵点',
+    };
+  }
+
+  const vSet = new Set<string>();
+  const iSet = new Set<string>();
+  const tSet = new Set<string>();
+  const rSet = new Set<string>();
+  let vMin = Infinity;
+  let vMax = -Infinity;
+  let iMin = Infinity;
+  let iMax = -Infinity;
+  let tMin = Infinity;
+  let tMax = -Infinity;
+  let rMin = Infinity;
+  let rMax = -Infinity;
+
+  for (const pt of points) {
+    vSet.add(pt.vBusV.toFixed(3));
+    iSet.add(pt.iLoadA.toFixed(3));
+    tSet.add(pt.tjC.toFixed(2));
+    const rgEff = Number.isFinite(pt.rgOhm)
+      ? pt.rgOhm
+      : 0.5 * ((pt.rgOnOhm ?? 0) + (pt.rgOffOhm ?? 0));
+    rSet.add(rgEff.toFixed(3));
+    if (pt.vBusV < vMin) vMin = pt.vBusV;
+    if (pt.vBusV > vMax) vMax = pt.vBusV;
+    if (pt.iLoadA < iMin) iMin = pt.iLoadA;
+    if (pt.iLoadA > iMax) iMax = pt.iLoadA;
+    if (pt.tjC < tMin) tMin = pt.tjC;
+    if (pt.tjC > tMax) tMax = pt.tjC;
+    if (rgEff < rMin) rMin = rgEff;
+    if (rgEff > rMax) rMax = rgEff;
+  }
+
+  const coversAutomotive9to16V = vMin <= 9.0 + 1e-6 && vMax >= 16.0 - 1e-6 && vSet.size >= 2;
+  const statusGlyph: '●' | '▲' = coversAutomotive9to16V ? '●' : '▲';
+  const statusText = coversAutomotive9to16V
+    ? '已覆盖 9～16V 车用母线包络'
+    : `未完整覆盖 9～16V（当前 ${vMin.toFixed(1)}～${vMax.toFixed(1)}V）`;
+
+  return {
+    pointCount: points.length,
+    uniqueVbusCount: vSet.size,
+    uniqueIloadCount: iSet.size,
+    uniqueTjCount: tSet.size,
+    uniqueRgCount: rSet.size,
+    vBusRangeV: [vMin, vMax],
+    iLoadRangeA: [iMin, iMax],
+    tjRangeC: [tMin, tMax],
+    rgRangeOhm: [rMin, rMax],
+    coversAutomotive9to16V,
+    statusGlyph,
+    statusText,
+  };
+}
+
+function validateAndBuildDptPoint(
+  raw: Record<string, unknown>,
+  rowLabel: string,
+  index: number
+): DptOperatingPoint {
+  const reqNum = (key: string, label: string, min: number, max: number, strictGtMin: boolean = false): number => {
+    const val = raw[key];
+    if (val === null || val === undefined || val === '') {
+      throw new Error(`${rowLabel} 缺少必填实测字段 ${label}（${key}）；不允许空白或 null 占位值参与计算。`);
+    }
+    const n = typeof val === 'number' ? val : Number(String(val).trim());
+    if (!Number.isFinite(n)) {
+      throw new Error(`${rowLabel} 字段 ${label}（${key}）不是有效有限数值。`);
+    }
+    if (strictGtMin ? n <= min : n < min || n > max) {
+      throw new Error(`${rowLabel} 字段 ${label}（${key}=${n}）超出物理允许范围 (${min}～${max})。`);
+    }
+    if (n > max) {
+      throw new Error(`${rowLabel} 字段 ${label}（${key}=${n}）超出物理允许范围 (${min}～${max})。`);
+    }
+    return n;
+  };
+
+  const optNum = (key: string): number | undefined => {
+    const val = raw[key];
+    if (val === null || val === undefined || val === '') return undefined;
+    const n = typeof val === 'number' ? val : Number(String(val).trim());
+    if (!Number.isFinite(n)) {
+      throw new Error(`${rowLabel} 可选字段 ${key} 不是有效有限数值。`);
+    }
+    return n;
+  };
+
+  const vBusV = reqNum('vBusV', '母线电压 Vbus', 0, 2000, true);
+  const iLoadA = reqNum('iLoadA', '负载电流 Iload', 0, 5000, true);
+  const tjC = reqNum('tjC', '结温 Tj', -55, 225, false);
+
+  const rawRgOn = optNum('rgOnOhm');
+  const rawRgOff = optNum('rgOffOhm');
+  const rawRg = optNum('rgOhm');
+  if (rawRgOn === undefined && rawRgOff === undefined && rawRg === undefined) {
+    throw new Error(`${rowLabel} 缺少必填门极电阻（rgOnOhm/rgOffOhm 或 rgOhm）；不允许空白或 null 占位值。`);
+  }
+  const rgOnOhm = rawRgOn ?? rawRg ?? rawRgOff!;
+  const rgOffOhm = rawRgOff ?? rawRg ?? rawRgOn!;
+  if (rgOnOhm < 0 || rgOnOhm > 1000 || rgOffOhm < 0 || rgOffOhm > 1000) {
+    throw new Error(`${rowLabel} 门极电阻 rgOnOhm/rgOffOhm 超出物理范围 [0, 1000] Ω。`);
+  }
+  const rgOhm = rawRg ?? 0.5 * (rgOnOhm + rgOffOhm);
+
+  const eOnUj = reqNum('eOnUj', '开通损耗 Eon', 0, 1e6, false);
+  const eOffUj = reqNum('eOffUj', '关断损耗 Eoff', 0, 1e6, false);
+  const qRrNc = reqNum('qRrNc', '反向恢复电荷 Qrr', 0, 1e6, false);
+  const eOnSansQrrUj = optNum('eOnSansQrrUj');
+  if (eOnSansQrrUj !== undefined && (eOnSansQrrUj < 0 || eOnSansQrrUj > eOnUj + 1e-6)) {
+    throw new Error(`${rowLabel} 字段 eOnSansQrrUj (${eOnSansQrrUj} µJ) 必须位于 [0, Eon=${eOnUj}] 区间内。`);
+  }
+
+  return {
+    id: `dpt_imp_${index + 1}_${Math.round(vBusV * 10)}_${Math.round(iLoadA * 10)}`,
+    vBusV,
+    iLoadA,
+    tjC,
+    rgOhm,
+    rgOnOhm,
+    rgOffOhm,
+    eOnUj,
+    eOffUj,
+    qRrNc,
+    eOnSansQrrUj,
+  };
+}
+
+export function parseDptLutImportText(rawText: string): DptLutImportResult {
+  const trimmed = (rawText || '').trim();
+  if (!trimmed) {
+    throw new Error('4D DPT 实测文件内容为空。');
+  }
+
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`4D DPT JSON 语法无效：${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    let rawPoints: unknown[];
+    let devicePartNumber: string | undefined;
+    if (Array.isArray(parsed)) {
+      rawPoints = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      if (obj.schema !== undefined && obj.schema !== 'wave-test-dpt-4d-lut') {
+        throw new Error(`4D DPT JSON schema 不匹配（期望 wave-test-dpt-4d-lut，收到 ${String(obj.schema)}）。`);
+      }
+      if (!Array.isArray(obj.points)) {
+        throw new Error('4D DPT JSON 缺少 points 数组。');
+      }
+      rawPoints = obj.points;
+      if (typeof obj.devicePartNumber === 'string' && obj.devicePartNumber.trim()) {
+        devicePartNumber = obj.devicePartNumber.trim();
+      }
+    } else {
+      throw new Error('4D DPT JSON 根对象格式无效。');
+    }
+
+    if (rawPoints.length === 0) {
+      throw new Error('4D DPT JSON 的 points 数组为空，至少需要 1 个已实测工况点。');
+    }
+
+    const points = rawPoints.map((item, idx) => {
+      if (!item || typeof item !== 'object') {
+        throw new Error(`第 ${idx + 1} 个点不是有效对象。`);
+      }
+      return validateAndBuildDptPoint(item as Record<string, unknown>, `第 ${idx + 1} 条记录`, idx);
+    });
+
+    return {
+      points,
+      summary: summarizeDptLutCoverage(points),
+      devicePartNumber,
+      format: 'json',
+    };
+  }
+
+  // CSV mode
+  const rawLines = trimmed.split(/\r?\n/);
+  const dataLines: Array<{ lineNo: number; text: string }> = [];
+  let devicePartNumber: string | undefined;
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i].trim();
+    if (!line) continue;
+    if (line.startsWith('#')) {
+      const m = line.match(/Device\s*=\s*([^|,\s]+)/i);
+      if (m && m[1]) devicePartNumber = m[1].trim();
+      continue;
+    }
+    dataLines.push({ lineNo: i + 1, text: line });
+  }
+
+  if (dataLines.length < 2) {
+    throw new Error('4D DPT CSV 至少需要表头行与 1 行实测数据。');
+  }
+
+  const headerCells = dataLines[0].text.split(',').map((h) => h.trim());
+  const colIndexMap: Record<string, number> = {};
+  const aliasToField: Record<string, string> = {
+    vbusv: 'vBusV',
+    vbus: 'vBusV',
+    vds: 'vBusV',
+    iloada: 'iLoadA',
+    iload: 'iLoadA',
+    id: 'iLoadA',
+    tjc: 'tjC',
+    tj: 'tjC',
+    rgohm: 'rgOhm',
+    rg: 'rgOhm',
+    rgonohm: 'rgOnOhm',
+    rgon: 'rgOnOhm',
+    rg_on: 'rgOnOhm',
+    rgoffohm: 'rgOffOhm',
+    rgoff: 'rgOffOhm',
+    rg_off: 'rgOffOhm',
+    eonuj: 'eOnUj',
+    eon: 'eOnUj',
+    eoffuj: 'eOffUj',
+    eoff: 'eOffUj',
+    qrrnc: 'qRrNc',
+    qrr: 'qRrNc',
+    qr: 'qRrNc',
+    eonsansqrruj: 'eOnSansQrrUj',
+  };
+
+  headerCells.forEach((rawHeader, colIdx) => {
+    const norm = rawHeader.replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+    const mapped = aliasToField[norm];
+    if (mapped) colIndexMap[mapped] = colIdx;
+  });
+
+  if (colIndexMap.vBusV === undefined || colIndexMap.iLoadA === undefined || colIndexMap.eOnUj === undefined || colIndexMap.eOffUj === undefined) {
+    throw new Error('4D DPT CSV 缺少必要表头列（需包含 vBusV, iLoadA, tjC, rgOnOhm/rgOffOhm, eOnUj, eOffUj, qRrNc）。');
+  }
+
+  const points: DptOperatingPoint[] = [];
+  for (let r = 1; r < dataLines.length; r++) {
+    const entry = dataLines[r];
+    const cells = entry.text.split(',').map((c) => c.trim());
+    const rec: Record<string, unknown> = {};
+    for (const [field, colIdx] of Object.entries(colIndexMap)) {
+      rec[field] = colIdx < cells.length ? cells[colIdx] : '';
+    }
+    points.push(validateAndBuildDptPoint(rec, `CSV 第 ${entry.lineNo} 行`, r - 1));
+  }
+
+  return {
+    points,
+    summary: summarizeDptLutCoverage(points),
+    devicePartNumber,
+    format: 'csv',
+  };
+}
+
+export function serializeDptLutToJson(
+  points: DptOperatingPoint[],
+  devicePartNumber: string = 'BUK7Q6R0-40H'
+): string {
+  const doc: DptLutTemplateDocument = {
+    schema: 'wave-test-dpt-4d-lut',
+    schemaVersion: 1,
+    devicePartNumber,
+    provenance: 'measured',
+    note: '由 WAVE-Test 导出的 4D DPT 实测开关损耗查找表档案。',
+    units: {
+      vBusV: 'V',
+      iLoadA: 'A',
+      tjC: 'degC',
+      rgOnOhm: 'Ohm',
+      rgOffOhm: 'Ohm',
+      eOnUj: 'uJ',
+      eOffUj: 'uJ',
+      qRrNc: 'nC',
+    },
+    points: points.map((pt) => ({
+      vBusV: pt.vBusV,
+      iLoadA: pt.iLoadA,
+      tjC: pt.tjC,
+      rgOnOhm: pt.rgOnOhm ?? pt.rgOhm,
+      rgOffOhm: pt.rgOffOhm ?? pt.rgOhm,
+      eOnUj: pt.eOnUj,
+      eOffUj: pt.eOffUj,
+      qRrNc: pt.qRrNc,
+      ...(pt.eOnSansQrrUj !== undefined ? { eOnSansQrrUj: pt.eOnSansQrrUj } : {}),
+    })),
+  };
+  return JSON.stringify(doc, null, 2);
+}
+
+export function serializeDptLutToCsv(
+  points: DptOperatingPoint[],
+  devicePartNumber: string = 'BUK7Q6R0-40H'
+): string {
+  const lines: string[] = [
+    `# WAVE-Test 4D DPT LUT Export | Device=${devicePartNumber} | Provenance=measured`,
+    'vBusV,iLoadA,tjC,rgOnOhm,rgOffOhm,eOnUj,eOffUj,qRrNc,eOnSansQrrUj',
+  ];
+  for (const pt of points) {
+    lines.push(
+      [
+        pt.vBusV,
+        pt.iLoadA,
+        pt.tjC,
+        pt.rgOnOhm ?? pt.rgOhm,
+        pt.rgOffOhm ?? pt.rgOhm,
+        pt.eOnUj,
+        pt.eOffUj,
+        pt.qRrNc,
+        pt.eOnSansQrrUj !== undefined ? pt.eOnSansQrrUj : '',
+      ].join(',')
+    );
+  }
+  return lines.join('\n') + '\n';
+}
+

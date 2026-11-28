@@ -298,3 +298,157 @@ export function interpolateSmoothSegments(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Viewport Decimation LRU Cache
+// ---------------------------------------------------------------------------
+
+export interface DecimationCacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  size: number;
+  maxEntries: number;
+}
+
+export interface CachedDecimationParams {
+  channelId: string;
+  traceKind: 'active' | 'ref' | 'diff';
+  t: Float64Array;
+  vPrimary: Float32Array;
+  vSecondary?: Float32Array | null;
+  dataVersion?: number;
+  startIdx: number;
+  endIdx: number;
+  pixelWidth: number;
+  mode: DecimationMode;
+  gapThreshold: number;
+  coupling?: string;
+  inverted?: boolean;
+  readVal: SampleReader;
+}
+
+const MAX_DECIMATION_CACHE_ENTRIES = 128;
+const bufferIdentityMap = new WeakMap<ArrayBufferView, number>();
+let nextBufferIdentityId = 1;
+
+function getBufferIdentity(buf: ArrayBufferView | null | undefined): number {
+  if (!buf) return 0;
+  let id = bufferIdentityMap.get(buf);
+  if (id === undefined) {
+    id = nextBufferIdentityId++;
+    bufferIdentityMap.set(buf, id);
+  }
+  return id;
+}
+
+function sampleSentinel(arr: Float32Array, startIdx: number, endIdx: number): string {
+  const n = arr.length;
+  if (n === 0) return '0';
+  const i0 = Math.max(0, Math.min(n - 1, startIdx));
+  const i2 = Math.max(0, Math.min(n - 1, endIdx - 1));
+  const i1 = (i0 + i2) >> 1;
+  const a = arr[i0];
+  const b = arr[i1];
+  const c = arr[i2];
+  return `${Number.isNaN(a) ? 'N' : a}|${Number.isNaN(b) ? 'N' : b}|${Number.isNaN(c) ? 'N' : c}`;
+}
+
+const decimationLruCache = new Map<string, DecimatedPoint[][]>();
+let decimationCacheHits = 0;
+let decimationCacheMisses = 0;
+let decimationCacheEvictions = 0;
+
+/**
+ * Computes or retrieves cached gap-aware decimated polyline segments.
+ * Keyed by buffer object identities (WeakMap), explicit channel dataVersion,
+ * O(1) boundary sentinel samples, viewport slice [startIdx, endIdx), pixel width,
+ * decimation mode, gap threshold, and conditioning flags (coupling/inverted).
+ */
+export function getCachedDecimatedSegments(params: CachedDecimationParams): DecimatedPoint[][] {
+  const {
+    channelId,
+    traceKind,
+    t,
+    vPrimary,
+    vSecondary,
+    dataVersion = 0,
+    startIdx,
+    endIdx,
+    pixelWidth,
+    mode,
+    gapThreshold,
+    coupling = 'DC',
+    inverted = false,
+    readVal,
+  } = params;
+
+  const targetWidth = Math.max(100, Math.round(pixelWidth));
+  const gapKey = Number.isFinite(gapThreshold) ? gapThreshold.toPrecision(6) : 'inf';
+  const cacheKey = [
+    channelId,
+    traceKind,
+    getBufferIdentity(t),
+    getBufferIdentity(vPrimary),
+    getBufferIdentity(vSecondary),
+    t.length,
+    vPrimary.length,
+    dataVersion,
+    startIdx,
+    endIdx,
+    targetWidth,
+    mode,
+    gapKey,
+    coupling,
+    inverted ? 1 : 0,
+    sampleSentinel(vPrimary, startIdx, endIdx),
+  ].join('|');
+
+  const cached = decimationLruCache.get(cacheKey);
+  if (cached !== undefined) {
+    // Refresh LRU recency
+    decimationLruCache.delete(cacheKey);
+    decimationLruCache.set(cacheKey, cached);
+    decimationCacheHits++;
+    return cached;
+  }
+
+  decimationCacheMisses++;
+  const segments = buildDecimatedSegments(
+    t,
+    readVal,
+    startIdx,
+    endIdx,
+    targetWidth,
+    mode,
+    gapThreshold
+  );
+
+  if (decimationLruCache.size >= MAX_DECIMATION_CACHE_ENTRIES) {
+    const oldestKey = decimationLruCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      decimationLruCache.delete(oldestKey);
+      decimationCacheEvictions++;
+    }
+  }
+  decimationLruCache.set(cacheKey, segments);
+  return segments;
+}
+
+export function getDecimationCacheStats(): DecimationCacheStats {
+  return {
+    hits: decimationCacheHits,
+    misses: decimationCacheMisses,
+    evictions: decimationCacheEvictions,
+    size: decimationLruCache.size,
+    maxEntries: MAX_DECIMATION_CACHE_ENTRIES,
+  };
+}
+
+export function resetDecimationCache(): void {
+  decimationLruCache.clear();
+  decimationCacheHits = 0;
+  decimationCacheMisses = 0;
+  decimationCacheEvictions = 0;
+}
+
+

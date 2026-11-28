@@ -26,7 +26,7 @@ import {
   VERTICAL_DIVISIONS,
 } from '../modules/oscilloscopeScale';
 import {
-  buildDecimatedSegments,
+  getCachedDecimatedSegments,
   interpolateSmoothSegments,
   DecimatedPoint,
   SampleReader,
@@ -34,6 +34,7 @@ import {
 import { MEASUREMENT_DEFINITIONS, MeasurementDefinition } from '../modules/measurements';
 import { computeXYAlignedTrajectory, computeXYMetrics } from '../modules/xyAnalysis';
 import { GoldenEvaluationResult } from '../modules/anomalyScanner';
+import { resolveChannelTextColor } from '../modules/themeManager';
 
 export type { PlotArea, SubplotRect };
 
@@ -701,7 +702,7 @@ export function drawChannelWaveform(
   const primaryCh = tab.channels[tab.drawOrder[0]] || Object.values(tab.channels)[0];
   const usesPrimaryIndex =
     !primaryCh ||
-    ch === primaryCh ||
+    (ch === primaryCh && !ch.timeShiftSec) ||
     (ch.t === primaryCh.t && !ch.timeShiftSec && !primaryCh.timeShiftSec);
   let startIdx: number;
   let endIdx: number;
@@ -755,15 +756,21 @@ export function drawChannelWaveform(
       return ch.inverted ? -ac : ac;
     };
 
-    let refSegments = buildDecimatedSegments(
+    let refSegments = getCachedDecimatedSegments({
+      channelId: ch.id,
+      traceKind: 'ref',
       t,
-      readRef,
-      drawStartIdx,
-      drawEndIdx,
-      area.width,
-      decimationMode,
-      gapThreshold
-    );
+      vPrimary: refArr,
+      dataVersion: ch.dataVersion,
+      startIdx: drawStartIdx,
+      endIdx: drawEndIdx,
+      pixelWidth: area.width,
+      mode: decimationMode,
+      gapThreshold,
+      coupling: ch.coupling || 'DC',
+      inverted: !!ch.inverted,
+      readVal: readRef,
+    });
     if (renderMode === 'sinc' && pointsInView <= 600) {
       refSegments = interpolateSmoothSegments(refSegments, 8);
     }
@@ -793,15 +800,21 @@ export function drawChannelWaveform(
   const readActive: SampleReader = (i: number) =>
     isConditioned ? getChannelDisplayValue(ch, i, cachedMean) : v[i];
 
-  const rawActiveSegments = buildDecimatedSegments(
+  const rawActiveSegments = getCachedDecimatedSegments({
+    channelId: ch.id,
+    traceKind: 'active',
     t,
-    readActive,
-    drawStartIdx,
-    drawEndIdx,
-    area.width,
-    decimationMode,
-    gapThreshold
-  );
+    vPrimary: v,
+    dataVersion: ch.dataVersion,
+    startIdx: drawStartIdx,
+    endIdx: drawEndIdx,
+    pixelWidth: area.width,
+    mode: decimationMode,
+    gapThreshold,
+    coupling: ch.coupling || 'DC',
+    inverted: !!ch.inverted,
+    readVal: readActive,
+  });
   const activeSegments =
     renderMode === 'sinc' && pointsInView <= 600
       ? interpolateSmoothSegments(rawActiveSegments, 8)
@@ -868,15 +881,22 @@ export function drawChannelWaveform(
     const sign = ch.inverted ? -1 : 1;
     const readDiff: SampleReader = (i: number) => (v[i] - refArr[i]) * sign;
 
-    const diffSegments = buildDecimatedSegments(
+    const diffSegments = getCachedDecimatedSegments({
+      channelId: ch.id,
+      traceKind: 'diff',
       t,
-      readDiff,
-      drawStartIdx,
-      drawEndIdx,
-      area.width,
-      decimationMode,
-      gapThreshold
-    );
+      vPrimary: v,
+      vSecondary: refArr,
+      dataVersion: ch.dataVersion,
+      startIdx: drawStartIdx,
+      endIdx: drawEndIdx,
+      pixelWidth: area.width,
+      mode: decimationMode,
+      gapThreshold,
+      coupling: 'DC',
+      inverted: !!ch.inverted,
+      readVal: readDiff,
+    });
 
     const diffCol = theme.isLight ? '#e11d48' : '#fb7185';
     ctx.save();
@@ -1493,8 +1513,9 @@ export function drawCursors(
     ctx.lineWidth = 1;
     ctx.strokeRect(bx, by, boxW, boxH);
 
+    const yCursorTextColor = resolveChannelTextColor(targetCh.color, Boolean(theme.isLight));
     lines.forEach((ln, idx) => {
-      ctx.fillStyle = idx < 2 && showX ? theme.cursor : theme.cursorY;
+      ctx.fillStyle = idx < 2 && showX ? theme.cursor : yCursorTextColor;
       ctx.fillText(ln, bx + 8, by + 15 + idx * 15);
     });
   }
@@ -2221,6 +2242,29 @@ export function generateWaveformSVG(
   return parts.join('\n');
 }
 
+export function formatSlewRate(raw: number, signalUnit: string): string {
+  if (!Number.isFinite(raw)) return 'N/A';
+  const baseUnit = (signalUnit || 'V').trim();
+  const absVal = Math.abs(raw);
+  if (absVal >= 1e9) return `${(raw / 1e9).toPrecision(3)} ${baseUnit}/ns`;
+  if (absVal >= 1e6) return `${(raw / 1e6).toPrecision(3)} ${baseUnit}/µs`;
+  if (absVal >= 1e3) return `${(raw / 1e3).toPrecision(3)} ${baseUnit}/ms`;
+  return `${raw.toPrecision(3)} ${baseUnit}/s`;
+}
+
+export function formatMetricScalarValue(
+  raw: number | null | undefined,
+  unitType: MeasurementDefinition['unitType'],
+  signalUnit: string
+): string {
+  if (raw === null || raw === undefined || !isFinite(raw)) return 'N/A';
+  if (unitType === 'percent') return `${raw.toFixed(1)}%`;
+  if (unitType === 'freq') return formatEng(raw, 'Hz', 3);
+  if (unitType === 'time') return formatEng(raw, 's', 3);
+  if (unitType === 'slew') return formatSlewRate(raw, signalUnit);
+  return formatEng(raw, signalUnit, 3);
+}
+
 /**
  * Formats an automated measurement value consistently for both the DOM capsule strip and PNG exports.
  */
@@ -2230,18 +2274,7 @@ export function formatMeasurementMetricValue(
   signalUnit: string
 ): string {
   const raw = m[def.key];
-  if (raw === null || raw === undefined || !isFinite(raw)) return 'N/A';
-
-  if (def.unitType === 'percent') {
-    return `${raw.toFixed(1)}%`;
-  }
-  if (def.unitType === 'freq') {
-    return formatEng(raw, 'Hz', 3);
-  }
-  if (def.unitType === 'time') {
-    return formatEng(raw, 's', 3);
-  }
-  return formatEng(raw, signalUnit, 3);
+  return formatMetricScalarValue(typeof raw === 'number' ? raw : null, def.unitType, signalUnit);
 }
 
 export function formatCustomMeasurementValue(
@@ -2326,13 +2359,14 @@ export function drawMeasurementStripOnCanvas(
     ctx.fillStyle = ch.color;
     ctx.fillRect(curX, curY, cardW, 2);
 
+    const chTextColor = resolveChannelTextColor(ch.color, Boolean(theme.isLight));
     ctx.textAlign = 'left';
-    ctx.font = '10px "IBM Plex Sans", sans-serif';
-    ctx.fillStyle = theme.axisText || '#94a3b8';
+    ctx.font = '600 10px "IBM Plex Sans", sans-serif';
+    ctx.fillStyle = chTextColor;
     ctx.fillText(titleStr, curX + 8, curY + 14);
 
-    ctx.font = '600 12px "JetBrains Mono", monospace';
-    ctx.fillStyle = theme.text || '#f1f5f9';
+    ctx.font = '700 12px "JetBrains Mono", monospace';
+    ctx.fillStyle = chTextColor;
     ctx.fillText(valStr, curX + 8, curY + 30);
 
     curX += cardW + gap;

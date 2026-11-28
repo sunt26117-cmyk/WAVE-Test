@@ -191,11 +191,11 @@ export function detectDelimiter(text: string): string {
   const firstLines = allLines.slice(-Math.min(allLines.length, 15));
   if (firstLines.length === 0) return ',';
 
-  const candidates = [',', '\t', ';', ' '];
+  const explicitCandidates = [',', '\t', ';'];
   let bestDelim = ',';
   let bestScore = -1;
 
-  for (const delim of candidates) {
+  for (const delim of explicitCandidates) {
     const counts = firstLines.map((line) => {
       let count = 0;
       for (let i = 0; i < line.length; i++) {
@@ -221,13 +221,30 @@ export function detectDelimiter(text: string): string {
     }
   }
 
+  // Only treat whitespace as the column delimiter when no explicit ',', '\t', or ';' delimiter matched
+  if (bestScore < 0) {
+    const spaceCounts = firstLines.map((line) => {
+      const trimmed = line.trim();
+      return trimmed ? Math.max(0, trimmed.split(/\s+/).length - 1) : 0;
+    });
+    const minCount = Math.min(...spaceCounts);
+    const maxCount = Math.max(...spaceCounts);
+    if (minCount > 0 && maxCount - minCount <= 1) {
+      bestDelim = ' ';
+    }
+  }
+
   return bestDelim;
 }
 
 /**
- * Splits a CSV line taking quotes into account.
+ * Splits a CSV line taking quotes and multi-space whitespace padding into account.
  */
 export function splitCsvLine(line: string, delimiter: string): string[] {
+  if (delimiter === ' ' && !line.includes('"')) {
+    const trimmed = line.trim();
+    return trimmed ? trimmed.split(/\s+/) : [];
+  }
   const fields: string[] = [];
   let current = '';
   let inQuotes = false;
@@ -520,6 +537,8 @@ export function parseFullCsv(
   channels: Record<string, WaveformChannel>;
   drawOrder: string[];
   quality: any;
+  timeOriginSec: number | null;
+  timeOriginKind: 'clock-of-day' | 'numeric' | 'synthetic';
 } {
   const clean = stripBom(text);
   const lines = clean.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -764,5 +783,17 @@ export function parseFullCsv(
     drawOrder.push(chId);
   }
 
-  return { channels, drawOrder, quality };
+  const timeOriginKind: 'clock-of-day' | 'numeric' | 'synthetic' = syntheticClockUsed
+    ? 'synthetic'
+    : baseClockTime !== null
+    ? 'clock-of-day'
+    : 'numeric';
+
+  return {
+    channels,
+    drawOrder,
+    quality,
+    timeOriginSec: baseClockTime,
+    timeOriginKind,
+  };
 }

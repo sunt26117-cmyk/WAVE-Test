@@ -3273,7 +3273,7 @@ export function computeLossWithDeskewAndEoss(
     };
   }
 
-  if (zvsTurnOnCount > 0 && eossJ > 0) {
+  if (zvsTurnOnCount > 0 && (eossJ > 0 || Boolean(opts.eossCurve))) {
     warnings.push(`检测到 ${zvsTurnOnCount} 次开通边沿处于零/反向电流 (ZVS/体二极管续流) 状态，已跳过 +Eoss 补偿以避免多加损耗。`);
   }
   if (rdsFeedbackEnabled && r25Ohm > 0 && alpha !== 0) {
@@ -3282,7 +3282,6 @@ export function computeLossWithDeskewAndEoss(
 
   // Advance closed-loop Tj(t) with optional temperature-dependent Rds(on)(Tj) feedback and Cauer sub-stepping
   const initialTj = mStages > 0 ? nodeT[0] : opts.tAmbC;
-  let sumLoss = 0;
   let tjMaxC = initialTj;
   let tjMinC = initialTj;
   let sumTj = initialTj;
@@ -3327,8 +3326,9 @@ export function computeLossWithDeskewAndEoss(
       if (tjC[k] < tjMinC) tjMinC = tjC[k];
       sumTj += tjC[k];
     }
-    sumLoss += pLossW[k];
   }
+  let sumLoss = 0;
+  for (let k = 0; k < evalLen; k++) sumLoss += pLossW[k];
 
   const totalDurationSec = evalLen > 1 ? time[evalLen - 1] - time[0] : 0;
   const pLossMeanW =

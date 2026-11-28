@@ -21,6 +21,7 @@ import {
 import { MotorParams, getEffectiveRsOhm } from '../../modules/focDyno/motorPhysics';
 import { PYTHON_BUNDLE_FILES, downloadPythonBundleZip } from '../../modules/focDyno/pythonBundle';
 import { FocThermalHandoffPayload } from '../../modules/focDyno/scopeBridge';
+import { FocMissionStage } from '../../modules/focThermal';
 import { TabState } from '../../types/models';
 import { SidebarParams } from './SidebarParams';
 import { Tab1DynoCalib } from './Tab1DynoCalib';
@@ -32,6 +33,7 @@ export interface FocDynoLabAppProps {
   getActiveScopeTab: () => TabState | null;
   onSendTabToScope: (tab: TabState) => void;
   onSendToSixMosThermal: (payload: FocThermalHandoffPayload) => void;
+  onAppendMissionStage?: (stage: FocMissionStage) => void;
   onNotify: (msg: string, level?: 'info' | 'warn' | 'error') => void;
 }
 
@@ -39,10 +41,30 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
   getActiveScopeTab,
   onSendTabToScope,
   onSendToSixMosThermal,
+  onAppendMissionStage,
   onNotify,
 }) => {
   const [activeTab, setActiveTab] = useState<'tab1' | 'tab2' | 'tab3' | 'tab4'>('tab1');
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('wvp_foc_sidebar_open_v1');
+      if (saved === '0') return false;
+    } catch {
+      // ignore storage errors
+    }
+    return true;
+  });
+  const toggleSidebarOpen = useCallback(() => {
+    setSidebarOpen((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('wvp_foc_sidebar_open_v1', next ? '1' : '0');
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
   const [params, setParams] = useState<MotorParams>(() => ({ ...DEMO_MOTOR_PARAMS }));
 
   // Tab 1 Dyno state
@@ -213,21 +235,26 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
     PYTHON_BUNDLE_FILES.find((f) => f.name === selectedPyFile)?.content ?? PYTHON_BUNDLE_FILES[0].content;
   const rsEff = getEffectiveRsOhm(params);
 
+  // Smart Data Provenance Strip: only occupy a full row when the active tab uses DEMO / synthetic / mixed data
+  const isAllMeasuredOnActiveTab =
+    (activeTab === 'tab1' && !isOpenLoopDemo && !isClosedLoopDemo && !isParamsDemo) ||
+    (activeTab === 'tab2' && !isLogDemo && !isParamsDemo);
+
   return (
     <div className="dyno-chassis flex min-h-full flex-col">
-      {/* Sub-workspace Ribbon */}
-      <div className="dyno-panel sticky top-0 z-20 flex flex-wrap items-center justify-between gap-4 border-b px-5 py-2">
-        <div className="flex flex-wrap items-center gap-5">
+      {/* Sub-workspace Ribbon (compressed density matching Scope) */}
+      <div className="dyno-panel sticky top-0 z-20 flex flex-wrap items-center justify-between gap-3 border-b px-3 py-1">
+        <div className="flex flex-wrap items-center gap-3">
           <button
             type="button"
-            onClick={() => setSidebarOpen((v) => !v)}
-            className="dyno-btn-ghost inline-flex items-center gap-1.5 rounded-sm border px-2.5 py-1 text-xs whitespace-nowrap cursor-pointer"
+            onClick={toggleSidebarOpen}
+            className="dyno-btn-ghost inline-flex items-center gap-1.5 rounded-sm border px-2 py-1 text-xs whitespace-nowrap cursor-pointer"
           >
             {sidebarOpen ? <PanelLeftClose className="h-3.5 w-3.5" /> : <PanelLeftOpen className="h-3.5 w-3.5" />}
-            {sidebarOpen ? '收起参数栏' : '展开参数栏'}
+            {sidebarOpen ? '收起面板' : '展开面板'}
           </button>
 
-          <nav className="flex items-center gap-5 text-xs font-medium">
+          <nav className="flex items-center gap-4 text-xs font-medium">
             {(
               [
                 ['tab1', '01. 测功仪标定与 Map'],
@@ -258,72 +285,86 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
           </nav>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
+          {isAllMeasuredOnActiveTab && (
+            <span
+              className="inline-flex items-center gap-1 rounded-xs border px-2 py-0.5 font-mono text-[11px] dyno-alert-ok whitespace-nowrap"
+              title={
+                activeTab === 'tab1'
+                  ? `用户实测台架表 (${openLoopRaw.fileName} / ${closedLoopRaw.fileName})`
+                  : `实测日志 (${logFileName}) + 已标定电机参数`
+              }
+            >
+              ✓ 实测数据
+            </span>
+          )}
           <span className="hidden xl:inline font-mono text-[11px] tabular-nums dyno-text-muted">
             p={params.polePairs} · Ke&apos;={params.kePrime.toFixed(5)} · Rs_eff={rsEff.toFixed(4)} Ω · β={params.betaSat.toFixed(5)}
           </span>
           <button
             type="button"
             onClick={handleLoadDemo}
-            className="dyno-btn-primary rounded-sm px-3.5 py-1.5 text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+            className="dyno-btn-primary rounded-sm px-2.5 py-1 text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
           >
             载入 13.5V/30W Demo
           </button>
         </div>
       </div>
 
-      {/* Explicit Data Provenance Strip */}
-      <div className="dyno-panel border-b px-5 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="dyno-text-muted font-medium">数据来源追踪:</span>
-          {activeTab === 'tab1' && (
-            <>
+      {/* Explicit Data Provenance Strip (shown when active tab contains DEMO / mixed / synthetic data) */}
+      {!isAllMeasuredOnActiveTab && (
+        <div className="dyno-panel border-b px-3 py-1 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="dyno-text-muted font-medium">数据来源追踪:</span>
+            {activeTab === 'tab1' && (
+              <>
+                <span
+                  className={`rounded-xs border px-2 py-0.5 font-mono ${
+                    isOpenLoopDemo || isClosedLoopDemo ? 'dyno-alert-warn' : 'dyno-alert-ok'
+                  }`}
+                >
+                  {isOpenLoopDemo && isClosedLoopDemo
+                    ? 'DEMO 示例测功数据 (13.5V/30W) — 请勿直接作为实机台架结论'
+                    : isOpenLoopDemo || isClosedLoopDemo
+                    ? `混合数据: 开环[${isOpenLoopDemo ? 'Demo' : '实测'}] · 闭环[${isClosedLoopDemo ? 'Demo' : '实测'}]`
+                    : `用户实测台架表 (${openLoopRaw.fileName} / ${closedLoopRaw.fileName})`}
+                </span>
+                {isParamsDemo && (
+                  <span className="rounded-xs border px-2 py-0.5 dyno-alert-info">
+                    电机基准参数仍为 Demo 默认值
+                  </span>
+                )}
+              </>
+            )}
+            {activeTab === 'tab2' && (
               <span
                 className={`rounded-xs border px-2 py-0.5 font-mono ${
-                  isOpenLoopDemo || isClosedLoopDemo ? 'dyno-alert-warn' : 'dyno-alert-ok border-emerald-500/40'
+                  isLogDemo || isParamsDemo ? 'dyno-alert-warn' : 'dyno-alert-ok'
                 }`}
               >
-                {isOpenLoopDemo && isClosedLoopDemo
-                  ? 'DEMO 示例测功数据 (13.5V/30W) — 请勿直接作为实机台架结论'
-                  : isOpenLoopDemo || isClosedLoopDemo
-                  ? `混合数据: 开环[${isOpenLoopDemo ? 'Demo' : '实测'}] · 闭环[${isClosedLoopDemo ? 'Demo' : '实测'}]`
-                  : `用户实测台架表 (${openLoopRaw.fileName} / ${closedLoopRaw.fileName})`}
+                日志: {isLogDemo ? `DEMO (${logFileName})` : `实测/示波器 (${logFileName})`} · 电机参数: {isParamsDemo && isClosedLoopDemo ? 'DEMO 基准' : '已标定/用户修改'}
               </span>
-              {isParamsDemo && (
-                <span className="rounded-xs border px-2 py-0.5 dyno-alert-info">
-                  电机基准参数仍为 Demo 默认值
-                </span>
-              )}
-            </>
-          )}
-          {activeTab === 'tab2' && (
-            <span
-              className={`rounded-xs border px-2 py-0.5 font-mono ${
-                isLogDemo || isParamsDemo ? 'dyno-alert-warn' : 'dyno-alert-ok border-emerald-500/40'
-              }`}
-            >
-              日志: {isLogDemo ? `DEMO (${logFileName})` : `实测/示波器 (${logFileName})`} · 电机参数: {isParamsDemo && isClosedLoopDemo ? 'DEMO 基准' : '已标定/用户修改'}
-            </span>
-          )}
-          {activeTab === 'tab3' && (
-            <span
-              className={`rounded-xs border px-2 py-0.5 font-mono ${
-                isExportPointDemo || isParamsDemo ? 'dyno-alert-warn' : 'dyno-alert-ok border-emerald-500/40'
-              }`}
-            >
-              工况点: {isExportPointDemo ? 'DEMO 额定工况 (13.5V / 1.06A / 1000RPM)' : '用户设定/日志传参'} · 波形属性: 理想对称稳态合成（非实测采样）
-            </span>
-          )}
-          {activeTab === 'tab4' && (
-            <span className="rounded-xs border px-2 py-0.5 font-mono dyno-alert-warn">
-              来源: synthetic_assumed_uncalibrated · 独立动态 PMSM dq RK4 模型（与 Tab 1 稳态标定器隔离）
-            </span>
-          )}
+            )}
+            {activeTab === 'tab3' && (
+              <span
+                className={`rounded-xs border px-2 py-0.5 font-mono ${
+                  isExportPointDemo || isParamsDemo ? 'dyno-alert-warn' : 'dyno-alert-ok'
+                }`}
+              >
+                工况点: {isExportPointDemo ? 'DEMO 额定工况 (13.5V / 1.06A / 1000RPM)' : '用户设定/日志传参'} · 波形属性: 理想对称稳态合成（非实测采样）
+              </span>
+            )}
+            {activeTab === 'tab4' && (
+              <span className="rounded-xs border px-2 py-0.5 font-mono dyno-alert-warn">
+                来源: synthetic_assumed_uncalibrated · 独立动态 PMSM dq RK4 模型（与 Tab 1 稳态标定器隔离）
+              </span>
+            )}
+          </div>
+          <span className="dyno-text-muted hidden md:inline">
+            实时辨识与逆向反推基于稳态 Y 型非凸极 Id=0 模型
+          </span>
         </div>
-        <span className="dyno-text-muted hidden md:inline">
-          实时辨识与逆向反推基于稳态 Y 型非凸极 Id=0 模型
-        </span>
-      </div>
+      )}
 
       {/* Main Split Console */}
       <div className="flex flex-1 flex-col lg:flex-row">
@@ -342,7 +383,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
           />
         )}
 
-        <div className="min-w-0 flex-1 p-5 lg:p-6">
+        <div className="min-w-0 flex-1 p-3 lg:p-4">
           {activeTab === 'tab1' && (
             <Tab1DynoCalib
               params={params}
@@ -448,6 +489,7 @@ export const FocDynoLabApp: React.FC<FocDynoLabAppProps> = ({
               onSendToSixMosThermal={(payload) => {
                 onSendToSixMosThermal(payload);
               }}
+              onAppendMissionStage={onAppendMissionStage}
               onNotify={showToast}
             />
           )}

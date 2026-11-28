@@ -3,18 +3,41 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_FOC_MODEL,
   computePhaseMosLosses,
+  exportPcbSpatialDocumentFromModel,
+  focModelToSpice,
   getModulationLinearCeiling,
+  parsePcbSpatialImportJson,
   runFocStallSweep,
   simulateFoc6Mos,
+  summarizePcbSpatialNetwork,
 } from './focThermal';
+import { solveCoupledThermalSteadyState } from './focThermal/thermalNetwork';
+import { computePhaseMosLosses as directComputePhaseMosLosses } from './focThermal/lossModel';
+import { simulateFoc6MosSteadyState as directSteadySolver } from './focThermal/steadySolver';
+import { simulateFoc6MosSteadyState as barrelSteadySolver } from './focThermal';
 import { BUK7Q6R0_40H_PROFILE, createBuk7Q6R0_40HRdsCurve } from './focMosDeviceProfiles';
 import { computeMeasurements } from './measurements';
 import { applyWaveformFilter, computeFilterBodeResponse, createDefaultFilterConfig } from './filter';
 import { computeFFT } from './fft';
-import { decimateMinMaxSegment } from './decimator';
+import {
+  buildDecimatedSegments,
+  decimateMinMaxSegment,
+  getCachedDecimatedSegments,
+  getDecimationCacheStats,
+  resetDecimationCache,
+} from './decimator';
+import { applyGlobalEdit } from './waveformEditor';
 import { analyzeSamplingQuality } from './qualityCheck';
 import { WaveformChannel } from '../types/models';
-import { DptOperatingPoint } from './dptAnalyzer';
+import {
+  DptOperatingPoint,
+  createDptLutImportCsvTemplate,
+  createDptLutImportTemplate,
+  parseDptLutImportText,
+  serializeDptLutToCsv,
+  serializeDptLutToJson,
+  summarizeDptLutCoverage,
+} from './dptAnalyzer';
 
 function makeChannel(
   id: string,
@@ -404,3 +427,347 @@ test('Audit P2-Scope: FFT window gain, non-2^n zero-padding, and MinMax decimato
   assert.equal(mx, 25.0);
   assert.equal(mn, -18.0);
 });
+
+test('Audit P2-Render-Cache: 1M-point viewport decimation LRU cache achieves >90% speedup, bounded LRU, and invalidates on edits', () => {
+  resetDecimationCache();
+  const n = 1_000_000;
+  const t = new Float64Array(n);
+  const v = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    t[i] = i * 1e-6;
+    v[i] = Math.sin(2 * Math.PI * 50 * t[i]) * 10;
+  }
+  v[456_789] = 42.5;
+  const ch = makeChannel('bench_1m', t, v, 'V');
+  const readVal = (i: number) => ch.v[i];
+
+  // Uncached baseline: 20 frames over 1M samples
+  const frames = 20;
+  const t0Uncached = performance.now();
+  let baselineSegs = buildDecimatedSegments(t, readVal, 0, n, 1200, 'minmax', Infinity);
+  for (let f = 1; f < frames; f++) {
+    baselineSegs = buildDecimatedSegments(t, readVal, 0, n, 1200, 'minmax', Infinity);
+  }
+  const uncachedMs = performance.now() - t0Uncached;
+
+  // Cached path: 1 miss + 19 hits (simulating cursor drag / annotation / vertical scale pan)
+  const t0Cached = performance.now();
+  let cachedSegs = getCachedDecimatedSegments({
+    channelId: ch.id,
+    traceKind: 'active',
+    t: ch.t,
+    vPrimary: ch.v,
+    dataVersion: ch.dataVersion,
+    startIdx: 0,
+    endIdx: n,
+    pixelWidth: 1200,
+    mode: 'minmax',
+    gapThreshold: Infinity,
+    readVal,
+  });
+  for (let f = 1; f < frames; f++) {
+    cachedSegs = getCachedDecimatedSegments({
+      channelId: ch.id,
+      traceKind: 'active',
+      t: ch.t,
+      vPrimary: ch.v,
+      dataVersion: ch.dataVersion,
+      startIdx: 0,
+      endIdx: n,
+      pixelWidth: 1200,
+      mode: 'minmax',
+      gapThreshold: Infinity,
+      readVal,
+    });
+  }
+  const cachedMs = performance.now() - t0Cached;
+  const stats = getDecimationCacheStats();
+
+  assert.equal(stats.misses, 1);
+  assert.equal(stats.hits, frames - 1);
+  assert.equal(cachedSegs.length, baselineSegs.length);
+  assert.equal(cachedSegs[0].length, baselineSegs[0].length);
+  // 1 miss + 19 O(1) hits must be vastly faster than 20 full 1M-point scans
+  assert.ok(
+    cachedMs < uncachedMs * 0.25,
+    `Expected cached 20-frame time (${cachedMs.toFixed(2)}ms) < 25% of uncached (${uncachedMs.toFixed(2)}ms)`
+  );
+
+  // In-place waveform edit bumps ch.dataVersion and MUST invalidate cache (zero stale reads)
+  applyGlobalEdit(ch, { type: 'offset', value: 100 });
+  assert.ok((ch.dataVersion ?? 0) >= 1);
+  const editedSegs = getCachedDecimatedSegments({
+    channelId: ch.id,
+    traceKind: 'active',
+    t: ch.t,
+    vPrimary: ch.v,
+    dataVersion: ch.dataVersion,
+    startIdx: 0,
+    endIdx: n,
+    pixelWidth: 1200,
+    mode: 'minmax',
+    gapThreshold: Infinity,
+    readVal,
+  });
+  const editedMax = Math.max(...editedSegs[0].map((p) => p.value));
+  assert.ok(editedMax > 140, `Expected edited spike ~142.5V after cache invalidation, got ${editedMax}`);
+  assert.equal(getDecimationCacheStats().misses, 2);
+
+  // Bounded LRU eviction guard (<= 128 entries)
+  for (let k = 0; k < 150; k++) {
+    getCachedDecimatedSegments({
+      channelId: ch.id,
+      traceKind: 'active',
+      t: ch.t,
+      vPrimary: ch.v,
+      dataVersion: ch.dataVersion,
+      startIdx: k * 100,
+      endIdx: k * 100 + 5000,
+      pixelWidth: 800,
+      mode: 'minmax',
+      gapThreshold: Infinity,
+      readVal,
+    });
+  }
+  const finalStats = getDecimationCacheStats();
+  assert.ok(finalStats.size <= finalStats.maxEntries);
+  assert.ok(finalStats.evictions > 0);
+});
+
+test('Audit P2-Thermal-Modular: focThermal barrel re-exports preserve exact identity with internal submodules', () => {
+  assert.equal(computePhaseMosLosses, directComputePhaseMosLosses);
+  assert.equal(barrelSteadySolver, directSteadySolver);
+});
+
+test('Audit P3-Hardware-DPT-Template: honest null templates block unmeasured import, validate bounds & round-trip JSON/CSV', () => {
+  const jsonTemplate = createDptLutImportTemplate('BUK7Q6R0-40H');
+  assert.equal(jsonTemplate.schema, 'wave-test-dpt-4d-lut');
+  assert.equal(jsonTemplate.devicePartNumber, 'BUK7Q6R0-40H');
+  assert.equal(jsonTemplate.provenance, 'measured');
+  assert.ok(jsonTemplate.points.length >= 18);
+  assert.ok(jsonTemplate.points.every((p) => p.eOnUj === null && p.eOffUj === null && p.qRrNc === null));
+
+  // Unfilled JSON & CSV templates must be strictly blocked on import (never fabricate zeros/defaults)
+  assert.throws(() => parseDptLutImportText(JSON.stringify(jsonTemplate)), /不允许空白或 null 占位值/);
+  const csvTemplate = createDptLutImportCsvTemplate('BUK7Q6R0-40H');
+  assert.throws(() => parseDptLutImportText(csvTemplate), /不允许空白或 null 占位值/);
+
+  // Negative energy & invalid eOnSansQrrUj must be rejected with row diagnostics
+  assert.throws(
+    () =>
+      parseDptLutImportText(
+        'vBusV,iLoadA,tjC,rgOnOhm,rgOffOhm,eOnUj,eOffUj,qRrNc\n13.5,30,25,4.7,4.7,-1,10,13\n'
+      ),
+    /CSV 第 2 行.*超出物理允许范围/
+  );
+  assert.throws(
+    () =>
+      parseDptLutImportText(
+        'vBusV,iLoadA,tjC,rgOnOhm,rgOffOhm,eOnUj,eOffUj,qRrNc,eOnSansQrrUj\n13.5,30,25,4.7,4.7,12,10,13,15\n'
+      ),
+    /eOnSansQrrUj/
+  );
+
+  // Valid 9 / 13.5 / 16 V measured dataset round-trips cleanly via JSON and CSV
+  const samplePoints: DptOperatingPoint[] = [
+    { id: 'p1', vBusV: 9.0, iLoadA: 20, tjC: 25, rgOhm: 4.7, rgOnOhm: 4.7, rgOffOhm: 4.7, eOnUj: 8.5, eOffUj: 6.2, qRrNc: 11.0 },
+    { id: 'p2', vBusV: 13.5, iLoadA: 40, tjC: 75, rgOhm: 4.7, rgOnOhm: 4.7, rgOffOhm: 4.7, eOnUj: 19.2, eOffUj: 14.8, qRrNc: 13.0 },
+    { id: 'p3', vBusV: 16.0, iLoadA: 60, tjC: 125, rgOhm: 6.8, rgOnOhm: 6.8, rgOffOhm: 6.8, eOnUj: 31.4, eOffUj: 24.1, qRrNc: 15.2 },
+  ];
+  const jsonRound = parseDptLutImportText(serializeDptLutToJson(samplePoints, 'BUK7Q6R0-40H'));
+  assert.equal(jsonRound.format, 'json');
+  assert.equal(jsonRound.points.length, 3);
+  assert.equal(jsonRound.summary.coversAutomotive9to16V, true);
+  assert.equal(jsonRound.summary.statusGlyph, '●');
+
+  const csvRound = parseDptLutImportText(serializeDptLutToCsv(samplePoints, 'BUK7Q6R0-40H'));
+  assert.equal(csvRound.format, 'csv');
+  assert.equal(csvRound.points.length, 3);
+  assert.equal(csvRound.summary.coversAutomotive9to16V, true);
+  assert.ok(Math.abs(csvRound.points[1].eOnUj - 19.2) < 1e-9);
+
+  // Partial voltage range (12–14V) explicitly flags incomplete 9–16V coverage
+  const partialCov = summarizeDptLutCoverage([samplePoints[1]]);
+  assert.equal(partialCov.coversAutomotive9to16V, false);
+  assert.equal(partialCov.statusGlyph, '▲');
+});
+
+test('Audit P3-Hardware-PCB-Spatial: export/re-import round-trip & validation summary distinguish measured vs geometry estimate', () => {
+  const estSummary = summarizePcbSpatialNetwork({
+    ...DEFAULT_FOC_MODEL,
+    thermalTopologyMode: 'pcb_spatial_coupled',
+    spatialMatrix: {
+      copperOz: 2.0,
+      layoutPitchMm: 14,
+      provenance: 'geometry_estimated',
+    },
+  });
+  assert.equal(estSummary.valid, true);
+  assert.equal(estSummary.zoneCount, 6);
+  assert.equal(estSummary.statusGlyph, '▲');
+  assert.ok(estSummary.symmetryErrorMaxWPerC <= 1e-9);
+
+  const exportedDoc = exportPcbSpatialDocumentFromModel(
+    {
+      ...DEFAULT_FOC_MODEL,
+      thermalTopologyMode: 'pcb_spatial_coupled',
+      spatialMatrix: {
+        provenance: 'measured',
+        sourceLabel: 'Real 4-layer EVB Thermal Camera Fit',
+        zoneThermalCapJPerC: [0.32, 0.34, 0.28, 0.30, 0.33, 0.35],
+        zoneVerticalRthCPerW: [3.2, 3.1, 3.8, 3.7, 3.3, 3.2],
+        mutualConductanceMatrixWPerC: [
+          [0, 0.12, 0.04, 0.02, 0, 0],
+          [0.12, 0, 0.02, 0.04, 0, 0],
+          [0.04, 0.02, 0, 0.14, 0.04, 0.02],
+          [0.02, 0.04, 0.14, 0, 0.02, 0.04],
+          [0, 0, 0.04, 0.02, 0, 0.12],
+          [0, 0, 0.02, 0.04, 0.12, 0],
+        ],
+      },
+    },
+    'BUK7Q6R0-40H 12V Inverter RevB'
+  );
+  const reparsed = parsePcbSpatialImportJson(JSON.stringify(exportedDoc));
+  const importedSummary = summarizePcbSpatialNetwork(DEFAULT_FOC_MODEL, reparsed);
+  assert.equal(importedSummary.valid, true);
+  assert.equal(importedSummary.statusGlyph, '●');
+  assert.equal(importedSummary.couplingLinkCount, 11);
+  assert.ok(Math.abs(importedSummary.maxMutualConductanceWPerC - 0.14) < 1e-6);
+  assert.ok(importedSummary.symmetryErrorMaxWPerC <= 1e-9);
+});
+
+test('Audit MOS-Thermal: 4D DPT stall coupling, hot-range DPT seed, SPICE independent C parity, and -55°C ambient solve', () => {
+  // 1) Hot-range 4D DPT LUT [50, 150]°C with strong Tj dependence must NOT fail on hardcoded 25°C probe
+  //    AND must couple Tj-dependent switching loss into runFocStallSweep steady state.
+  const makeHotLut = (hotMultiplier: number): DptOperatingPoint[] => {
+    const pts: DptOperatingPoint[] = [];
+    for (const vBusV of [10, 20]) {
+      for (const iLoadA of [0, 30]) {
+        for (const tjC of [50, 150]) {
+          for (const rgOhm of [3.3, 10.0]) {
+            const scale = tjC === 150 ? hotMultiplier : 1.0;
+            const rgScale = 0.8 + 0.04 * rgOhm;
+            const eOn = (10 + 1.2 * iLoadA) * scale * rgScale;
+            const eOff = (8 + 1.0 * iLoadA) * scale * rgScale;
+            pts.push({
+              id: `pt_${vBusV}_${iLoadA}_${tjC}_${rgOhm}`,
+              vBusV,
+              iLoadA,
+              tjC,
+              rgOhm,
+              rgOnOhm: rgOhm,
+              rgOffOhm: rgOhm,
+              eOnUj: eOn,
+              eOffUj: eOff,
+              eOnSansQrrUj: eOn * 0.85,
+              qRrNc: 30 * scale,
+            });
+          }
+        }
+      }
+    }
+    return pts;
+  };
+
+  const baseMos = {
+    rdsOn25Mohm: 6.0,
+    tempCoeffAlphaPerC: 0.004,
+    vsdV: 0.8,
+    eonPlusEoffUj: 0,
+    vRefV: 14,
+    iRefA: 20,
+    qrrNc: 0,
+    eonIncludesQrr: true,
+    eossAlreadyIncludedInEsw: true,
+    rgOnOhm: 4.7,
+    rgOffOhm: 4.7,
+    rgProvenance: 'measured' as const,
+  };
+
+  const stallFlat = runFocStallSweep({
+    iPeakA: 20,
+    tjLimitC: 150,
+    tAmbC: 60,
+    modulation: 'SVPWM',
+    modDepthM: 0.6,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: { ...baseMos, dptLut: makeHotLut(1.0) },
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 14,
+    horizonSec: 10,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.1,
+  });
+  const stallHot = runFocStallSweep({
+    iPeakA: 20,
+    tjLimitC: 150,
+    tAmbC: 60,
+    modulation: 'SVPWM',
+    modDepthM: 0.6,
+    fswHz: 20000,
+    tDeadNs: 200,
+    mos: { ...baseMos, dptLut: makeHotLut(3.5) },
+    model: DEFAULT_FOC_MODEL,
+    vBusV: 14,
+    horizonSec: 10,
+    stallDutyMode: 'resistive',
+    rPhaseOhm: 0.1,
+  });
+  assert.ok(stallFlat.stallSteadyConverged && stallHot.stallSteadyConverged);
+  assert.ok(
+    stallHot.worstSteadyTjC > stallFlat.worstSteadyTjC + 0.5,
+    `4D DPT Tj-axis must raise stall steady Tj (flat=${stallFlat.worstSteadyTjC.toFixed(2)}°C, hot=${stallHot.worstSteadyTjC.toFixed(2)}°C)`
+  );
+
+  // Steady-state solver also works cleanly on hot-range [50, 150]°C DPT LUT at tAmbC = 60°C
+  const steadyHot = barrelSteadySolver({
+    model: DEFAULT_FOC_MODEL,
+    mos: { ...baseMos, dptLut: makeHotLut(2.0) },
+    ctrl: {
+      modulation: 'SVPWM',
+      modDepthM: 0.5,
+      pfAngleDeg: 10,
+      fswHz: 20000,
+      tDeadNs: 200,
+      tAmbC: 60,
+      vBusConstV: 14,
+    },
+    operatingPoint: { iqPeakA: 15, idPeakA: 0, electricalFrequencyHz: 100, mode: 'rotating' },
+    integrationSamples: 144,
+  });
+  assert.equal(steadyHot.steadyConverged, true);
+  assert.ok(steadyHot.tjMaxSteadyC > 60 && steadyHot.tjMaxSteadyC < 150);
+
+  // 2) Independent-mode SPICE export must emit custom per-zone spatial.cPcb[m] matching StarCoupled6MosThermalSolver
+  const customCaps = [0.21, 0.22, 0.23, 0.24, 0.25, 0.26];
+  const spiceIndep = focModelToSpice(
+    {
+      ...DEFAULT_FOC_MODEL,
+      thermalTopologyMode: 'independent',
+      spatialMatrix: {
+        provenance: 'measured',
+        zoneThermalCapJPerC: customCaps,
+      },
+    },
+    25
+  );
+  assert.ok(spiceIndep.includes(`C_BRD_AH_1 TBRD_AH 0 ${customCaps[0].toExponential(6)}`), 'SPICE independent C_BRD_AH_1 must match spatial.cPcb[0]');
+  assert.ok(spiceIndep.includes(`C_BRD_CL_1 TBRD_CL 0 ${customCaps[5].toExponential(6)}`), 'SPICE independent C_BRD_CL_1 must match spatial.cPcb[5]');
+
+  // 3) Sub--50°C automotive cold-chamber ambient (-55°C) must NOT clamp at -50°C
+  const coldSteady = solveCoupledThermalSteadyState({
+    pCond25W: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+    pFixedW: [0, 0, 0, 0, 0, 0],
+    alphaPerC: 0.004,
+    rJcTotalByArm: [1, 1, 1, 1, 1, 1],
+    rBrdTotal: 2,
+    tAmbC: -55,
+  });
+  assert.equal(coldSteady.converged, true);
+  assert.ok(coldSteady.tBoardSteadyC < -54 && coldSteady.tBoardSteadyC > -55, `Expected T_board near -54.6°C, got ${coldSteady.tBoardSteadyC}`);
+  assert.ok(coldSteady.tjSteadyC.every((t) => t < -54 && t > -55));
+});
+
+

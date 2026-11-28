@@ -8,11 +8,11 @@ import './index.css';
 import { OscilloscopeApp } from './engine/uiController';
 import { runAllTests } from './tests/testSuite';
 import { TabState, WaveformChannel, CursorMode, MeasurementGate, MeasurementMetricKey, ThemeId, CustomMeasurementUnitType } from './types/models';
-import { formatEng, getTimeBoundsForView, isComputedChannel } from './engine/canvasRenderer';
-import { getSavedThemeId } from './modules/themeManager';
+import { formatEng, formatMeasurementMetricValue, getTimeBoundsForView, isComputedChannel } from './engine/canvasRenderer';
+import { getSavedThemeId, resolveChannelTextColor, THEME_PRESETS } from './modules/themeManager';
 import { LtspiceFileWatcher } from './modules/ltspiceWatcher';
 import { setupToolDrawer } from './modules/toolDrawer';
-import { fitChannelTo125 } from './modules/oscilloscopeScale';
+import { fitChannelTo125, getTimebaseInfo } from './modules/oscilloscopeScale';
 import { MEASUREMENT_DEFINITIONS, CUSTOM_MEASUREMENT_PRESETS } from './modules/measurements';
 import { estimateSpeedFromSignal, computeTwoChannelPhaseDiff } from './modules/motorAnalysis';
 import { runBatchAnalysisOnFiles, exportBatchResultsCSV, BatchFileRow } from './modules/batchAnalyzer';
@@ -30,12 +30,19 @@ import {
   alignAndInterpolateReference,
   buildMappedReferenceTrace,
   computeAutoTimeAlignShift,
+  computeAutoTimeAlignDetailed,
   computeWaveformCompareMetrics,
+  exportCompareSummaryCsv,
   parseReferenceFileToChannels,
   computeFileFingerprint,
   detectRecommendedTimeScale,
+  canApplyCompareOverlay,
+  AutoAlignMode,
+  CompareStatus,
   WaveformCompareMetrics,
 } from './modules/waveformCompare';
+import { previewMathExpression } from './modules/mathParser';
+import { FocMissionStage } from './modules/focThermal';
 import { evaluateGoldenTolerance } from './modules/anomalyScanner';
 import { setupDraggableModals } from './modules/draggableModals';
 import {
@@ -80,6 +87,7 @@ interface CompareQueueEntry {
     pass: boolean;
     violationCount: number;
     valid: boolean;
+    status?: CompareStatus;
     reason?: string;
   };
 }
@@ -99,6 +107,7 @@ let activeWorkspace: 'scope' | 'focDyno' = 'scope';
 
 function switchWorkspace(target: 'scope' | 'focDyno') {
   activeWorkspace = target;
+  document.body.dataset.workspace = target;
   const scopeMain = document.getElementById('scopeWorkspaceMain');
   const dynoView = document.getElementById('focDynoLabView');
   const wsScopeBtn = document.getElementById('wsScopeBtn');
@@ -110,16 +119,8 @@ function switchWorkspace(target: 'scope' | 'focDyno') {
   if (dynoView) dynoView.classList.toggle('hidden', isScope);
   if (togglePanelBtn) togglePanelBtn.classList.toggle('hidden', !isScope);
 
-  if (wsScopeBtn) {
-    wsScopeBtn.className = isScope
-      ? 'px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold whitespace-nowrap cursor-pointer'
-      : 'px-2 py-0.5 rounded-xs text-slate-300 hover:text-white whitespace-nowrap cursor-pointer';
-  }
-  if (wsDynoBtn) {
-    wsDynoBtn.className = !isScope
-      ? 'px-2 py-0.5 rounded-xs bg-cyan-600 text-slate-950 font-semibold whitespace-nowrap cursor-pointer'
-      : 'px-2 py-0.5 rounded-xs text-slate-300 hover:text-white whitespace-nowrap cursor-pointer';
-  }
+  wsScopeBtn?.setAttribute('aria-pressed', isScope ? 'true' : 'false');
+  wsDynoBtn?.setAttribute('aria-pressed', !isScope ? 'true' : 'false');
 
   if (isScope) {
     requestAnimationFrame(() => app?.handleResize());
@@ -131,12 +132,17 @@ function switchWorkspace(target: 'scope' | 'focDyno') {
 function syncLtspiceWatchUI() {
   const tab = app?.getActiveTab() || null;
   const entry = ltspiceWatcher?.getEntry(tab?.id || null) || null;
+  const strip = document.getElementById('ltspiceHeaderStatusStrip');
   const reloadBtn = document.getElementById('reloadLtspiceBtn');
   const autoWrap = document.getElementById('ltspiceAutoWrap');
   const autoChk = document.getElementById('autoLtspiceChk') as HTMLInputElement | null;
   const badge = document.getElementById('ltspiceWatchBadge');
 
   if (entry) {
+    if (strip) {
+      strip.classList.remove('hidden');
+      strip.classList.add('flex');
+    }
     reloadBtn?.classList.remove('hidden');
     if (autoWrap) {
       autoWrap.classList.remove('hidden');
@@ -145,9 +151,13 @@ function syncLtspiceWatchUI() {
     if (autoChk) autoChk.checked = entry.autoReload;
     if (badge) {
       badge.classList.remove('hidden');
-      badge.innerText = entry.autoReload ? 'LIVE' : 'PAUSED';
+      badge.innerText = entry.autoReload ? '实时' : '暂停';
     }
   } else {
+    if (strip) {
+      strip.classList.add('hidden');
+      strip.classList.remove('flex');
+    }
     reloadBtn?.classList.add('hidden');
     if (autoWrap) {
       autoWrap.classList.add('hidden');
@@ -197,6 +207,42 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // Forward Tool Drawer notifications (e.g. max 3 tabs eviction) to unified Toast
+  window.addEventListener('wvp-drawer-notify', (ev: Event) => {
+    const detail = (ev as CustomEvent<{ message: string; level?: 'info' | 'warn' | 'error' }>).detail;
+    if (detail?.message) {
+      app.showToast(detail.message, detail.level || 'info');
+    }
+  });
+
+  // Right-panel collapsible accordions with localStorage persistence
+  const accordionStorageKey = 'wvp_right_accordions_v1';
+  let savedAccordions: Record<string, boolean> = {};
+  try {
+    const raw = localStorage.getItem(accordionStorageKey);
+    if (raw) savedAccordions = JSON.parse(raw) || {};
+  } catch {
+    savedAccordions = {};
+  }
+  document.querySelectorAll('.wvp-accordion-section[data-accordion-key]').forEach((sec) => {
+    const key = sec.getAttribute('data-accordion-key') || '';
+    if (key && savedAccordions[key] === true) {
+      sec.classList.add('is-collapsed');
+    }
+    const header = sec.querySelector('.wvp-accordion-header');
+    header?.addEventListener('click', () => {
+      const collapsed = sec.classList.toggle('is-collapsed');
+      if (key) {
+        savedAccordions[key] = collapsed;
+        try {
+          localStorage.setItem(accordionStorageKey, JSON.stringify(savedAccordions));
+        } catch {
+          // ignore storage error
+        }
+      }
+    });
+  });
+
   bindToolbarActions();
   bindFrontPanelControls();
   bindModals();
@@ -223,6 +269,12 @@ window.addEventListener('DOMContentLoaded', () => {
           switchWorkspace('scope');
           requestAnimationFrame(() => {
             thermalCtrl?.loadExternalFocAnalysis(payload);
+          });
+        },
+        onAppendMissionStage: (stage: FocMissionStage) => {
+          switchWorkspace('scope');
+          requestAnimationFrame(() => {
+            thermalCtrl?.appendMissionStageFromDyno(stage, true);
           });
         },
         onNotify: (msg, level = 'info') => app.showToast(msg, level),
@@ -255,7 +307,7 @@ function bindToolbarActions() {
     if (!res.ok && res.reason) {
       app.showToast(res.reason, 'warn');
     } else if (res.ok) {
-      app.showToast('LTspice file linked. Auto-reload on simulation rerun is active.', 'info');
+      app.showToast('已关联 LTspice 文件，仿真重跑后将自动重载波形。', 'info');
     }
     syncLtspiceWatchUI();
   });
@@ -264,7 +316,7 @@ function bindToolbarActions() {
     const tab = app.getActiveTab();
     if (tab && ltspiceWatcher) {
       const ok = await ltspiceWatcher.forceReload(tab.id);
-      if (!ok) app.showToast('No watched LTspice file handle linked to active tab.', 'warn');
+      if (!ok) app.showToast('当前标签页未关联可热重载的 LTspice 文件。', 'warn');
     }
   });
 
@@ -286,10 +338,14 @@ function bindToolbarActions() {
   document.getElementById('themeSelect')?.addEventListener('change', (e: any) => {
     const themeId = e.target.value as ThemeId;
     app.setTheme(themeId, true);
+    const tab = app.getActiveTab();
     const cmpModal = document.getElementById('compareModal');
-    if (cmpModal && cmpModal.style.display === 'flex') {
-      const tab = app.getActiveTab();
-      if (tab) recomputeComparePanel(tab);
+    if (cmpModal && cmpModal.style.display === 'flex' && tab) {
+      recomputeComparePanel(tab);
+    }
+    const measModal = document.getElementById('measureModal');
+    if (measModal && measModal.style.display === 'flex' && tab) {
+      renderMeasureModalCheckboxes(tab);
     }
     filterCtrl?.syncIfOpen();
   });
@@ -315,7 +371,14 @@ function bindToolbarActions() {
     });
   });
   document.querySelectorAll('.wvp-dropdown-menu button').forEach((item) => {
-    item.addEventListener('click', () => closeAllDropdowns());
+    item.addEventListener('click', () => {
+      if (!item.closest('.wvp-dropdown-keep-open')) {
+        closeAllDropdowns();
+      }
+    });
+  });
+  document.querySelectorAll('.wvp-dropdown-keep-open').forEach((el) => {
+    el.addEventListener('click', (e) => e.stopPropagation());
   });
   document.addEventListener('click', (e) => {
     if (!(e.target as HTMLElement)?.closest('.wvp-dropdown')) {
@@ -363,6 +426,12 @@ function bindToolbarActions() {
   });
 
   // Dynamic Measurement Strip Actions
+  document.getElementById('stripMeasStatsToggleBtn')?.addEventListener('click', () => {
+    app.toggleMeasurementStats();
+  });
+  document.getElementById('stripCopyMeasBtn')?.addEventListener('click', () => {
+    void app.copyMeasurementStripTable();
+  });
   document.getElementById('stripAddMeasBtn')?.addEventListener('click', () => {
     const tab = app.getActiveTab();
     if (tab) openMeasureModal(tab);
@@ -372,7 +441,13 @@ function bindToolbarActions() {
     const tab = app.getActiveTab();
     if (tab) {
       tab.measurementGate = e.target.value as MeasurementGate;
+      const modalGate = document.getElementById('measureModalGateSelect') as HTMLSelectElement | null;
+      if (modalGate) modalGate.value = tab.measurementGate;
       app.renderMeasurementStrip(tab);
+      const measModal = document.getElementById('measureModal');
+      if (measModal && measModal.style.display === 'flex') {
+        renderMeasureModalCheckboxes(tab);
+      }
     }
   });
 
@@ -444,7 +519,7 @@ function bindToolbarActions() {
   document.getElementById('exportCsvSpectrumBtn')?.addEventListener('click', () => app.exportSpectrumCSV());
   const triggerOfflineHtmlDownload = async () => {
     if (window.location.protocol === 'file:') {
-      app.showToast('You are already running the standalone offline HTML file.');
+      app.showToast('当前已经在运行独立的离线 HTML 文件。');
       return;
     }
     try {
@@ -474,9 +549,9 @@ function bindToolbarActions() {
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      app.showToast('Downloaded standalone offline HTML (waveform-viewer-pro.html).');
+      app.showToast('已下载离线独立单页版（waveform-viewer-pro.html）。');
     } catch (err: any) {
-      app.showToast(`Offline HTML download failed: ${err?.message || 'Unavailable'}`, 'error');
+      app.showToast(`离线 HTML 下载失败：${err?.message || '暂不可用'}`, 'error');
     }
   };
   document.getElementById('exportStandaloneHtmlBtn')?.addEventListener('click', triggerOfflineHtmlDownload);
@@ -495,9 +570,14 @@ function bindFrontPanelControls() {
   colorInp?.addEventListener('input', () => {
     const tab = app.getActiveTab();
     const ch = tab && tab.channels[tab.activeChannelId || ''];
-    if (ch) {
+    if (tab && ch) {
       ch.color = colorInp.value;
       app.renderSidebar();
+      app.renderMeasurementStrip(tab);
+      const measModal = document.getElementById('measureModal');
+      if (measModal && measModal.style.display === 'flex') {
+        renderMeasureModalCheckboxes(tab);
+      }
       app.draw();
     }
   });
@@ -573,6 +653,58 @@ function bindFrontPanelControls() {
       const divs = parseFloat(offsetSlider.value);
       const vPerDiv = ch.voltsPerDiv || (ch.vMax - ch.vMin) / 8 || 1;
       app.setChannelOffset(ch.id, divs * vPerDiv);
+    }
+  });
+
+  // --- 1b. Direct Per-Channel Horizontal Time Shift Δt Controls ---
+  const getTimeShiftNudgeStep = (tab: TabState, ch: WaveformChannel, shiftKey: boolean): number => {
+    const tb = getTimebaseInfo(tab);
+    const chDt = ch.dt || (ch.t.length >= 2 ? Math.abs(ch.t[1] - ch.t[0]) : 1e-4);
+    const spanStep = tb.totalSpanSec > 0 ? tb.totalSpanSec * 0.01 : 1e-4;
+    const baseStep = Math.max(1e-12, Math.min(chDt > 0 ? chDt * 10 : spanStep, spanStep));
+    return baseStep * (shiftKey ? 10 : 1);
+  };
+
+  document.getElementById('chTimeShiftDecBtn')?.addEventListener('click', (ev) => {
+    const tab = app.getActiveTab();
+    const ch = tab && tab.channels[tab.activeChannelId || ''];
+    if (!tab || !ch) return;
+    const step = getTimeShiftNudgeStep(tab, ch, (ev as MouseEvent).shiftKey);
+    app.setChannelsTimeShift([ch.id], (ch.timeShiftSec || 0) - step, true);
+  });
+
+  document.getElementById('chTimeShiftIncBtn')?.addEventListener('click', (ev) => {
+    const tab = app.getActiveTab();
+    const ch = tab && tab.channels[tab.activeChannelId || ''];
+    if (!tab || !ch) return;
+    const step = getTimeShiftNudgeStep(tab, ch, (ev as MouseEvent).shiftKey);
+    app.setChannelsTimeShift([ch.id], (ch.timeShiftSec || 0) + step, true);
+  });
+
+  const chTimeShiftInp = document.getElementById('chTimeShiftInput') as HTMLInputElement | null;
+  chTimeShiftInp?.addEventListener('change', () => {
+    const tab = app.getActiveTab();
+    const ch = tab && tab.channels[tab.activeChannelId || ''];
+    if (!tab || !ch) return;
+    const val = parseFloat(chTimeShiftInp.value);
+    if (!Number.isFinite(val)) {
+      chTimeShiftInp.value = String(ch.timeShiftSec || 0);
+      return;
+    }
+    app.setChannelsTimeShift([ch.id], val, true);
+  });
+
+  document.getElementById('chTimeShiftSnapBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (tab?.activeChannelId) {
+      app.snapChannelStartToPrimary(tab.activeChannelId);
+    }
+  });
+
+  document.getElementById('chTimeShiftZeroBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (tab?.activeChannelId) {
+      app.resetChannelsTimeShift([tab.activeChannelId], true);
     }
   });
 
@@ -680,10 +812,16 @@ function bindModals() {
   document.getElementById('csvLoadResampleBtn')?.addEventListener('click', () => {
     app.confirmCsvImport(true);
   });
-  document.getElementById('csvCancelBtn')?.addEventListener('click', () => {
+  document.getElementById('csvApplyRulesAllBtn')?.addEventListener('click', () => {
+    app.applyCsvRulesToAllQueued();
+  });
+  const closeCsvImportModal = () => {
+    app.clearPendingCsvImport();
     const m = document.getElementById('csvQualityModal');
     if (m) m.style.display = 'none';
-  });
+  };
+  document.getElementById('csvCancelBtn')?.addEventListener('click', closeCsvImportModal);
+  document.getElementById('csvCancelBottomBtn')?.addEventListener('click', closeCsvImportModal);
 
   // Math Modal
   document.getElementById('mathApplyBtn')?.addEventListener('click', () => {
@@ -711,6 +849,16 @@ function bindModals() {
         errBox.classList.remove('hidden');
       }
     }
+  });
+
+  let mathPreviewTimer: number | null = null;
+  document.getElementById('mathExprInput')?.addEventListener('input', () => {
+    if (mathPreviewTimer !== null) window.clearTimeout(mathPreviewTimer);
+    mathPreviewTimer = window.setTimeout(() => {
+      mathPreviewTimer = null;
+      const tab = app.getActiveTab();
+      if (tab) updateMathLivePreview(tab);
+    }, 120);
   });
 
   document.getElementById('mathCancelBtn')?.addEventListener('click', () => {
@@ -832,7 +980,7 @@ function bindModals() {
     const validRpm = Number.isFinite(rpm) && rpm > 0;
 
     if (enableChk.checked && (!validRpm || !validPoles)) {
-      app.showToast('Harmonic markers require valid RPM (> 0) and integer rotor pole pairs (p >= 1).', 'warn');
+      app.showToast('谐波标尺需要有效的转速 RPM (> 0) 与整数极对数 (p ≥ 1)。', 'warn');
     }
 
     tab.motorConfig.enabled = enableChk.checked;
@@ -884,7 +1032,10 @@ function bindModals() {
     const tab = app.getActiveTab();
     if (tab) {
       tab.measurementGate = e.target.value as MeasurementGate;
+      const stripGate = document.getElementById('stripMeasGateSelect') as HTMLSelectElement | null;
+      if (stripGate) stripGate.value = tab.measurementGate;
       app.renderMeasurementStrip(tab);
+      renderMeasureModalCheckboxes(tab);
     }
   });
   document.getElementById('measureSelectAllChBtn')?.addEventListener('click', () => {
@@ -935,9 +1086,9 @@ function bindModals() {
       if (labelInp) labelInp.value = '';
       if (exprInp) exprInp.value = '';
       renderMeasureModalCheckboxes(tab);
-      app.showToast(`Added custom metric "${label}".`, 'info');
+      app.showToast(`已添加自定义测量项「${label}」。`, 'info');
     } catch (err: any) {
-      app.showToast(err?.message || 'Failed to add custom metric.', 'error');
+      app.showToast(err?.message || '添加自定义测量项失败。', 'error');
     }
   });
 
@@ -1074,7 +1225,7 @@ function bindModals() {
   document.getElementById('goldenTolInput')?.addEventListener('change', () => syncGoldenFromUI(false));
   document.getElementById('goldenCaptureBtn')?.addEventListener('click', () => {
     syncGoldenFromUI(true);
-    app.showToast('Captured current waveform as Golden Tolerance Reference.', 'info');
+    app.showToast('已捕获当前波形作为 Golden 容差基准包络。', 'info');
   });
 
   // Real-Time Proportional Δt Shift Controls inside Edit/Ref Modal
@@ -1366,7 +1517,7 @@ function bindModals() {
           addedCount++;
         });
       } catch (err: any) {
-        app.showToast(`Failed to load ${file.name}: ${err?.message || err}`, 'error');
+        app.showToast(`加载 ${file.name} 失败：${err?.message || err}`, 'error');
       }
     }
 
@@ -1381,7 +1532,7 @@ function bindModals() {
     } else if (skippedDupCount > 0 && excelFiles.length === 0) {
       app.showToast(`检测到 ${skippedDupCount} 个完全相同的文件（文件名+内容一致），已自动跳过重复加载。`, 'warn');
     } else if (addedCount === 0 && excelFiles.length === 0) {
-      app.showToast('No waveform channels found in selected file(s).', 'warn');
+      app.showToast('所选文件中未检测到有效波形通道。', 'warn');
     }
 
     if (excelFiles.length > 0) {
@@ -1471,7 +1622,28 @@ function bindModals() {
     const tab = app.getActiveTab();
     if (tab) recomputeComparePanel(tab);
   };
-  document.getElementById('cmpTargetSelect')?.addEventListener('change', refreshCompare);
+  document.getElementById('cmpTargetSelect')?.addEventListener('change', () => {
+    const tab = app.getActiveTab();
+    if (!tab) return;
+    const autoChk = (document.getElementById('cmpAutoFitOnAddChk') as HTMLInputElement)?.checked ?? true;
+    const newTarget = getCompareTargetChannel(tab);
+    if (autoChk && newTarget) {
+      compareQueue.forEach((entry) => {
+        const rec = detectRecommendedTimeScale(newTarget, entry.channel);
+        const curScale = entry.timeScale || 1;
+        const rT0 = entry.channel.t[0] ?? 0;
+        const rT1 = rT0 + ((entry.channel.t[entry.channel.t.length - 1] ?? rT0) - rT0) * curScale + (entry.timeShiftSec || 0);
+        const rS0 = rT0 + (entry.timeShiftSec || 0);
+        const tS0 = newTarget.t[0] ?? 0;
+        const tS1 = newTarget.t[newTarget.t.length - 1] ?? tS0;
+        const hasOverlap = Math.min(rT1, tS1) > Math.max(rS0, tS0);
+        if (!hasOverlap || rec.isLargeMismatch) {
+          applyAutoAlignToEntry(newTarget, entry, false);
+        }
+      });
+    }
+    recomputeComparePanel(tab);
+  });
   document.getElementById('cmpPaletteModeSelect')?.addEventListener('change', refreshCompare);
   document.getElementById('cmpTagTargetChk')?.addEventListener('change', refreshCompare);
   document.getElementById('cmpGroupNameInput')?.addEventListener('input', refreshCompare);
@@ -1499,22 +1671,52 @@ function bindModals() {
       compareQueue.push(entry);
       return true;
     }
-    app.showToast('Add at least one file or channel to the comparison group first.', 'warn');
+    app.showToast('请先向对比组添加至少一个文件或参考通道。', 'warn');
     return false;
   };
 
-  const runCompareAutoAlignAll = (mode: 'start' | 'rising-edge' | 'first-peak' | 'xcorr') => {
+  const runCompareAutoAlignAll = (mode: AutoAlignMode) => {
     const tab = app.getActiveTab();
     if (!tab || !ensureQueueHasItem(tab)) return;
     const targetCh = getCompareTargetChannel(tab);
     if (!targetCh) return;
+    const thresholdPct = parseFloat((document.getElementById('cmpEdgeThreshSelect') as HTMLSelectElement)?.value || '50') || 50;
+    const viewOnly = !!(document.getElementById('cmpAlignViewOnlyChk') as HTMLInputElement)?.checked;
+    const targetWindow = viewOnly ? getTimeBoundsForView(tab, targetCh) : undefined;
+    const diagLines: string[] = [];
+    let hasWarning = false;
     compareQueue.forEach((entry) => {
-      entry.timeShiftSec = computeAutoTimeAlignShift(targetCh, entry.channel, mode, entry.timeScale || 1);
+      const detail = computeAutoTimeAlignDetailed(targetCh, entry.channel, mode, entry.timeScale || 1, {
+        thresholdPct,
+        targetTimeWindow: targetWindow ? { tStart: targetWindow.tStart, tEnd: targetWindow.tEnd } : undefined,
+      });
+      entry.timeShiftSec = detail.shiftSec;
+      const shiftStr = formatEng(detail.shiftSec, 's', 3);
+      if (detail.warning) {
+        hasWarning = true;
+        diagLines.push(`▲ ${entry.label}: Δt=${shiftStr} · ${detail.warning}`);
+      } else if (typeof detail.confidenceR === 'number') {
+        diagLines.push(`${entry.label}: Δt=${shiftStr} · 相关系数 r=${detail.confidenceR.toFixed(4)}`);
+      } else {
+        diagLines.push(`${entry.label}: Δt=${shiftStr}`);
+      }
     });
+    const diagEl = document.getElementById('cmpAlignDiagBanner');
+    if (diagEl) {
+      if (diagLines.length > 0) {
+        diagEl.textContent = diagLines.slice(0, 3).join('  |  ') + (diagLines.length > 3 ? ` (+${diagLines.length - 3}条)` : '');
+        diagEl.className = hasWarning
+          ? 'w-full px-2 py-1 rounded-xs bg-amber-950/50 border border-amber-500/60 font-mono text-[11px] text-amber-200'
+          : 'w-full px-2 py-1 rounded-xs bg-[#111821] border border-[#26313d] font-mono text-[11px] text-cyan-200';
+      } else {
+        diagEl.classList.add('hidden');
+      }
+    }
     recomputeComparePanel(tab);
   };
   document.getElementById('cmpAlignStartBtn')?.addEventListener('click', () => runCompareAutoAlignAll('start'));
   document.getElementById('cmpAlignEdgeBtn')?.addEventListener('click', () => runCompareAutoAlignAll('rising-edge'));
+  document.getElementById('cmpAlignFallEdgeBtn')?.addEventListener('click', () => runCompareAutoAlignAll('falling-edge'));
   document.getElementById('cmpAlignPeakBtn')?.addEventListener('click', () => runCompareAutoAlignAll('first-peak'));
   document.getElementById('cmpAlignXCorrBtn')?.addEventListener('click', () => runCompareAutoAlignAll('xcorr'));
   document.getElementById('cmpMatchSpanBtn')?.addEventListener('click', () => {
@@ -1524,7 +1726,7 @@ function bindModals() {
     if (!targetCh) return;
     compareQueue.forEach((entry) => applyAutoAlignToEntry(targetCh, entry, true));
     recomputeComparePanel(tab);
-    app.showToast('Matched time span (ms↔s) and aligned initial t0 for all queued waveforms.', 'info');
+    app.showToast('已为队列中所有参考波形匹配时间量纲（ms↔s）并对齐初始起点 t₀。', 'info');
   });
   document.getElementById('cmpAlignResetBtn')?.addEventListener('click', () => {
     compareQueue.forEach((entry) => {
@@ -1532,6 +1734,8 @@ function bindModals() {
       entry.timeScale = 1;
       entry.autoScaledFrom = undefined;
     });
+    const diagEl = document.getElementById('cmpAlignDiagBanner');
+    if (diagEl) diagEl.classList.add('hidden');
     refreshCompare();
   });
 
@@ -1544,7 +1748,7 @@ function bindModals() {
     if (!tab) return;
     if (tab.goldenBand) tab.goldenBand.enabled = false;
     app.draw();
-    app.showToast('Cleared Golden tolerance band.', 'info');
+    app.showToast('已清除 Golden 容差带。', 'info');
   });
 
   const applyCompareGroupFromUI = (opts: { overlayRefs: boolean; addDiffs: boolean }) => {
@@ -1565,12 +1769,21 @@ function bindModals() {
     const groupId = editingCompareGroupId || `grp_${groupNameRaw.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now().toString(36)}`;
     const colorOffset = tagTarget ? 1 : 0;
 
-    const validEntries = compareQueue.filter((e) => e.computed?.valid);
+    const validEntries = compareQueue.filter((e) =>
+      canApplyCompareOverlay(
+        e.computed?.status,
+        e.computed?.fullRefT,
+        opts.overlayRefs,
+        Boolean(e.computed?.valid)
+      )
+    );
     const skippedCount = compareQueue.length - validEntries.length;
     if (validEntries.length === 0) {
       const firstReason = compareQueue.find((e) => e.computed?.reason)?.computed?.reason;
       app.showToast(
-        firstReason || 'Cannot apply compare group: all reference traces failed unit/overlap validation.',
+        opts.overlayRefs
+          ? firstReason || '无法叠加到 Scope：参考波形单位不兼容或缺少有效时间样本。'
+          : firstReason || '无法生成差值通道：请先调整 Δt 使参考波形与目标产生重叠，或点击「应用到 Scope」直接叠加查看。',
         'error'
       );
       return;
@@ -1586,9 +1799,12 @@ function bindModals() {
       fullRefV: entry.computed!.fullRefV,
     }));
 
+    const hasPartialDisjoint = opts.overlayRefs && validEntries.some((e) => !e.computed?.valid);
     if (skippedCount > 0) {
-      app.showToast(`Skipped ${skippedCount} invalid/non-overlapping reference trace(s) before applying.`, 'warn');
+      app.showToast(`已跳过 ${skippedCount} 条单位不兼容或无重叠的参考波形。`, 'warn');
     }
+
+    const canDrawGolden = Boolean(opts.overlayRefs && enableGolden && validEntries[0]?.computed?.valid);
 
     app.applyMultiCompareGroup(
       tgtId,
@@ -1600,7 +1816,7 @@ function bindModals() {
         targetColor: tagTarget && paletteMode === 'family' ? getCompareGroupTraceColor(theme.id, 0, 'family') : undefined,
         tagTargetChannel: tagTarget,
         overlayRefTraces: opts.overlayRefs,
-        enableGoldenBand: opts.overlayRefs && enableGolden,
+        enableGoldenBand: canDrawGolden,
         goldenMode: tolMode,
         goldenTolerance: isFinite(tolVal) && tolVal > 0 ? tolVal : 5,
         minCoveragePct,
@@ -1618,13 +1834,51 @@ function bindModals() {
     if (!editingCompareGroupId) compareGroupCounter++;
     app.showToast(
       opts.addDiffs && !opts.overlayRefs
-        ? `Added ${payloadItems.length} diff trace(s) in group [${groupNameRaw}].`
-        : `Overlaid ${payloadItems.length} waveform(s) in group [${groupNameRaw}].`,
-      'info'
+        ? `已在对比组 [${groupNameRaw}] 中生成 ${payloadItems.length} 条差值通道。`
+        : hasPartialDisjoint
+        ? `已将 ${payloadItems.length} 条波形叠加到 Scope（部分时间轴暂未重叠，时间轴已按最长展开，可微调 Δt）。`
+        : `已在对比组 [${groupNameRaw}] 中叠加 ${payloadItems.length} 条波形到 Scope。`,
+      hasPartialDisjoint ? 'warn' : 'info'
     );
     closeCompareModal();
   };
 
+  document.getElementById('cmpExportCsvBtn')?.addEventListener('click', () => {
+    const tab = app.getActiveTab();
+    if (!tab || compareQueue.length === 0) {
+      app.showToast('对比队列为空，请先添加参考波形。', 'warn');
+      return;
+    }
+    recomputeComparePanel(tab);
+    const targetCh = getCompareTargetChannel(tab);
+    const targetLabel = targetCh ? `${targetCh.name} (${targetCh.unit || 'V'})` : 'Target';
+    const validRows = compareQueue
+      .filter((entry) => Boolean(entry.computed?.metrics))
+      .map((entry) => ({
+        refLabel: entry.label,
+        sourceName: entry.channel.name,
+        unit: entry.channel.unit || 'V',
+        timeScale: entry.timeScale || 1,
+        timeShiftSec: entry.timeShiftSec || 0,
+        metrics: entry.computed!.metrics,
+        toleranceStatus: !entry.computed!.valid
+          ? `INVALID (${entry.computed!.reason || 'validation failed'})`
+          : entry.computed!.pass
+          ? 'PASS'
+          : `FAIL (${entry.computed!.violationCount} violations)`,
+      }));
+    const csv = exportCompareSummaryCsv(targetLabel, validRows);
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `wave-compare-summary-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 600);
+    app.showToast(`已导出 ${compareQueue.length} 条对比指标 CSV 报表。`, 'info');
+  });
   document.getElementById('cmpAddDiffBtn')?.addEventListener('click', () => {
     applyCompareGroupFromUI({ overlayRefs: false, addDiffs: true });
   });
@@ -1684,7 +1938,7 @@ function bindModals() {
   batchFolderInp?.addEventListener('change', () => onBatchFilesSelected(batchFolderInp.files));
   document.getElementById('batchRunBtn')?.addEventListener('click', async () => {
     if (batchQueuedFiles.length === 0) {
-      app.showToast('Select CSV/Excel/WFM files or a folder first.', 'warn');
+      app.showToast('请先选择 CSV / Excel / WFM 文件或文件夹。', 'warn');
       return;
     }
     const chIdx = Math.max(0, (parseInt((document.getElementById('batchChIndexInput') as HTMLInputElement)?.value || '1', 10) || 1) - 1);
@@ -1709,7 +1963,7 @@ function bindModals() {
         files: excelFiles,
         colors: ['#facc15', '#22d3ee', '#f472b6', '#4ade80'],
         onConfirm: async (res) => {
-          if (lbl) lbl.innerText = `Analyzing ${standardFiles.length + res.items.length} file(s)/sheet(s)...`;
+          if (lbl) lbl.innerText = `正在分析 ${standardFiles.length + res.items.length} 个文件/工作表...`;
           lastBatchRows = await runBatchAnalysisOnFiles(
             standardFiles,
             chIdx,
@@ -1718,7 +1972,7 @@ function bindModals() {
             thresholds,
             res.items
           );
-          if (lbl) lbl.innerText = `Completed: ${lastBatchRows.length} item(s).`;
+          if (lbl) lbl.innerText = `已完成：共 ${lastBatchRows.length} 项。`;
           renderBatchTable(lastBatchRows);
         },
         onNotify: (msg, level) => app.showToast(msg, level),
@@ -1726,7 +1980,7 @@ function bindModals() {
       return;
     }
 
-    if (lbl) lbl.innerText = `Analyzing ${batchQueuedFiles.length} files...`;
+    if (lbl) lbl.innerText = `正在分析 ${batchQueuedFiles.length} 个文件...`;
     lastBatchRows = await runBatchAnalysisOnFiles(
       batchQueuedFiles,
       chIdx,
@@ -1734,16 +1988,16 @@ function bindModals() {
       'entire',
       thresholds
     );
-    if (lbl) lbl.innerText = `Completed: ${lastBatchRows.length} file(s).`;
+    if (lbl) lbl.innerText = `已完成：共 ${lastBatchRows.length} 个文件。`;
     renderBatchTable(lastBatchRows);
   });
   document.getElementById('batchExportCsvBtn')?.addEventListener('click', () => {
     if (lastBatchRows.length === 0) {
-      app.showToast('Run a batch measurement first before exporting.', 'warn');
+      app.showToast('请先执行批量测量后再导出汇总表。', 'warn');
       return;
     }
     const fname = exportBatchResultsCSV(lastBatchRows, BATCH_EXPORT_METRICS);
-    app.showToast(`Exported ${fname}`, 'info');
+    app.showToast(`已导出 ${fname}`, 'info');
   });
 
   // Workbench Presets Modal
@@ -1760,7 +2014,7 @@ function bindModals() {
     savePresetToStorage(preset);
     if (nameInp) nameInp.value = '';
     renderPresetsList();
-    app.showToast(`Saved template "${preset.name}".`, 'info');
+    app.showToast(`已保存分析模板「${preset.name}」。`, 'info');
   });
 
   // BLDC Motor & Inverter Diagnostics Suite Modal
@@ -1829,7 +2083,7 @@ function bindModals() {
     if (!ph) return;
     const derived = computeBldcDerivedTraces(ph.chU, ph.chV, ph.chW);
     if (!derived.valid || derived.time.length < 2) {
-      app.showToast(derived.warnings[0] || 'No valid synchronized timebase or compatible units for 3-phase traces.', 'error');
+      app.showToast(derived.warnings[0] || '三相波形缺少有效同步时间基准或单位不兼容。', 'error');
       return;
     }
     const unit = derived.unit || ph.chU.unit || 'V';
@@ -1866,7 +2120,7 @@ function bindModals() {
       },
     ]);
     app.showToast(
-      derived.warnings.length > 0 ? `Added Line-to-Line traces (${derived.warnings[0]})` : 'Added Line-to-Line traces: Uuv, Uvw, Uwu',
+      derived.warnings.length > 0 ? `已添加线间波形（${derived.warnings[0]}）` : '已添加线间波形：Uuv、Uvw、Uwu',
       derived.warnings.length > 0 ? 'warn' : 'info'
     );
   });
@@ -1878,7 +2132,7 @@ function bindModals() {
     if (!ph) return;
     const derived = computeBldcDerivedTraces(ph.chU, ph.chV, ph.chW);
     if (!derived.valid || derived.time.length < 2) {
-      app.showToast(derived.warnings[0] || 'No valid synchronized timebase or compatible units for 3-phase traces.', 'error');
+      app.showToast(derived.warnings[0] || '三相波形缺少有效同步时间基准或单位不兼容。', 'error');
       return;
     }
     const unit = derived.unit || ph.chU.unit || 'V';
@@ -1895,7 +2149,7 @@ function bindModals() {
       },
     ]);
     app.showToast(
-      derived.warnings.length > 0 ? `Added Zero-Sequence V0 (${derived.warnings[0]})` : 'Added Zero-Sequence V0 trace',
+      derived.warnings.length > 0 ? `已添加零序分量 V0（${derived.warnings[0]}）` : '已添加零序分量 V0 波形',
       derived.warnings.length > 0 ? 'warn' : 'info'
     );
   });
@@ -1907,7 +2161,7 @@ function bindModals() {
     if (!ph) return;
     const derived = computeBldcDerivedTraces(ph.chU, ph.chV, ph.chW);
     if (!derived.valid || derived.time.length < 2) {
-      app.showToast(derived.warnings[0] || 'No valid synchronized timebase or compatible units for 3-phase traces.', 'error');
+      app.showToast(derived.warnings[0] || '三相波形缺少有效同步时间基准或单位不兼容。', 'error');
       return;
     }
     const unit = derived.unit || ph.chU.unit || 'V';
@@ -1924,7 +2178,7 @@ function bindModals() {
       },
     ]);
     app.showToast(
-      derived.warnings.length > 0 ? `Added Space Vector |Vs| (${derived.warnings[0]})` : 'Added Space Vector Magnitude |Vs| trace',
+      derived.warnings.length > 0 ? `已添加空间矢量幅值 |Vs|（${derived.warnings[0]}）` : '已添加空间矢量幅值 |Vs| 波形',
       derived.warnings.length > 0 ? 'warn' : 'info'
     );
   });
@@ -2048,6 +2302,7 @@ function openMathModal(tab: TabState) {
       btn.title = `Click to insert ${alias} (${ch.name})`;
       btn.addEventListener('click', () => {
         insertAtCursor(exprInput, alias);
+        updateMathLivePreview(tab);
       });
       availContainer.appendChild(btn);
     });
@@ -2059,30 +2314,73 @@ function openMathModal(tab: TabState) {
     newBtn.addEventListener('click', () => {
       const textToInsert = newBtn.getAttribute('data-insert') || '';
       insertAtCursor(exprInput, textToInsert);
+      updateMathLivePreview(tab);
     });
   });
 
   const presetContainer = document.getElementById('quickMathPresets');
   if (presetContainer) {
     presetContainer.innerHTML = `
-      <div class="flex flex-wrap gap-1.5 text-xs">
-        <button type="button" class="preset-btn px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 - CH2">Diff: CH1 - CH2</button>
-        <button type="button" class="preset-btn px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 * CH2">Product: CH1 * CH2</button>
-        <button type="button" class="preset-btn px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 - mean(CH1)">Ripple: CH1 - mean</button>
-        <button type="button" class="preset-btn px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="deriv(CH1)">dV/dt: deriv(CH1)</button>
-        <button type="button" class="preset-btn px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="abs(CH1)">Rectify: abs(CH1)</button>
-        <button type="button" class="preset-btn px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="sqrt(CH1^2 + CH2^2)">Mag: sqrt(CH1^2+CH2^2)</button>
+      <div class="space-y-1.5 text-[11px]">
+        <div class="flex flex-wrap items-center gap-1">
+          <span class="text-[10px] text-amber-300 font-semibold w-14 shrink-0">功率/能量</span>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 * CH2" data-name="P_inst">瞬时功率 CH1*CH2</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="integ(CH1 * CH2)" data-name="E_switch">开关能量 integ(CH1*CH2)</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 - mean(CH1)" data-name="AC_Ripple">母线纹波 CH1-mean</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-1">
+          <span class="text-[10px] text-cyan-300 font-semibold w-14 shrink-0">包络/斜率</span>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="movrms(CH1, 0.01)" data-name="I_movrms">滑动RMS (10ms)</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="movavg(CH1, 0.005)" data-name="V_movavg">滑动均值 (5ms)</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="deriv(CH1)" data-name="dV_dt">斜率 deriv(CH1)</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-1">
+          <span class="text-[10px] text-emerald-300 font-semibold w-14 shrink-0">三相/向量</span>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 - CH2" data-name="V_line">差分 CH1-CH2</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="CH1 + CH2 + CH3" data-name="I_zero">零序 CH1+CH2+CH3</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="hypot(CH1, CH2)" data-name="Vec_Mag">幅值 hypot(CH1,CH2)</button>
+          <button type="button" class="preset-btn px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] rounded-sm text-slate-300 font-mono transition cursor-pointer" data-formula="atan2(CH2, CH1)" data-name="Vec_Angle">相角 atan2(CH2,CH1)</button>
+        </div>
       </div>
     `;
 
     presetContainer.querySelectorAll('.preset-btn').forEach((btn) => {
       btn.addEventListener('click', (e: any) => {
-        if (exprInput) exprInput.value = e.target.dataset.formula;
+        const el = e.currentTarget as HTMLElement;
+        if (exprInput && el.dataset.formula) exprInput.value = el.dataset.formula;
+        if (nameInput && el.dataset.name && /^Math \d+$/.test(nameInput.value.trim())) {
+          nameInput.value = el.dataset.name;
+        }
+        updateMathLivePreview(tab);
       });
     });
   }
 
+  updateMathLivePreview(tab);
   modal.style.display = 'flex';
+}
+
+function updateMathLivePreview(tab: TabState) {
+  const previewEl = document.getElementById('mathLivePreview');
+  const exprInput = document.getElementById('mathExprInput') as HTMLInputElement | null;
+  if (!previewEl || !exprInput) return;
+  const expr = exprInput.value.trim();
+  if (!expr) {
+    previewEl.className = 'mt-1 px-2 py-1 rounded-xs bg-[#0c0f13] border border-[#222933] font-mono text-[11px] text-slate-500';
+    previewEl.textContent = '输入公式实时校验语法、参数个数与推演量纲…';
+    return;
+  }
+  const res = previewMathExpression(expr, tab.channels, tab.drawOrder);
+  if (res.valid) {
+    const chNames = res.referencedChannels
+      .slice(0, 4)
+      .join(', ');
+    previewEl.className = 'mt-1 px-2 py-1 rounded-xs bg-emerald-950/35 border border-emerald-600/50 font-mono text-[11px] text-emerald-200';
+    previewEl.textContent = `✓ 语法有效 · 推演单位: ${res.inferredUnit || '(无量纲)'}${chNames ? ` · 引用通道: ${chNames}` : ''}`;
+  } else {
+    previewEl.className = 'mt-1 px-2 py-1 rounded-xs bg-red-950/50 border border-red-600/60 font-mono text-[11px] text-red-200';
+    previewEl.textContent = `✖ ${res.error || '表达式语法错误'}`;
+  }
 }
 
 function insertAtCursor(input: HTMLInputElement, text: string) {
@@ -2230,19 +2528,33 @@ function renderMeasureModalCheckboxes(tab: TabState) {
   const timingBox = document.getElementById('measureTimingList');
   if (!voltageBox || !timingBox || !chId) return;
 
+  const ch = tab.channels[chId];
+  const isLight = Boolean(THEME_PRESETS[app.getThemeId()]?.isLight);
+  const chTextColor = ch ? resolveChannelTextColor(ch.color, isLight) : (isLight ? '#0369a1' : '#38bdf8');
+  if (chSel && ch) {
+    chSel.style.borderLeftWidth = '3px';
+    chSel.style.borderLeftColor = ch.color;
+    chSel.style.color = chTextColor;
+  }
+  const liveMeas = ch ? app.getChannelMeasurementsSnapshot(tab, ch) : null;
+
   const selectedSet = new Set((tab.selectedMeasurements || []).map((m) => m.id));
   const buildGroup = (container: HTMLElement, group: 'voltage' | 'timing') => {
     container.innerHTML = '';
     MEASUREMENT_DEFINITIONS.filter((d) => d.group === group).forEach((def) => {
       const id = `${chId}::${def.key}`;
+      const previewVal =
+        ch && liveMeas && liveMeas.valid !== false
+          ? formatMeasurementMetricValue(liveMeas, def, ch.unit)
+          : '--';
       const label = document.createElement('label');
       label.className = 'flex items-center justify-between gap-2 px-2 py-1 bg-[#12161c] hover:bg-[#1a222d] border border-[#222933] rounded-sm cursor-pointer';
       label.innerHTML = `
-        <span class="flex items-center gap-2 text-slate-200">
-          <input type="checkbox" class="accent-cyan-400 cursor-pointer" ${selectedSet.has(id) ? 'checked' : ''} />
-          <span>${escapeHtml(def.label)}</span>
+        <span class="flex items-center gap-2 text-slate-200 min-w-0">
+          <input type="checkbox" class="accent-cyan-400 cursor-pointer shrink-0" ${selectedSet.has(id) ? 'checked' : ''} />
+          <span class="truncate">${escapeHtml(def.label)}</span>
         </span>
-        <span class="font-mono text-[10px] text-slate-500">${escapeHtml(def.shortLabel)}</span>
+        <span class="font-mono text-[11px] font-semibold tabular-nums shrink-0" style="color:${chTextColor}">${escapeHtml(previewVal)}</span>
       `;
       label.querySelector('input')?.addEventListener('change', (e: any) => {
         app.toggleMeasurementSelection(chId, def.key, !!e.target.checked);
@@ -2742,15 +3054,15 @@ function renderPresetsList() {
   }
   presets.forEach((p) => {
     const row = document.createElement('div');
-    row.className = 'flex items-center justify-between gap-2 p-2 bg-[#12161c] border border-[#222933] rounded-sm text-xs';
+    row.className = 'flex items-center justify-between gap-2 p-2 bg-well border border-line rounded-sm text-xs';
     row.innerHTML = `
       <div class="min-w-0">
-        <div class="text-slate-100 font-medium truncate">${escapeHtml(p.name)}</div>
-        <div class="text-[10px] font-mono text-slate-400">${p.mathDefs.length} Math · ${p.selectedMetricsByIndex.length} Metrics · ${p.separateView ? 'Separate' : 'Overlap'} · ${escapeHtml(p.renderMode)}</div>
+        <div class="text-fg font-medium truncate">${escapeHtml(p.name)}</div>
+        <div class="text-[10px] font-mono text-fg-muted">${p.mathDefs.length} 数学 · ${p.selectedMetricsByIndex.length} 测量 · ${p.separateView ? '独立分屏' : '重叠视图'} · ${escapeHtml(p.renderMode)}</div>
       </div>
       <div class="flex items-center gap-1.5 shrink-0">
-        <button class="preset-apply-btn px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-semibold rounded-sm cursor-pointer">Apply</button>
-        <button class="preset-del-btn px-2 py-1 bg-[#161b22] hover:bg-red-950/60 border border-[#222933] text-red-300 rounded-sm cursor-pointer">Del</button>
+        <button class="preset-apply-btn wvp-btn-primary px-2.5 py-1 text-xs">应用</button>
+        <button class="preset-del-btn wvp-btn-danger-ghost px-2 py-1 border border-line text-xs">删除</button>
       </div>
     `;
     row.querySelector('.preset-apply-btn')?.addEventListener('click', () => {
@@ -2759,7 +3071,7 @@ function renderPresetsList() {
       const res = applyPresetToTab(tab, p);
       app.renderSidebar();
       app.draw();
-      app.showToast(`Applied "${p.name}": +${res.mathCreated} Math, ${res.metricsApplied} Metrics.`, 'info');
+      app.showToast(`已应用模板「${p.name}」：新增 ${res.mathCreated} 数学通道，应用 ${res.metricsApplied} 项测量。`, 'info');
       document.getElementById('presetModal')!.style.display = 'none';
     });
     row.querySelector('.preset-del-btn')?.addEventListener('click', () => {
@@ -2807,11 +3119,11 @@ function renderCompareGroupSwatches() {
     const isSel = theme.id === selectedCompareThemeId;
     btn.title = `${theme.label} Group Theme`;
     btn.className = `w-6 h-6 rounded-sm border transition cursor-pointer flex items-center justify-center ${
-      isSel ? 'border-white scale-110 ring-1 ring-white/60' : 'border-[#2c3543] opacity-75 hover:opacity-100'
+      isSel ? 'border-slate-900 scale-110 ring-2 ring-cyan-500/70' : 'border-[#2c3543] opacity-75 hover:opacity-100'
     }`;
     btn.style.background = theme.badgeColor;
     if (isSel) {
-      btn.innerHTML = '<span class="w-2 h-2 rounded-full bg-slate-950"></span>';
+      btn.innerHTML = '<span class="w-2 h-2 rounded-full bg-white shadow-xs"></span>';
     }
     btn.addEventListener('click', () => {
       selectedCompareThemeId = theme.id;
@@ -3161,11 +3473,13 @@ function recomputeComparePanel(tab: TabState) {
       removeDcOffset: removeDc,
     });
     const cmpValid = aligned.valid && metrics.valid;
-    const cmpStatus = !aligned.valid
+    const cmpStatus: CompareStatus = !aligned.valid
       ? aligned.status
       : !metrics.valid
       ? metrics.status
-      : golden.status;
+      : golden.status === 'INSUFFICIENT_DATA' || golden.status === 'INVALID'
+      ? golden.status
+      : 'OK';
     const cmpReason = aligned.invalidReason || metrics.invalidReason || golden.invalidReason || aligned.metricGridWarning || null;
     const cmpStatusLabel = cmpValid
       ? golden.status === 'PASS'
@@ -3173,10 +3487,12 @@ function recomputeComparePanel(tab: TabState) {
         : golden.status === 'FAIL'
         ? `超差 FAIL（${golden.violationCount} 点）`
         : golden.status === 'INSUFFICIENT_DATA'
-        ? '覆盖不足'
+        ? '覆盖不足 (可叠加)'
         : '数据无效'
       : cmpStatus === 'INVALID'
-      ? '数据无效'
+      ? '数据/单位无效'
+      : mappedFull.t.length >= 2
+      ? '时间轴未重叠 (可叠加)'
       : '无连续有效区间';
 
     entry.computed = {
@@ -3188,6 +3504,7 @@ function recomputeComparePanel(tab: TabState) {
       pass: golden.pass,
       violationCount: golden.violationCount,
       valid: cmpValid,
+      status: cmpStatus,
       reason: cmpReason || undefined,
     };
 
@@ -3342,7 +3659,7 @@ function recomputeComparePanel(tab: TabState) {
   wrap.innerHTML = '';
   wrap.appendChild(table);
   const legend = document.createElement('div');
-  legend.className = 'px-2 py-1.5 text-[9px] text-slate-500 border-t border-[#222933]';
+  legend.className = 'px-2 py-1.5 text-[10px] text-fg-muted border-t border-line';
   legend.textContent = '指标口径：RMSE/MAE 按时间积分（非均匀采样不按点数加权）；时间覆盖率按连续有效时长计算；PASS 需满足最低覆盖率且全部有效比较点落在容差带内。匹配时长或首样本对齐不代表采集同步。';
   wrap.appendChild(legend);
   renderComparePreviewCanvas(targetCh, paletteMode, theme.id, colorOffset);

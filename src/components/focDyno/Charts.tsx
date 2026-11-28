@@ -354,9 +354,9 @@ export const DynoFitComparisonChart: React.FC<FitCompareProps> = ({ points }) =>
 
           return (
             <g key={idx} onMouseEnter={() => setHoverIdx(idx)}>
-              <rect x={cx - barW / 2} y={yInv} width={barW} height={hInv} fill="#64748B" />
-              <rect x={cx - barW / 2} y={yCu} width={barW} height={hCu} fill="#f59e0b" />
-              <rect x={cx - barW / 2} y={yFe} width={barW} height={hFe} fill="#06b6d4" />
+              <rect x={cx - barW / 2} y={yInv} width={barW} height={hInv} fill="var(--text-muted)" />
+              <rect x={cx - barW / 2} y={yCu} width={barW} height={hCu} fill="var(--warn)" />
+              <rect x={cx - barW / 2} y={yFe} width={barW} height={hFe} fill="var(--accent)" />
               <rect x={cx - plotW / sorted.length / 2} y={padT} width={plotW / sorted.length} height={plotH} fill="transparent" />
             </g>
           );
@@ -383,22 +383,22 @@ export const DynoFitComparisonChart: React.FC<FitCompareProps> = ({ points }) =>
             {metricView === 'losses' ? (
               <>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#06b6d4]" />
+                  <span className="h-2 w-2 rounded-xs" style={{ backgroundColor: 'var(--accent)' }} />
                   铁损+风摩 P0
                 </span>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#f59e0b]" />
+                  <span className="h-2 w-2 rounded-xs" style={{ backgroundColor: 'var(--warn)' }} />
                   铜耗 1.5RsIq²
                 </span>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#64748B]" />
+                  <span className="h-2 w-2 rounded-xs" style={{ backgroundColor: 'var(--text-muted)' }} />
                   逆变器/线损
                 </span>
               </>
             ) : (
               <>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-0.5 w-3 border-t-2 border-dashed border-slate-400" />
+                  <span className="h-0.5 w-3 border-t-2 border-dashed" style={{ borderColor: 'var(--text-muted)' }} />
                   实测值
                 </span>
                 <span className="inline-flex items-center gap-1.5">

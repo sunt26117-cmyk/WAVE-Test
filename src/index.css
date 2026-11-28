@@ -5,41 +5,115 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
-@theme {
+@theme inline {
   --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-chassis: var(--bg-chassis);
+  --color-panel: var(--bg-panel);
+  --color-elevated: var(--bg-elevated);
+  --color-well: var(--bg-well);
+  --color-hover: var(--bg-hover);
+  --color-stage: var(--canvas-stage);
+  --color-input: var(--bg-input);
+  --color-line: var(--border-subtle);
+  --color-line-strong: var(--border-strong);
+  --color-fg: var(--text-primary);
+  --color-fg-secondary: var(--text-secondary);
+  --color-fg-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
 }
 
-/* Calibrated Multi-Theme Surface Hierarchy */
+/* ==================== Calibrated Multi-Theme Surface Hierarchy ==================== */
+/* Default: Modern Light-Gray Engineering Theme (60% alabaster/white, 30% cool slate, 10% cobalt-cyan) */
 :root,
+html[data-theme="daylight"] {
+  color-scheme: light;
+  --bg-chassis: #eef2f6;
+  --bg-panel: #f8fafc;
+  --bg-elevated: #ffffff;
+  --bg-well: #edf1f6;
+  --bg-hover: #e2e8f0;
+  --bg-input: #ffffff;
+  --bg-segment-active: #ffffff;
+  --border-subtle: #d8e0ea;
+  --border-strong: #b8c4d4;
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --accent: #0284c7;
+  --accent-hover: #0369a1;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(2, 132, 199, 0.11);
+  --canvas-stage: #ffffff;
+  --focus-ring: rgba(2, 132, 199, 0.42);
+  --ok: #047857;
+  --ok-soft: rgba(5, 150, 105, 0.11);
+  --ok-border: rgba(5, 150, 105, 0.38);
+  --warn: #b45309;
+  --warn-soft: rgba(217, 119, 6, 0.12);
+  --warn-border: rgba(217, 119, 6, 0.42);
+  --danger: #be123c;
+  --danger-soft: rgba(225, 29, 72, 0.10);
+  --danger-border: rgba(225, 29, 72, 0.40);
+  --info: #0369a1;
+  --info-soft: rgba(2, 132, 199, 0.11);
+  --info-border: rgba(2, 132, 199, 0.42);
+  --shadow-modal: 0 20px 50px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(148, 163, 184, 0.35);
+  --z-dropdown: 50;
+  --z-modal: 60;
+  --z-floating: 75;
+  --z-toast: 90;
+}
+
 html[data-theme="obsidian"] {
   color-scheme: dark;
-  --bg-chassis: #0c1016;
-  --bg-panel: #111722;
-  --bg-elevated: #1b2433;
-  --bg-well: #080b10;
-  --bg-hover: #243044;
-  --border-subtle: #232d3d;
-  --border-strong: #394860;
+  --bg-chassis: #0d1117;
+  --bg-panel: #141922;
+  --bg-elevated: #1c2432;
+  --bg-well: #0a0d12;
+  --bg-hover: #253042;
+  --bg-input: #0e131b;
+  --bg-segment-active: #263244;
+  --border-subtle: #242e3d;
+  --border-strong: #39485e;
   --text-primary: #f1f5f9;
   --text-secondary: #cbd5e1;
-  --text-muted: #8a99ad;
+  --text-muted: #8b9ab0;
   --accent: #06b6d4;
   --accent-hover: #22d3ee;
   --accent-fg: #041318;
   --accent-soft: rgba(6, 182, 212, 0.14);
-  --canvas-stage: #07090e;
+  --canvas-stage: #090c11;
+  --focus-ring: rgba(34, 211, 238, 0.45);
+  --ok: #34d399;
+  --ok-soft: rgba(16, 185, 129, 0.13);
+  --ok-border: rgba(16, 185, 129, 0.45);
+  --warn: #fcd34d;
+  --warn-soft: rgba(245, 158, 11, 0.14);
+  --warn-border: rgba(245, 158, 11, 0.45);
+  --danger: #fda4af;
+  --danger-soft: rgba(244, 63, 94, 0.14);
+  --danger-border: rgba(244, 63, 94, 0.48);
+  --info: #67e8f9;
+  --info-soft: rgba(6, 182, 212, 0.14);
+  --info-border: rgba(6, 182, 212, 0.48);
+  --shadow-modal: 0 24px 60px rgba(0, 0, 0, 0.56), 0 0 0 1px rgba(57, 72, 94, 0.9);
 }
 
 html[data-theme="midnight"] {
   color-scheme: dark;
-  --bg-chassis: #0d1526;
-  --bg-panel: #131d33;
-  --bg-elevated: #1e2c48;
-  --bg-well: #090f1d;
-  --bg-hover: #293b5f;
-  --border-subtle: #273858;
-  --border-strong: #475d85;
+  --bg-chassis: #0b1220;
+  --bg-panel: #111b2e;
+  --bg-elevated: #1b2944;
+  --bg-well: #080e1a;
+  --bg-hover: #26385c;
+  --bg-input: #0d1628;
+  --bg-segment-active: #243556;
+  --border-subtle: #243554;
+  --border-strong: #415780;
   --text-primary: #f8fafc;
   --text-secondary: #e2e8f0;
   --text-muted: #94a3b8;
@@ -47,26 +121,21 @@ html[data-theme="midnight"] {
   --accent-hover: #7dd3fc;
   --accent-fg: #041423;
   --accent-soft: rgba(56, 189, 248, 0.16);
-  --canvas-stage: #080e1c;
-}
-
-html[data-theme="daylight"] {
-  color-scheme: light;
-  --bg-chassis: #eaeff5;
-  --bg-panel: #f6f8fb;
-  --bg-elevated: #ffffff;
-  --bg-well: #eef2f6;
-  --bg-hover: #e2e8f0;
-  --border-subtle: #d3dce6;
-  --border-strong: #94a3b8;
-  --text-primary: #0f172a;
-  --text-secondary: #334155;
-  --text-muted: #64748b;
-  --accent: #0284c7;
-  --accent-hover: #0369a1;
-  --accent-fg: #ffffff;
-  --accent-soft: rgba(2, 132, 199, 0.12);
-  --canvas-stage: #ffffff;
+  --canvas-stage: #070c17;
+  --focus-ring: rgba(56, 189, 248, 0.5);
+  --ok: #34d399;
+  --ok-soft: rgba(16, 185, 129, 0.14);
+  --ok-border: rgba(16, 185, 129, 0.45);
+  --warn: #fde68a;
+  --warn-soft: rgba(245, 158, 11, 0.15);
+  --warn-border: rgba(245, 158, 11, 0.48);
+  --danger: #fda4af;
+  --danger-soft: rgba(244, 63, 94, 0.15);
+  --danger-border: rgba(244, 63, 94, 0.5);
+  --info: #7dd3fc;
+  --info-soft: rgba(56, 189, 248, 0.16);
+  --info-border: rgba(56, 189, 248, 0.5);
+  --shadow-modal: 0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(65, 87, 128, 0.9);
 }
 
 @layer base {
@@ -82,6 +151,19 @@ html[data-theme="daylight"] {
   select {
     font-variant-numeric: tabular-nums;
   }
+
+  button:focus-visible,
+  select:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+}
+
+/* Workspace contextual visibility (preserves all DOM IDs & listeners) */
+body[data-workspace="focDyno"] .scope-only {
+  display: none !important;
 }
 
 .tabular-nums {
@@ -129,6 +211,122 @@ html[data-theme="daylight"] {
   color: var(--text-muted);
 }
 
+/* Unified Semantic Alert & Toast Tokens */
+.wvp-alert-info {
+  background-color: var(--info-soft);
+  border-color: var(--info-border);
+  color: var(--info);
+}
+
+.wvp-alert-ok {
+  background-color: var(--ok-soft);
+  border-color: var(--ok-border);
+  color: var(--ok);
+}
+
+.wvp-alert-warn {
+  background-color: var(--warn-soft);
+  border-color: var(--warn-border);
+  color: var(--warn);
+}
+
+.wvp-alert-danger {
+  background-color: var(--danger-soft);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+
+/* Standardized Precision Instrument Buttons & Segmented Controls */
+.wvp-btn {
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.wvp-btn:hover:not(:disabled) {
+  background-color: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.wvp-btn-primary {
+  background-color: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.wvp-btn-primary:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.wvp-btn-accent-soft {
+  background-color: var(--accent-soft);
+  border: 1px solid var(--info-border);
+  color: var(--accent);
+  font-weight: 600;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.wvp-btn-accent-soft:hover:not(:disabled) {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.wvp-btn-danger-ghost {
+  color: var(--text-muted);
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.wvp-btn-danger-ghost:hover:not(:disabled) {
+  background-color: var(--danger-soft);
+  color: var(--danger);
+}
+
+.wvp-seg-track {
+  background-color: var(--bg-well);
+  border: 1px solid var(--border-subtle);
+}
+
+.wvp-seg-btn {
+  color: var(--text-muted);
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.wvp-seg-btn:hover:not([aria-pressed="true"]) {
+  color: var(--text-primary);
+  background-color: var(--bg-hover);
+}
+
+/* Primary Mode Segmented Control (Time/FFT/XY, Workspace Switcher, Cursor Mode) */
+.wvp-seg-btn.wvp-seg-primary[aria-pressed="true"],
+.wvp-seg-accent {
+  background-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+/* Secondary Option Segmented Control (Overlap/Separate, Render, Decimation, Merge/Separate) */
+.wvp-seg-btn.wvp-seg-secondary[aria-pressed="true"],
+.wvp-seg-active {
+  background-color: var(--bg-segment-active);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1);
+}
+
+/* Tool active state (Zoom Box / Point / Text / Area) */
+.wvp-tool-btn[aria-pressed="true"] {
+  background-color: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
 /* Crisp oscilloscope console scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
@@ -148,7 +346,104 @@ html[data-theme="daylight"] {
   background: var(--text-muted);
 }
 
-/* Blocking centered dialogs */
+/* ==================== Right Panel Compact Co-Existence & Accordions ==================== */
+#rightControlPanel.is-compact-channel-only > section:not(#channelInspectorSection) {
+  display: none !important;
+}
+
+#rightControlPanel.is-compact-channel-only {
+  width: 268px;
+}
+
+.wvp-accordion-header {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.wvp-accordion-chevron {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.wvp-accordion-section.is-collapsed .wvp-accordion-chevron {
+  transform: rotate(-90deg);
+}
+
+.wvp-accordion-section.is-collapsed .wvp-accordion-body {
+  display: none;
+}
+
+/* Compact Channel Inspector Docked under Softkeys (<1366px when Drawer is Open) */
+#compactChannelDockSlot:empty {
+  display: none;
+}
+
+#compactChannelDockSlot #channelInspectorSection {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 6px 10px;
+  border-bottom: none;
+  border-top: 1px solid var(--border-subtle);
+  background-color: var(--bg-panel);
+}
+
+#compactChannelDockSlot #channelInspectorSection > * {
+  margin: 0 !important;
+  padding-top: 0 !important;
+  border-top: none !important;
+}
+
+#compactChannelDockSlot #vOffsetSliderWrap {
+  display: none;
+}
+
+/* Canvas Context Menu & Y-Axis Gesture Hint */
+.wvp-context-menu {
+  position: fixed;
+  z-index: 95;
+  min-width: 184px;
+  padding: 4px 0;
+  border-radius: 4px;
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-modal);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.wvp-context-menu-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 12px;
+  text-align: left;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+
+.wvp-context-menu-item:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.wvp-context-menu-sep {
+  margin: 4px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* ==================== Floating & Wide Workbench Modals ==================== */
 .modal-overlay {
   background-color: transparent;
   backdrop-filter: none;
@@ -156,16 +451,44 @@ html[data-theme="daylight"] {
 }
 
 .modal-overlay.modal-backdrop-dim {
-  background-color: rgba(4, 6, 9, 0.44);
+  background-color: rgba(15, 23, 42, 0.32);
   backdrop-filter: none;
   pointer-events: auto;
+}
+
+html.dark .modal-overlay.modal-backdrop-dim {
+  background-color: rgba(4, 7, 12, 0.54);
 }
 
 .modal-overlay > div {
   pointer-events: auto;
   background-color: var(--bg-elevated);
   border-color: var(--border-strong);
-  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px var(--border-strong);
+  box-shadow: var(--shadow-modal);
+}
+
+/* Centered wide workbench modals (Thermal, Compare, BLDC, Batch) */
+.modal-overlay.tool-wide-modal > div {
+  border-radius: 4px;
+}
+
+/* Maximize wide workbench cleanly over canvas area while keeping top header visible */
+.modal-overlay.is-canvas-maximized {
+  top: 40px !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  padding: 6px !important;
+  align-items: stretch !important;
+  justify-content: stretch !important;
+}
+
+.modal-overlay.is-canvas-maximized > div {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: 100% !important;
+  max-height: 100% !important;
+  transform: none !important;
 }
 
 .modal-drag-handle {
@@ -173,7 +496,29 @@ html[data-theme="daylight"] {
   user-select: none;
 }
 
-/* Side-by-Side Non-Overlapping Tool Drawer */
+.modal-window-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 2px;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-well);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.modal-window-action-btn:hover {
+  background-color: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+/* ==================== Side-by-Side Non-Overlapping Tool Drawer ==================== */
 .tool-drawer {
   display: flex;
   flex-direction: column;
@@ -204,14 +549,14 @@ html[data-theme="daylight"] {
 
 .tool-drawer-header {
   background-color: var(--bg-panel);
-  border-bottom: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .tool-drawer-tab {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 6px;
+  padding: 2px 7px;
   border-radius: 2px;
   border: 1px solid var(--border-subtle);
   background-color: var(--bg-well);
@@ -258,19 +603,20 @@ html[data-theme="daylight"] {
 }
 
 .tool-drawer-split-btn {
-  background-color: var(--bg-well);
-  border-color: var(--border-strong);
-  color: var(--text-primary);
+  background-color: var(--bg-elevated);
+  border-color: var(--border-subtle);
+  color: var(--text-secondary);
   font-weight: 500;
 }
 
 .tool-drawer-split-btn:hover:not(:disabled) {
   background-color: var(--bg-hover);
+  border-color: var(--border-strong);
   color: var(--text-primary);
 }
 
 .tool-drawer-split-btn:disabled {
-  opacity: 0.45;
+  opacity: 0.42;
   color: var(--text-muted);
   cursor: not-allowed;
 }
@@ -283,7 +629,7 @@ html[data-theme="daylight"] {
 }
 
 /* Docked tool panels inside #toolDrawerBody flow cleanly without overlay shadows or overlap */
-#toolDrawerBody .modal-overlay.tool-dockable {
+#toolDrawerBody .modal-overlay {
   position: static !important;
   inset: auto !important;
   z-index: auto !important;
@@ -295,7 +641,7 @@ html[data-theme="daylight"] {
   border-bottom: 1px solid var(--border-strong);
 }
 
-#toolDrawerBody .modal-overlay.tool-dockable:only-child {
+#toolDrawerBody .modal-overlay:only-child {
   flex: 1 1 0%;
   min-height: 0;
   height: 100%;
@@ -303,21 +649,21 @@ html[data-theme="daylight"] {
   border-bottom: none;
 }
 
-#toolDrawerBody .modal-overlay.tool-dockable:only-child > div {
+#toolDrawerBody .modal-overlay:only-child > div {
   height: 100% !important;
   min-height: 0;
   overflow-y: auto;
 }
 
-#toolDrawerBody .modal-overlay.tool-dockable[style*="display: none"] {
+#toolDrawerBody .modal-overlay[style*="display: none"] {
   display: none !important;
 }
 
-#toolDrawerBody .modal-overlay.tool-dockable:last-child {
+#toolDrawerBody .modal-overlay:last-child {
   border-bottom: none;
 }
 
-#toolDrawerBody .modal-overlay.tool-dockable > div {
+#toolDrawerBody .modal-overlay > div {
   max-width: 100% !important;
   width: 100% !important;
   max-height: none !important;
@@ -326,9 +672,10 @@ html[data-theme="daylight"] {
   border-radius: 0 !important;
   background-color: var(--bg-elevated) !important;
   padding: 12px 14px !important;
+  transform: none !important;
 }
 
-/* Ensure Compare & Multi-Column Tool Grids Stay Compact Inside Docked Drawer */
+/* Ensure Multi-Column Tool Grids Stay Compact When Explicitly Docked */
 #toolDrawerBody #compareModal .md\:grid-cols-12,
 #toolDrawerBody #batchModal .md\:grid-cols-6,
 #toolDrawerBody #anomalyModal .md\:grid-cols-5 {
@@ -350,53 +697,74 @@ html[data-theme="daylight"] {
 .wvp-dropdown-menu {
   background-color: var(--bg-elevated);
   border: 1px solid var(--border-strong);
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.16);
 }
 
-/* Surface luminance separation for dark & midnight themes on existing utility cards */
-html.dark .bg-\[\#12161c\] {
+html.dark .wvp-dropdown-menu {
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45);
+}
+
+/* ==================== Dark & Midnight Theme Surface Mapping ==================== */
+html.dark .bg-\[\#12161c\],
+html.dark .bg-\[\#12161c\]\/95 {
   background-color: var(--bg-panel);
 }
 
 html.dark .bg-\[\#0c0f13\],
-html.dark .bg-\[\#0e1217\] {
-  background-color: var(--bg-chassis);
+html.dark .bg-\[\#0e1217\],
+html.dark .bg-\[\#0c1118\],
+html.dark .bg-\[\#111821\],
+html.dark .bg-\[\#0b1016\],
+html.dark .bg-\[\#10151b\] {
+  background-color: var(--bg-well);
 }
 
-html.dark .bg-\[\#080b0f\] {
+html.dark .bg-\[\#080b0f\],
+html.dark .bg-\[\#07090e\] {
   background-color: var(--canvas-stage);
 }
 
-html.dark .bg-\[\#161b22\] {
+html.dark .bg-\[\#161b22\],
+html.dark .bg-\[\#121822\] {
   background-color: var(--bg-elevated);
 }
 
 html.dark .border-\[\#222933\],
 html.dark .border-\[\#1b212a\],
 html.dark .border-\[\#1b222c\],
-html.dark .border-\[\#1f2732\] {
+html.dark .border-\[\#1e2631\],
+html.dark .border-\[\#1f2732\],
+html.dark .border-\[\#26313d\],
+html.dark .border-\[\#283340\],
+html.dark .border-\[\#2a3441\] {
   border-color: var(--border-subtle);
 }
 
-html.dark .border-\[\#2c3543\] {
+html.dark .border-\[\#2c3543\],
+html.dark .border-\[\#2c3849\],
+html.dark .border-\[\#334155\],
+html.dark .border-\[\#46515f\] {
   border-color: var(--border-strong);
 }
 
-/* Daylight Lab Light Theme Contrast Overrides (preserves all dark-mode utility classes cleanly) */
-html:not(.dark) {
-  background-color: var(--bg-chassis);
-  color: var(--text-primary);
-}
-
+/* ==================== Modern Light-Gray Engineering Theme Surface Mapping ==================== */
+html:not(.dark),
 html:not(.dark) body {
   background-color: var(--bg-chassis);
   color: var(--text-primary);
 }
 
 html:not(.dark) .bg-\[\#07090e\],
+html:not(.dark) .bg-\[\#0b1016\],
 html:not(.dark) .bg-\[\#0c0f13\],
+html:not(.dark) .bg-\[\#0c1118\],
 html:not(.dark) .bg-\[\#0d1117\],
-html:not(.dark) .bg-\[\#0e1217\] {
+html:not(.dark) .bg-\[\#0e1217\],
+html:not(.dark) .bg-\[\#10151b\],
+html:not(.dark) .bg-\[\#111821\],
+html:not(.dark) .bg-slate-900,
+html:not(.dark) .bg-slate-950,
+html:not(.dark) .bg-slate-950\/60 {
   background-color: var(--bg-well) !important;
 }
 
@@ -409,103 +777,200 @@ html:not(.dark) .bg-\[\#12161c\]\/95 {
   background-color: var(--bg-panel) !important;
 }
 
+html:not(.dark) .bg-\[\#121822\],
 html:not(.dark) .bg-\[\#161b22\],
+html:not(.dark) .bg-\[\#161b22\]\/80,
 html:not(.dark) .bg-\[\#1a222d\],
-html:not(.dark) .bg-\[\#162229\],
-html:not(.dark) .bg-\[\#132229\],
-html:not(.dark) .bg-\[\#1d1729\],
-html:not(.dark) .bg-\[\#1f2732\] {
+html:not(.dark) .bg-\[\#1a222d\]\/60,
+html:not(.dark) .bg-\[\#1f2732\],
+html:not(.dark) .bg-slate-800\/60 {
   background-color: var(--bg-elevated) !important;
 }
 
+html:not(.dark) .bg-slate-700,
 html:not(.dark) .bg-slate-800 {
   background-color: #e2e8f0 !important;
+  border: 1px solid var(--border-strong);
 }
 
+html:not(.dark) .hover\:bg-slate-600:hover,
+html:not(.dark) .hover\:bg-slate-800\/60:hover,
 html:not(.dark) .hover\:bg-\[\#1e2530\]:hover,
 html:not(.dark) .hover\:bg-\[\#243040\]:hover,
 html:not(.dark) .hover\:bg-\[\#1a222d\]:hover,
 html:not(.dark) .hover\:bg-\[\#1a222d\]\/60:hover,
 html:not(.dark) .hover\:bg-\[\#161b22\]\/80:hover,
-html:not(.dark) .hover\:bg-\[\#1d303a\]:hover,
-html:not(.dark) .hover\:bg-\[\#19303a\]:hover,
-html:not(.dark) .hover\:bg-\[\#2b2040\]:hover,
-html:not(.dark) .hover\:bg-\[\#161b22\]:hover {
+html:not(.dark) .hover\:bg-\[\#161b22\]:hover,
+html:not(.dark) .hover\:bg-\[\#1b2433\]:hover {
   background-color: var(--bg-hover) !important;
 }
 
 html:not(.dark) .bg-\[\#222933\] {
-  background-color: #cbd5e1 !important;
+  background-color: #ffffff !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
 }
 
+html:not(.dark) .bg-\[\#132229\],
+html:not(.dark) .bg-\[\#162229\],
+html:not(.dark) .bg-\[\#17212a\],
+html:not(.dark) .bg-cyan-600\/25,
+html:not(.dark) .bg-cyan-600\/30,
+html:not(.dark) .bg-cyan-900,
+html:not(.dark) .bg-cyan-950,
+html:not(.dark) .bg-cyan-950\/15,
 html:not(.dark) .bg-cyan-950\/35,
 html:not(.dark) .bg-cyan-950\/40,
 html:not(.dark) .bg-cyan-950\/50,
-html:not(.dark) .bg-cyan-950\/60 {
-  background-color: rgba(2, 132, 199, 0.12) !important;
+html:not(.dark) .bg-cyan-950\/60,
+html:not(.dark) .bg-cyan-950\/70,
+html:not(.dark) .bg-sky-950\/50 {
+  background-color: rgba(2, 132, 199, 0.11) !important;
 }
 
-html:not(.dark) .hover\:bg-cyan-900\/70:hover {
-  background-color: rgba(2, 132, 199, 0.22) !important;
+html:not(.dark) .hover\:bg-\[\#19303a\]:hover,
+html:not(.dark) .hover\:bg-\[\#1d303a\]:hover,
+html:not(.dark) .hover\:bg-\[\#1e303a\]:hover,
+html:not(.dark) .hover\:bg-\[\#20303e\]:hover,
+html:not(.dark) .hover\:bg-cyan-900\/70:hover,
+html:not(.dark) .hover\:bg-sky-950\/50:hover {
+  background-color: rgba(2, 132, 199, 0.2) !important;
 }
 
+html:not(.dark) .bg-amber-800,
+html:not(.dark) .bg-amber-800\/70,
+html:not(.dark) .bg-amber-900\/60,
+html:not(.dark) .bg-amber-950,
 html:not(.dark) .bg-amber-950\/20,
+html:not(.dark) .bg-amber-950\/25,
+html:not(.dark) .bg-amber-950\/30,
+html:not(.dark) .bg-amber-950\/40,
+html:not(.dark) .bg-amber-950\/45,
 html:not(.dark) .bg-amber-950\/50,
-html:not(.dark) .bg-amber-950\/60 {
+html:not(.dark) .bg-amber-950\/60,
+html:not(.dark) .bg-amber-950\/70,
+html:not(.dark) .bg-amber-950\/75,
+html:not(.dark) .bg-amber-950\/80 {
   background-color: rgba(217, 119, 6, 0.12) !important;
 }
 
+html:not(.dark) .hover\:bg-amber-700:hover,
+html:not(.dark) .hover\:bg-amber-900\/60:hover,
+html:not(.dark) .hover\:bg-amber-950\/30:hover,
+html:not(.dark) .hover\:bg-amber-950\/40:hover,
+html:not(.dark) .hover\:bg-amber-950\/50:hover,
+html:not(.dark) .hover\:bg-amber-950\/60:hover {
+  background-color: rgba(217, 119, 6, 0.21) !important;
+}
+
+html:not(.dark) .bg-\[\#17251e\],
+html:not(.dark) .bg-emerald-900,
+html:not(.dark) .bg-emerald-950,
+html:not(.dark) .bg-emerald-950\/20,
 html:not(.dark) .bg-emerald-950\/30,
+html:not(.dark) .bg-emerald-950\/35,
+html:not(.dark) .bg-emerald-950\/50,
 html:not(.dark) .bg-emerald-950\/60,
-html:not(.dark) .bg-emerald-950\/70 {
-  background-color: rgba(5, 150, 105, 0.12) !important;
+html:not(.dark) .bg-emerald-950\/70,
+html:not(.dark) .bg-emerald-950\/80 {
+  background-color: rgba(5, 150, 105, 0.11) !important;
 }
 
+html:not(.dark) .hover\:bg-\[\#20382a\]:hover,
 html:not(.dark) .hover\:bg-emerald-900\/70:hover {
-  background-color: rgba(5, 150, 105, 0.22) !important;
+  background-color: rgba(5, 150, 105, 0.2) !important;
 }
 
+html:not(.dark) .bg-\[\#1d1729\],
+html:not(.dark) .bg-purple-950,
+html:not(.dark) .bg-purple-950\/60 {
+  background-color: rgba(109, 40, 217, 0.11) !important;
+}
+
+html:not(.dark) .hover\:bg-\[\#2b2040\]:hover {
+  background-color: rgba(109, 40, 217, 0.19) !important;
+}
+
+html:not(.dark) .bg-orange-950,
 html:not(.dark) .bg-orange-950\/50,
+html:not(.dark) .bg-orange-950\/70,
 html:not(.dark) .bg-orange-600\/20 {
   background-color: rgba(234, 88, 12, 0.12) !important;
 }
 
+html:not(.dark) .bg-rose-900,
+html:not(.dark) .bg-rose-950,
+html:not(.dark) .bg-rose-950\/20,
 html:not(.dark) .bg-rose-950\/25,
+html:not(.dark) .bg-rose-950\/30,
+html:not(.dark) .bg-rose-950\/35,
 html:not(.dark) .bg-rose-950\/50,
 html:not(.dark) .bg-rose-950\/60,
 html:not(.dark) .bg-rose-950\/70,
 html:not(.dark) .bg-rose-950\/80,
+html:not(.dark) .bg-rose-950\/90,
+html:not(.dark) .bg-red-900,
+html:not(.dark) .bg-red-950,
 html:not(.dark) .bg-red-950\/30,
 html:not(.dark) .bg-red-950\/50,
+html:not(.dark) .bg-red-950\/55,
+html:not(.dark) .bg-red-950\/60,
 html:not(.dark) .bg-red-950\/70,
+html:not(.dark) .bg-red-950\/75,
 html:not(.dark) .bg-red-950\/80 {
-  background-color: rgba(220, 38, 38, 0.11) !important;
+  background-color: rgba(220, 38, 38, 0.1) !important;
 }
 
 html:not(.dark) .hover\:bg-rose-900\/70:hover,
-html:not(.dark) .hover\:bg-red-900\/60:hover {
-  background-color: rgba(220, 38, 38, 0.2) !important;
+html:not(.dark) .hover\:bg-rose-950\/70:hover,
+html:not(.dark) .hover\:bg-red-900\/60:hover,
+html:not(.dark) .hover\:bg-red-950\/50:hover,
+html:not(.dark) .hover\:bg-red-950\/60:hover {
+  background-color: rgba(220, 38, 38, 0.18) !important;
 }
 
-html:not(.dark) .border-\[\#222933\],
+/* Keep full-screen file drop overlay dark translucent with crisp white text */
+html:not(.dark) #drag-overlay {
+  background-color: rgba(8, 51, 68, 0.88) !important;
+}
+
+html:not(.dark) #drag-overlay .text-white {
+  color: #ffffff !important;
+}
+
+html:not(.dark) #drag-overlay .text-cyan-300 {
+  color: #67e8f9 !important;
+}
+
+html:not(.dark) .border-\[\#1b2028\],
 html:not(.dark) .border-\[\#1b212a\],
 html:not(.dark) .border-\[\#1b222c\],
-html:not(.dark) .border-\[\#1f2732\],
-html:not(.dark) .border-\[\#1f2631\],
 html:not(.dark) .border-\[\#1d232d\],
-html:not(.dark) .border-\[\#1b2028\],
-html:not(.dark) .border-\[\#2c3543\],
-html:not(.dark) .border-\[\#2c3849\] {
+html:not(.dark) .border-\[\#1e2631\],
+html:not(.dark) .border-\[\#1f2631\],
+html:not(.dark) .border-\[\#1f2732\],
+html:not(.dark) .border-\[\#222933\],
+html:not(.dark) .border-\[\#26313d\],
+html:not(.dark) .border-\[\#283340\],
+html:not(.dark) .border-\[\#2a3441\] {
   border-color: var(--border-subtle) !important;
 }
 
+html:not(.dark) .border-\[\#2c3543\],
+html:not(.dark) .border-\[\#2c3849\],
+html:not(.dark) .border-\[\#334155\],
+html:not(.dark) .border-\[\#46515f\] {
+  border-color: var(--border-strong) !important;
+}
+
 html:not(.dark) .text-white,
+html:not(.dark) .text-slate-50,
 html:not(.dark) .text-slate-100,
 html:not(.dark) .text-slate-200 {
   color: #0f172a !important;
 }
 
-html:not(.dark) .hover\:text-white:hover {
+html:not(.dark) .hover\:text-white:hover,
+html:not(.dark) .hover\:text-slate-200:hover {
   color: #0f172a !important;
 }
 
@@ -519,18 +984,26 @@ html:not(.dark) .text-slate-600 {
   color: #64748b !important;
 }
 
+html:not(.dark) .text-cyan-100,
 html:not(.dark) .text-cyan-200,
 html:not(.dark) .text-cyan-300,
-html:not(.dark) .text-cyan-400 {
+html:not(.dark) .text-cyan-400,
+html:not(.dark) .text-sky-200,
+html:not(.dark) .text-sky-300,
+html:not(.dark) .text-sky-400 {
   color: #0369a1 !important;
 }
 
+html:not(.dark) .text-amber-50,
+html:not(.dark) .text-amber-100,
 html:not(.dark) .text-amber-200,
 html:not(.dark) .text-amber-300,
-html:not(.dark) .text-amber-400 {
+html:not(.dark) .text-amber-400,
+html:not(.dark) .text-amber-500 {
   color: #b45309 !important;
 }
 
+html:not(.dark) .text-emerald-100,
 html:not(.dark) .text-emerald-200,
 html:not(.dark) .text-emerald-300,
 html:not(.dark) .text-emerald-400 {
@@ -538,37 +1011,60 @@ html:not(.dark) .text-emerald-400 {
 }
 
 html:not(.dark) .text-purple-200,
-html:not(.dark) .text-purple-300 {
+html:not(.dark) .text-purple-300,
+html:not(.dark) .text-violet-400 {
   color: #6d28d9 !important;
 }
 
+html:not(.dark) .text-pink-200,
 html:not(.dark) .text-pink-300,
+html:not(.dark) .text-pink-400,
 html:not(.dark) .text-rose-200,
 html:not(.dark) .text-rose-300,
+html:not(.dark) .text-rose-400,
 html:not(.dark) .text-red-200,
 html:not(.dark) .text-red-300,
 html:not(.dark) .text-red-400 {
   color: #be123c !important;
 }
 
+html:not(.dark) .hover\:text-red-300:hover,
+html:not(.dark) .hover\:text-rose-200:hover {
+  color: #9f1239 !important;
+}
+
 html:not(.dark) .text-orange-200,
-html:not(.dark) .text-orange-300 {
+html:not(.dark) .text-orange-300,
+html:not(.dark) .text-orange-400 {
   color: #c2410c !important;
 }
 
 /* Primary filled action buttons retain crisp white text on light theme */
 html:not(.dark) .bg-cyan-600,
+html:not(.dark) .bg-sky-600,
 html:not(.dark) .bg-emerald-500,
 html:not(.dark) .bg-emerald-600,
+html:not(.dark) .bg-emerald-700,
 html:not(.dark) .bg-orange-600,
 html:not(.dark) .bg-purple-600,
-html:not(.dark) .bg-amber-500 {
+html:not(.dark) .bg-amber-500,
+html:not(.dark) .bg-amber-600 {
   color: #ffffff !important;
+}
+
+html:not(.dark) .bg-cyan-600 {
+  background-color: var(--accent) !important;
+}
+
+html:not(.dark) .hover\:bg-cyan-500:hover {
+  background-color: var(--accent-hover) !important;
 }
 
 html:not(.dark) #timeModeBtn.bg-cyan-600,
 html:not(.dark) #freqModeBtn.bg-cyan-600,
-html:not(.dark) #xyModeBtn.bg-cyan-600 {
+html:not(.dark) #xyModeBtn.bg-cyan-600,
+html:not(.dark) #wsScopeBtn.bg-cyan-600,
+html:not(.dark) #wsFocDynoBtn.bg-cyan-600 {
   color: #ffffff !important;
 }
 
@@ -578,8 +1074,27 @@ html:not(.dark) textarea {
   color: #0f172a;
 }
 
-html:not(.dark) .modal-overlay.modal-backdrop-dim {
-  background-color: rgba(15, 23, 42, 0.35);
+/* Measurement cards & elevated inputs on light theme pop crisply off subtle gray bar */
+html:not(.dark) #measurementStripBar {
+  background-color: var(--bg-chassis) !important;
+}
+
+html:not(.dark) #measurementCardsContainer > div {
+  background-color: var(--bg-elevated) !important;
+  border-color: var(--border-subtle) !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+}
+
+html:not(.dark) #channelSoftkeysBar > div {
+  background-color: var(--bg-elevated) !important;
+}
+
+html:not(.dark) header {
+  background-color: var(--bg-panel) !important;
+}
+
+html:not(.dark) footer {
+  background-color: var(--bg-panel) !important;
 }
 
 /* ==================== FOC DynoLab Multi-Theme Surface & Control Tokens ==================== */
@@ -628,7 +1143,7 @@ html:not(.dark) .modal-overlay.modal-backdrop-dim {
 }
 
 .dyno-input {
-  background-color: var(--bg-well);
+  background-color: var(--bg-elevated);
   border-color: var(--border-strong);
   color: var(--text-primary);
 }
@@ -647,8 +1162,8 @@ html:not(.dark) .modal-overlay.modal-backdrop-dim {
 }
 
 .dyno-btn-ghost {
-  background-color: var(--bg-well);
-  border-color: var(--border-strong);
+  background-color: var(--bg-elevated);
+  border-color: var(--border-subtle);
   color: var(--text-secondary);
 }
 
@@ -711,4 +1226,3 @@ html.dark .dyno-alert-ok {
 html:not(.dark) .dyno-alert-ok {
   color: #047857;
 }
-

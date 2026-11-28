@@ -73,12 +73,12 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
 
   return (
     <aside className="dyno-panel w-full shrink-0 border-b lg:w-80 lg:border-b-0 lg:border-r lg:overflow-y-auto">
-      <div className="flex items-center justify-between border-b dyno-border px-4 py-3">
+      <div className="border-b dyno-border px-3 py-2.5 space-y-2">
         <div className="min-w-0">
           <h2 className="text-xs font-semibold tracking-wide dyno-text-primary">电机与驱动物理基准</h2>
           <p className="text-[11px] dyno-text-muted">等幅值变换 · 国际单位制 (SI)</p>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div className="grid grid-cols-3 gap-1.5">
           <button
             type="button"
             onClick={() => update({
@@ -91,7 +91,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
               vSdV: 0,
             })}
             title="理想驱动基线：关闭逆变效率、线束、静态电流、MOS 压降与死区修正。用于隔离电机模型，不代表真实驱动器。"
-            className="dyno-btn-ghost rounded-sm border px-2 py-1 text-[10px] font-medium whitespace-nowrap cursor-pointer"
+            className="dyno-btn-ghost rounded-sm border px-2 py-1 text-[11px] font-medium whitespace-nowrap cursor-pointer text-center"
           >
             理想基线
           </button>
@@ -107,7 +107,7 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
               vSdV: 0.85,
             })}
             title="仅供 12–24V 演示计算的示例假设，不是低压 BLDC 通用推荐值；须按实际驱动器、线束与波形复核。"
-            className="dyno-btn-ghost rounded-sm border px-2 py-1 text-[10px] font-medium whitespace-nowrap cursor-pointer"
+            className="dyno-btn-ghost rounded-sm border px-2 py-1 text-[11px] font-medium whitespace-nowrap cursor-pointer text-center"
           >
             演示假设
           </button>
@@ -115,16 +115,16 @@ export const SidebarParams: React.FC<SidebarParamsProps> = ({
             type="button"
             onClick={onResetDemoParams}
             title="恢复 13.5V 演示电机与驱动假设，不代表目标电机实测值"
-            className="dyno-btn-ghost inline-flex items-center gap-1 rounded-sm border px-2 py-1 text-[10px] font-medium whitespace-nowrap cursor-pointer"
+            className="dyno-btn-ghost inline-flex items-center justify-center gap-1 rounded-sm border px-2 py-1 text-[11px] font-medium whitespace-nowrap cursor-pointer"
           >
-            <RotateCcw className="h-3 w-3" />
+            <RotateCcw className="h-3 w-3 shrink-0" />
             演示默认
           </button>
         </div>
       </div>
 
-      <div className="px-4 pt-2 text-[10px] leading-relaxed dyno-text-muted">
-        必要基准：极对数、Ke、R_LL、L_LL 和绕组温度应来自目标电机/测量。未辨识的 β、P0(a/b) 可设为 0 关闭对应修正，但这不代表实际磁饱和/铁耗/风摩为 0；关闭后高电流转矩或高速轻载效率可能偏乐观。驱动器选填项用中性值关闭：I_idle / I_deadband / R_line / Rds / t_dead / Vsd = 0，η_inv = 1。不要把演示值当作实测标定。
+      <div className="px-4 pt-2.5 text-[10px] leading-relaxed dyno-text-muted">
+        必要基准：极对数、Ke、R_LL、L_LL 和绕组温度应来自目标电机/测量。未辨识的 β、P0(a/b) 可设为 0 关闭对应修正；驱动器选填项设为中性值（0 或 η_inv=1）即关闭对应压降。
       </div>
       <div className="divide-y dyno-divide px-4 py-2">
         {/* 1. Motor Nameplate & Winding */}

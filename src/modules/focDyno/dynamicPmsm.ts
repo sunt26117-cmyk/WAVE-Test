@@ -363,9 +363,17 @@ function computeFluxMapCurrentTarget(
   const iMax = Math.max(0.05, params.iMaxA);
   const sign = iTorqueCmdA >= 0 ? 1 : -1;
   const requestedIq = Math.min(Math.abs(iTorqueCmdA), iMax) * sign;
+  if (params.controlMode === 'id_zero') {
+    return {
+      idRefA: 0,
+      iqRefA: requestedIq,
+      currentLimited: Math.abs(iTorqueCmdA) > iMax + 1e-9,
+      fieldWeakeningActive: false,
+    };
+  }
   const psiScale = 1; // Flux-map temperature compensation requires a temperature-indexed map; do not scale Ld/Lq derivatives as if they were PM flux only.
   const targetTorque = calcDynamicPmsmTorque(0, requestedIq, params.polePairs, params.psiFVs, params.ldH, params.lqH, params.fluxMap);
-  const rs = params.rsOhm * (1 + (params.rsTempCoeffPerC ?? 0) * ((params.windingTempC ?? params.referenceTempC ?? 25) - (params.referenceTempC ?? 25)));
+  const rs = params.rsOhm * (1 + (params.rsTempCoeffPerC ?? 0.00393) * ((params.windingTempC ?? params.referenceTempC ?? 25) - (params.referenceTempC ?? 25)));
   const vMax = Math.max(0.5, vBusV) / Math.sqrt(3) * 0.96;
   const absTarget = Math.abs(targetTorque);
   let best: { id: number; iq: number; current2: number; torqueError: number; voltage: number } | null = null;
@@ -431,47 +439,79 @@ export function computeMtpaAndFieldWeakeningTarget(
   if (params.controlMode === 'mtpa_current_loop') {
     const dL = params.ldH - params.lqH;
     if (Math.abs(dL) > 1e-9 && iMag > 1e-9) {
-      // Exact MTPA root minimizing |I| for given Te (negative id when Ld < Lq)
+      // Exact rationalized MTPA root minimizing |I| for given Te (negative id when Ld < Lq)
       const psi = Math.max(1e-6, params.psiFVs);
       const disc = psi * psi + 8 * dL * dL * iMag * iMag;
-      idRef = (-psi + Math.sqrt(disc)) / (4 * dL);
-      // Clamp |idRef| <= iMag/sqrt(2) safety
+      idRef = (2 * dL * iMag * iMag) / (psi + Math.sqrt(disc));
+      // Clamp |idRef| <= 0.95*iMag safety
       const idBound = iMag * 0.95;
       if (Math.abs(idRef) > idBound) idRef = Math.sign(idRef) * idBound;
       iqRef = signQ * Math.sqrt(Math.max(0, iMag * iMag - idRef * idRef));
     }
   }
 
-  // Voltage-ellipse check for field weakening (SVPWM linear limit Vmax = Vbus / sqrt(3))
+  // Voltage-ellipse check for field weakening (SVPWM linear limit Vmax = Vbus / sqrt(3)),
+  // including stator resistive drop Rs*(id, iq) and signed electrical speed omegaE.
   const vMaxEff = (Math.max(0.5, vBusV) / Math.sqrt(3)) * 0.96;
+  const rsEff = Math.max(
+    0,
+    params.rsOhm *
+      (1 +
+        (params.rsTempCoeffPerC ?? 0.00393) *
+          ((params.windingTempC ?? params.referenceTempC ?? 25) - (params.referenceTempC ?? 25)))
+  );
   const absWe = Math.abs(omegaERadS);
   let fieldWeakeningActive = false;
   if (absWe > 1.0 && params.controlMode === 'mtpa_current_loop') {
-    const vReq = Math.hypot(-absWe * params.lqH * iqRef, absWe * (params.ldH * idRef + params.psiFVs));
+    const vdReq = rsEff * idRef - omegaERadS * params.lqH * iqRef;
+    const vqReq = rsEff * iqRef + omegaERadS * (params.ldH * idRef + params.psiFVs);
+    const vReq = Math.hypot(vdReq, vqReq);
     if (vReq > vMaxEff) {
       fieldWeakeningActive = true;
-      // Solve voltage ellipse boundary for maximum feasible |iq| while pushing id < 0
-      // Try bisection on id in [-iMax, idRef] maximizing |iq| inside both current & voltage circles
+      // Solve exact resistive voltage ellipse A*x^2 + 2*Bs*x + C <= 0 for x = |iq| >= 0
+      // with iq = signQ * x along id in [-iMax, idRef].
       const loInit = -iMax;
       const hiInit = idRef;
+      const absIqTarget = Math.abs(iqRef);
+      const aQuad = rsEff * rsEff + omegaERadS * omegaERadS * params.lqH * params.lqH;
+      let exactId: number | null = null;
+      let exactI2 = Infinity;
       let bestId = loInit;
       let bestIqAbs = 0;
       const samples = 40;
       for (let k = 0; k <= samples; k++) {
         const idCand = loInit + ((hiInit - loInit) * k) / samples;
         const iqCapCur = Math.sqrt(Math.max(0, iMax * iMax - idCand * idCand));
-        const vdBack = absWe * (params.ldH * idCand + params.psiFVs);
-        const remV2 = vMaxEff * vMaxEff - vdBack * vdBack;
-        if (remV2 <= 0) continue;
-        const iqCapVolt = Math.sqrt(remV2) / Math.max(1e-7, absWe * params.lqH);
-        const iqFeas = Math.min(iqCapCur, iqCapVolt);
-        if (iqFeas > bestIqAbs) {
-          bestIqAbs = iqFeas;
+        const a0 = rsEff * idCand;
+        const b0 = omegaERadS * (params.ldH * idCand + params.psiFVs);
+        const bQuad = signQ * rsEff * omegaERadS * ((params.ldH - params.lqH) * idCand + params.psiFVs);
+        const cQuad = a0 * a0 + b0 * b0 - vMaxEff * vMaxEff;
+        const disc = bQuad * bQuad - aQuad * cQuad;
+        if (disc < 0) continue;
+        const sqrtDisc = Math.sqrt(disc);
+        const xLo = Math.max(0, (-bQuad - sqrtDisc) / aQuad);
+        const xHi = Math.min(iqCapCur, (-bQuad + sqrtDisc) / aQuad);
+        if (xHi < xLo - 1e-12) continue;
+        if (absIqTarget >= xLo - 1e-12 && absIqTarget <= xHi + 1e-12) {
+          const candI2 = idCand * idCand + absIqTarget * absIqTarget;
+          if (candI2 < exactI2) {
+            exactI2 = candI2;
+            exactId = idCand;
+          }
+        }
+        const iqFeas = Math.min(absIqTarget, xHi);
+        if (iqFeas >= xLo - 1e-12 && xHi > bestIqAbs) {
+          bestIqAbs = xHi;
           bestId = idCand;
         }
       }
-      idRef = bestId;
-      iqRef = signQ * Math.min(Math.abs(iqRef), bestIqAbs);
+      if (exactId !== null) {
+        idRef = exactId;
+        iqRef = signQ * absIqTarget;
+      } else {
+        idRef = bestId;
+        iqRef = signQ * Math.min(absIqTarget, bestIqAbs);
+      }
     }
   }
 
@@ -603,12 +643,8 @@ export function simulateDynamicPmsm(
     validatePmsmFluxMap(rawParams.fluxMap);
     const mapReferenceTemp = rawParams.fluxMap.referenceTemperatureC;
     if (mapReferenceTemp === undefined || !Number.isFinite(mapReferenceTemp)) throw new Error('非线性 PMSM 磁链 Map 必须提供 referenceTemperatureC，禁止将未知温度数据当作当前温度使用。');
-    if (Math.abs(magnetTempC - mapReferenceTemp) > 1e-6) throw new Error(`磁体温度 ${magnetTempC}°C 与磁链 Map 参考温度 ${mapReferenceTemp}°C 不一致；请导入对应温度 Map。`);
+    if (Math.abs(magnetTempC - mapReferenceTemp) > 1e-6) throw new Error(`当前磁体温度 ${magnetTempC}°C 与磁链 Map 参考温度 ${mapReferenceTemp}°C 不一致。当前 Map 未提供温度维度，禁止对非线性磁链曲线整体套用 ψf 温度系数。`);
     if (rawParams.fluxMap.idAxisA[0] > -iMax || rawParams.fluxMap.idAxisA[rawParams.fluxMap.idAxisA.length - 1] < iMax || rawParams.fluxMap.iqAxisA[0] > -iMax || rawParams.fluxMap.iqAxisA[rawParams.fluxMap.iqAxisA.length - 1] < iMax) throw new Error(`PMSM 磁链 Map 电流覆盖范围必须至少覆盖 ±Imax（当前 Imax=${iMax}A）；禁止控制器搜索到 Map 外部。`);
-    const mapTemp = rawParams.fluxMap.referenceTemperatureC;
-    if (mapTemp !== undefined && Math.abs(magnetTempC - mapTemp) > 1e-6) {
-      throw new Error(`当前磁体温度 ${magnetTempC}°C 与磁链 Map 参考温度 ${mapTemp}°C 不一致。当前 Map 未提供温度维度，禁止对非线性磁链曲线整体套用 ψf 温度系数。`);
-    }
     if (rawParams.psiTempCoeffPerC !== undefined && rawParams.psiTempCoeffPerC !== 0) {
       throw new Error('使用非线性磁链 Map 时，不允许对整个 ψd/ψq Map 乘永磁体温度系数；请导入对应温度的磁链 Map。');
     }
@@ -647,6 +683,8 @@ export function simulateDynamicPmsm(
     jKgM2: jRot, bNmSPerRad: bVisc, tCoulombNm: tCoul,
     vBusV: vBusDefault, iMaxA: iMax,
     windingTempC, magnetTempC, referenceTempC,
+    rsTempCoeffPerC: 0, // rsOhm is already temperature-corrected to windingTempC; prevent double scaling in sub-helpers.
+    psiTempCoeffPerC: 0,
   };
 
   const tauElecMin = Math.min(ld, lq) / rs;

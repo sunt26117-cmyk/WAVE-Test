@@ -382,6 +382,14 @@ export function isLtspiceExportText(text: string): boolean {
 }
 
 /**
+ * Checks whether a text file is a multi-run stepped LTspice export ("Step Information:").
+ * Single-run 2-column tab/space text exports are routed to the interactive import wizard.
+ */
+export function isLtspiceSteppedExportText(text: string): boolean {
+  return /Step Information:/i.test(text);
+}
+
+/**
  * Parses LTspice exported `.txt` (including multi-run "Step Information: ... (Run: 1/3)" blocks).
  */
 export function parseLtspiceText(text: string, colors: string[]): LtspiceParseResult {

@@ -59,6 +59,7 @@ import {
   buildDynamicPmsmScopeTab,
   buildDynamicPresetScenario,
   calcDynamicPmsmTorque,
+  computeMtpaAndFieldWeakeningTarget,
   kePrimeToPsiF,
   simulateDynamicPmsm,
   createPmsmFluxMapImportTemplate,
@@ -1606,3 +1607,149 @@ print(json.dumps({'source_model':r['source_model'],'last_id':r['id_a'][-1],'last
     assert.ok(pyOut.max_m_res < 1e-7);
   }
 });
+
+test('P3: Python dyno_calibrator.py emits >5% Vbus spread warning before 2D map gridding without disturbing z_extrap_mask', () => {
+  const dynoPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dyno_calibrator.py')?.content || '';
+  assert.ok(dynoPy.includes('def _check_vbus_spread_warning('));
+  assert.ok(dynoPy.includes('vbus_spread_warn = _check_vbus_spread_warning('));
+  assert.ok(dynoPy.includes('"z_extrap_mask": z_extrap_mask'));
+
+  const pyExe = resolvePythonExecutable();
+  if (pyExe) {
+    const runner = [
+      'import ast, json, math, sys',
+      'from typing import Optional',
+      'src = sys.stdin.read()',
+      'tree = ast.parse(src)',
+      'fn_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_check_vbus_spread_warning")',
+      'mod = ast.Module(body=[fn_node], type_ignores=[])',
+      'ns = {"math": math, "Optional": Optional}',
+      'exec(compile(mod, "<dyno_calibrator>", "exec"), ns)',
+      'fn = ns["_check_vbus_spread_warning"]',
+      'print(json.dumps({',
+      '  "wide": fn([9.0, 13.5, 16.0]),',
+      '  "tight": fn([13.4, 13.5, 13.6]),',
+      '  "single": fn([13.5]),',
+      '}, ensure_ascii=False))',
+    ].join('\n');
+    const res = spawnSync(pyExe, ['-c', runner], { input: dynoPy, encoding: 'utf8' });
+    assert.equal(res.status, 0, res.stderr || res.stdout);
+    const out = JSON.parse(res.stdout.trim());
+    assert.ok(typeof out.wide === 'string' && out.wide.includes('>5%') && out.wide.includes('9.00V') && out.wide.includes('16.00V'));
+    assert.equal(out.tight, null);
+    assert.equal(out.single, null);
+  }
+});
+
+test('Audit: dynamicPmsm fluxMap honors id_zero, avoids double Rs temp scaling, and linear FW includes Rs drop (TS & Python parity)', () => {
+  const imported = parsePmsmFluxMapJson(JSON.stringify(createPmsmFluxMapImportTemplate()));
+
+  // 1) fluxMap + id_zero must strictly hold idRefA === 0
+  const idZeroTarget = computeMtpaAndFieldWeakeningTarget(8, 600, 24, {
+    polePairs: 4,
+    rsOhm: 0.12,
+    ldH: 0.2e-3,
+    lqH: 0.5e-3,
+    psiFVs: 0.01,
+    jKgM2: 8e-5,
+    bNmSPerRad: 1e-4,
+    tCoulombNm: 0.002,
+    vBusV: 24,
+    iMaxA: 15,
+    controlMode: 'id_zero',
+    fluxMap: imported,
+  });
+  assert.equal(idZeroTarget.idRefA, 0);
+  assert.equal(idZeroTarget.iqRefA, 8);
+  assert.equal(idZeroTarget.fieldWeakeningActive, false);
+
+  // 2) simulateDynamicPmsm with fluxMap + hot windingTempC must scale Rs ONCE (identical to pre-scaled Rs at referenceTempC)
+  const rs25 = 0.2;
+  const alpha = 0.00393;
+  const tHot = 125;
+  const rsHot = rs25 * (1 + alpha * (tHot - 25));
+  const simCfg = {
+    durationSec: 0.03,
+    dtOutSec: 2e-4,
+    initialSpeedRpm: 1800,
+    scenario: [{ tStartSec: 0, tEndSec: 0.03, tLoadNm: 0.08, speedRefRpm: 2600 }],
+  };
+  const baseSimParams = {
+    polePairs: 4,
+    ldH: 0.2e-3,
+    lqH: 0.5e-3,
+    psiFVs: 0.01,
+    jKgM2: 8e-5,
+    bNmSPerRad: 1e-4,
+    tCoulombNm: 0.002,
+    vBusV: 14,
+    iMaxA: 15,
+    controlMode: 'mtpa_current_loop' as const,
+    fluxMap: imported,
+    magnetTempC: 25,
+    referenceTempC: 25,
+  };
+  const resTempScaled = simulateDynamicPmsm(
+    { ...baseSimParams, rsOhm: rs25, windingTempC: tHot, rsTempCoeffPerC: alpha },
+    simCfg
+  );
+  const resPreScaled = simulateDynamicPmsm(
+    { ...baseSimParams, rsOhm: rsHot, windingTempC: 25, rsTempCoeffPerC: 0 },
+    simCfg
+  );
+  const last = resTempScaled.time.length - 1;
+  assert.ok(Math.abs(resTempScaled.idA[last] - resPreScaled.idA[last]) < 1e-9, 'fluxMap simulation must not double-scale Rs by winding temperature');
+  assert.ok(Math.abs(resTempScaled.iqA[last] - resPreScaled.iqA[last]) < 1e-9);
+  assert.ok(Math.abs(resTempScaled.vdV[last] - resPreScaled.vdV[last]) < 1e-9);
+
+  // 3) Linear FW accounts for Rs resistive drop (motoring hits FW earlier than regen at identical speed)
+  const lvParams = {
+    polePairs: 4,
+    rsOhm: 0.45,
+    ldH: 0.2e-3,
+    lqH: 0.4e-3,
+    psiFVs: 0.012,
+    jKgM2: 8e-5,
+    bNmSPerRad: 1e-4,
+    tCoulombNm: 0.002,
+    vBusV: 12,
+    iMaxA: 12,
+    controlMode: 'mtpa_current_loop' as const,
+  };
+  // At omegaE = 300 rad/s, back-EMF = 3.6 V, vMaxEff = 6.65 V, Rs*Iq = 4.5 V => motoring Vq ~ 8.1 V > 6.65 V (FW active),
+  // whereas regen (iq = -10 A) has Vq ~ 3.6 - 4.5 = -0.9 V (well inside voltage circle, FW inactive).
+  const motoringTgt = computeMtpaAndFieldWeakeningTarget(10, 300, 12, lvParams);
+  const regenTgt = computeMtpaAndFieldWeakeningTarget(-10, 300, 12, lvParams);
+  assert.equal(motoringTgt.fieldWeakeningActive, true);
+  assert.equal(regenTgt.fieldWeakeningActive, false);
+  const vdMot = lvParams.rsOhm * motoringTgt.idRefA - 300 * lvParams.lqH * motoringTgt.iqRefA;
+  const vqMot = lvParams.rsOhm * motoringTgt.iqRefA + 300 * (lvParams.ldH * motoringTgt.idRefA + lvParams.psiFVs);
+  assert.ok(Math.hypot(vdMot, vqMot) <= (12 / Math.sqrt(3)) * 0.96 + 1e-6);
+
+  // 4) Python parity for fluxMap closed-loop hot-winding run & id_zero
+  const dynPy = PYTHON_BUNDLE_FILES.find((f) => f.name === 'dynamic_pmsm.py')?.content || '';
+  if (PYTHON_EXECUTABLE) {
+    const pyScript = `
+import json, sys
+ns = {}
+exec(sys.stdin.read(), ns)
+doc = json.loads(${JSON.stringify(JSON.stringify(createPmsmFluxMapImportTemplate()))})
+flux = ns['parse_pmsm_flux_map_json'](json.dumps(doc))
+p_hot = ns['DynamicPmsmParams'](pole_pairs=4,rs_ohm=${rs25},ld_h=0.2e-3,lq_h=0.5e-3,psi_f_vs=0.01,j_kg_m2=8e-5,b_nm_s_per_rad=1e-4,t_coulomb_nm=0.002,v_bus_v=14,i_max_a=15,control_mode='mtpa_current_loop',flux_map=flux,reference_temp_c=25,winding_temp_c=${tHot},magnet_temp_c=25,rs_temp_coeff_per_c=${alpha})
+cfg = ns['DynamicPmsmConfig'](duration_sec=0.03,dt_out_sec=2e-4,initial_speed_rpm=1800,scenario=[ns['DynamicScenarioStep'](0,0.03,t_load_nm=0.08,speed_ref_rpm=2600)])
+r = ns['simulate_dynamic_pmsm'](p_hot, cfg)
+p_id0 = ns['DynamicPmsmParams'](pole_pairs=4,rs_ohm=0.12,ld_h=0.2e-3,lq_h=0.5e-3,psi_f_vs=0.01,j_kg_m2=8e-5,b_nm_s_per_rad=1e-4,t_coulomb_nm=0.002,v_bus_v=24,i_max_a=15,control_mode='id_zero',flux_map=flux)
+t_id0 = ns['compute_mtpa_and_fw_target'](8.0, 600.0, 24.0, p_id0)
+print(json.dumps({'last_id': r['id_a'][-1], 'last_iq': r['iq_a'][-1], 'id0_id': t_id0['id_ref_a'], 'id0_iq': t_id0['iq_ref_a']}))
+`;
+    const pyProc = spawnSync(PYTHON_EXECUTABLE, ['-c', pyScript], { input: dynPy, encoding: 'utf8' });
+    assert.equal(pyProc.status, 0, pyProc.stderr || pyProc.stdout);
+    const pyOut = JSON.parse(pyProc.stdout.trim());
+    assert.equal(pyOut.id0_id, 0);
+    assert.equal(pyOut.id0_iq, 8);
+    assert.ok(Math.abs(pyOut.last_id - resTempScaled.idA[last]) < 1e-6);
+    assert.ok(Math.abs(pyOut.last_iq - resTempScaled.iqA[last]) < 1e-6);
+  }
+});
+
+

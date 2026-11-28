@@ -11,7 +11,7 @@ import { previewCsv, parseFullCsv } from '../parsers/csvParser';
 import { parseWfmBuffer } from '../parsers/wfmParser';
 import {
   parseLtspiceRawBuffer,
-  isLtspiceExportText,
+  isLtspiceSteppedExportText,
   parseLtspiceText,
 } from '../parsers/ltspiceParser';
 import { computeTemporalCoverage } from './temporalCompare';
@@ -21,6 +21,7 @@ import {
   sampleSeriesAtTimeStrict,
   validateChannelIntegrity,
 } from './timeSync';
+import { resampleUniform } from './resampler';
 
 export interface CompareGroupTheme {
   id: string;
@@ -189,8 +190,42 @@ export async function computeFileFingerprint(file: File): Promise<string> {
 }
 
 /**
- * Detects whether two channels have a large time-span / step mismatch (e.g. ms vs s, 1000x).
- * Returns recommended timeScale (e.g. 0.001 or durT/durR) when ratio >= 10x or <= 0.1x; otherwise 1.
+ * Ensures a channel has strictly increasing finite timestamps by dropping duplicate or non-increasing samples.
+ */
+export function sanitizeMonotonicChannel(ch: WaveformChannel): WaveformChannel {
+  if (!ch || !ch.t || ch.t.length < 2) return ch;
+  const integrity = validateChannelIntegrity(ch, 2, DEFAULT_SAMPLING_GAP_FACTOR);
+  if (integrity.valid) return ch;
+  const keepIdx: number[] = [];
+  let lastT = -Infinity;
+  for (let i = 0; i < ch.t.length; i++) {
+    const tVal = ch.t[i];
+    if (!Number.isFinite(tVal)) continue;
+    if (keepIdx.length === 0 || tVal > lastT) {
+      keepIdx.push(i);
+      lastT = tVal;
+    }
+  }
+  if (keepIdx.length < 2) return ch;
+  const cleanT = new Float64Array(keepIdx.length);
+  const cleanV = new Float32Array(keepIdx.length);
+  for (let k = 0; k < keepIdx.length; k++) {
+    cleanT[k] = ch.t[keepIdx[k]];
+    cleanV[k] = ch.v[keepIdx[k]];
+  }
+  return {
+    ...ch,
+    t: cleanT,
+    v: cleanV,
+    rawT: cleanT,
+    rawV: cleanV,
+  };
+}
+
+/**
+ * Detects whether two channels have a genuine metric time-unit mismatch (e.g. ms vs s, 1000x, or us vs s, 1e6x).
+ * Only returns `isLargeMismatch: true` when the duration scale or sampling step scale is close to a metric decade
+ * (1e-9, 1e-6, 1e-3, 1e3, 1e6, 1e9), avoiding false time-squashing when two waveforms simply have different durations.
  */
 export function detectRecommendedTimeScale(
   targetCh: WaveformChannel,
@@ -205,20 +240,19 @@ export function detectRecommendedTimeScale(
   if (durT <= 1e-18 || durR <= 1e-18) return { timeScale: 1, ratio: 1, isLargeMismatch: false };
 
   const ratio = durR / durT;
-  const isLargeMismatch = ratio >= 10 || ratio <= 0.1;
-  if (!isLargeMismatch) {
+  if (ratio < 500 && ratio > 0.002) {
     return { timeScale: 1, ratio, isLargeMismatch: false };
   }
 
-  // Snap to clean metric decade if within 8% (handles ms vs s, us vs ms, us vs s cleanly)
+  // Snap to clean metric decade only if within 15% of a metric unit decade (ms vs s, us vs ms, us vs s)
   const decades = [1e-9, 1e-6, 1e-3, 1e3, 1e6, 1e9];
   const exactScale = durT / durR;
   for (const d of decades) {
-    if (Math.abs(exactScale - d) / d <= 0.08) {
+    if (Math.abs(exactScale - d) / d <= 0.15) {
       return { timeScale: d, ratio, isLargeMismatch: true };
     }
   }
-  return { timeScale: exactScale, ratio, isLargeMismatch: true };
+  return { timeScale: 1, ratio, isLargeMismatch: false };
 }
 
 interface CompareMetricGrid {
@@ -577,22 +611,21 @@ export interface MappedReferenceTrace {
  */
 export function buildMappedReferenceTrace(
   targetCh: WaveformChannel,
-  refCh: WaveformChannel,
+  refChInput: WaveformChannel,
   timeShiftSec: number = 0,
   removeDcOffset: boolean = false,
   timeScale: number = 1,
   targetMeanApplied?: number,
   refMeanApplied?: number
 ): MappedReferenceTrace {
+  const refCh = sanitizeMonotonicChannel(refChInput);
   const refIntegrity = validateChannelIntegrity(refCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
   if (!refIntegrity.valid) {
     return { t: new Float64Array(0), v: new Float32Array(0) };
   }
   const unitCheck = resolveUnitPairCompatibility(targetCh.unit, refCh.unit);
-  if (!unitCheck.compatible) {
-    return { t: new Float64Array(0), v: new Float32Array(0) };
-  }
-  const refScaleToTarget = unitCheck.scaleBToA;
+  const refScaleToTarget = unitCheck.compatible ? unitCheck.scaleBToA : 1;
+  const effectiveRemoveDc = removeDcOffset && unitCheck.compatible;
 
   const nR = refCh.t.length;
   const mappedT = new Float64Array(nR);
@@ -604,7 +637,7 @@ export function buildMappedReferenceTrace(
 
   let targetShift = 0;
   let refShift = 0;
-  if (removeDcOffset) {
+  if (effectiveRemoveDc) {
     if (targetMeanApplied !== undefined && refMeanApplied !== undefined) {
       targetShift = targetMeanApplied;
       refShift = refMeanApplied;
@@ -641,23 +674,87 @@ export function buildMappedReferenceTrace(
     if (!isFinite(raw)) {
       mappedV[i] = NaN;
     } else {
-      mappedV[i] = removeDcOffset ? raw - refShift + targetShift : raw;
+      mappedV[i] = effectiveRemoveDc ? raw - refShift + targetShift : raw;
     }
   }
 
   return { t: mappedT, v: mappedV };
 }
 
-function findFirstRisingCrossingTime(ch: WaveformChannel): number | null {
+/**
+ * Determines whether a queued Compare entry can be overlaid onto Scope or used for Diff traces.
+ * When `overlayRefs` is true, differing/disjoint time axes or different units are allowed
+ * as long as `fullRefT` has at least 2 samples.
+ */
+export function canApplyCompareOverlay(
+  alignedStatus: CompareStatus | undefined,
+  fullRefT: ArrayLike<number> | null | undefined,
+  overlayRefs: boolean,
+  alignedValid: boolean
+): boolean {
+  if (!fullRefT || fullRefT.length < 2) return false;
+  if (overlayRefs) return true;
+  if (alignedStatus === 'INVALID') return false;
+  return alignedValid;
+}
+
+export type AutoAlignMode = 'start' | 'rising-edge' | 'falling-edge' | 'first-peak' | 'xcorr';
+
+export interface AutoAlignOptions {
+  /** Edge threshold percentage of (max - min), default 50 (supports e.g. 10, 50, 90). */
+  thresholdPct?: number;
+  /** 1-based occurrence index of matching edge inside window (default 1). */
+  edgeIndex?: number;
+  /** Optional time window [tStart, tEnd] in each channel's frame (or target frame for viewport alignment). */
+  targetTimeWindow?: { tStart: number; tEnd: number } | null;
+  refTimeWindow?: { tStart: number; tEnd: number } | null;
+}
+
+export interface AutoAlignDetailedResult {
+  shiftSec: number;
+  mode: AutoAlignMode;
+  matched: boolean;
+  confidenceR: number | null;
+  ambiguousPeriodic: boolean;
+  targetAnchorTime: number | null;
+  refAnchorTime: number | null;
+  warning: string | null;
+}
+
+function clampWindowIndices(
+  t: Float64Array,
+  win?: { tStart: number; tEnd: number } | null
+): { start: number; end: number } {
+  const n = t.length;
+  if (!win || n === 0) return { start: 0, end: Math.max(0, n - 1) };
+  const wS = Math.min(win.tStart, win.tEnd);
+  const wE = Math.max(win.tStart, win.tEnd);
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi && t[lo] < wS) lo++;
+  while (hi > lo && t[hi] > wE) hi--;
+  return { start: lo, end: hi };
+}
+
+function findNthEdgeCrossingTime(
+  ch: WaveformChannel,
+  polarity: 'rising' | 'falling',
+  thresholdPct: number = 50,
+  edgeIndex: number = 1,
+  timeWindow?: { tStart: number; tEnd: number } | null
+): number | null {
   const integrity = validateChannelIntegrity(ch, 4, DEFAULT_SAMPLING_GAP_FACTOR);
   if (!integrity.valid) return null;
-  const n = ch.t.length;
+  const { start, end } = clampWindowIndices(ch.t, timeWindow);
+  if (end - start < 3) return null;
+
   const gapThreshold = integrity.timebase.gapThresholdSec;
   const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
   let mn = Infinity;
   let mx = -Infinity;
-  const step = n > 60000 ? Math.floor(n / 30000) : 1;
-  for (let i = 0; i < n; i += step) {
+  const spanN = end - start + 1;
+  const step = spanN > 60000 ? Math.floor(spanN / 30000) : 1;
+  for (let i = start; i <= end; i += step) {
     const val = getChannelDisplayValue(ch, i, mean);
     if (isFinite(val)) {
       if (val < mn) mn = val;
@@ -666,11 +763,15 @@ function findFirstRisingCrossingTime(ch: WaveformChannel): number | null {
   }
   const span = mx - mn;
   if (!isFinite(span) || span <= 1e-12) return null;
-  const mid = (mx + mn) / 2;
-  const hyst = span * 0.06;
-  let armed = false;
 
-  for (let i = 1; i < n; i++) {
+  const pct = Math.max(2, Math.min(98, Number.isFinite(thresholdPct) ? thresholdPct : 50)) / 100;
+  const level = mn + pct * span;
+  const hyst = Math.min(0.06 * span, Math.max(0.015 * span, 0.25 * Math.min(level - mn, mx - level)));
+  const targetOccurrence = Math.max(1, Math.floor(edgeIndex));
+  let armed = false;
+  let foundCount = 0;
+
+  for (let i = start + 1; i <= end; i++) {
     const prev = getChannelDisplayValue(ch, i - 1, mean);
     const curr = getChannelDisplayValue(ch, i, mean);
     const dt = ch.t[i] - ch.t[i - 1];
@@ -678,24 +779,43 @@ function findFirstRisingCrossingTime(ch: WaveformChannel): number | null {
       armed = false;
       continue;
     }
-    if (prev <= mid - hyst) armed = true;
-    if (armed && prev < mid && curr >= mid) {
-      const denom = curr - prev;
-      const frac = denom > 1e-15 ? (mid - prev) / denom : 0;
-      return ch.t[i - 1] + frac * dt;
+
+    if (polarity === 'rising') {
+      if (prev <= level - hyst) armed = true;
+      if (armed && prev < level && curr >= level) {
+        const denom = curr - prev;
+        const frac = denom > 1e-15 ? Math.max(0, Math.min(1, (level - prev) / denom)) : 0;
+        const tCross = ch.t[i - 1] + frac * dt;
+        foundCount++;
+        if (foundCount === targetOccurrence) return tCross;
+        armed = false;
+      }
+    } else {
+      if (prev >= level + hyst) armed = true;
+      if (armed && prev > level && curr <= level) {
+        const denom = prev - curr;
+        const frac = denom > 1e-15 ? Math.max(0, Math.min(1, (prev - level) / denom)) : 0;
+        const tCross = ch.t[i - 1] + frac * dt;
+        foundCount++;
+        if (foundCount === targetOccurrence) return tCross;
+        armed = false;
+      }
     }
   }
   return null;
 }
 
-function findPeakTime(ch: WaveformChannel): number | null {
+function findPeakTime(
+  ch: WaveformChannel,
+  timeWindow?: { tStart: number; tEnd: number } | null
+): number | null {
   const integrity = validateChannelIntegrity(ch, 1, DEFAULT_SAMPLING_GAP_FACTOR);
   if (!integrity.valid) return null;
-  const n = ch.t.length;
+  const { start, end } = clampWindowIndices(ch.t, timeWindow);
   const mean = ch.coupling === 'AC' ? computeChannelMean(ch) : 0;
   let bestIdx = -1;
   let bestVal = -Infinity;
-  for (let i = 0; i < n; i++) {
+  for (let i = start; i <= end; i++) {
     const val = getChannelDisplayValue(ch, i, mean);
     if (isFinite(val) && val > bestVal) {
       bestVal = val;
@@ -706,54 +826,143 @@ function findPeakTime(ch: WaveformChannel): number | null {
 }
 
 /**
- * Estimates optimal time shift Δt (in seconds) to align refCh (after optional timeScale) to targetCh.
+ * Detailed auto time-alignment returning Δt plus confidence r, anchor timestamps,
+ * and periodic multi-peak ambiguity detection for engineering review.
  */
-export function computeAutoTimeAlignShift(
+export function computeAutoTimeAlignDetailed(
   targetCh: WaveformChannel,
   refCh: WaveformChannel,
-  mode: 'start' | 'rising-edge' | 'first-peak' | 'xcorr',
-  timeScale: number = 1
-): number {
+  mode: AutoAlignMode,
+  timeScale: number = 1,
+  options?: AutoAlignOptions
+): AutoAlignDetailedResult {
   const tgtInt = validateChannelIntegrity(targetCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
   const refInt = validateChannelIntegrity(refCh, 1, DEFAULT_SAMPLING_GAP_FACTOR);
-  if (!tgtInt.valid || !refInt.valid) return 0;
+  if (!tgtInt.valid || !refInt.valid) {
+    return {
+      shiftSec: 0,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: null,
+      refAnchorTime: null,
+      warning: '通道数据完整性校验未通过，无法执行自动对齐。',
+    };
+  }
 
   const safeScale = isFinite(timeScale) && timeScale > 0 ? timeScale : 1;
   const refT0 = refCh.t[0];
+  const fallbackShift = targetCh.t[0] - refT0;
 
   if (mode === 'start') {
-    return targetCh.t[0] - refT0;
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: true,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: targetCh.t[0],
+      refAnchorTime: refT0,
+      warning: null,
+    };
   }
 
-  if (mode === 'rising-edge') {
-    const tT = findFirstRisingCrossingTime(targetCh);
-    const tR = findFirstRisingCrossingTime(refCh);
+  if (mode === 'rising-edge' || mode === 'falling-edge') {
+    const polarity = mode === 'rising-edge' ? 'rising' : 'falling';
+    const pct = options?.thresholdPct ?? 50;
+    const edgeIdx = options?.edgeIndex ?? 1;
+    const tT = findNthEdgeCrossingTime(targetCh, polarity, pct, edgeIdx, options?.targetTimeWindow);
+    const tR = findNthEdgeCrossingTime(refCh, polarity, pct, edgeIdx, options?.refTimeWindow);
     if (tT !== null && tR !== null) {
       const mappedTR = refT0 + (tR - refT0) * safeScale;
-      return tT - mappedTR;
+      return {
+        shiftSec: tT - mappedTR,
+        mode,
+        matched: true,
+        confidenceR: null,
+        ambiguousPeriodic: false,
+        targetAnchorTime: tT,
+        refAnchorTime: tR,
+        warning: null,
+      };
     }
-    return targetCh.t[0] - refT0;
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: tT,
+      refAnchorTime: tR,
+      warning: `未在指定范围内找到足够的 ${pct}% ${polarity === 'rising' ? '上升沿' : '下降沿'}，已回退为首样本对齐。`,
+    };
   }
 
   if (mode === 'first-peak') {
-    const tT = findPeakTime(targetCh);
-    const tR = findPeakTime(refCh);
+    const tT = findPeakTime(targetCh, options?.targetTimeWindow);
+    const tR = findPeakTime(refCh, options?.refTimeWindow);
     if (tT !== null && tR !== null) {
       const mappedTR = refT0 + (tR - refT0) * safeScale;
-      return tT - mappedTR;
+      return {
+        shiftSec: tT - mappedTR,
+        mode,
+        matched: true,
+        confidenceR: null,
+        ambiguousPeriodic: false,
+        targetAnchorTime: tT,
+        refAnchorTime: tR,
+        warning: null,
+      };
     }
-    return targetCh.t[0] - refT0;
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: tT,
+      refAnchorTime: tR,
+      warning: '未找到有效峰值，已回退为首样本对齐。',
+    };
   }
 
-  // Coarse normalized cross-correlation over scaled duration
+  // Normalized cross-correlation with parabolic sub-bin refinement + periodic multi-peak ambiguity guard
   const nT = targetCh.t.length;
   const nR = refCh.t.length;
-  if (nT < 8 || nR < 8) return targetCh.t[0] - refT0;
+  if (nT < 8 || nR < 8) {
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: null,
+      refAnchorTime: null,
+      warning: '有效样本不足 8 点，无法执行互相关对齐。',
+    };
+  }
 
-  const t0T = targetCh.t[0];
-  const durT = targetCh.t[nT - 1] - t0T;
-  const durR = (refCh.t[nR - 1] - refT0) * safeScale;
-  if (durT <= 0 || durR <= 0) return t0T - refT0;
+  const tgtBounds = clampWindowIndices(targetCh.t, options?.targetTimeWindow);
+  const refBounds = clampWindowIndices(refCh.t, options?.refTimeWindow);
+  const t0T = targetCh.t[tgtBounds.start];
+  const t1T = targetCh.t[tgtBounds.end];
+  const r0Raw = refCh.t[refBounds.start];
+  const r1Raw = refCh.t[refBounds.end];
+  const durT = t1T - t0T;
+  const durR = (r1Raw - r0Raw) * safeScale;
+  if (durT <= 0 || durR <= 0) {
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: null,
+      refAnchorTime: null,
+      warning: '时间跨度为 0，无法执行互相关对齐。',
+    };
+  }
 
   const bins = 512;
   const minDur = Math.min(durT, durR);
@@ -773,7 +982,7 @@ export function computeAutoTimeAlignShift(
   let cntR = 0;
   for (let i = 0; i < bins; i++) {
     const tv = sampleRefAtTime(targetCh.t, targetCh, meanT, t0T + i * dtGrid, tgtGapLimit).value;
-    const rv = sampleRefAtTime(refCh.t, refCh, meanR, refT0 + (i * dtGrid) / safeScale, refGapLimit).value;
+    const rv = sampleRefAtTime(refCh.t, refCh, meanR, r0Raw + (i * dtGrid) / safeScale, refGapLimit).value;
     if (isFinite(tv)) {
       sigT[i] = tv;
       validT[i] = 1;
@@ -787,7 +996,18 @@ export function computeAutoTimeAlignShift(
       cntR++;
     }
   }
-  if (cntT < 4 || cntR < 4) return t0T - refT0;
+  if (cntT < 4 || cntR < 4) {
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: null,
+      refAnchorTime: null,
+      warning: '互相关网格有效点不足，已回退为首样本对齐。',
+    };
+  }
   avgT /= cntT;
   avgR /= cntR;
   for (let i = 0; i < bins; i++) {
@@ -796,6 +1016,10 @@ export function computeAutoTimeAlignShift(
   }
 
   const maxLag = Math.floor(bins * 0.45);
+  const lagCount = 2 * maxLag + 1;
+  const corrArr = new Float64Array(lagCount);
+  corrArr.fill(-Infinity);
+
   let bestLag = 0;
   let bestCorr = -Infinity;
 
@@ -815,6 +1039,7 @@ export function computeAutoTimeAlignShift(
     const denom = Math.sqrt(dT * dR);
     if (pairCnt >= 8 && denom > 1e-18) {
       const c = num / denom;
+      corrArr[lag + maxLag] = c;
       if (c > bestCorr) {
         bestCorr = c;
         bestLag = lag;
@@ -822,7 +1047,135 @@ export function computeAutoTimeAlignShift(
     }
   }
 
-  return t0T - refT0 + bestLag * dtGrid;
+  if (!Number.isFinite(bestCorr)) {
+    return {
+      shiftSec: fallbackShift,
+      mode,
+      matched: false,
+      confidenceR: null,
+      ambiguousPeriodic: false,
+      targetAnchorTime: null,
+      refAnchorTime: null,
+      warning: '信号为直流或方差为零，无法通过互相关对齐。',
+    };
+  }
+
+  // Parabolic sub-bin interpolation around bestLag
+  let refinedLag = bestLag;
+  const bestIdx = bestLag + maxLag;
+  if (bestIdx > 0 && bestIdx < lagCount - 1) {
+    const cPrev = corrArr[bestIdx - 1];
+    const cCurr = corrArr[bestIdx];
+    const cNext = corrArr[bestIdx + 1];
+    const denom = cPrev - 2 * cCurr + cNext;
+    if (Number.isFinite(cPrev) && Number.isFinite(cNext) && Math.abs(denom) > 1e-12 && denom < 0) {
+      const delta = Math.max(-0.5, Math.min(0.5, 0.5 * (cPrev - cNext) / denom));
+      refinedLag = bestLag + delta;
+    }
+  }
+
+  // Detect secondary local maxima far from bestLag (> 3 bins) indicating periodic whole-cycle ambiguity
+  let secondPeakCorr = -Infinity;
+  for (let idx = 1; idx < lagCount - 1; idx++) {
+    if (Math.abs(idx - bestIdx) <= 4) continue;
+    const c = corrArr[idx];
+    if (Number.isFinite(c) && c >= corrArr[idx - 1] && c >= corrArr[idx + 1] && c > secondPeakCorr) {
+      secondPeakCorr = c;
+    }
+  }
+  const ambiguousPeriodic = bestCorr > 0.5 && secondPeakCorr >= bestCorr * 0.92;
+  const mappedR0 = refT0 + (r0Raw - refT0) * safeScale;
+  const shiftSec = t0T - mappedR0 + refinedLag * dtGrid;
+
+  const warning = ambiguousPeriodic
+    ? `互相关检测到多个近似等高相关峰 (主峰 r=${bestCorr.toFixed(3)}，次峰 r=${secondPeakCorr.toFixed(3)})，周期信号可能存在整周期错位；建议改用上升/下降沿对齐或勾选“仅当前视口”缩放至特征跳变区。`
+    : bestCorr < 0.6
+    ? `互相关峰值偏低 (r=${bestCorr.toFixed(3)})，请复核对齐结果。`
+    : null;
+
+  return {
+    shiftSec,
+    mode,
+    matched: true,
+    confidenceR: Math.max(-1, Math.min(1, bestCorr)),
+    ambiguousPeriodic,
+    targetAnchorTime: t0T,
+    refAnchorTime: r0Raw,
+    warning,
+  };
+}
+
+/**
+ * Estimates optimal time shift Δt (in seconds) to align refCh (after optional timeScale) to targetCh.
+ */
+export function computeAutoTimeAlignShift(
+  targetCh: WaveformChannel,
+  refCh: WaveformChannel,
+  mode: AutoAlignMode,
+  timeScale: number = 1,
+  options?: AutoAlignOptions
+): number {
+  return computeAutoTimeAlignDetailed(targetCh, refCh, mode, timeScale, options).shiftSec;
+}
+
+export interface CompareCsvRowInput {
+  refLabel: string;
+  sourceName: string;
+  unit: string;
+  timeScale: number;
+  timeShiftSec: number;
+  metrics: WaveformCompareMetrics;
+  toleranceStatus: string;
+}
+
+/**
+ * Generates an engineering CSV report summarizing multi-waveform comparison errors and alignment shifts.
+ */
+export function exportCompareSummaryCsv(targetLabel: string, rows: CompareCsvRowInput[]): string {
+  const esc = (s: string) => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+  const header = [
+    'Target',
+    'Reference',
+    'Source',
+    'Unit',
+    'TimeScale',
+    'TimeShift_s',
+    'Status',
+    'Coverage_pct',
+    'RMSE',
+    'MAE',
+    'MaxAbsDiff',
+    'MaxAbsDiffTime_s',
+    'Pearson_r',
+    'Similarity_pct',
+    'ToleranceResult',
+  ];
+  const lines = [header.join(',')];
+  for (const r of rows) {
+    const m = r.metrics;
+    const fmt = (v: number | null | undefined, digits = 6) =>
+      v !== null && v !== undefined && Number.isFinite(v) ? v.toFixed(digits) : '';
+    lines.push(
+      [
+        esc(targetLabel),
+        esc(r.refLabel),
+        esc(r.sourceName),
+        esc(r.unit),
+        fmt(r.timeScale, 6),
+        fmt(r.timeShiftSec, 9),
+        esc(m.status),
+        fmt(m.coveragePct, 2),
+        fmt(m.rmse, 6),
+        fmt(m.mae, 6),
+        fmt(m.maxAbsDiff, 6),
+        fmt(m.maxAbsDiffTime, 9),
+        fmt(m.correlation, 5),
+        fmt(m.similarityPct, 2),
+        esc(r.toleranceStatus),
+      ].join(',')
+    );
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -1100,7 +1453,7 @@ export async function parseReferenceFileToChannels(
     return {
       fileName: file.name,
       fingerprint,
-      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean),
+      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean).map(sanitizeMonotonicChannel),
     };
   }
   if (lower.endsWith('.raw')) {
@@ -1108,17 +1461,17 @@ export async function parseReferenceFileToChannels(
     return {
       fileName: file.name,
       fingerprint,
-      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean),
+      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean).map(sanitizeMonotonicChannel),
     };
   }
 
   const text = new TextDecoder().decode(buf);
-  if (lower.endsWith('.txt') && isLtspiceExportText(text)) {
+  if (lower.endsWith('.txt') && isLtspiceSteppedExportText(text)) {
     const res = parseLtspiceText(text, colors);
     return {
       fileName: file.name,
       fingerprint,
-      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean),
+      channels: res.drawOrder.map((id) => res.channels[id]).filter(Boolean).map(sanitizeMonotonicChannel),
     };
   }
   const prev = previewCsv(text);
@@ -1138,6 +1491,6 @@ export async function parseReferenceFileToChannels(
   return {
     fileName: file.name,
     fingerprint,
-    channels: parsed.drawOrder.map((id) => parsed.channels[id]).filter(Boolean),
+    channels: parsed.drawOrder.map((id) => parsed.channels[id]).filter(Boolean).map(sanitizeMonotonicChannel),
   };
 }

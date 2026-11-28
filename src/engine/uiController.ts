@@ -54,6 +54,7 @@ import {
   generateWaveformSVG,
   formatEng,
   formatMeasurementMetricValue,
+  formatMetricScalarValue,
   formatCustomMeasurementValue,
 } from './canvasRenderer';
 import {
@@ -62,6 +63,7 @@ import {
   applyThemeToDocument,
   getComputedPaletteColor,
   getRawPaletteColor,
+  resolveChannelTextColor,
 } from '../modules/themeManager';
 import {
   STANDARD_125_VALUES,
@@ -128,6 +130,7 @@ import { parseWfmBuffer } from '../parsers/wfmParser';
 import {
   parseLtspiceRawBuffer,
   isLtspiceExportText,
+  isLtspiceSteppedExportText,
   parseLtspiceText,
 } from '../parsers/ltspiceParser';
 import { computeBufferFingerprint, computeTextFingerprint } from '../modules/waveformCompare';
@@ -140,7 +143,12 @@ import {
   releaseExcelWorkbookSession,
 } from '../parsers/excelParser';
 import { excelImportModal, ExcelImportedSheetPayload } from '../modules/excelImportModal';
-import { mergeExcelChannelsByTime, resolveExcelMergedViewport, type ExcelMergeTimeMode } from '../modules/excelTimeAlignment';
+import {
+  mergeExcelChannelsByTime,
+  resolveExcelMergedViewport,
+  type ExcelMergeTimeMode,
+  type ExcelMergeSource,
+} from '../modules/excelTimeAlignment';
 import { escapeHtml, escapeCsvCell } from '../utils/html';
 
 type DragMode =
@@ -166,19 +174,35 @@ type DragMode =
       initialVOffset: number;
       voltsPerDiv: number;
       area: PlotArea;
+      undoPushed?: boolean;
+    }
+  | {
+      type: 'timeShift';
+      channelId: string;
+      startX: number;
+      initialTimeShiftSec: number;
+      tSpan: number;
+      undoPushed?: boolean;
     }
   | { type: 'cursorX'; which: 'x1' | 'x2' }
   | { type: 'cursorY'; which: 'y1' | 'y2'; channelId: string; area: PlotArea }
-  | { type: 'gnd'; channelId: string; area: PlotArea }
+  | { type: 'gnd'; channelId: string; area: PlotArea; startY: number; undoPushed?: boolean }
   | { type: 'trigger'; channelId: string; area: PlotArea }
-  | { type: 'areaZoom'; start: { x: number; y: number }; end: { x: number; y: number } }
+  | {
+      type: 'areaZoom';
+      start: { x: number; y: number };
+      end: { x: number; y: number };
+      isRightButton?: boolean;
+      clientX?: number;
+      clientY?: number;
+    }
   | { type: 'areaAnnotate'; channelId: string; area: PlotArea; start: { x: number; y: number }; end: { x: number; y: number } };
 
 export class OscilloscopeApp {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
-  private themeId: ThemeId = 'obsidian';
-  private theme: RenderTheme = DEFAULT_THEME;
+  private themeId: ThemeId = 'daylight';
+  private theme: RenderTheme = THEME_PRESETS.daylight.canvas;
 
   private tabs: TabState[] = [];
   private activeTabIndex: number = -1;
@@ -194,11 +218,16 @@ export class OscilloscopeApp {
   private customMeasCache: Record<string, { key: string; values: Record<string, CustomMeasurementDetailedResult> }> = {};
   private pendingDrawRaf: number | null = null;
   private editVersion: number = 0;
+  private lastHudSyncAt: number = 0;
+  private hudSettleTimer: number | null = null;
+  private readonly hudThrottleMs: number = 100;
+  private readonly hudSettleDelayMs: number = 120;
 
-  // CSV import modal state
-  private pendingCsvText: string = '';
-  private pendingCsvPreview: CsvPreviewInfo | null = null;
-  private pendingFileName: string = '';
+  // CSV / TXT multi-file import modal queue state
+  private pendingCsvQueue: Array<{ fileName: string; text: string; preview: CsvPreviewInfo }> = [];
+  private pendingCsvActiveIndex: number = 0;
+  private pendingCsvDisposition: 'separate' | 'merge' | 'append' = 'separate';
+  private pendingCsvTimeAlignment: ExcelMergeTimeMode = 'auto-best';
 
   // Per-tab anti-jitter dynamic Y-axis margin cache
   private tabLeftMarginCache: Map<string, { margin: number; layoutKey: string }> = new Map();
@@ -206,6 +235,9 @@ export class OscilloscopeApp {
   // Pending text annotation coordinate
   private pendingAnnotationCoord: { time: number; voltage: number; channelId: string } | null = null;
   private toastTimer: number | null = null;
+  private contextMenuPoint: { x: number; y: number } | null = null;
+  private soloPrevVisibility: Record<string, boolean> | null = null;
+  private soloChannelId: string | null = null;
 
   // Hook for opening/editing a Compare Group from softkey pill or sidebar
   public onEditCompareGroup?: (groupId: string) => void;
@@ -331,24 +363,45 @@ export class OscilloscopeApp {
     window.dispatchEvent(new CustomEvent('wvp-theme-changed', { detail: { themeId: preset.id } }));
   }
 
-  public showToast(message: string, level: 'info' | 'warn' | 'error' | 'success' = 'info'): void {
+  public showToast(
+    message: string,
+    level: 'info' | 'warn' | 'error' | 'success' = 'info',
+    options?: { undoable?: boolean }
+  ): void {
     const el = document.getElementById('scopeToast');
     if (!el) return;
-    el.innerText = message;
-    el.classList.remove('hidden', 'border-amber-500/60', 'text-amber-200', 'border-red-500/70', 'text-red-200', 'border-cyan-500/60', 'text-cyan-200', 'border-emerald-500/60', 'text-emerald-200');
-    if (level === 'error') {
-      el.classList.add('border-red-500/70', 'text-red-200');
-    } else if (level === 'warn') {
-      el.classList.add('border-amber-500/60', 'text-amber-200');
-    } else if (level === 'success') {
-      el.classList.add('border-emerald-500/60', 'text-emerald-200');
+    const msgEl = document.getElementById('scopeToastMsg');
+    const undoBtn = document.getElementById('scopeToastUndoBtn');
+    if (msgEl) {
+      msgEl.innerText = message;
     } else {
-      el.classList.add('border-cyan-500/60', 'text-cyan-200');
+      el.innerText = message;
+    }
+    el.classList.remove(
+      'hidden',
+      'wvp-alert-info',
+      'wvp-alert-ok',
+      'wvp-alert-warn',
+      'wvp-alert-danger'
+    );
+    el.classList.add('bg-elevated');
+    if (level === 'error') {
+      el.classList.add('wvp-alert-danger');
+    } else if (level === 'warn') {
+      el.classList.add('wvp-alert-warn');
+    } else if (level === 'success') {
+      el.classList.add('wvp-alert-ok');
+    } else {
+      el.classList.add('wvp-alert-info');
+    }
+    const showUndo = Boolean(options?.undoable && this.undoStack.length > 0);
+    if (undoBtn) {
+      undoBtn.classList.toggle('hidden', !showUndo);
     }
     if (this.toastTimer !== null) window.clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => {
       el.classList.add('hidden');
-    }, 3600);
+    }, showUndo ? 4500 : 3400);
   }
 
   private populateScaleDropdown(): void {
@@ -517,7 +570,7 @@ export class OscilloscopeApp {
   public undo(): void {
     const snap = this.undoStack.pop();
     if (!snap) {
-      this.showToast('Nothing to undo.', 'warn');
+      this.showToast('当前没有可撤销的操作。', 'warn');
       return;
     }
     const tab = this.tabs.find((t) => t.id === snap.tabId);
@@ -527,13 +580,13 @@ export class OscilloscopeApp {
     }
     this.restoreSnapshot(snap);
     this.updateUndoRedoButtons();
-    this.showToast(`Undo: ${snap.label}`, 'info');
+    this.showToast(`已撤销：${snap.label}`, 'info');
   }
 
   public redo(): void {
     const snap = this.redoStack.pop();
     if (!snap) {
-      this.showToast('Nothing to redo.', 'warn');
+      this.showToast('当前没有可重做的操作。', 'warn');
       return;
     }
     const tab = this.tabs.find((t) => t.id === snap.tabId);
@@ -543,7 +596,7 @@ export class OscilloscopeApp {
     }
     this.restoreSnapshot(snap);
     this.updateUndoRedoButtons();
-    this.showToast(`Redo: ${snap.label}`, 'info');
+    this.showToast(`已重做：${snap.label}`, 'info');
   }
 
   private updateUndoRedoButtons(): void {
@@ -650,14 +703,14 @@ export class OscilloscopeApp {
   }
 
   public zeroChannelOffset(chId: string): void {
-    this.pushUndoSnapshot('Zero Offset');
+    this.pushUndoSnapshot('归零垂直偏移');
     this.setChannelOffset(chId, 0);
   }
 
   public fitSingleChannel(chId: string): void {
     const tab = this.getActiveTab();
     if (!tab || !tab.channels[chId]) return;
-    this.pushUndoSnapshot('Fit Channel');
+    this.pushUndoSnapshot('单通道自适应刻度');
     fitChannelTo125(tab.channels[chId]);
     clampCursorsToViewport(tab);
     this.renderSidebar();
@@ -667,28 +720,72 @@ export class OscilloscopeApp {
   public syncSameUnitScales(): void {
     const tab = this.getActiveTab();
     if (!tab) return;
-    this.pushUndoSnapshot('Sync Same-Unit Scale');
+    this.pushUndoSnapshot('同步同单位通道刻度');
     const res = syncSameUnitChannelsScale(tab, tab.activeChannelId);
     if (!res) {
-      this.showToast('No visible channels found to synchronize.', 'warn');
+      this.undoStack.pop();
+      this.updateUndoRedoButtons();
+      this.showToast('未找到可同步的可见通道。', 'warn');
       return;
     }
     clampCursorsToViewport(tab);
     this.renderSidebar();
     this.draw();
     this.showToast(
-      `Synced ${res.syncedCount} [${res.unit}] channel(s) to ${formatEng(res.targetVoltsPerDiv, res.unit, 1)}/div (driver: ${res.driverChannelName})`,
-      'info'
+      `已将 ${res.syncedCount} 条 [${res.unit}] 通道统一为 ${formatEng(res.targetVoltsPerDiv, res.unit, 1)}/div（基准：${res.driverChannelName}）`,
+      'info',
+      { undoable: true }
     );
   }
 
   public toggleChannelVisible(chId: string): void {
     const tab = this.getActiveTab();
     if (!tab || !tab.channels[chId]) return;
-    this.pushUndoSnapshot('Toggle Channel Visibility');
+    this.pushUndoSnapshot('切换通道显示');
     tab.channels[chId].visible = !tab.channels[chId].visible;
+    this.soloPrevVisibility = null;
+    this.soloChannelId = null;
     this.renderSidebar();
     this.draw();
+  }
+
+  public toggleSoloChannel(chId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.channels[chId]) return;
+    const ch = tab.channels[chId];
+    const nonRefIds = tab.drawOrder.filter((id) => tab.channels[id] && tab.channels[id].compareRole !== 'ref');
+    if (nonRefIds.length <= 1) {
+      this.selectActiveChannel(chId);
+      return;
+    }
+    this.pushUndoSnapshot(`独奏通道 ${ch.name}`);
+    if (this.soloChannelId === chId && this.soloPrevVisibility) {
+      for (const id of nonRefIds) {
+        const target = tab.channels[id];
+        if (target && this.soloPrevVisibility[id] !== undefined) {
+          target.visible = this.soloPrevVisibility[id];
+        }
+      }
+      this.soloPrevVisibility = null;
+      this.soloChannelId = null;
+      this.renderSidebar();
+      this.draw();
+      this.showToast(`已退出独奏，恢复各通道显示状态。`, 'info', { undoable: true });
+      return;
+    }
+    const prev: Record<string, boolean> = {};
+    for (const id of nonRefIds) {
+      prev[id] = tab.channels[id].visible;
+      tab.channels[id].visible = id === chId;
+    }
+    this.soloPrevVisibility = prev;
+    this.soloChannelId = chId;
+    tab.activeChannelId = chId;
+    tab.selectedMeasurementChannelId = chId;
+    tab.cursors.trackingChannel = chId;
+    this.renderSidebar();
+    this.draw();
+    this.showToast(`已独奏通道 ${ch.name}（再次双击恢复）`, 'info', { undoable: true });
   }
 
   public toggleChannelCoupling(chId: string): void {
@@ -769,7 +866,12 @@ export class OscilloscopeApp {
     const btn = document.getElementById('togglePanelBtn');
     if (!panel) return;
     const isNowHidden = panel.classList.toggle('hidden');
-    if (btn) btn.innerText = isNowHidden ? 'Show Panel' : 'Hide Panel';
+    if (btn) btn.innerText = isNowHidden ? '展开右侧控制面板' : '收起右侧控制面板';
+    try {
+      localStorage.setItem('wvp_panel_collapsed_v1', isNowHidden ? '1' : '0');
+    } catch {
+      // ignore storage error
+    }
     this.handleResize();
   }
 
@@ -784,9 +886,14 @@ export class OscilloscopeApp {
   public clearAnnotations(): void {
     const tab = this.getActiveTab();
     if (!tab) return;
+    if (tab.annotations.length === 0) {
+      this.showToast('当前没有可清除的波形标注。', 'warn');
+      return;
+    }
+    this.pushUndoSnapshot('清除波形标注');
     tab.annotations = [];
     this.draw();
-    this.showToast('Cleared waveform annotations.', 'info');
+    this.showToast('已清除所有波形标注。', 'info', { undoable: true });
   }
 
   public setCursorMode(mode: CursorMode): void {
@@ -824,7 +931,7 @@ export class OscilloscopeApp {
     centerCursorsInViewport(tab);
     this.renderSidebar();
     this.draw();
-    this.showToast('Cursors centered at 25% & 75% of viewport.', 'info');
+    this.showToast('游标已居中至当前视窗 25% 与 75% 位置。', 'info');
   }
 
   public setCursorTargetChannel(chId: string): void {
@@ -963,7 +1070,7 @@ export class OscilloscopeApp {
     this.cachedSpectrumKey = '';
     this.renderSidebar();
     this.draw();
-    this.showToast(`Applied ${op.type} to ${ch.name} (Ref locked).`, 'info');
+    this.showToast(`已对 ${ch.name} 应用 ${op.type}（原始参考波形已锁定）。`, 'info', { undoable: true });
   }
 
   public applyChannelLocalEdit(channelId: string, op: LocalEditOp): number {
@@ -982,7 +1089,7 @@ export class OscilloscopeApp {
       tEnd = bounds.tEnd;
     }
 
-    this.pushUndoSnapshot(`Local Edit (${op.type})`, true);
+    this.pushUndoSnapshot(`局部编辑 (${op.type})`, true);
     const modified = applyLocalEdit(ch, tStart, tEnd, op);
     if (modified > 0) {
       this.editVersion++;
@@ -990,11 +1097,11 @@ export class OscilloscopeApp {
       this.cachedSpectrumKey = '';
       this.renderSidebar();
       this.draw();
-      this.showToast(`Edited ${modified.toLocaleString()} samples on ${ch.name} (Ref locked).`, 'info');
+      this.showToast(`已修改 ${ch.name} 共 ${modified.toLocaleString()} 个采样点（原始参考波形已锁定）。`, 'info', { undoable: true });
     } else {
       this.undoStack.pop();
       this.updateUndoRedoButtons();
-      this.showToast('No samples in selected [X1, X2] range.', 'warn');
+      this.showToast('所选 [X1, X2] 区间内无采样点。', 'warn');
     }
     return modified;
   }
@@ -1003,18 +1110,18 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     const ch = tab?.channels[channelId];
     if (!tab || !ch) return;
-    this.pushUndoSnapshot('Revert Edits', true);
+    this.pushUndoSnapshot('还原原始参考波形', true);
     if (revertChannelToReference(ch)) {
       this.editVersion++;
       this.cachedSpectrum = null;
       this.cachedSpectrumKey = '';
       this.renderSidebar();
       this.draw();
-      this.showToast(`Reverted ${ch.name} to original Reference trace.`, 'info');
+      this.showToast(`已将 ${ch.name} 还原为原始参考波形。`, 'info', { undoable: true });
     } else {
       this.undoStack.pop();
       this.updateUndoRedoButtons();
-      this.showToast(`${ch.name} has no pending edits to revert.`, 'warn');
+      this.showToast(`${ch.name} 当前无待还原的编辑修改。`, 'warn');
     }
   }
 
@@ -1065,13 +1172,14 @@ export class OscilloscopeApp {
       this.renderSidebar();
       this.draw();
       this.showToast(
-        `Filtered ${srcCh.name} in-place (${res.metrics.summaryText}, recomputed from original Ref).${res.warning ? ` Note: ${res.warning}` : ''}`,
-        check.warning || res.warning ? 'warn' : 'info'
+        `已就地滤波 ${srcCh.name}（${res.metrics.summaryText}，基于原始参考重算）。${res.warning ? `提示：${res.warning}` : ''}`,
+        check.warning || res.warning ? 'warn' : 'info',
+        { undoable: true }
       );
       return { ok: true, targetChannelId: srcCh.id, result: res };
     }
 
-    this.pushUndoSnapshot(`New Filtered Trace (${res.metrics.badgeText})`, true);
+    this.pushUndoSnapshot(`新建滤波通道 (${res.metrics.badgeText})`, true);
     const filterCount = tab.drawOrder.filter((id) => tab.channels[id]?.derivedKind === 'filter').length;
     const newId = `filt_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     const newCh: WaveformChannel = {
@@ -1114,7 +1222,7 @@ export class OscilloscopeApp {
     this.renderSidebar();
     this.draw();
     this.showToast(
-      `Created [${res.metrics.badgeText}] ${newCh.name} (${res.metrics.sampleCountFiltered.toLocaleString()} pts).${res.warning ? ` Note: ${res.warning}` : ''}`,
+      `已创建滤波通道 [${res.metrics.badgeText}] ${newCh.name}（${res.metrics.sampleCountFiltered.toLocaleString()} 点）。${res.warning ? `提示：${res.warning}` : ''}`,
       check.warning || res.warning ? 'warn' : 'info'
     );
     return { ok: true, targetChannelId: newId, result: res };
@@ -1128,7 +1236,7 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     if (!tab || channelIds.length === 0) return;
     if (pushUndo) {
-      this.pushUndoSnapshot('Time Shift Δt', true);
+      this.pushUndoSnapshot('时间平移 Δt', true);
     }
     let changed = false;
     for (const id of channelIds) {
@@ -1139,6 +1247,7 @@ export class OscilloscopeApp {
     }
     if (!changed) return;
     extendTabViewToLongestChannel(tab);
+    clampCursorsToViewport(tab);
     this.editVersion++;
     this.cachedSpectrum = null;
     this.cachedSpectrumKey = '';
@@ -1146,11 +1255,41 @@ export class OscilloscopeApp {
     this.draw();
   }
 
+  public snapChannelStartToPrimary(channelId: string): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    const ch = tab.channels[channelId];
+    if (!ch || !ch.t || ch.t.length === 0) return;
+
+    // Pick longest other visible channel (or drawOrder[0]) as reference anchor
+    let anchor: WaveformChannel | null = null;
+    let bestSpan = -1;
+    for (const id of tab.drawOrder) {
+      if (id === channelId) continue;
+      const cand = tab.channels[id];
+      if (!cand || !cand.t || cand.t.length < 2) continue;
+      const span = cand.t[cand.t.length - 1] - cand.t[0];
+      if (span > bestSpan) {
+        bestSpan = span;
+        anchor = cand;
+      }
+    }
+    if (!anchor) return;
+    const baseStart =
+      ch.timeShiftBaseT && ch.timeShiftBaseT.length === ch.t.length
+        ? ch.timeShiftBaseT[0]
+        : ch.t[0];
+    const targetStart = anchor.t[0];
+    if (!Number.isFinite(baseStart) || !Number.isFinite(targetStart)) return;
+    this.setChannelsTimeShift([channelId], targetStart - baseStart, true);
+    this.showToast(`已将 ${ch.name} 起点对齐到主波形 (${formatEng(targetStart, 's', 3)})。`, 'info', { undoable: true });
+  }
+
   public resetChannelsTimeShift(channelIds: string[], pushUndo: boolean = true): void {
     const tab = this.getActiveTab();
     if (!tab || channelIds.length === 0) return;
     if (pushUndo) {
-      this.pushUndoSnapshot('Reset Time Shift Δt', true);
+      this.pushUndoSnapshot('归零时间平移 Δt', true);
     }
     let anyReset = false;
     for (const id of channelIds) {
@@ -1165,12 +1304,14 @@ export class OscilloscopeApp {
       }
       return;
     }
+    extendTabViewToLongestChannel(tab);
+    clampCursorsToViewport(tab);
     this.editVersion++;
     this.cachedSpectrum = null;
     this.cachedSpectrumKey = '';
     this.renderSidebar();
     this.draw();
-    this.showToast(`Reset Δt = 0 for ${channelIds.length} channel(s).`, 'info');
+    this.showToast(`已将 ${channelIds.length} 条通道的 Δt 归零。`, 'info', { undoable: true });
   }
 
   public getGoldenEvaluation(tab: TabState): GoldenEvaluationResult | null {
@@ -1192,8 +1333,8 @@ export class OscilloscopeApp {
     this.draw();
     this.showToast(
       events.length > 0
-        ? `Found ${events.length} anomaly event(s) on ${ch.name}.`
-        : `No anomalies matched criteria on ${ch.name}.`,
+        ? `在 ${ch.name} 上检测到 ${events.length} 个异常事件。`
+        : `${ch.name} 未检测到符合条件的异常事件。`,
       events.length > 0 ? 'warn' : 'info'
     );
     return events;
@@ -1665,7 +1806,7 @@ export class OscilloscopeApp {
     this.cachedSpectrumKey = '';
     this.renderSidebar();
     this.draw();
-    this.showToast(`Removed compare group${grpName ? ` [${grpName}]` : ''}.`, 'info');
+    this.showToast(`已移除对比组${grpName ? ` [${grpName}]` : ''}。`, 'info');
   }
 
   public exportCroppedSlice(format: 'csv' | 'json', rangeMode: 'view' | 'cursors', channelIds: string[]): void {
@@ -1691,9 +1832,9 @@ export class OscilloscopeApp {
         format === 'json'
           ? exportCroppedWaveformJSON(tab, tStart, tEnd, channelIds)
           : exportCroppedWaveformCSV(tab, tStart, tEnd, channelIds);
-      this.showToast(`Exported ${res.rowCount.toLocaleString()} cropped samples (${format.toUpperCase()}).`, 'info');
+      this.showToast(`已导出 ${res.rowCount.toLocaleString()} 个截取采样点（${format.toUpperCase()}）。`, 'info');
     } catch (err: any) {
-      this.showToast(`Crop export failed: ${err.message}`, 'error');
+      this.showToast(`截取导出失败：${err.message}`, 'error');
     }
   }
 
@@ -1747,11 +1888,49 @@ export class OscilloscopeApp {
     if (this.pendingDrawRaf !== null) return;
     this.pendingDrawRaf = requestAnimationFrame(() => {
       this.pendingDrawRaf = null;
-      this.draw();
+      this.draw(false);
     });
   }
 
-  public draw(): void {
+  private syncHud(tab: TabState | null, immediate: boolean): void {
+    const runSync = (): void => {
+      this.lastHudSyncAt = performance.now();
+      this.updateStatusBar();
+      this.updateScreenTelemetry();
+      if (tab) {
+        this.renderMeasurementStrip(tab);
+      }
+    };
+
+    if (immediate) {
+      if (this.hudSettleTimer !== null) {
+        window.clearTimeout(this.hudSettleTimer);
+        this.hudSettleTimer = null;
+      }
+      runSync();
+      return;
+    }
+
+    const now = performance.now();
+    if (now - this.lastHudSyncAt >= this.hudThrottleMs) {
+      runSync();
+    }
+    if (this.hudSettleTimer !== null) {
+      window.clearTimeout(this.hudSettleTimer);
+    }
+    this.hudSettleTimer = window.setTimeout(() => {
+      this.hudSettleTimer = null;
+      const latestTab = this.getActiveTab();
+      this.lastHudSyncAt = performance.now();
+      this.updateStatusBar();
+      this.updateScreenTelemetry();
+      if (latestTab && latestTab.drawOrder.length > 0) {
+        this.renderMeasurementStrip(latestTab);
+      }
+    }, this.hudSettleDelayMs);
+  }
+
+  public draw(immediateHud: boolean = true): void {
     if (this.pendingDrawRaf !== null) {
       cancelAnimationFrame(this.pendingDrawRaf);
       this.pendingDrawRaf = null;
@@ -1768,8 +1947,7 @@ export class OscilloscopeApp {
       drawGrid(this.ctx, p, this.theme);
       const emptyOverlay = document.getElementById('emptyScopeOverlay');
       if (emptyOverlay) emptyOverlay.style.display = 'flex';
-      this.updateStatusBar();
-      this.updateScreenTelemetry();
+      this.syncHud(null, true);
       return;
     }
 
@@ -1813,7 +1991,9 @@ export class OscilloscopeApp {
       const { start, end, type } = this.dragState;
       this.ctx.save();
       this.ctx.fillStyle = type === 'areaZoom' ? 'rgba(56, 189, 248, 0.18)' : 'rgba(52, 211, 153, 0.18)';
-      this.ctx.strokeStyle = type === 'areaZoom' ? '#38bdf8' : '#34d399';
+      this.ctx.strokeStyle = this.theme.isLight
+        ? (type === 'areaZoom' ? '#0284c7' : '#059669')
+        : (type === 'areaZoom' ? '#38bdf8' : '#34d399');
       this.ctx.lineWidth = 1.2;
       const rx = Math.min(start.x, end.x);
       const ry = Math.min(start.y, end.y);
@@ -1824,9 +2004,7 @@ export class OscilloscopeApp {
       this.ctx.restore();
     }
 
-    this.updateStatusBar();
-    this.updateScreenTelemetry();
-    this.renderMeasurementStrip(tab);
+    this.syncHud(tab, immediateHud);
   }
 
   private renderTimeDomain(tab: TabState, p: PlotArea): void {
@@ -1974,10 +2152,147 @@ export class OscilloscopeApp {
   }
 
   // --- Interaction & Events ---
+  private hideScopeContextMenu(): void {
+    const menu = document.getElementById('scopeContextMenu');
+    if (menu) menu.classList.add('hidden');
+    this.contextMenuPoint = null;
+  }
+
+  private openScopeContextMenu(clientX: number, clientY: number, canvasX: number, canvasY: number): void {
+    const menu = document.getElementById('scopeContextMenu');
+    const stage = this.canvas.parentElement;
+    if (!menu || !stage) return;
+    this.contextMenuPoint = { x: canvasX, y: canvasY };
+    menu.classList.remove('hidden');
+    const stageRect = stage.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const left = Math.max(4, Math.min(stageRect.width - menuRect.width - 6, clientX - stageRect.left));
+    const top = Math.max(4, Math.min(stageRect.height - menuRect.height - 6, clientY - stageRect.top));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  private setYAxisGestureHintVisible(show: boolean): void {
+    const el = document.getElementById('yAxisGestureHint');
+    if (!el) return;
+    if (show) {
+      try {
+        if (localStorage.getItem('wvp_hide_yaxis_hint_v1') === '1') return;
+      } catch {
+        // ignore storage error
+      }
+      el.classList.remove('hidden');
+      el.classList.add('flex');
+    } else {
+      el.classList.add('hidden');
+      el.classList.remove('flex');
+    }
+  }
+
   private initEvents(): void {
+    // Restore right panel collapsed state from localStorage
+    try {
+      if (localStorage.getItem('wvp_panel_collapsed_v1') === '1') {
+        const panel = document.getElementById('rightControlPanel');
+        const btn = document.getElementById('togglePanelBtn');
+        panel?.classList.add('hidden');
+        if (btn) btn.innerText = '展开右侧控制面板';
+      }
+    } catch {
+      // ignore
+    }
+
+    // Inline Toast Undo button
+    document.getElementById('scopeToastUndoBtn')?.addEventListener('click', () => {
+      document.getElementById('scopeToast')?.classList.add('hidden');
+      this.undo();
+    });
+
+    // Y-axis gesture hint dismiss
+    document.getElementById('yAxisGestureHintCloseBtn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      try {
+        localStorage.setItem('wvp_hide_yaxis_hint_v1', '1');
+      } catch {
+        // ignore
+      }
+      this.setYAxisGestureHintVisible(false);
+    });
+
+    // Canvas right-click context menu actions
+    document.getElementById('scopeContextMenu')?.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement)?.closest('[data-ctx-action]') as HTMLElement | null;
+      if (!btn) return;
+      const action = btn.dataset.ctxAction;
+      const pt = this.contextMenuPoint;
+      this.hideScopeContextMenu();
+      const tab = this.getActiveTab();
+      if (!tab) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      const p = this.getTabPlotArea(tab, this.canvas.width / dpr, this.canvas.height / dpr, false);
+      const hit = pt ? this.findSubplotAtPoint(tab, p, pt.y) : null;
+      const activeCh = tab.channels[tab.activeChannelId || ''] || hit?.channel || tab.channels[tab.drawOrder[0]];
+
+      if (action === 'fit') {
+        this.fitView();
+      } else if (action === 'autoset') {
+        this.executeAutoSet();
+      } else if (action === 'zeroOffset') {
+        if (activeCh) {
+          this.zeroChannelOffset(activeCh.id);
+          this.showToast(`已归零垂直偏移（${activeCh.name} = 0 ${activeCh.unit}）`, 'info', { undoable: true });
+        }
+      } else if (action === 'placeCursor' && pt && activeCh) {
+        const dataPt = screenToData(pt, tab, activeCh.id, hit?.area || p);
+        if (resolveCursorMode(tab) === 'off') {
+          this.setCursorMode('x');
+        }
+        tab.cursors.x1 = dataPt.time;
+        clampCursorsToViewport(tab);
+        this.renderCursorReadoutOnly(tab);
+        this.draw();
+        this.showToast(`已将 X1 游标放置于 T = ${formatEng(dataPt.time, 's', 4)}`, 'info');
+      } else if (action === 'addPoint' && pt && activeCh) {
+        const targetCh = hit?.channel || activeCh;
+        const dataPt = screenToData(pt, tab, targetCh.id, hit?.area || p);
+        const sampledV = sampleChannelValueAtTime(targetCh, dataPt.time);
+        this.pushUndoSnapshot('添加单点标注');
+        tab.annotations.push({
+          id: `ann_${Date.now()}`,
+          type: 'point',
+          x: dataPt.time,
+          y: sampledV !== null ? sampledV : dataPt.voltage,
+          channelId: targetCh.id,
+          color: targetCh.color,
+        });
+        tab.annotationsVisible = true;
+        this.draw();
+        this.showToast(`已在 ${targetCh.name} 添加单点标注。`, 'info', { undoable: true });
+      } else if (action === 'copyReadout' && pt && activeCh) {
+        const targetCh = hit?.channel || activeCh;
+        const dataPt = screenToData(pt, tab, targetCh.id, hit?.area || p);
+        const sampledV = sampleChannelValueAtTime(targetCh, dataPt.time);
+        const val = sampledV !== null ? sampledV : dataPt.voltage;
+        const txt = `${targetCh.name}: T=${formatEng(dataPt.time, 's', 5)}, V=${formatEng(val, targetCh.unit, 4)}`;
+        navigator.clipboard?.writeText(txt).then(
+          () => this.showToast(`已复制读数：${txt}`, 'info'),
+          () => this.showToast(`读数：${txt}`, 'info')
+        );
+      }
+    });
+
+    document.addEventListener('mousedown', (e) => {
+      const menu = document.getElementById('scopeContextMenu');
+      if (menu && !menu.classList.contains('hidden') && !(e.target as HTMLElement)?.closest('#scopeContextMenu')) {
+        this.hideScopeContextMenu();
+      }
+    });
+
     window.addEventListener('resize', () => this.handleResize());
 
     this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+    this.canvas.addEventListener('mouseleave', () => this.setYAxisGestureHintVisible(false));
     this.canvas.addEventListener('dblclick', (e) => {
       const tab = this.getActiveTab();
       if (tab && tab.plotMode === 'time') {
@@ -1990,7 +2305,7 @@ export class OscilloscopeApp {
           const targetCh = tab.separateView && hit ? hit.channel : tab.channels[tab.activeChannelId || ''] || hit?.channel;
           if (targetCh) {
             this.zeroChannelOffset(targetCh.id);
-            this.showToast(`Zeroed vertical offset (${targetCh.name} = 0 ${targetCh.unit})`, 'info');
+            this.showToast(`已归零垂直偏移（${targetCh.name} = 0 ${targetCh.unit}）`, 'info', { undoable: true });
             return;
           }
         }
@@ -2002,8 +2317,9 @@ export class OscilloscopeApp {
     window.addEventListener('mouseup', () => this.handleMouseUp());
     this.canvas.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
 
-    // Clipboard CSV Paste
+    // Clipboard CSV Paste (Scope workspace only)
     window.addEventListener('paste', (e: ClipboardEvent) => {
+      if ((document.body.dataset.workspace || 'scope') !== 'scope') return;
       const activeEl = document.activeElement;
       if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT')) {
         return;
@@ -2015,9 +2331,10 @@ export class OscilloscopeApp {
       }
     });
 
-    // Drag and Drop files
+    // Drag and Drop files (Workspace isolated)
     window.addEventListener('dragover', (e) => {
       e.preventDefault();
+      if ((document.body.dataset.workspace || 'scope') !== 'scope') return;
       const overlay = document.getElementById('drag-overlay');
       if (overlay) overlay.style.display = 'flex';
     });
@@ -2033,14 +2350,26 @@ export class OscilloscopeApp {
       e.preventDefault();
       const overlay = document.getElementById('drag-overlay');
       if (overlay) overlay.style.display = 'none';
+      if ((document.body.dataset.workspace || 'scope') !== 'scope') {
+        if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+          this.showToast('当前位于 FOC 测功台，请使用页内导入按钮，或切换到「示波器」后拖入波形文件。', 'warn');
+        }
+        return;
+      }
       if (e.dataTransfer && e.dataTransfer.files.length > 0) {
         this.handleFiles(Array.from(e.dataTransfer.files));
       }
     });
 
-    // Keyboard Shortcuts
+    // Keyboard Shortcuts (Workspace isolated + Deterministic Esc Priority)
     window.addEventListener('keydown', (e) => {
+      if ((document.body.dataset.workspace || 'scope') !== 'scope') return;
+
       const key = e.key.toUpperCase();
+      const activeEl = document.activeElement;
+      const isTypingInInput = Boolean(
+        activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'SELECT' || activeEl.tagName === 'TEXTAREA')
+      );
 
       // Screenshot hotkey (Ctrl+S / Cmd+S / F12)
       if (((e.ctrlKey || e.metaKey) && key === 'S') || e.key === 'F12') {
@@ -2049,38 +2378,71 @@ export class OscilloscopeApp {
         return;
       }
 
-      // Undo / Redo hotkeys
-      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === 'Z') {
+      // Undo / Redo hotkeys (do not hijack text editing inside inputs)
+      if (!isTypingInInput && (e.ctrlKey || e.metaKey) && !e.shiftKey && key === 'Z') {
         e.preventDefault();
         this.undo();
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && (key === 'Y' || (e.shiftKey && key === 'Z'))) {
+      if (!isTypingInInput && (e.ctrlKey || e.metaKey) && (key === 'Y' || (e.shiftKey && key === 'Z'))) {
         e.preventDefault();
         this.redo();
         return;
       }
 
-      // Close active docked drawer tab or blocking modal on Escape even if focus is inside an input
+      // Deterministic Esc Priority Chain:
+      // 1. Canvas context menu -> 2. Import modals -> 3. Active drawing/zoom tool -> 4. Docked drawer -> 5. Topmost visible modal -> 6. Fit view
       if (key === 'ESCAPE') {
+        const ctxMenu = document.getElementById('scopeContextMenu');
+        if (ctxMenu && !ctxMenu.classList.contains('hidden')) {
+          this.hideScopeContextMenu();
+          return;
+        }
         if (excelImportModal.isOpen()) {
           excelImportModal.closeAndRelease(true);
           return;
         }
+        const csvModal = document.getElementById('csvQualityModal');
+        if (csvModal && csvModal.style.display === 'flex') {
+          this.clearPendingCsvImport();
+          csvModal.style.display = 'none';
+          return;
+        }
+        const curTab = this.getActiveTab();
+        if (curTab?.activeTool && curTab.activeTool !== 'pan') {
+          this.setActiveTool('pan');
+          return;
+        }
         if (closeActiveToolDrawerItem()) return;
-        let closedModal = false;
-        document.querySelectorAll('.modal-overlay:not(.tool-dockable)').forEach((overlay) => {
-          const el = overlay as HTMLElement;
-          if (el.style.display === 'flex') {
-            el.style.display = 'none';
-            closedModal = true;
-          }
-        });
-        if (closedModal) return;
+
+        // Close topmost visible non-docked floating modal by z-index
+        const visibleModals = Array.from(document.querySelectorAll('.modal-overlay')).filter((node) => {
+          const el = node as HTMLElement;
+          if (el.closest('#toolDrawerBody')) return false;
+          return el.style.display === 'flex';
+        }) as HTMLElement[];
+        if (visibleModals.length > 0) {
+          visibleModals.sort((a, b) => {
+            const za = parseInt(getComputedStyle(a).zIndex || '0', 10) || 0;
+            const zb = parseInt(getComputedStyle(b).zIndex || '0', 10) || 0;
+            return zb - za;
+          });
+          visibleModals[0].style.display = 'none';
+          return;
+        }
+
+        if (!isTypingInInput && curTab) {
+          this.fitView();
+        }
+        return;
       }
 
-      const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'SELECT' || activeEl.tagName === 'TEXTAREA')) {
+      if (isTypingInInput) return;
+
+      // '?' opens shortcuts cheat-sheet even without a loaded tab
+      if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+        const modal = document.getElementById('shortcutsModal');
+        if (modal) modal.style.display = 'flex';
         return;
       }
 
@@ -2096,6 +2458,17 @@ export class OscilloscopeApp {
         return;
       }
 
+      if (e.key === '[' || e.key === ']') {
+        const selectable = tab.drawOrder.filter((id) => tab.channels[id] && tab.channels[id].compareRole !== 'ref');
+        if (selectable.length > 1) {
+          const curIdx = Math.max(0, selectable.indexOf(tab.activeChannelId || selectable[0]));
+          const delta = e.key === ']' ? 1 : -1;
+          const nextIdx = (curIdx + delta + selectable.length) % selectable.length;
+          this.selectActiveChannel(selectable[nextIdx]);
+        }
+        return;
+      }
+
       if (key === 'U') {
         this.syncSameUnitScales();
       } else if (key === 'A') {
@@ -2107,6 +2480,16 @@ export class OscilloscopeApp {
       } else if (key === 'T') {
         const cur = resolveCursorMode(tab);
         this.setCursorMode(cur === 'off' ? 'xy' : 'off');
+      } else if (key === 'C' && !e.ctrlKey && !e.metaKey) {
+        const modes: CursorMode[] = ['off', 'x', 'y', 'xy', 'track'];
+        const cur = resolveCursorMode(tab);
+        const nextMode = modes[(modes.indexOf(cur) + 1) % modes.length];
+        this.setCursorMode(nextMode);
+      } else if (key === 'M' && !e.ctrlKey && !e.metaKey) {
+        document.getElementById('openMeasureModalBtn')?.click();
+      } else if (key === 'H' && !e.ctrlKey && !e.metaKey) {
+        const chId = tab.activeChannelId || tab.drawOrder[0];
+        if (chId) this.toggleChannelVisible(chId);
       } else if (key === 'O') {
         this.setSeparateView(false);
       } else if (key === 'S' && !e.ctrlKey && !e.metaKey) {
@@ -2120,21 +2503,21 @@ export class OscilloscopeApp {
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         const chId = tab.activeChannelId || tab.drawOrder[0];
-        if (chId) this.stepChannelScale(chId, -1);
+        if (chId) {
+          if (e.shiftKey) this.nudgeChannelOffsetDivs(chId, 0.5);
+          else this.stepChannelScale(chId, -1);
+        }
       } else if (e.key === 'ArrowDown') {
         e.preventDefault();
         const chId = tab.activeChannelId || tab.drawOrder[0];
-        if (chId) this.stepChannelScale(chId, 1);
+        if (chId) {
+          if (e.shiftKey) this.nudgeChannelOffsetDivs(chId, -0.5);
+          else this.stepChannelScale(chId, 1);
+        }
       } else if (e.key === '+' || e.key === '=') {
         this.stepTimebase(-1);
       } else if (e.key === '-' || e.key === '_') {
         this.stepTimebase(1);
-      } else if (key === 'ESCAPE') {
-        if (tab.activeTool && tab.activeTool !== 'pan') {
-          this.setActiveTool('pan');
-        } else {
-          this.fitView();
-        }
       }
     });
   }
@@ -2171,6 +2554,7 @@ export class OscilloscopeApp {
   }
 
   private handleMouseDown(e: MouseEvent): void {
+    this.hideScopeContextMenu();
     const tab = this.getActiveTab();
     if (!tab) return;
 
@@ -2179,26 +2563,24 @@ export class OscilloscopeApp {
     const y = e.clientY - rect.top;
     const p = this.getTabPlotArea(tab, rect.width, rect.height, false);
 
-    // 1. Check Left GND Handles (interactive vertical offset drag)
+    // 1. Check Left GND Handles (interactive vertical offset drag — push undo only after >2px movement)
     const gndHandles = getGndHandlePositions(p, tab);
     for (let i = gndHandles.length - 1; i >= 0; i--) {
       const h = gndHandles[i];
       if (x >= h.x - 20 && x <= h.x + 6 && Math.abs(y - h.y) <= 9) {
-        this.pushUndoSnapshot('Drag GND Offset');
         this.selectActiveChannel(h.channelId);
-        this.dragState = { type: 'gnd', channelId: h.channelId, area: h.area };
+        this.dragState = { type: 'gnd', channelId: h.channelId, area: h.area, startY: y, undoPushed: false };
         return;
       }
     }
 
-    // 2b. Check Left Y-Axis Gutter for direct Vertical Offset dragging
+    // 2b. Check Left Y-Axis Gutter for direct Vertical Offset dragging (push undo only after >2px movement)
     if (e.button === 0 && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
       const hit = this.findSubplotAtPoint(tab, p, y);
       const targetCh = tab.separateView && hit ? hit.channel : tab.channels[tab.activeChannelId || ''] || hit?.channel;
       if (targetCh) {
         const area = hit ? hit.area : p;
         const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(targetCh);
-        this.pushUndoSnapshot(`Drag Y-Axis Offset (${targetCh.name})`);
         if (tab.separateView && targetCh.id !== tab.activeChannelId) {
           this.selectActiveChannel(targetCh.id);
         }
@@ -2209,6 +2591,7 @@ export class OscilloscopeApp {
           initialVOffset: vOffset,
           voltsPerDiv,
           area,
+          undoPushed: false,
         };
         return;
       }
@@ -2216,12 +2599,15 @@ export class OscilloscopeApp {
 
     if (x < p.x || x > p.x + p.width || y < p.y || y > p.y + p.height) return;
 
-    // Right-drag inside graticule always triggers Box Zoom
+    // Right-click (<4px) opens context menu; Right-drag (>=4px) triggers Box Zoom
     if (e.button === 2) {
       this.dragState = {
         type: 'areaZoom',
         start: { x, y },
         end: { x, y },
+        isRightButton: true,
+        clientX: e.clientX,
+        clientY: e.clientY,
       };
       return;
     }
@@ -2322,6 +2708,28 @@ export class OscilloscopeApp {
       this.selectActiveChannel(subHit.channel.id);
     }
 
+    // 5b. Alt + Drag inside time-domain plot shifts active channel's Δt directly
+    if (e.altKey && tab.plotMode === 'time') {
+      const shiftTargetCh =
+        tab.separateView && subHit
+          ? subHit.channel
+          : tab.channels[tab.activeChannelId || ''] || subHit?.channel;
+      if (shiftTargetCh) {
+        const { tSpan } = getTimeBoundsForView(tab, shiftTargetCh);
+        if (tSpan > 0) {
+          this.dragState = {
+            type: 'timeShift',
+            channelId: shiftTargetCh.id,
+            startX: x,
+            initialTimeShiftSec: shiftTargetCh.timeShiftSec || 0,
+            tSpan,
+            undoPushed: false,
+          };
+          return;
+        }
+      }
+    }
+
     // 6. Area Zoom or Pan
     if (e.shiftKey || tab.activeTool === 'areaZoom') {
       this.dragState = {
@@ -2364,9 +2772,15 @@ export class OscilloscopeApp {
     const p = this.getTabPlotArea(tab, rect.width, rect.height, false);
 
     if (this.dragState) {
+      this.setYAxisGestureHintVisible(false);
+
       if (this.dragState.type === 'gnd') {
         const ch = tab.channels[this.dragState.channelId];
-        if (ch) {
+        if (ch && (this.dragState.undoPushed || Math.abs(y - this.dragState.startY) > 2)) {
+          if (!this.dragState.undoPushed) {
+            this.pushUndoSnapshot(`拖动 GND 偏移 (${ch.name})`);
+            this.dragState.undoPushed = true;
+          }
           const { voltsPerDiv } = ensureChannelScaleOffset(ch);
           const { area } = this.dragState;
           const fracFromBottom = Math.max(-0.25, Math.min(1.25, (area.y + area.height - y) / area.height));
@@ -2383,12 +2797,40 @@ export class OscilloscopeApp {
 
       if (this.dragState.type === 'yAxisOffset') {
         const ch = tab.channels[this.dragState.channelId];
-        if (ch) {
+        if (ch && (this.dragState.undoPushed || Math.abs(y - this.dragState.startY) > 2)) {
+          if (!this.dragState.undoPushed) {
+            this.pushUndoSnapshot(`拖动 Y 轴偏移 (${ch.name})`);
+            this.dragState.undoPushed = true;
+          }
           const { area, startY, initialVOffset, voltsPerDiv } = this.dragState;
           const deltaV = ((startY - y) / Math.max(1, area.height)) * (8 * voltsPerDiv);
           ch.vOffset = initialVOffset + deltaV;
           syncChannelBoundsFromScaleOffset(ch);
           clampCursorsToViewport(tab);
+          this.syncVerticalPanelOnly(ch);
+          this.renderSoftkeysOnly(tab);
+          this.renderCursorReadoutOnly(tab);
+          this.scheduleDraw();
+        }
+        return;
+      }
+
+      if (this.dragState.type === 'timeShift') {
+        const ch = tab.channels[this.dragState.channelId];
+        const dx = x - this.dragState.startX;
+        if (ch && (this.dragState.undoPushed || Math.abs(dx) > 2)) {
+          if (!this.dragState.undoPushed) {
+            this.pushUndoSnapshot(`Alt+拖动 Δt 平移 (${ch.name})`, true);
+            this.dragState.undoPushed = true;
+          }
+          const dt = (dx / Math.max(1, p.width)) * this.dragState.tSpan;
+          const nextShift = this.dragState.initialTimeShiftSec + dt;
+          applyChannelTimeShift(ch, nextShift);
+          extendTabViewToLongestChannel(tab);
+          clampCursorsToViewport(tab);
+          this.editVersion++;
+          this.cachedSpectrum = null;
+          this.cachedSpectrumKey = '';
           this.syncVerticalPanelOnly(ch);
           this.renderSoftkeysOnly(tab);
           this.renderCursorReadoutOnly(tab);
@@ -2476,7 +2918,7 @@ export class OscilloscopeApp {
           const ch = tab.channels[this.dragState.targetChannelId];
           if (ch) {
             if (!this.dragState.undoPushed) {
-              this.pushUndoSnapshot('2D Canvas Pan');
+              this.pushUndoSnapshot('画布平移');
               this.dragState.undoPushed = true;
             }
             const area = this.dragState.area || p;
@@ -2499,6 +2941,8 @@ export class OscilloscopeApp {
     // Dynamic hover cursor icon & readout (when mouse is inside canvas)
     if (x >= 0 && x <= rect.width && y >= 0 && y <= rect.height) {
       let nextCursor = 'crosshair';
+      const inYAxisGutter = tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height;
+      this.setYAxisGestureHintVisible(inYAxisGutter);
 
       const gndHandles = getGndHandlePositions(p, tab);
       for (const h of gndHandles) {
@@ -2508,7 +2952,7 @@ export class OscilloscopeApp {
         }
       }
 
-      if (nextCursor === 'crosshair' && tab.plotMode === 'time' && x >= 0 && x < p.x && y >= p.y && y <= p.y + p.height) {
+      if (nextCursor === 'crosshair' && inYAxisGutter) {
         nextCursor = 'ns-resize';
       }
 
@@ -2535,6 +2979,10 @@ export class OscilloscopeApp {
             }
           }
         }
+      }
+
+      if (nextCursor === 'crosshair' && e.altKey && tab.plotMode === 'time') {
+        nextCursor = 'ew-resize';
       }
 
       this.canvas.style.cursor = nextCursor;
@@ -2569,11 +3017,14 @@ export class OscilloscopeApp {
             const dataPt = screenToData({ x, y }, tab, hit.channel.id, hit.area);
             const el = document.getElementById('hoverInfoReadout');
             if (el) {
-              el.innerText = `${hit.channel.name}: T = ${formatEng(dataPt.time, 's', 4)}   V = ${formatEng(dataPt.voltage, hit.channel.unit, 3)}`;
+              const chColor = resolveChannelTextColor(hit.channel.color, Boolean(this.theme.isLight));
+              el.innerHTML = `<span style="color:${chColor};font-weight:600">${escapeHtml(hit.channel.name)}</span> · T = ${escapeHtml(formatEng(dataPt.time, 's', 4))} · <span style="color:${chColor};font-weight:600">V = ${escapeHtml(formatEng(dataPt.voltage, hit.channel.unit, 3))}</span>`;
             }
           }
         }
       }
+    } else {
+      this.setYAxisGestureHintVisible(false);
     }
   }
 
@@ -2590,6 +3041,13 @@ export class OscilloscopeApp {
     const p = this.getTabPlotArea(tab, this.canvas.width / dpr, this.canvas.height / dpr, false);
 
     if (currentDrag.type === 'areaZoom') {
+      const dist = Math.hypot(currentDrag.end.x - currentDrag.start.x, currentDrag.end.y - currentDrag.start.y);
+      if (currentDrag.isRightButton && dist < 4 && currentDrag.clientX !== undefined && currentDrag.clientY !== undefined) {
+        this.openScopeContextMenu(currentDrag.clientX, currentDrag.clientY, currentDrag.start.x, currentDrag.start.y);
+        this.draw();
+        return;
+      }
+
       const x1 = Math.min(currentDrag.start.x, currentDrag.end.x);
       const x2 = Math.max(currentDrag.start.x, currentDrag.end.x);
       if (x2 - x1 > 6) {
@@ -3014,10 +3472,10 @@ export class OscilloscopeApp {
       this.renderTabsBar();
       this.renderSidebar();
       this.draw();
-      this.showToast(`Reloaded LTspice data: ${file.name}`, 'info');
+      this.showToast(`已重载 LTspice 波形：${file.name}`, 'info');
       return true;
     } catch (err: any) {
-      this.showToast(`Reload failed (${file.name}): ${err.message}`, 'error');
+      this.showToast(`重载失败（${file.name}）：${err.message}`, 'error');
       return false;
     }
   }
@@ -3025,7 +3483,7 @@ export class OscilloscopeApp {
   private createTabFromExcelPayloads(
     items: ExcelImportedSheetPayload[],
     disposition: 'separate' | 'merge',
-    timeAlignment: ExcelMergeTimeMode = 'preserve'
+    timeAlignment: ExcelMergeTimeMode = 'auto-best'
   ): void {
     const colors = this.getRawColors();
     if (disposition === 'merge') {
@@ -3036,7 +3494,7 @@ export class OscilloscopeApp {
       if (timeAlignment === 'preserve' && !merged.canMergePreservingTime) {
         const reason = merged.warnings.join(' ');
         this.showToast(
-          `未创建混合时间坐标的合并视图。请确认各文件首样本确实对应同一时刻后，选择「首样本对齐」；否则请分别打开。${reason}`,
+          `未创建混合时间坐标的合并视图。请切换为「自动对应时间」或「首样本对齐」，否则请分别打开。${reason}`,
           'error'
         );
         return;
@@ -3046,15 +3504,21 @@ export class OscilloscopeApp {
         this.showToast('无法为合并波形建立有效时间视窗：请检查各通道是否至少有两个严格递增的有效时间点。', 'error');
         return;
       }
-      mergedDrawOrder = [viewport.primaryChannelId, ...mergedDrawOrder.filter((id) => id !== viewport.primaryChannelId)];
+      // Put the longest valid channel first when in auto-best / align-start, or viewport anchor otherwise
+      const longestAudit = [...merged.audit]
+        .filter((r) => r.sampleCount >= 2 && r.monotonic && r.durationSec > 0)
+        .sort((a, b) => b.durationSec - a.durationSec)[0];
+      const anchorId =
+        timeAlignment === 'auto-best' && longestAudit ? longestAudit.id : viewport.primaryChannelId;
+      mergedDrawOrder = [anchorId, ...mergedDrawOrder.filter((id) => id !== anchorId)];
       this.markRawChannelsAndFit(mergedChannels);
       const uniqueFiles = Array.from(new Set(items.map((it) => it.fileName)));
       const tabTitle =
         uniqueFiles.length === 1
-          ? `${uniqueFiles[0]} (${items.length} sheets, merged)`
-          : `${uniqueFiles[0]} +${uniqueFiles.length - 1} (${items.length} sheets, merged)`;
+          ? `${uniqueFiles[0]} (${items.length} sheets, 合并)`
+          : `${uniqueFiles[0]} +${uniqueFiles.length - 1} (${items.length} sheets, 合并)`;
 
-      this.addTab({
+      const newTab: TabState = {
         id: `tab_${Date.now()}_${Math.random()}`,
         fileName: tabTitle,
         fileFingerprint: items.map((it) => `${it.fingerprint}::${it.sheetName}`).join('|'),
@@ -3088,13 +3552,22 @@ export class OscilloscopeApp {
         separateView: false,
         activeChannelId: mergedDrawOrder[0],
         activeTool: 'pan',
-      });
+      };
+      const globalBounds = getTabGlobalIndexBounds(newTab);
+      newTab.view.startIndex = globalBounds.minIdx;
+      newTab.view.endIndex = globalBounds.maxIdx;
+      this.addTab(newTab);
       const overlapText = merged.hasCommonOverlap
         ? `公共时间窗 ${formatEng(merged.commonOverlapSec, 's', 3)} · 最小覆盖 ${merged.minimumOverlapPct.toFixed(1)}%`
         : '无公共时间重叠区间';
-      const modeText = timeAlignment === 'align-start' ? '首样本平移至 t=0' : '保留源时间坐标';
+      const modeText =
+        timeAlignment === 'align-start'
+          ? '首样本平移至 t=0'
+          : timeAlignment === 'auto-best'
+          ? '最长轴 + 自动时间对应'
+          : '保留源时间坐标';
       this.showToast(
-        `已合并 ${items.length} 个 Sheet / ${mergedDrawOrder.length} 条通道 · ${modeText} · ${overlapText} · 不强制插值对齐`,
+        `已合并 ${items.length} 个 Sheet / ${mergedDrawOrder.length} 条通道 · ${modeText} · ${overlapText}`,
         merged.warnings.length ? 'warn' : 'info'
       );
       merged.warnings.forEach((warning) => this.showToast(warning, 'warn'));
@@ -3149,18 +3622,7 @@ export class OscilloscopeApp {
     const colors = this.getRawColors();
     const excelFiles = files.filter((f) => isExcelFileName(f.name));
     const standardFiles = files.filter((f) => !isExcelFileName(f.name));
-
-    if (excelFiles.length > 0) {
-      void excelImportModal.open({
-        mode: 'main',
-        files: excelFiles,
-        colors,
-        onConfirm: (res) => {
-          this.createTabFromExcelPayloads(res.items, res.tabDisposition, res.timeAlignment);
-        },
-        onNotify: (msg, level) => this.showToast(msg, level),
-      });
-    }
+    const tabularFiles: File[] = [];
 
     for (const file of standardFiles) {
       const ext = file.name.split('.').pop()?.toLowerCase();
@@ -3177,7 +3639,7 @@ export class OscilloscopeApp {
             this.renderSidebar();
             this.draw();
           } catch (err: any) {
-            this.showToast(`Failed to load session: ${err.message}`, 'error');
+            this.showToast(`加载工程文件失败：${err.message}`, 'error');
           }
         };
         reader.readAsText(file);
@@ -3216,63 +3678,114 @@ export class OscilloscopeApp {
             };
             this.addTab(tab);
             if (ext === 'raw') {
-              const stepInfo = (parsed as any).stepCount > 1 ? ` · ${(parsed as any).stepCount} steps` : '';
-              this.showToast(`Loaded LTspice .raw (${parsed.drawOrder.length} traces${stepInfo})`, 'info');
+              const stepInfo = (parsed as any).stepCount > 1 ? ` · ${(parsed as any).stepCount} 步` : '';
+              this.showToast(`已载入 LTspice .raw（${parsed.drawOrder.length} 条波形${stepInfo}）`, 'info');
             }
           } catch (err: any) {
-            this.showToast(`Failed to parse ${ext?.toUpperCase()}: ${err.message}`, 'error');
+            this.showToast(`解析 ${ext?.toUpperCase()} 失败：${err.message}`, 'error');
           }
         };
         reader.readAsArrayBuffer(file);
       } else {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          try {
-            const text = e.target?.result as string;
-            if (ext === 'txt' && isLtspiceExportText(text)) {
-              const fileFingerprint = computeTextFingerprint(file.name, text);
-              const parsed = parseLtspiceText(text, colors);
-              this.markRawChannelsAndFit(parsed.channels);
-              const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
-              this.addTab({
-                id: `tab_${Date.now()}_${Math.random()}`,
-                fileName: file.name,
-                fileFingerprint,
-                channels: parsed.channels,
-                drawOrder: parsed.drawOrder,
-                view: { startIndex: 0, endIndex: totalPoints },
-                cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
-                annotations: [],
-                annotationMode: false,
-                annotationsVisible: true,
-                isOverlap: false,
-                plotMode: 'time',
-                fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
-                motorConfig: { rpm: null, polePairs: null, enabled: false },
-                triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
-                measurementGate: 'view',
-                separateView: false,
-                activeChannelId: parsed.drawOrder[0],
-                activeTool: 'pan',
-              });
-              const stepInfo = parsed.stepCount > 1 ? ` · ${parsed.stepCount} steps` : '';
-              this.showToast(`Loaded LTspice export (${parsed.drawOrder.length} traces${stepInfo})`, 'info');
-              return;
-            }
-            this.showCsvImportModal(text, file.name);
-          } catch (err: any) {
-            this.showToast(`Failed to inspect file: ${err.message}`, 'error');
-          }
-        };
-        reader.readAsText(file);
+        tabularFiles.push(file);
       }
+    }
+
+    const openTabularBatch = async () => {
+      if (tabularFiles.length === 0) return;
+      try {
+        const loaded = await Promise.all(
+          tabularFiles.map(async (file) => ({
+            fileName: file.name,
+            ext: file.name.split('.').pop()?.toLowerCase() || '',
+            text: await file.text(),
+          }))
+        );
+
+        const csvQueueItems: Array<{ text: string; fileName: string }> = [];
+        for (const entry of loaded) {
+          // Only bypass the acquisition options screen when the .txt is an explicit multi-step LTspice file.
+          // Single-run 2-col or multi-col .txt/.csv files MUST open the acquisition options modal.
+          const isSteppedLtspice =
+            entry.ext === 'txt' && isLtspiceSteppedExportText(entry.text) && isLtspiceExportText(entry.text);
+          if (isSteppedLtspice) {
+            const fileFingerprint = computeTextFingerprint(entry.fileName, entry.text);
+            const parsed = parseLtspiceText(entry.text, colors);
+            this.markRawChannelsAndFit(parsed.channels);
+            const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+            this.addTab({
+              id: `tab_${Date.now()}_${Math.random()}`,
+              fileName: entry.fileName,
+              fileFingerprint,
+              channels: parsed.channels,
+              drawOrder: parsed.drawOrder,
+              view: { startIndex: 0, endIndex: totalPoints },
+              cursors: { enabled: false, mode: 'off', x1: null, x2: null, y1: null, y2: null, trackingChannel: parsed.drawOrder[0] || null },
+              annotations: [],
+              annotationMode: false,
+              annotationsVisible: true,
+              isOverlap: false,
+              plotMode: 'time',
+              fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+              motorConfig: { rpm: null, polePairs: null, enabled: false },
+              triggerConfig: { enabled: false, channelId: parsed.drawOrder[0], type: 'rising', level: 0, positionPercent: 50 },
+              measurementGate: 'view',
+              separateView: false,
+              activeChannelId: parsed.drawOrder[0],
+              activeTool: 'pan',
+            });
+            const stepInfo = parsed.stepCount > 1 ? ` · ${parsed.stepCount} 步` : '';
+            this.showToast(`已载入 LTspice 导出数据（${parsed.drawOrder.length} 条波形${stepInfo}）`, 'info');
+          } else {
+            csvQueueItems.push({ text: entry.text, fileName: entry.fileName });
+          }
+        }
+
+        if (csvQueueItems.length > 0) {
+          this.showCsvImportModalBatch(csvQueueItems);
+        }
+      } catch (err: any) {
+        this.showToast(`文件预检失败：${err?.message || err}`, 'error');
+      }
+    };
+
+    if (excelFiles.length > 0) {
+      void excelImportModal.open({
+        mode: 'main',
+        files: excelFiles,
+        colors,
+        onConfirm: (res) => {
+          this.createTabFromExcelPayloads(res.items, res.tabDisposition, res.timeAlignment);
+          if (tabularFiles.length > 0) {
+            void openTabularBatch();
+          }
+        },
+        onCancel: () => {
+          if (tabularFiles.length > 0) {
+            void openTabularBatch();
+          }
+        },
+        onNotify: (msg, level) => this.showToast(msg, level),
+      });
+    } else if (tabularFiles.length > 0) {
+      void openTabularBatch();
     }
   }
 
   public showCsvImportModal(text: string, fileName: string): void {
-    this.pendingCsvText = text;
-    this.pendingFileName = fileName;
-    this.pendingCsvPreview = previewCsv(text);
+    this.showCsvImportModalBatch([{ text, fileName }]);
+  }
+
+  public showCsvImportModalBatch(items: Array<{ text: string; fileName: string }>): void {
+    if (!items || items.length === 0) return;
+    this.pendingCsvQueue = items.map((item) => ({
+      fileName: item.fileName,
+      text: item.text,
+      preview: previewCsv(item.text),
+    }));
+    this.pendingCsvActiveIndex = 0;
+    this.pendingCsvDisposition = items.length > 1 ? 'merge' : 'separate';
+    this.pendingCsvTimeAlignment = 'auto-best';
 
     const modal = document.getElementById('csvQualityModal');
     if (!modal) return;
@@ -3281,9 +3794,115 @@ export class OscilloscopeApp {
     this.renderCsvModalContent();
   }
 
+  public applyCsvRulesToAllQueued(): void {
+    if (this.pendingCsvQueue.length <= 1) return;
+    const src = this.pendingCsvQueue[this.pendingCsvActiveIndex];
+    if (!src) return;
+    const srcP = src.preview;
+    let updated = 0;
+
+    for (let i = 0; i < this.pendingCsvQueue.length; i++) {
+      if (i === this.pendingCsvActiveIndex) continue;
+      const tgt = this.pendingCsvQueue[i];
+      const tp = tgt.preview;
+      tp.timeUnit = srcP.timeUnit;
+      tp.sampleRateOverrideHz = srcP.sampleRateOverrideHz ?? null;
+
+      // Sync matching column roles by index if count matches, or by header name
+      if (tp.columnMappings.length === srcP.columnMappings.length) {
+        tp.columnMappings.forEach((m, idx) => {
+          m.role = srcP.columnMappings[idx].role;
+        });
+        tp.timeColIndex = srcP.timeColIndex;
+      } else {
+        let nextTimeCol = -1;
+        tp.columnMappings.forEach((m, idx) => {
+          const matchByName = srcP.columnMappings.find(
+            (sm) => sm.header.trim().toLowerCase() === m.header.trim().toLowerCase()
+          );
+          if (matchByName) {
+            m.role = matchByName.role;
+            if (m.role === 'time' && nextTimeCol === -1) nextTimeCol = idx;
+          }
+        });
+        if (nextTimeCol >= 0) tp.timeColIndex = nextTimeCol;
+      }
+      tp.quality = computeCsvPreviewQuality(tgt.text, tp, tp.timeUnit, tp.sampleRateOverrideHz);
+      updated++;
+    }
+    this.renderCsvModalContent();
+    this.showToast(`已将当前时间单位、采样率与列规则同步到其余 ${updated} 个文件。`, 'info');
+  }
+
   private renderCsvModalContent(): void {
-    if (!this.pendingCsvPreview) return;
-    const p = this.pendingCsvPreview;
+    const activeItem = this.pendingCsvQueue[this.pendingCsvActiveIndex];
+    if (!activeItem) return;
+    const p = activeItem.preview;
+
+    const subEl = document.getElementById('csvModalSubtitle');
+    if (subEl) {
+      subEl.innerText =
+        this.pendingCsvQueue.length > 1
+          ? `${activeItem.fileName} · 第 ${this.pendingCsvActiveIndex + 1} / ${this.pendingCsvQueue.length} 个文件`
+          : activeItem.fileName;
+    }
+
+    const multiBar = document.getElementById('csvMultiFileBar');
+    const pillsWrap = document.getElementById('csvFilePillsWrap');
+    if (multiBar && pillsWrap) {
+      if (this.pendingCsvQueue.length > 1) {
+        multiBar.classList.remove('hidden');
+        multiBar.classList.add('flex');
+        pillsWrap.innerHTML = '';
+        this.pendingCsvQueue.forEach((item, idx) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const chCount = item.preview.columnMappings.filter((m) => m.role === 'channel').length;
+          btn.className =
+            idx === this.pendingCsvActiveIndex
+              ? 'px-2 py-1 bg-cyan-600 text-slate-950 font-semibold rounded-xs text-[11px] font-mono cursor-pointer whitespace-nowrap'
+              : 'px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-xs text-[11px] font-mono cursor-pointer whitespace-nowrap';
+          btn.innerText = `${item.fileName} (${chCount}ch)`;
+          btn.addEventListener('click', () => {
+            this.pendingCsvActiveIndex = idx;
+            this.renderCsvModalContent();
+          });
+          pillsWrap.appendChild(btn);
+        });
+      } else {
+        multiBar.classList.add('hidden');
+        multiBar.classList.remove('flex');
+      }
+    }
+
+    const dispSel = document.getElementById('csvDispositionSelect') as HTMLSelectElement | null;
+    const mergeTimeWrap = document.getElementById('csvMergeTimeModeWrap');
+    const mergeTimeSel = document.getElementById('csvMergeTimeModeSelect') as HTMLSelectElement | null;
+    if (dispSel) {
+      const appendOpt = dispSel.querySelector('option[value="append"]') as HTMLOptionElement | null;
+      if (appendOpt) appendOpt.disabled = this.tabs.length === 0;
+      if (this.pendingCsvDisposition === 'append' && this.tabs.length === 0) {
+        this.pendingCsvDisposition = this.pendingCsvQueue.length > 1 ? 'merge' : 'separate';
+      }
+      dispSel.value = this.pendingCsvDisposition;
+      dispSel.onchange = () => {
+        const val = dispSel.value;
+        this.pendingCsvDisposition =
+          val === 'merge' ? 'merge' : val === 'append' ? 'append' : 'separate';
+        this.renderCsvModalContent();
+      };
+    }
+    if (mergeTimeWrap && mergeTimeSel) {
+      const showAlign = this.pendingCsvDisposition === 'merge' || this.pendingCsvDisposition === 'append';
+      mergeTimeWrap.classList.toggle('hidden', !showAlign);
+      mergeTimeWrap.classList.toggle('flex', showAlign);
+      mergeTimeSel.value = this.pendingCsvTimeAlignment;
+      mergeTimeSel.onchange = () => {
+        const val = mergeTimeSel.value;
+        this.pendingCsvTimeAlignment =
+          val === 'align-start' ? 'align-start' : val === 'preserve' ? 'preserve' : 'auto-best';
+      };
+    }
 
     const previewContainer = document.getElementById('csvPreviewContainer');
     if (previewContainer) {
@@ -3329,7 +3948,7 @@ export class OscilloscopeApp {
             p.columnMappings[colIdx].role = role;
             if (colIdx === p.timeColIndex) p.timeColIndex = -1;
           }
-          p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+          p.quality = computeCsvPreviewQuality(activeItem.text, p, p.timeUnit, p.sampleRateOverrideHz);
           this.renderCsvModalContent();
         });
       });
@@ -3340,7 +3959,7 @@ export class OscilloscopeApp {
       timeUnitSel.value = p.timeUnit;
       timeUnitSel.onchange = () => {
         p.timeUnit = (timeUnitSel.value as 's' | 'ms' | 'us' | 'ns' | 'ps') || 's';
-        p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+        p.quality = computeCsvPreviewQuality(activeItem.text, p, p.timeUnit, p.sampleRateOverrideHz);
         this.renderCsvModalContent();
       };
     }
@@ -3388,14 +4007,14 @@ export class OscilloscopeApp {
           p.sampleRateOverrideHz = Number(val);
           customRateInput.classList.add('hidden');
         }
-        p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+        p.quality = computeCsvPreviewQuality(activeItem.text, p, p.timeUnit, p.sampleRateOverrideHz);
         this.renderCsvModalContent();
       };
 
       customRateInput.onchange = () => {
         const parsedVal = parseFloat(customRateInput.value);
         p.sampleRateOverrideHz = isFinite(parsedVal) && parsedVal > 0 ? parsedVal : null;
-        p.quality = computeCsvPreviewQuality(this.pendingCsvText, p, p.timeUnit, p.sampleRateOverrideHz);
+        p.quality = computeCsvPreviewQuality(activeItem.text, p, p.timeUnit, p.sampleRateOverrideHz);
         this.renderCsvModalContent();
       };
     }
@@ -3437,70 +4056,272 @@ export class OscilloscopeApp {
   }
 
   public confirmCsvImport(resample: boolean): void {
-    if (!this.pendingCsvPreview || !this.pendingCsvText) return;
+    if (this.pendingCsvQueue.length === 0) return;
 
     try {
-      const timeUnitSel = document.getElementById('csvTimeUnitSelect') as HTMLSelectElement;
-      const timeUnit = (timeUnitSel?.value as 's' | 'ms' | 'us' | 'ns' | 'ps') || this.pendingCsvPreview.timeUnit;
-
-      const parsed = parseFullCsv(this.pendingCsvText, {
-        delimiter: this.pendingCsvPreview.delimiter,
-        hasHeader: this.pendingCsvPreview.hasHeader,
-        skipLines: this.pendingCsvPreview.skipLines,
-        timeColIndex: this.pendingCsvPreview.timeColIndex,
-        timeUnit,
-        sampleRateOverrideHz: this.pendingCsvPreview.sampleRateOverrideHz ?? null,
-        columnMappings: this.pendingCsvPreview.columnMappings,
-        resample,
-        colors: this.getRawColors(),
+      const colors = this.getRawColors();
+      const parsedEntries = this.pendingCsvQueue.map((item, idx) => {
+        const p = item.preview;
+        const parsed = parseFullCsv(item.text, {
+          delimiter: p.delimiter,
+          hasHeader: p.hasHeader,
+          skipLines: p.skipLines,
+          timeColIndex: p.timeColIndex,
+          timeUnit: p.timeUnit,
+          sampleRateOverrideHz: p.sampleRateOverrideHz ?? null,
+          columnMappings: p.columnMappings,
+          resample,
+          colors,
+        });
+        // Re-key channels uniquely per queued file so multi-file merge never collides
+        const remappedChannels: Record<string, WaveformChannel> = {};
+        const remappedDrawOrder: string[] = [];
+        parsed.drawOrder.forEach((cid, cIdx) => {
+          const ch = parsed.channels[cid];
+          if (!ch) return;
+          const uniqueId = `csv_f${idx}_${cIdx}_${cid}`;
+          remappedChannels[uniqueId] = { ...ch, id: uniqueId };
+          remappedDrawOrder.push(uniqueId);
+        });
+        return {
+          item,
+          parsed: {
+            channels: remappedChannels,
+            drawOrder: remappedDrawOrder,
+            quality: parsed.quality,
+            timeOriginSec: parsed.timeOriginSec,
+            timeOriginKind: parsed.timeOriginKind,
+          },
+          isSynthetic: Boolean(parsed.quality?.syntheticClockUsed),
+        };
       });
 
-      this.markRawChannelsAndFit(parsed.channels);
+      const disposition = this.pendingCsvDisposition;
+      const activeTab = this.getActiveTab();
 
-      const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
-      const tab: TabState = {
-        id: `tab_${Date.now()}_${Math.random()}`,
-        fileName: this.pendingFileName,
-        fileFingerprint: computeTextFingerprint(this.pendingFileName, this.pendingCsvText),
-        channels: parsed.channels,
-        drawOrder: parsed.drawOrder,
-        view: { startIndex: 0, endIndex: totalPoints },
-        cursors: {
-          enabled: false,
-          mode: 'off',
-          x1: null,
-          x2: null,
-          y1: null,
-          y2: null,
-          trackingChannel: parsed.drawOrder[0] || null,
-        },
-        annotations: [],
-        annotationMode: false,
-        annotationsVisible: true,
-        isOverlap: false,
-        plotMode: 'time',
-        fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
-        motorConfig: { rpm: null, polePairs: null, enabled: false },
-        triggerConfig: {
-          enabled: false,
-          channelId: parsed.drawOrder[0],
-          type: 'rising',
-          level: 0,
-          positionPercent: 50,
-        },
-        measurementGate: 'view',
-        separateView: false,
-        activeChannelId: parsed.drawOrder[0],
-        activeTool: 'pan',
-      };
+      if (disposition === 'append' && activeTab) {
+        this.pushUndoSnapshot('Append Table Files', true);
+        // Pick longest existing channel on activeTab as anchor
+        let anchorCh = activeTab.channels[activeTab.drawOrder[0]];
+        let bestAnchorSpan = anchorCh && anchorCh.t.length >= 2 ? anchorCh.t[anchorCh.t.length - 1] - anchorCh.t[0] : -1;
+        for (const id of activeTab.drawOrder) {
+          const cand = activeTab.channels[id];
+          if (!cand || !cand.t || cand.t.length < 2) continue;
+          const sp = cand.t[cand.t.length - 1] - cand.t[0];
+          if (sp > bestAnchorSpan) {
+            bestAnchorSpan = sp;
+            anchorCh = cand;
+          }
+        }
+        const anchorStart = anchorCh && anchorCh.t.length ? anchorCh.t[0] : 0;
+        const anchorEnd = anchorCh && anchorCh.t.length ? anchorCh.t[anchorCh.t.length - 1] : 0;
+        const anchorIsSynthetic = Boolean(anchorCh?.metadata?.syntheticClockUsed);
 
-      this.addTab(tab);
+        const newChannelIds: string[] = [];
+        parsedEntries.forEach(({ item, parsed, isSynthetic }) => {
+          const shortName = item.fileName.replace(/\.[^.]+$/, '');
+          parsed.drawOrder.forEach((cid) => {
+            const ch = parsed.channels[cid];
+            if (!ch) return;
+            const colorIdx = activeTab.drawOrder.length + newChannelIds.length;
+            const newId = `app_${Date.now().toString(36)}_${newChannelIds.length}_${cid}`;
+            const nextCh: WaveformChannel = {
+              ...ch,
+              id: newId,
+              name: `[${shortName}] ${ch.name}`,
+              color: colors[colorIdx % colors.length] || ch.color,
+              channelKind: 'raw',
+            };
+            const srcStart = nextCh.t[0] || 0;
+            const srcEnd = nextCh.t[nextCh.t.length - 1] || srcStart;
+            let shiftSec = 0;
+            if (this.pendingCsvTimeAlignment === 'align-start') {
+              shiftSec = anchorStart - srcStart;
+            } else if (this.pendingCsvTimeAlignment === 'auto-best') {
+              const overlap =
+                !isSynthetic &&
+                !anchorIsSynthetic &&
+                Math.min(srcEnd, anchorEnd) > Math.max(srcStart, anchorStart);
+              if (!overlap) {
+                shiftSec = anchorStart - srcStart;
+              }
+            }
+            if (Math.abs(shiftSec) > 1e-15) {
+              applyChannelTimeShift(nextCh, shiftSec);
+            }
+            fitChannelTo125(nextCh);
+            activeTab.channels[newId] = nextCh;
+            activeTab.drawOrder.push(newId);
+            newChannelIds.push(newId);
+          });
+        });
 
+        // Ensure longest channel sits at drawOrder[0] so X axis grid covers longest span naturally
+        let longestId = activeTab.drawOrder[0];
+        let maxSpan = -1;
+        for (const id of activeTab.drawOrder) {
+          const ch = activeTab.channels[id];
+          if (!ch || !ch.t || ch.t.length < 2) continue;
+          const sp = ch.t[ch.t.length - 1] - ch.t[0];
+          if (sp > maxSpan) {
+            maxSpan = sp;
+            longestId = id;
+          }
+        }
+        if (longestId && activeTab.drawOrder[0] !== longestId) {
+          activeTab.drawOrder = [longestId, ...activeTab.drawOrder.filter((id) => id !== longestId)];
+        }
+        extendTabViewToLongestChannel(activeTab);
+        clampCursorsToViewport(activeTab);
+        this.cachedSpectrum = null;
+        this.cachedSpectrumKey = '';
+        this.renderTabsBar();
+        this.renderSidebar();
+        this.draw();
+        this.showToast(`已将 ${newChannelIds.length} 条新通道追加到当前波形屏（最长轴自动展开，支持右侧 Δt 微调）。`, 'info');
+      } else if (disposition === 'merge' && parsedEntries.length >= 1) {
+        const sources: ExcelMergeSource[] = parsedEntries.map(({ item, parsed, isSynthetic }) => ({
+          fileName: item.fileName,
+          sheetName: 'CSV',
+          channels: parsed.channels,
+          drawOrder: parsed.drawOrder,
+          timeOriginSec: parsed.timeOriginSec,
+          timeOriginKind: isSynthetic ? 'synthetic' : parsed.timeOriginKind,
+        }));
+
+        const mergeMode = this.pendingCsvTimeAlignment;
+        const merged = mergeExcelChannelsByTime(sources, colors, mergeMode);
+        if (merged.drawOrder.length === 0) {
+          throw new Error('没有可导入的数值通道。');
+        }
+        if (mergeMode === 'preserve' && !merged.canMergePreservingTime) {
+          this.showToast(
+            `多文件包含合成采样时间或不同坐标系，无法仅按原始时间戳合并；请切换为「自动对应时间」或「首样本对齐」。`,
+            'warn'
+          );
+          return;
+        }
+        const viewport = resolveExcelMergedViewport(merged);
+        if (!viewport) {
+          throw new Error('合并波形缺少至少两个严格递增的有效时间点。');
+        }
+        const longestAudit = [...merged.audit]
+          .filter((r) => r.sampleCount >= 2 && r.monotonic && r.durationSec > 0)
+          .sort((a, b) => b.durationSec - a.durationSec)[0];
+        const anchorId =
+          mergeMode === 'auto-best' && longestAudit ? longestAudit.id : viewport.primaryChannelId;
+        const mergedDrawOrder = [anchorId, ...merged.drawOrder.filter((id) => id !== anchorId)];
+        this.markRawChannelsAndFit(merged.channels);
+
+        const tabTitle =
+          parsedEntries.length === 1
+            ? parsedEntries[0].item.fileName
+            : `${parsedEntries[0].item.fileName} +${parsedEntries.length - 1} (${mergedDrawOrder.length}ch 合并)`;
+
+        const tab: TabState = {
+          id: `tab_${Date.now()}_${Math.random()}`,
+          fileName: tabTitle,
+          fileFingerprint: parsedEntries
+            .map((e) => computeTextFingerprint(e.item.fileName, e.item.text))
+            .join('|'),
+          channels: merged.channels,
+          drawOrder: mergedDrawOrder,
+          view: { startIndex: viewport.startIndex, endIndex: viewport.endIndex },
+          cursors: {
+            enabled: false,
+            mode: 'off',
+            x1: null,
+            x2: null,
+            y1: null,
+            y2: null,
+            trackingChannel: mergedDrawOrder[0] || null,
+          },
+          annotations: [],
+          annotationMode: false,
+          annotationsVisible: true,
+          isOverlap: false,
+          plotMode: 'time',
+          fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+          motorConfig: { rpm: null, polePairs: null, enabled: false },
+          triggerConfig: {
+            enabled: false,
+            channelId: mergedDrawOrder[0],
+            type: 'rising',
+            level: 0,
+            positionPercent: 50,
+          },
+          measurementGate: 'view',
+          separateView: false,
+          activeChannelId: mergedDrawOrder[0],
+          activeTool: 'pan',
+        };
+        const globalBounds = getTabGlobalIndexBounds(tab);
+        tab.view.startIndex = globalBounds.minIdx;
+        tab.view.endIndex = globalBounds.maxIdx;
+        this.addTab(tab);
+        this.showToast(
+          `已将 ${parsedEntries.length} 个文件合并到同屏 ${mergedDrawOrder.length} 条通道（时间轴按最长波形展开，支持右侧面板调节 Δt）。`,
+          merged.warnings.length ? 'warn' : 'info'
+        );
+        merged.warnings.forEach((w) => this.showToast(w, 'warn'));
+      } else {
+        for (const { item, parsed } of parsedEntries) {
+          this.markRawChannelsAndFit(parsed.channels);
+          const totalPoints = Object.values(parsed.channels)[0]?.v.length || 1000;
+          const tab: TabState = {
+            id: `tab_${Date.now()}_${Math.random()}`,
+            fileName: item.fileName,
+            fileFingerprint: computeTextFingerprint(item.fileName, item.text),
+            channels: parsed.channels,
+            drawOrder: parsed.drawOrder,
+            view: { startIndex: 0, endIndex: totalPoints },
+            cursors: {
+              enabled: false,
+              mode: 'off',
+              x1: null,
+              x2: null,
+              y1: null,
+              y2: null,
+              trackingChannel: parsed.drawOrder[0] || null,
+            },
+            annotations: [],
+            annotationMode: false,
+            annotationsVisible: true,
+            isOverlap: false,
+            plotMode: 'time',
+            fftOptions: { range: 'view', window: 'hann', scale: 'db', zeroPadding: 1, removeDC: true },
+            motorConfig: { rpm: null, polePairs: null, enabled: false },
+            triggerConfig: {
+              enabled: false,
+              channelId: parsed.drawOrder[0],
+              type: 'rising',
+              level: 0,
+              positionPercent: 50,
+            },
+            measurementGate: 'view',
+            separateView: false,
+            activeChannelId: parsed.drawOrder[0],
+            activeTool: 'pan',
+          };
+          this.addTab(tab);
+        }
+        if (parsedEntries.length > 1) {
+          this.showToast(`已分别打开 ${parsedEntries.length} 个波形标签页。`, 'info');
+        }
+      }
+
+      this.pendingCsvQueue = [];
+      this.pendingCsvActiveIndex = 0;
       const modal = document.getElementById('csvQualityModal');
       if (modal) modal.style.display = 'none';
     } catch (err: any) {
-      this.showToast(`CSV Import Failed: ${err.message}`, 'error');
+      this.showToast(`CSV 导入失败：${err.message}`, 'error');
     }
+  }
+
+  public clearPendingCsvImport(): void {
+    this.pendingCsvQueue = [];
+    this.pendingCsvActiveIndex = 0;
   }
 
   // --- AutoSet, Trigger, Math, Clarke, Park, Power ---
@@ -3508,7 +4329,7 @@ export class OscilloscopeApp {
     const tab = this.getActiveTab();
     if (!tab) return;
 
-    this.pushUndoSnapshot('AutoSet');
+    this.pushUndoSnapshot('自动设置刻度');
     const res = performAutoSet(tab.channels, tab.drawOrder, tab.view);
     for (const [id, bounds] of Object.entries(res.updatedChannels)) {
       const ch = tab.channels[id];
@@ -3525,7 +4346,7 @@ export class OscilloscopeApp {
 
     this.renderSidebar();
     this.draw();
-    this.showToast(res.statusMessage, 'info');
+    this.showToast(res.statusMessage, 'info', { undoable: true });
   }
 
   public applyTrigger(): void {
@@ -3542,13 +4363,13 @@ export class OscilloscopeApp {
       this.renderSidebar();
       this.draw();
     } else {
-      this.showToast(`Trigger level not crossed on "${ch.name}".`, 'warn');
+      this.showToast(`通道「${ch.name}」未检测到触发电平穿越。`, 'warn');
     }
   }
 
   public addMathChannel(expr: string, name: string): { success: boolean; error?: string } {
     const tab = this.getActiveTab();
-    if (!tab) return { success: false, error: 'No active dataset or tab found.' };
+    if (!tab) return { success: false, error: '当前没有打开的波形标签页。' };
 
     try {
       const mathId = `math_${Date.now()}`;
@@ -3572,7 +4393,7 @@ export class OscilloscopeApp {
 
       this.renderSidebar();
       this.draw();
-      this.showToast(`Created Math channel: ${name}`, 'info');
+      this.showToast(`已创建数学通道：${name}`, 'info');
       return { success: true };
     } catch (err: any) {
       console.error('Math evaluation error:', err);
@@ -3796,19 +4617,19 @@ export class OscilloscopeApp {
     const chC = tab.channels[ucId];
 
     if (!chA || !chB || !chC) {
-      this.showToast('Selected phase channels are invalid.', 'error');
+      this.showToast('所选三相通道无效。', 'error');
       return;
     }
 
     try {
       const unitInfo = resolveCompatibleSiGroupScale([chA, chB, chC]);
       if (!unitInfo.valid) {
-        this.showToast(unitInfo.reason || 'Three-phase channels have incompatible units.', 'error');
+        this.showToast(unitInfo.reason || '三相通道单位不兼容。', 'error');
         return;
       }
       const synced = alignChannelsToCommonTimebase([chA, chB, chC]);
       if (!synced.valid || synced.time.length < 2) {
-        this.showToast(synced.invalidReason || synced.warnings[0] || 'Three-phase channels have no valid synchronized timebase.', 'error');
+        this.showToast(synced.invalidReason || synced.warnings[0] || '三相通道缺少有效的同步时间基准。', 'error');
         return;
       }
       const scaleArr = (arr: Float32Array, scale: number): Float32Array => {
@@ -3896,12 +4717,12 @@ export class OscilloscopeApp {
       const extraWarn = Array.from(new Set([unitInfo.normalizedNote, ...synced.warnings].filter(Boolean))).join(' | ');
       this.showToast(
         extraWarn
-          ? `Generated Clarke α/β (${extraWarn})`
-          : 'Generated Clarke α and β channels.',
+          ? `已生成 Clarke α/β 通道（${extraWarn}）`
+          : '已生成 Clarke α 与 β 通道。',
         synced.resampled || unitInfo.normalizedNote || synced.warnings.length > 0 ? 'warn' : 'info'
       );
     } catch (err: any) {
-      this.showToast(`Clarke Transform Failed: ${err.message}`, 'error');
+      this.showToast(`Clarke 变换失败：${err.message}`, 'error');
     }
   }
 
@@ -3917,7 +4738,7 @@ export class OscilloscopeApp {
     const alphaCh = tab.channels[alphaId];
     const betaCh = tab.channels[betaId];
     if (!alphaCh || !betaCh) {
-      this.showToast('Select valid α and β channels.', 'error');
+      this.showToast('请选择有效的 α 与 β 通道。', 'error');
       return;
     }
 
@@ -3925,12 +4746,12 @@ export class OscilloscopeApp {
       const offsetRad = ((isFinite(offsetDeg) ? offsetDeg : 0) * Math.PI) / 180;
       const angleCh = angleMode === 'channel' ? tab.channels[angleChannelId] : undefined;
       if (angleMode === 'channel' && !angleCh) {
-        this.showToast('Select a valid electrical angle θ(t) channel or switch to Auto mode.', 'error');
+        this.showToast('请选择有效的电角度 θ(t) 通道，或切换为自动模式。', 'error');
         return;
       }
       const parkRes = computeParkFromChannels(alphaCh, betaCh, angleCh, offsetRad);
       if (!parkRes.valid || parkRes.time.length < 2) {
-        this.showToast(parkRes.invalidReason || parkRes.warnings[0] || 'Park transform failed.', 'error');
+        this.showToast(parkRes.invalidReason || parkRes.warnings[0] || 'Park 变换失败。', 'error');
         return;
       }
 
@@ -4001,11 +4822,11 @@ export class OscilloscopeApp {
       this.draw();
       const topWarn = Array.from(new Set(parkRes.warnings.filter(Boolean))).join(' | ');
       this.showToast(
-        topWarn ? `Generated Park (${topWarn})` : 'Generated Park d and q channels.',
+        topWarn ? `已生成 Park d/q 通道（${topWarn}）` : '已生成 Park d 与 q 通道。',
         parkRes.warnings.length > 0 || parkRes.resampled ? 'warn' : 'info'
       );
     } catch (err: any) {
-      this.showToast(`Park Transform Failed: ${err.message}`, 'error');
+      this.showToast(`Park 变换失败：${err.message}`, 'error');
     }
   }
 
@@ -4023,7 +4844,7 @@ export class OscilloscopeApp {
     const uaCh = tab.channels[uaId];
     const iaCh = tab.channels[iaId];
     if (!uaCh || !iaCh) {
-      this.showToast('Select valid Voltage and Current channels.', 'error');
+      this.showToast('请选择有效的电压与电流通道。', 'error');
       return;
     }
 
@@ -4041,7 +4862,7 @@ export class OscilloscopeApp {
         siScaled = Math.abs(vScale - 1) > 1e-12 || Math.abs(iScale - 1) > 1e-12;
         const synced = alignChannelsToCommonTimebase([uaCh, iaCh]);
         if (!synced.valid || synced.time.length < 2) {
-          this.showToast(synced.invalidReason || synced.warnings[0] || 'Voltage and current channels have no valid synchronized timebase.', 'error');
+          this.showToast(synced.invalidReason || synced.warnings[0] || '电压与电流通道缺少有效的同步时间基准。', 'error');
           return;
         }
         syncTime = synced.time;
@@ -4057,7 +4878,7 @@ export class OscilloscopeApp {
         const ibCh = tab.channels[ibId];
         const icCh = tab.channels[icId];
         if (!ubCh || !ucCh || !ibCh || !icCh) {
-          this.showToast('All 3 voltage and 3 current channels are required for 3-phase power.', 'error');
+          this.showToast('三相功率计算需要同时选择全部 3 路电压与 3 路电流通道。', 'error');
           return;
         }
         const vScaleA = parseSiUnitScale(uaCh.unit, 'V', uaCh.name, { strict: true });
@@ -4069,7 +4890,7 @@ export class OscilloscopeApp {
         siScaled = [vScaleA, vScaleB, vScaleC, iScaleA, iScaleB, iScaleC].some((s) => Math.abs(s - 1) > 1e-12);
         const synced = alignChannelsToCommonTimebase([uaCh, ubCh, ucCh, iaCh, ibCh, icCh]);
         if (!synced.valid || synced.time.length < 2) {
-          this.showToast(synced.invalidReason || synced.warnings[0] || '6-channel 3-phase power has no valid synchronized timebase.', 'error');
+          this.showToast(synced.invalidReason || synced.warnings[0] || '三相 6 通道功率缺少有效的同步时间基准。', 'error');
           return;
         }
         syncTime = synced.time;
@@ -4125,20 +4946,20 @@ export class OscilloscopeApp {
       this.draw();
 
       const summary = computePowerSummary(pCh.t, pCh.v);
-      const flags = [wasResampled ? 'Timebase Synced' : '', siScaled ? 'SI Scaled' : ''].filter(Boolean).join(' · ');
+      const flags = [wasResampled ? '时基已同步' : '', siScaled ? 'SI 已缩放' : ''].filter(Boolean).join(' · ');
       if (!summary.valid) {
         this.showToast(
-          `${flags ? `[${flags}] ` : ''}P(t) created, 积分无效 (${summary.status}): ${summary.invalidReason || '数据不足'}`,
+          `${flags ? `[${flags}] ` : ''}已创建 P(t)，积分无效 (${summary.status})：${summary.invalidReason || '数据不足'}`,
           'warn'
         );
       } else {
         this.showToast(
-          `${flags ? `[${flags}] ` : ''}P(t) created · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_avg=${formatEng(summary.avgAbsPowerW, 'W', 3)} (非热损耗), E_net=${formatEng(summary.energyJ, 'J', 3)} (E+=${formatEng(summary.inputEnergyJ, 'J', 3)}, E-=${formatEng(summary.regenEnergyJ, 'J', 3)})`,
+          `${flags ? `[${flags}] ` : ''}已创建 P(t) · P_avg=${formatEng(summary.avgPowerW, 'W', 3)}, |P|_avg=${formatEng(summary.avgAbsPowerW, 'W', 3)} (非热损耗), E_net=${formatEng(summary.energyJ, 'J', 3)} (E+=${formatEng(summary.inputEnergyJ, 'J', 3)}, E-=${formatEng(summary.regenEnergyJ, 'J', 3)})`,
           wasResampled || siScaled || summary.skippedGapCount > 0 ? 'warn' : 'info'
         );
       }
     } catch (err: any) {
-      this.showToast(`Power Calculation Failed: ${err.message}`, 'error');
+      this.showToast(`功率计算失败：${err.message}`, 'error');
     }
   }
 
@@ -4202,71 +5023,46 @@ export class OscilloscopeApp {
     if (srEl) srEl.innerText = tb.sampleRate ? formatEng(tb.sampleRate, 'Sa/s', 2) : 'Non-uniform';
     if (depthEl) depthEl.innerText = `${tb.visiblePoints.toLocaleString()} / ${tb.totalPoints.toLocaleString()} pts`;
 
-    // Mode toggles (Time | FFT | XY)
-    const activeModeCls = 'px-2 py-0.5 rounded-sm bg-cyan-600 text-slate-950 font-semibold transition cursor-pointer whitespace-nowrap';
-    const inactiveModeCls = 'px-2 py-0.5 rounded-sm text-slate-300 hover:text-white transition cursor-pointer whitespace-nowrap';
-    if (timeBtn) timeBtn.className = tab.plotMode === 'time' ? activeModeCls : inactiveModeCls;
-    if (freqBtn) freqBtn.className = tab.plotMode === 'frequency' ? activeModeCls : inactiveModeCls;
-    if (xyBtn) xyBtn.className = tab.plotMode === 'xy' ? activeModeCls : inactiveModeCls;
+    // Mode toggles (Time | FFT | XY) via aria-pressed
+    timeBtn?.setAttribute('aria-pressed', tab.plotMode === 'time' ? 'true' : 'false');
+    freqBtn?.setAttribute('aria-pressed', tab.plotMode === 'frequency' ? 'true' : 'false');
+    xyBtn?.setAttribute('aria-pressed', tab.plotMode === 'xy' ? 'true' : 'false');
 
-    if (overlapBtn && sepBtn) {
-      if (!tab.separateView) {
-        overlapBtn.className = 'px-2 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer';
-        sepBtn.className = 'px-2 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer';
-      } else {
-        sepBtn.className = 'px-2 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer';
-        overlapBtn.className = 'px-2 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer';
-      }
-    }
+    // Layout toggles (Overlap | Separate) via aria-pressed
+    overlapBtn?.setAttribute('aria-pressed', !tab.separateView ? 'true' : 'false');
+    sepBtn?.setAttribute('aria-pressed', tab.separateView ? 'true' : 'false');
 
-    // Render Mode 4-way switch
+    // Render Mode 4-way switch via aria-pressed
     const rm = tab.renderMode || 'vector';
-    const rVec = document.getElementById('renderModeVectorBtn');
-    const rSinc = document.getElementById('renderModeSincBtn');
-    const rDot = document.getElementById('renderModeDotsBtn');
-    const rMrk = document.getElementById('renderModeMarkersBtn');
-    const applyRmCls = (el: HTMLElement | null, active: boolean) => {
-      if (!el) return;
-      el.className = active
-        ? 'px-1.5 py-0.5 rounded-sm bg-[#222933] text-white font-medium transition cursor-pointer whitespace-nowrap'
-        : 'px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap';
-    };
-    applyRmCls(rVec, rm === 'vector');
-    applyRmCls(rSinc, rm === 'sinc');
-    applyRmCls(rDot, rm === 'dots');
-    applyRmCls(rMrk, rm === 'vector-markers');
+    document.getElementById('renderModeVectorBtn')?.setAttribute('aria-pressed', rm === 'vector' ? 'true' : 'false');
+    document.getElementById('renderModeSincBtn')?.setAttribute('aria-pressed', rm === 'sinc' ? 'true' : 'false');
+    document.getElementById('renderModeDotsBtn')?.setAttribute('aria-pressed', rm === 'dots' ? 'true' : 'false');
+    document.getElementById('renderModeMarkersBtn')?.setAttribute('aria-pressed', rm === 'vector-markers' ? 'true' : 'false');
 
-    // Decimation Mode 2-way switch
+    // Decimation Mode 2-way switch via aria-pressed
     const dm = tab.decimationMode || 'minmax';
-    const dMm = document.getElementById('decimMinMaxBtn');
-    const dLttb = document.getElementById('decimLttbBtn');
-    if (dMm && dLttb) {
-      dMm.className =
-        dm === 'minmax'
-          ? 'px-1.5 py-0.5 rounded-sm bg-[#222933] text-cyan-300 font-medium transition cursor-pointer whitespace-nowrap'
-          : 'px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap';
-      dLttb.className =
-        dm === 'lttb'
-          ? 'px-1.5 py-0.5 rounded-sm bg-[#222933] text-cyan-300 font-medium transition cursor-pointer whitespace-nowrap'
-          : 'px-1.5 py-0.5 rounded-sm text-slate-400 hover:text-white transition cursor-pointer whitespace-nowrap';
+    document.getElementById('decimMinMaxBtn')?.setAttribute('aria-pressed', dm === 'minmax' ? 'true' : 'false');
+    document.getElementById('decimLttbBtn')?.setAttribute('aria-pressed', dm === 'lttb' ? 'true' : 'false');
+
+    // Update compact Display popover summary badge
+    const displaySummaryEl = document.getElementById('displayMenuSummary');
+    if (displaySummaryEl) {
+      const rmLabel =
+        rm === 'sinc' ? '插值' : rm === 'dots' ? '散点' : rm === 'vector-markers' ? '连线+点' : '连线';
+      const dmLabel = dm === 'lttb' ? 'LTTB' : '峰谷';
+      displaySummaryEl.innerText = `${rmLabel} · ${dmLabel}`;
     }
 
     const measCount = `${(tab.selectedMeasurements || []).length}`;
     const measCountEl = document.getElementById('measureCountLabel');
     if (measCountEl) measCountEl.innerText = measCount;
 
-    // Active Tool button highlights
+    // Active Tool button highlights via aria-pressed
     const tool = tab.activeTool || 'pan';
-    const setToolBtnStyle = (el: HTMLElement | null, active: boolean) => {
-      if (!el) return;
-      el.classList.toggle('bg-cyan-600/30', active);
-      el.classList.toggle('text-cyan-200', active);
-      el.classList.toggle('border-cyan-500/70', active);
-    };
-    setToolBtnStyle(zoomBtn, tool === 'areaZoom');
-    setToolBtnStyle(ptBtn, tool === 'pointAnnotate');
-    setToolBtnStyle(txtBtn, tool === 'textAnnotate');
-    setToolBtnStyle(areaBtn, tool === 'areaAnnotate');
+    zoomBtn?.setAttribute('aria-pressed', tool === 'areaZoom' ? 'true' : 'false');
+    ptBtn?.setAttribute('aria-pressed', tool === 'pointAnnotate' ? 'true' : 'false');
+    txtBtn?.setAttribute('aria-pressed', tool === 'textAnnotate' ? 'true' : 'false');
+    areaBtn?.setAttribute('aria-pressed', tool === 'areaAnnotate' ? 'true' : 'false');
   }
 
   private renderSoftkeysOnly(tab: TabState): void {
@@ -4275,10 +5071,11 @@ export class OscilloscopeApp {
 
     dock.innerHTML = '';
     if (tab.drawOrder.length === 0) {
-      dock.innerHTML = '<div class="text-[11px] text-slate-500 font-mono px-2 py-1">No active channels</div>';
+      dock.innerHTML = '<div class="text-[11px] text-fg-muted font-mono px-2 py-1">暂无活动通道</div>';
       return;
     }
 
+    const isLight = Boolean(this.theme.isLight);
     let inputIdx = 0;
     tab.drawOrder.forEach((id) => {
       const ch = tab.channels[id];
@@ -4290,41 +5087,47 @@ export class OscilloscopeApp {
       const tag = computed ? `[${ch.derivedBadge || 'fx'}]` : `CH${++inputIdx}`;
       const isSelected = tab.activeChannelId === id;
       const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(ch);
+      const chTextColor = resolveChannelTextColor(ch.color, isLight);
 
       const keyEl = document.createElement('div');
       keyEl.className = `flex items-center gap-2 px-2.5 py-1 rounded-sm border cursor-pointer transition shrink-0 ${
         isSelected
-          ? 'bg-[#1a222d] border-slate-400 text-slate-100'
-          : 'bg-[#0c0f13] border-[#222933] text-slate-300 hover:border-[#334155]'
+          ? 'bg-elevated border-line-strong text-fg'
+          : 'bg-well border-line text-fg-secondary hover:border-line-strong'
       } ${!ch.visible ? 'opacity-50' : ''}`;
+      keyEl.title = '点击设为当前通道 · 双击独奏/恢复 · Alt+点击单通道自适应刻度';
       keyEl.style.borderTopWidth = '2px';
       keyEl.style.borderTopStyle = computed ? 'dashed' : 'solid';
       keyEl.style.borderTopColor = ch.color;
+      if (isSelected) {
+        keyEl.style.boxShadow = `inset 0 0 0 1px ${chTextColor}`;
+      }
       if (ch.compareGroupColor) {
         keyEl.style.borderLeftWidth = '3px';
         keyEl.style.borderLeftColor = ch.compareGroupColor;
       }
 
-      const refTag = ch.hasEdits ? '<span class="text-[9px] font-mono text-rose-300 border border-rose-500/50 px-1 ml-0.5">REF</span>' : '';
+      const refTag = ch.hasEdits ? '<span class="text-[10px] font-mono wvp-alert-danger border px-1 ml-0.5 rounded-xs">参考</span>' : '';
       const safeGrpName = escapeHtml(ch.compareGroupName || '');
       const safeChName = escapeHtml(ch.name);
+      const grpColor = resolveChannelTextColor(ch.compareGroupColor || ch.color, isLight);
       const grpBadge = ch.compareGroupName
-        ? `<span class="text-[9px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${ch.compareGroupColor || ch.color};border-color:${ch.compareGroupColor || ch.color}">${safeGrpName}</span>`
+        ? `<span class="text-[10px] font-mono font-bold px-1 rounded-xs border shrink-0" style="color:${grpColor};border-color:${grpColor}">${safeGrpName}</span>`
         : '';
       const swatchEl = computed
-        ? `<button class="sk-vis-btn w-4 h-3 flex items-center justify-center shrink-0 cursor-pointer" title="Toggle computed trace visibility"><span class="w-4 h-0 border-t-2 border-dashed block" style="border-color:${ch.color};opacity:${ch.visible ? 1 : 0.3}"></span></button>`
-        : `<button class="sk-vis-btn w-2.5 h-2.5 rounded-xs border border-slate-500 shrink-0 cursor-pointer" style="background:${ch.visible ? ch.color : 'transparent'}" title="Toggle trace visibility"></button>`;
+        ? `<button class="sk-vis-btn w-4 h-3 flex items-center justify-center shrink-0 cursor-pointer" title="显示/隐藏计算通道"><span class="w-4 h-0 border-t-2 border-dashed block" style="border-color:${ch.color};opacity:${ch.visible ? 1 : 0.3}"></span></button>`
+        : `<button class="sk-vis-btn w-2.5 h-2.5 rounded-xs border border-line-strong shrink-0 cursor-pointer" style="background:${ch.visible ? ch.color : 'transparent'}" title="显示/隐藏通道"></button>`;
 
       keyEl.innerHTML = `
         ${swatchEl}
         <div class="flex flex-col leading-tight min-w-0">
           <div class="flex items-center gap-1 font-mono text-[11px]">
             ${grpBadge}
-            <span class="font-bold" style="color:${ch.color}">${escapeHtml(tag)}</span>
-            <span class="truncate max-w-[88px] text-slate-200 font-sans text-[11px]" title="${safeChName}">${safeChName}</span>${refTag}
+            <span class="font-bold" style="color:${chTextColor}">${escapeHtml(tag)}</span>
+            <span class="truncate max-w-[88px] text-fg font-sans text-[11px]" title="${safeChName}">${safeChName}</span>${refTag}
           </div>
-          <div class="font-mono text-[10px] text-slate-400 tabular-nums">
-            ${escapeHtml(formatEng(voltsPerDiv, ch.unit, 1))}/ · ${ch.coupling || 'DC'}${ch.inverted ? ' · INV' : ''} · ${vOffset >= 0 ? '+' : ''}${vOffset.toFixed(1)}${escapeHtml(ch.unit)}
+          <div class="font-mono text-[10px] text-fg-muted tabular-nums">
+            <span style="color:${chTextColor};font-weight:600">${escapeHtml(formatEng(voltsPerDiv, ch.unit, 1))}/div</span> · ${ch.coupling || 'DC'}${ch.inverted ? ' · 反相' : ''} · ${vOffset >= 0 ? '+' : ''}${vOffset.toFixed(1)}${escapeHtml(ch.unit)}${Math.abs(ch.timeShiftSec || 0) > 1e-15 ? ` · <span class="text-accent">Δt=${escapeHtml(formatEng(ch.timeShiftSec!, 's', 2))}</span>` : ''}
           </div>
         </div>
       `;
@@ -4334,8 +5137,20 @@ export class OscilloscopeApp {
         this.toggleChannelVisible(id);
       });
 
-      keyEl.addEventListener('click', () => {
+      keyEl.addEventListener('click', (e) => {
+        if (e.altKey) {
+          e.preventDefault();
+          this.selectActiveChannel(id);
+          this.fitSingleChannel(id);
+          this.showToast(`已自适应通道 ${ch.name} 垂直刻度。`, 'info', { undoable: true });
+          return;
+        }
         this.selectActiveChannel(id);
+      });
+
+      keyEl.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        this.toggleSoloChannel(id);
       });
 
       dock.appendChild(keyEl);
@@ -4373,13 +5188,14 @@ export class OscilloscopeApp {
       grpChip.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-sm border bg-[#0c1118] text-[10px] font-mono shrink-0';
       grpChip.style.borderColor = grp.color;
       const safeGroupName = escapeHtml(grp.name);
+      const grpTextColor = resolveChannelTextColor(grp.color, Boolean(this.theme.isLight));
       grpChip.innerHTML = `
         <span class="w-2 h-2 rounded-full shrink-0" style="background:${grp.color}"></span>
-        <button type="button" class="grp-edit-btn font-bold hover:underline cursor-pointer" style="color:${grp.color}" title="Edit compare group">[${safeGroupName}]</button>
-        <span class="text-slate-400">· ${totalOverlays} ref${totalOverlays > 1 ? 's' : ''}</span>
-        <button type="button" class="grp-vis-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-slate-200 cursor-pointer" title="Show/Hide compare overlays">${grp.allRefVisible ? 'Hide' : 'Show'}</button>
-        <button type="button" class="grp-edit-icon-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 cursor-pointer" title="Edit / Re-align group">Edit</button>
-        <button type="button" class="grp-del-btn px-1 py-0.5 rounded-xs hover:bg-red-950/60 text-red-300 cursor-pointer" title="Remove compare group">✕</button>
+        <button type="button" class="grp-edit-btn font-bold hover:underline cursor-pointer" style="color:${grpTextColor}" title="编辑比较组">[${safeGroupName}]</button>
+        <span class="text-slate-400">· ${totalOverlays} 参考</span>
+        <button type="button" class="grp-vis-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-slate-200 cursor-pointer" title="显示或隐藏比较参考线">${grp.allRefVisible ? '隐藏' : '显示'}</button>
+        <button type="button" class="grp-edit-icon-btn px-1.5 py-0.5 rounded-xs bg-[#161b22] hover:bg-[#1e2530] border border-[#2c3543] text-cyan-300 cursor-pointer" title="编辑或重新对齐比较组">编辑</button>
+        <button type="button" class="grp-del-btn px-1 py-0.5 rounded-xs hover:bg-red-950/60 text-red-300 cursor-pointer" title="移除比较组">✕</button>
       `;
       grpChip.querySelector('.grp-vis-btn')?.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -4403,6 +5219,14 @@ export class OscilloscopeApp {
 
   private syncVerticalPanelOnly(ch: WaveformChannel): void {
     const { voltsPerDiv, vOffset } = ensureChannelScaleOffset(ch);
+    const chTextColor = resolveChannelTextColor(ch.color, Boolean(this.theme.isLight));
+
+    const activeChSel = document.getElementById('activeChannelSelect') as HTMLSelectElement | null;
+    if (activeChSel) {
+      activeChSel.style.borderLeftWidth = '3px';
+      activeChSel.style.borderLeftColor = ch.color;
+      activeChSel.style.color = chTextColor;
+    }
 
     const vDivSel = document.getElementById('vDivSelect') as HTMLSelectElement;
     if (vDivSel) {
@@ -4417,17 +5241,30 @@ export class OscilloscopeApp {
         }
       }
       vDivSel.value = bestOpt;
+      vDivSel.style.color = chTextColor;
     }
 
     const offsetInput = document.getElementById('vOffsetInput') as HTMLInputElement;
-    if (offsetInput && document.activeElement !== offsetInput) {
-      offsetInput.value = vOffset.toFixed(2);
+    if (offsetInput) {
+      if (document.activeElement !== offsetInput) {
+        offsetInput.value = vOffset.toFixed(2);
+      }
+      offsetInput.style.color = chTextColor;
     }
 
     const offsetSlider = document.getElementById('vOffsetSlider') as HTMLInputElement;
     if (offsetSlider && document.activeElement !== offsetSlider) {
       const divs = Math.max(-4, Math.min(4, vOffset / voltsPerDiv));
       offsetSlider.value = divs.toFixed(2);
+    }
+
+    const timeShiftInput = document.getElementById('chTimeShiftInput') as HTMLInputElement | null;
+    if (timeShiftInput) {
+      if (document.activeElement !== timeShiftInput) {
+        const shift = ch.timeShiftSec || 0;
+        timeShiftInput.value = Math.abs(shift) > 1e-15 ? String(Number(shift.toPrecision(7))) : '0';
+      }
+      timeShiftInput.style.color = chTextColor;
     }
   }
 
@@ -4438,23 +5275,26 @@ export class OscilloscopeApp {
     const mode = resolveCursorMode(tab);
     document.querySelectorAll('.cur-mode-btn').forEach((btn) => {
       const m = btn.getAttribute('data-curmode');
-      if (m === mode) {
-        btn.classList.add('bg-cyan-600', 'text-slate-950', 'font-semibold');
-        btn.classList.remove('text-slate-400');
-      } else {
-        btn.classList.remove('bg-cyan-600', 'text-slate-950', 'font-semibold');
-        btn.classList.add('text-slate-400');
-      }
+      btn.setAttribute('aria-pressed', m === mode ? 'true' : 'false');
     });
 
     if (mode === 'off') {
-      grid.innerHTML = '<div class="text-slate-500">Cursors disabled. Select X, Y, X+Y, or Track.</div>';
+      grid.innerHTML = '<div class="text-slate-500">游标已关闭，请选择 X、Y、X+Y 或追踪模式。</div>';
       return;
     }
 
     const targetId = tab.cursors.trackingChannel || tab.activeChannelId || tab.drawOrder[0];
     const targetCh = tab.channels[targetId] || tab.channels[tab.drawOrder[0]];
     const unit = targetCh?.unit || 'V';
+    const isLight = Boolean(this.theme.isLight);
+    const targetColor = targetCh ? resolveChannelTextColor(targetCh.color, isLight) : (isLight ? '#0369a1' : '#38bdf8');
+    const curChSel = document.getElementById('cursorChannelSelect') as HTMLSelectElement | null;
+    if (curChSel && targetCh) {
+      curChSel.style.borderLeftWidth = '3px';
+      curChSel.style.borderLeftColor = targetCh.color;
+      curChSel.style.color = targetColor;
+    }
+
     const { x1, x2 } = tab.cursors;
     let { y1, y2 } = tab.cursors;
 
@@ -4471,18 +5311,22 @@ export class OscilloscopeApp {
     let html = '<div class="grid grid-cols-2 gap-x-3 gap-y-1 bg-[#0c0f13] border border-[#222933] p-2 rounded-sm">';
     if (mode === 'x' || mode === 'xy' || mode === 'track') {
       html += `
-        <div class="flex justify-between"><span class="text-sky-400">X1:</span><span>${x1 !== null ? formatEng(x1, 's', 3) : '--'}</span></div>
-        <div class="flex justify-between"><span class="text-sky-400">X2:</span><span>${x2 !== null ? formatEng(x2, 's', 3) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-sky-400">X1:</span><span class="text-slate-200">${x1 !== null ? formatEng(x1, 's', 3) : '--'}</span></div>
+        <div class="flex justify-between"><span class="text-sky-400">X2:</span><span class="text-slate-200">${x2 !== null ? formatEng(x2, 's', 3) : '--'}</span></div>
         <div class="flex justify-between"><span class="text-slate-400">ΔX:</span><span class="text-slate-100 font-semibold">${dx !== null ? formatEng(dx, 's', 3) : '--'}</span></div>
         <div class="flex justify-between"><span class="text-slate-400">1/ΔX:</span><span class="text-cyan-300 font-semibold">${freq}</span></div>
       `;
     }
     if (mode === 'y' || mode === 'xy' || mode === 'track') {
       html += `
-        <div class="flex justify-between"><span class="text-violet-400">Y1:</span><span>${escapeHtml(y1 !== null ? formatEng(y1, unit, 2) : '--')}</span></div>
-        <div class="flex justify-between"><span class="text-violet-400">Y2:</span><span>${escapeHtml(y2 !== null ? formatEng(y2, unit, 2) : '--')}</span></div>
-        <div class="flex justify-between"><span class="text-slate-400">ΔY:</span><span class="text-slate-100 font-semibold">${escapeHtml(dy !== null ? formatEng(dy, unit, 2) : '--')}</span></div>
-        <div class="flex justify-between"><span class="text-slate-400">ΔY/ΔX:</span><span>${escapeHtml(slope)}</span></div>
+        <div class="col-span-2 flex items-center gap-1.5 pt-1 mt-0.5 border-t border-[#222933] text-[10px]">
+          <span class="w-2 h-2 rounded-xs shrink-0" style="background:${targetCh?.color || targetColor}"></span>
+          <span class="font-semibold truncate" style="color:${targetColor}">${escapeHtml(targetCh?.name || '目标通道')}</span>
+        </div>
+        <div class="flex justify-between"><span style="color:${targetColor}">Y1:</span><span class="font-semibold" style="color:${targetColor}">${escapeHtml(y1 !== null ? formatEng(y1, unit, 2) : '--')}</span></div>
+        <div class="flex justify-between"><span style="color:${targetColor}">Y2:</span><span class="font-semibold" style="color:${targetColor}">${escapeHtml(y2 !== null ? formatEng(y2, unit, 2) : '--')}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔY:</span><span class="font-bold" style="color:${targetColor}">${escapeHtml(dy !== null ? formatEng(dy, unit, 2) : '--')}</span></div>
+        <div class="flex justify-between"><span class="text-slate-400">ΔY/ΔX:</span><span class="font-semibold" style="color:${targetColor}">${escapeHtml(slope)}</span></div>
       `;
     }
     html += '</div>';
@@ -4604,7 +5448,7 @@ export class OscilloscopeApp {
 
       const visBtn = document.getElementById('activeChVisibleBtn');
       if (visBtn) {
-        visBtn.innerText = activeCh.visible ? 'ON' : 'OFF';
+        visBtn.innerText = activeCh.visible ? '开启' : '关闭';
         visBtn.className = `py-1 border rounded-sm cursor-pointer ${
           activeCh.visible
             ? 'bg-emerald-950/50 border-emerald-600/60 text-emerald-300 font-semibold'
@@ -4747,20 +5591,21 @@ export class OscilloscopeApp {
           card.style.borderLeftWidth = '3px';
           card.style.borderLeftColor = grp.color;
 
+          const grpTextColor = resolveChannelTextColor(grp.color, Boolean(this.theme.isLight));
           const headerHtml = `
             <div class="flex items-center justify-between gap-1">
               <div class="flex items-center gap-1.5 min-w-0">
                 <span class="w-2 h-2 rounded-full shrink-0" style="background:${grp.color}"></span>
-                <span class="font-mono font-bold truncate" style="color:${grp.color}">[${escapeHtml(grp.name)}]</span>
+                <span class="font-mono font-bold truncate" style="color:${grpTextColor}">[${escapeHtml(grp.name)}]</span>
                 <span class="text-[10px] font-mono text-slate-400">×${grp.members.length}</span>
               </div>
               <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
-                <button type="button" class="cmp-sb-vis px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">${grp.allVisible ? 'Hide' : 'Show'}</button>
-                <button type="button" class="cmp-sb-edit px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">Edit</button>
-                <button type="button" class="cmp-sb-del text-red-400 hover:text-red-300 px-1 py-0.5 cursor-pointer" title="Remove group">✕</button>
+                <button type="button" class="cmp-sb-vis px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-200 rounded-sm cursor-pointer">${grp.allVisible ? '隐藏' : '显示'}</button>
+                <button type="button" class="cmp-sb-edit px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-cyan-300 rounded-sm cursor-pointer">编辑</button>
+                <button type="button" class="cmp-sb-del text-red-400 hover:text-red-300 px-1 py-0.5 cursor-pointer" title="移除比较组">✕</button>
               </div>
             </div>
-            ${grp.targetName ? `<div class="text-[10px] font-mono text-slate-400 truncate">Base: <span class="text-slate-200">${escapeHtml(grp.targetName)}</span></div>` : ''}
+            ${grp.targetName ? `<div class="text-[10px] font-mono text-slate-400 truncate">基准: <span class="text-slate-200">${escapeHtml(grp.targetName)}</span></div>` : ''}
           `;
           card.innerHTML = headerHtml;
 
@@ -4847,7 +5692,7 @@ export class OscilloscopeApp {
                 <span class="font-medium text-purple-200 truncate max-w-[92px]" title="${safeMathChName}">${safeMathChName}</span>
               </div>
               <div class="flex items-center gap-1 font-mono text-[10px] shrink-0">
-                <button class="ch-fit-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">Fit</button>
+                <button class="ch-fit-btn px-1.5 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer">适配</button>
                 <button class="ch-fft-btn px-1.5 py-0.5 bg-[#1d1729] hover:bg-[#2b2040] border border-purple-700/60 text-purple-200 rounded-sm cursor-pointer">FFT</button>
                 <button class="ch-del-btn text-red-400 hover:text-red-300 px-1 py-0.5 cursor-pointer" title="Delete math channel">✕</button>
               </div>
@@ -4994,12 +5839,77 @@ export class OscilloscopeApp {
   }
 
   private lastMeasStripKey: string = '';
+  private showMeasurementStats: boolean = false;
+
+  public toggleMeasurementStats(): boolean {
+    this.showMeasurementStats = !this.showMeasurementStats;
+    const tab = this.getActiveTab();
+    if (tab) this.renderMeasurementStrip(tab);
+    return this.showMeasurementStats;
+  }
+
+  public async copyMeasurementStripTable(): Promise<boolean> {
+    const tab = this.getActiveTab();
+    if (!tab || !tab.selectedMeasurements || tab.selectedMeasurements.length === 0) {
+      this.showToast('当前测量条为空，请先勾选测量项。', 'warn');
+      return false;
+    }
+    const header = ['Channel', 'Metric', 'Value', 'Mean', 'Min', 'Max', 'StdDev', 'Cycles(N)', 'Gate'];
+    const lines: string[] = [header.join('\t')];
+    for (const item of tab.selectedMeasurements) {
+      const ch = tab.channels[item.channelId];
+      if (!ch) continue;
+      const m = this.getCachedMeasurements(tab, ch);
+      if (typeof item.metric === 'string' && item.metric.startsWith('custom:')) {
+        const customDef = (tab.customMeasurements || []).find((c) => c.id === item.metric.slice(7));
+        if (!customDef) continue;
+        const detail = this.getCachedCustomMeasurementValue(tab, ch, customDef, m);
+        const valStr = formatCustomMeasurementValue(detail.value, customDef, ch.unit);
+        lines.push([ch.name, customDef.shortLabel || customDef.label, valStr, '--', '--', '--', '--', '--', tab.measurementGate].join('\t'));
+      } else {
+        const def = MEASUREMENT_DEFINITIONS.find((d) => d.key === item.metric);
+        if (!def) continue;
+        const valStr = formatMeasurementMetricValue(m, def, ch.unit);
+        const stat = m.cycleStats?.[def.key];
+        const meanStr = stat ? formatMetricScalarValue(stat.mean, def.unitType, ch.unit) : '--';
+        const minStr = stat ? formatMetricScalarValue(stat.min, def.unitType, ch.unit) : '--';
+        const maxStr = stat ? formatMetricScalarValue(stat.max, def.unitType, ch.unit) : '--';
+        const stdStr = stat ? formatMetricScalarValue(stat.stdDev, def.unitType, ch.unit) : '--';
+        const nStr = stat ? String(stat.count) : '--';
+        lines.push([ch.name, def.shortLabel, valStr, meanStr, minStr, maxStr, stdStr, nStr, tab.measurementGate].join('\t'));
+      }
+    }
+    const tsv = lines.join('\n');
+    try {
+      await navigator.clipboard.writeText(tsv);
+      this.showToast(`已复制 ${lines.length - 1} 项测量统计表（可直接粘贴到 Excel）。`, 'info');
+      return true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = tsv;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      this.showToast(`已复制 ${lines.length - 1} 项测量统计表。`, 'info');
+      return true;
+    }
+  }
 
   public renderMeasurementStrip(tab: TabState): void {
     const bar = document.getElementById('measurementStripBar');
     const container = document.getElementById('measurementCardsContainer');
     const gateSel = document.getElementById('stripMeasGateSelect') as HTMLSelectElement;
+    const statsBtn = document.getElementById('stripMeasStatsToggleBtn');
     if (!bar || !container) return;
+
+    if (statsBtn) {
+      statsBtn.className = this.showMeasurementStats
+        ? 'px-2 py-0.5 bg-cyan-600/25 border border-cyan-500/70 text-cyan-200 rounded-sm cursor-pointer whitespace-nowrap font-semibold'
+        : 'px-2 py-0.5 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-sm cursor-pointer whitespace-nowrap';
+    }
 
     const items = tab.selectedMeasurements || [];
     if (items.length === 0) {
@@ -5013,22 +5923,25 @@ export class OscilloscopeApp {
 
     const curKey = tab.measurementGate === 'cursors' ? `${tab.cursors.x1}_${tab.cursors.x2}` : '';
     const customDefsKey = (tab.customMeasurements || []).map((c) => `${c.id}:${c.expression}:${c.shortLabel}`).join(';');
-    const itemsKey = items.map((i) => `${i.id}:${i.channelId}:${i.metric}`).join('|');
-    const stripKey = `${tab.id}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${this.editVersion}_${itemsKey}_${customDefsKey}`;
+    const itemsKey = items.map((i) => `${i.id}:${i.channelId}:${i.metric}:${tab.channels[i.channelId]?.color || ''}`).join('|');
+    const stripKey = `${tab.id}_${this.themeId}_${tab.measurementGate}_${tab.view.startIndex}_${tab.view.endIndex}_${curKey}_${this.editVersion}_${this.showMeasurementStats ? 1 : 0}_${itemsKey}_${customDefsKey}`;
     if (this.lastMeasStripKey === stripKey) return;
     this.lastMeasStripKey = stripKey;
 
     bar.classList.remove('hidden');
     if (gateSel) gateSel.value = tab.measurementGate;
 
+    const isLight = Boolean(this.theme.isLight);
     container.innerHTML = '';
     for (const item of items) {
       const ch = tab.channels[item.channelId];
       if (!ch) continue;
       const m = this.getCachedMeasurements(tab, ch);
+      const chTextColor = resolveChannelTextColor(ch.color, isLight);
 
       let shortLabel = '';
       let valStr = '';
+      let statsLineHtml = '';
       let cardInvalid = m.valid === false;
       let statusBadge: string | null = m.valid === false
         ? (m.status === 'NO_OVERLAP'
@@ -5063,11 +5976,22 @@ export class OscilloscopeApp {
         if (!def) continue;
         shortLabel = def.shortLabel;
         valStr = formatMeasurementMetricValue(m, def, ch.unit);
+        if (this.showMeasurementStats && !cardInvalid) {
+          const st = m.cycleStats?.[def.key];
+          if (st && st.count >= 2) {
+            const minS = formatMetricScalarValue(st.min, def.unitType, ch.unit);
+            const maxS = formatMetricScalarValue(st.max, def.unitType, ch.unit);
+            const stdS = formatMetricScalarValue(st.stdDev, def.unitType, ch.unit);
+            statsLineHtml = `<span class="text-[9px] font-mono text-slate-400 tabular-nums mt-0.5">Min ${escapeHtml(minS)} · Max ${escapeHtml(maxS)} · σ ${escapeHtml(stdS)} (N=${st.count})</span>`;
+          } else if (st && st.count === 1) {
+            statsLineHtml = `<span class="text-[9px] font-mono text-slate-500 tabular-nums mt-0.5">单周期 (N=1)</span>`;
+          }
+        }
       }
 
       const card = document.createElement('div');
       const isComputed = isComputedChannel(ch);
-      card.className = 'flex items-center gap-2 px-2 py-1 bg-[#12161c] border border-[#222933] rounded-sm text-[11px] shrink-0';
+      card.className = 'flex items-center gap-2 px-2.5 py-1 bg-[#12161c] border border-[#222933] rounded-sm text-[11px] shrink-0';
       card.style.borderTopWidth = '2px';
       card.style.borderTopStyle = isComputed ? 'dashed' : 'solid';
       card.style.borderTopColor = ch.color;
@@ -5078,16 +6002,22 @@ export class OscilloscopeApp {
       const fxTag = isComputed ? `<span class="text-[9px] font-mono text-purple-300 mr-1">[${escapeHtml(ch.derivedBadge || 'fx')}]</span>` : '';
       const warnTag =
         cardInvalid
-          ? `<span class="text-[9px] font-mono text-amber-400 ml-1" title="${escapeHtml(statusTip || 'Invalid window')}">[${escapeHtml(statusBadge || 'INVALID')}]</span>`
+          ? `<span class="text-[9px] font-mono text-amber-400 ml-1" title="${escapeHtml(statusTip || '无效窗口')}">[${escapeHtml(statusBadge || 'INVALID')}]</span>`
           : (m.gapCount || 0) > 0
-          ? `<span class="text-[9px] font-mono text-amber-300 ml-1" title="Segmented across ${m.gapCount} gap(s)">[${m.gapCount}g]</span>`
+          ? `<span class="text-[9px] font-mono text-amber-300 ml-1" title="跨越 ${m.gapCount} 个时间缺口分段计算">[${m.gapCount}g]</span>`
           : '';
+      const valStyle = cardInvalid ? '' : `style="color:${chTextColor}"`;
       card.innerHTML = `
         <div class="flex flex-col leading-tight">
-          <span class="text-[10px] text-slate-400 truncate max-w-[165px]">${fxTag}${escapeHtml(ch.name)} · ${escapeHtml(shortLabel)}${warnTag}</span>
-          <span class="font-mono font-semibold ${cardInvalid ? 'text-amber-300' : 'text-slate-100'} tabular-nums">${escapeHtml(valStr)}</span>
+          <span class="flex items-center gap-1 text-[10px] text-slate-400 truncate max-w-[175px]">
+            <span class="w-1.5 h-1.5 rounded-xs shrink-0" style="background:${ch.color}"></span>
+            ${fxTag}<span class="font-medium" style="color:${chTextColor}">${escapeHtml(ch.name)}</span>
+            <span>· ${escapeHtml(shortLabel)}</span>${warnTag}
+          </span>
+          <span class="font-mono font-bold text-[12px] ${cardInvalid ? 'text-amber-300' : ''} tabular-nums" ${valStyle}>${escapeHtml(valStr)}</span>
+          ${statsLineHtml}
         </div>
-        <button class="meas-card-remove text-slate-500 hover:text-red-300 px-0.5 font-mono cursor-pointer" title="Remove metric">×</button>
+        <button class="meas-card-remove text-slate-500 hover:text-red-300 px-0.5 font-mono cursor-pointer" title="移除测量项">×</button>
       `;
 
       card.querySelector('.meas-card-remove')?.addEventListener('click', () => {
@@ -5098,29 +6028,41 @@ export class OscilloscopeApp {
     }
   }
 
+  public getChannelMeasurementsSnapshot(tab: TabState, ch: WaveformChannel): ChannelMeasurements {
+    return this.getCachedMeasurements(tab, ch);
+  }
+
   private updateStatusBar(): void {
     const tab = this.getActiveTab();
     const statusEl = document.getElementById('statusBarContent');
     if (!statusEl) return;
 
     if (!tab) {
-      statusEl.innerText = 'Ready';
+      statusEl.innerText = '就绪';
       return;
     }
 
     const mode =
       tab.plotMode === 'frequency'
-        ? 'FFT'
+        ? 'FFT 频谱'
         : tab.plotMode === 'xy'
-        ? 'XY'
+        ? 'XY 李萨如'
         : tab.separateView
-        ? 'SEPARATE'
-        : 'OVERLAP';
-    const tool = tab.activeTool && tab.activeTool !== 'pan' ? ` | TOOL: ${tab.activeTool.toUpperCase()}` : '';
+        ? '分栏视图'
+        : '叠加视图';
+    const toolMap: Record<string, string> = {
+      areaZoom: '框选缩放',
+      pointAnnotate: '标点标注',
+      textAnnotate: '文本标注',
+      areaAnnotate: '框测标注',
+    };
+    const tool = tab.activeTool && tab.activeTool !== 'pan' ? ` · 工具: ${toolMap[tab.activeTool] || tab.activeTool}` : '';
     const activeCh = tab.channels[tab.activeChannelId || tab.drawOrder[0]];
-    const activeStr = activeCh ? ` | ACTIVE: ${activeCh.name}` : '';
+    const activeHtml = activeCh
+      ? ` · 当前通道: <span style="color:${resolveChannelTextColor(activeCh.color, Boolean(this.theme.isLight))};font-weight:600">${escapeHtml(activeCh.name)}</span>`
+      : '';
 
-    statusEl.innerText = `[${mode}] ${tab.fileName}${activeStr}${tool}`;
+    statusEl.innerHTML = `<span>[${mode}] ${escapeHtml(tab.fileName)}</span>${activeHtml}<span>${escapeHtml(tool)}</span>`;
   }
 
   // --- Export Operations ---
@@ -5142,9 +6084,9 @@ export class OscilloscopeApp {
         this.theme
       );
       const filename = downloadEngineeringReportHTML(html, tab.fileName);
-      this.showToast(`Exported Test Report ${filename} (open in browser to print/save PDF).`, 'info');
+      this.showToast(`已导出工程报告 ${filename}（在浏览器中打开即可打印/另存 PDF）。`, 'info');
     } catch (err: any) {
-      this.showToast(`Test Report export failed: ${err.message}`, 'error');
+      this.showToast(`导出工程报告失败：${err.message}`, 'error');
     }
   }
 
@@ -5156,9 +6098,9 @@ export class OscilloscopeApp {
       const width = this.canvas.width / dpr || 1200;
       const height = this.canvas.height / dpr || 640;
       const file = captureCompositeScopePNG(tab, width, height, this.cachedSpectrum, this.theme);
-      this.showToast(`Saved screenshot ${file}`, 'info');
+      this.showToast(`已保存截图 ${file}`, 'info');
     } catch (err: any) {
-      this.showToast(`Screenshot failed: ${err.message}`, 'error');
+      this.showToast(`截图失败：${err.message}`, 'error');
     }
   }
 
@@ -5224,7 +6166,7 @@ export class OscilloscopeApp {
 
   public exportSpectrumCSV(): void {
     if (!this.cachedSpectrum) {
-      this.showToast('Switch to FFT Spectrum mode first to compute spectrum.', 'warn');
+      this.showToast('请先切换到「频谱」模式以计算 FFT 数据。', 'warn');
       return;
     }
 
@@ -5244,7 +6186,7 @@ export class OscilloscopeApp {
 
   public saveSessionFile(): void {
     if (this.tabs.length === 0) {
-      this.showToast('No open tabs to save.', 'warn');
+      this.showToast('当前没有可保存的波形标签页。', 'warn');
       return;
     }
     const json = serializeSession(this.tabs, this.activeTabIndex);

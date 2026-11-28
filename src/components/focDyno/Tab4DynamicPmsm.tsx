@@ -13,7 +13,7 @@ import {
   kePrimeToPsiF,
   simulateDynamicPmsm,
 } from '../../modules/focDyno/dynamicPmsm';
-import { MotorParams, getEffectiveRsOhm } from '../../modules/focDyno/motorPhysics';
+import { MotorParams } from '../../modules/focDyno/motorPhysics';
 import { TabState } from '../../types/models';
 import { SmoothNumberInput } from './SmoothNumberInput';
 
@@ -40,7 +40,7 @@ export const Tab4DynamicPmsm: React.FC<Tab4DynamicPmsmProps> = ({
   const [scenario, setScenario] = useState<DynamicScenarioStep[]>(() => buildDynamicPresetScenario('startup_load_step').config.scenario);
   const [fluxMap, setFluxMap] = useState<PmsmFluxMap | undefined>(undefined);
   const [fluxMapFileName, setFluxMapFileName] = useState<string>('');
-  const [windingTempC, setWindingTempC] = useState<number>(25);
+  const [windingTempC, setWindingTempC] = useState<number>(() => baseParams.tCoilC);
   const [magnetTempC, setMagnetTempC] = useState<number>(25);
   const [rsTempCoeffPpmPerC, setRsTempCoeffPpmPerC] = useState<number>(3930);
   const [psiTempCoeffPpmPerC, setPsiTempCoeffPpmPerC] = useState<number>(0);
@@ -67,10 +67,17 @@ export const Tab4DynamicPmsm: React.FC<Tab4DynamicPmsmProps> = ({
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
   };
 
-  const dynParams: DynamicPmsmParams = useMemo(
-    () => ({
+  const dynParams: DynamicPmsmParams = useMemo(() => {
+    // Normalize Rs back to 25°C so simulateDynamicPmsm applies windingTempC scaling exactly once.
+    const rsAt25Ohm =
+      baseParams.rsEffOverrideOhm !== null &&
+      Number.isFinite(baseParams.rsEffOverrideOhm) &&
+      baseParams.rsEffOverrideOhm > 0
+        ? baseParams.rsEffOverrideOhm / Math.max(0.2, 1 + 0.00393 * (baseParams.tCoilC - 25))
+        : Math.max(1e-6, baseParams.rLL25Ohm * 0.5);
+    return {
       polePairs: baseParams.polePairs,
-      rsOhm: getEffectiveRsOhm(baseParams),
+      rsOhm: rsAt25Ohm,
       ldH: Math.max(1e-6, ldMh * 1e-3),
       lqH: Math.max(1e-6, lqMh * 1e-3),
       psiFVs: kePrimeToPsiF(baseParams.kePrime, baseParams.polePairs),
@@ -86,9 +93,8 @@ export const Tab4DynamicPmsm: React.FC<Tab4DynamicPmsmProps> = ({
       referenceTempC: 25,
       rsTempCoeffPerC: rsTempCoeffPpmPerC * 1e-6,
       psiTempCoeffPerC: fluxMap ? 0 : psiTempCoeffPpmPerC * 1e-6,
-    }),
-    [baseParams, ldMh, lqMh, jKgM2, bVisc, tCoulomb, vBusV, iMaxA, controlMode, fluxMap, windingTempC, magnetTempC, rsTempCoeffPpmPerC, psiTempCoeffPpmPerC]
-  );
+    };
+  }, [baseParams, ldMh, lqMh, jKgM2, bVisc, tCoulomb, vBusV, iMaxA, controlMode, fluxMap, windingTempC, magnetTempC, rsTempCoeffPpmPerC, psiTempCoeffPpmPerC]);
 
   const simulation = useMemo(() => {
     try {
@@ -379,12 +385,12 @@ export const Tab4DynamicPmsm: React.FC<Tab4DynamicPmsmProps> = ({
             <span className="text-slate-400">- - T_load (N·m)</span>
           </div>
         </div>
-        <svg viewBox={`0 0 ${chartPaths.w} ${chartPaths.h}`} className="w-full h-56 rounded-xs bg-slate-950/60 border border-slate-800">
-          <path d={chartPaths.pathSpeed} fill="none" stroke="#a78bfa" strokeWidth="1.8" />
-          <path d={chartPaths.pathId} fill="none" stroke="#60a5fa" strokeWidth="1.5" />
-          <path d={chartPaths.pathIq} fill="none" stroke="#f472b6" strokeWidth="1.6" />
-          <path d={chartPaths.pathTe} fill="none" stroke="#fb923c" strokeWidth="1.6" />
-          <path d={chartPaths.pathTload} fill="none" stroke="#94a3b8" strokeWidth="1.2" strokeDasharray="4 3" />
+        <svg viewBox={`0 0 ${chartPaths.w} ${chartPaths.h}`} className="w-full h-56 rounded-xs dyno-well border dyno-border">
+          <path d={chartPaths.pathSpeed} fill="none" stroke="#8b5cf6" strokeWidth="1.9" />
+          <path d={chartPaths.pathId} fill="none" stroke="#0284c7" strokeWidth="1.7" />
+          <path d={chartPaths.pathIq} fill="none" stroke="#ec4899" strokeWidth="1.8" />
+          <path d={chartPaths.pathTe} fill="none" stroke="#ea580c" strokeWidth="1.8" />
+          <path d={chartPaths.pathTload} fill="none" stroke="#64748b" strokeWidth="1.4" strokeDasharray="4 3" />
         </svg>
       </div>}
     </div>

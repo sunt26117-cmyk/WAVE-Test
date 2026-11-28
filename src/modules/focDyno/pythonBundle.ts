@@ -1373,6 +1373,9 @@ def run_stepwise_calibration(
     # Safe 2D Efficiency Map: linear interpolation inside convex hull, nearest-neighbor exterior fill marked untrusted
     grid_n = grid_t = z_meas = z_pred = z_extrap_mask = None
     if len(df_eval) >= 4 and df_eval["n_rpm"].nunique() >= 2 and df_eval["T_Nm"].nunique() >= 2:
+        vbus_spread_warn = _check_vbus_spread_warning(df_eval["V_bus"].tolist())
+        if vbus_spread_warn:
+            calib_warnings.append(vbus_spread_warn)
         try:
             grid_n = np.linspace(df_eval["n_rpm"].min(), df_eval["n_rpm"].max(), 30)
             grid_t = np.linspace(df_eval["T_Nm"].min(), df_eval["T_Nm"].max(), 24)
@@ -1436,6 +1439,31 @@ def run_stepwise_calibration(
         "z_pred": z_pred,
         "z_extrap_mask": z_extrap_mask,
     }
+
+
+def _check_vbus_spread_warning(vbus_values) -> Optional[str]:
+    vals = []
+    for raw_v in vbus_values:
+        if raw_v is None:
+            continue
+        try:
+            fv = float(raw_v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv) and fv > 0.0:
+            vals.append(fv)
+    if len(vals) < 2:
+        return None
+    v_min = min(vals)
+    v_max = max(vals)
+    v_mean = sum(vals) / len(vals)
+    if v_mean > 1e-6 and (v_max - v_min) / v_mean > 0.05:
+        spread_pct = ((v_max - v_min) / v_mean) * 100.0
+        return (
+            f"闭环测点母线电压离散度为 {spread_pct:.1f}% (>5%，范围 {v_min:.2f}V～{v_max:.2f}V)；"
+            "单平面 2D 效率 Map 混合了不同母线电压工况，请按电压分组评估或以实测工况点为准。"
+        )
+    return None
 
 
 def _t_critical_95(dof: int) -> float:
@@ -1950,15 +1978,26 @@ def compute_mtpa_and_fw_target(
     v_bus_v: float,
     params: DynamicPmsmParams,
 ) -> dict[str, float | bool]:
+    ref_t = float(params.reference_temp_c)
+    wind_t = float(params.winding_temp_c if params.winding_temp_c is not None else ref_t)
+    rs_eff = max(0.0, float(params.rs_ohm) * (1.0 + float(params.rs_temp_coeff_per_c) * (wind_t - ref_t)))
+
     if params.flux_map is not None:
         flux_map = params.flux_map
         validate_pmsm_flux_map(flux_map)
         sign = 1.0 if i_torque_cmd_a >= 0 else -1.0
-        i_max_map = float(params.i_max_a)
+        i_max_map = max(0.05, float(params.i_max_a))
         requested_iq = sign * min(abs(i_torque_cmd_a), i_max_map)
+        if params.control_mode == "id_zero":
+            return {
+                "id_ref_a": 0.0,
+                "iq_ref_a": requested_iq,
+                "current_limited": abs(i_torque_cmd_a) > i_max_map + 1e-9,
+                "field_weakening_active": False,
+            }
         target_torque = calc_dynamic_pmsm_torque(0.0, requested_iq, params.pole_pairs, params.psi_f_vs, params.ld_h, params.lq_h, flux_map)
         v_max = max(0.5, float(v_bus_v)) / math.sqrt(3.0) * 0.96
-        rs = float(params.rs_ohm)
+        rs = rs_eff
         best = None
         closest = None
         for k in range(49):
@@ -2003,7 +2042,7 @@ def compute_mtpa_and_fw_target(
         if abs(dl) > 1e-9 and i_mag > 1e-9:
             psi = max(1e-6, params.psi_f_vs)
             disc = psi * psi + 8.0 * dl * dl * i_mag * i_mag
-            id_ref = (-psi + math.sqrt(disc)) / (4.0 * dl)
+            id_ref = (2.0 * dl * i_mag * i_mag) / (psi + math.sqrt(disc))
             id_bound = i_mag * 0.95
             if abs(id_ref) > id_bound:
                 id_ref = math.copysign(id_bound, id_ref)
@@ -2013,28 +2052,50 @@ def compute_mtpa_and_fw_target(
     abs_we = abs(omega_e_rad_s)
     fw_active = False
     if abs_we > 1.0 and params.control_mode == "mtpa_current_loop":
-        v_req = math.hypot(-abs_we * params.lq_h * iq_ref, abs_we * (params.ld_h * id_ref + params.psi_f_vs))
+        vd_req = rs_eff * id_ref - omega_e_rad_s * params.lq_h * iq_ref
+        vq_req = rs_eff * iq_ref + omega_e_rad_s * (params.ld_h * id_ref + params.psi_f_vs)
+        v_req = math.hypot(vd_req, vq_req)
         if v_req > v_max_eff:
             fw_active = True
             lo_init = -i_max
             hi_init = id_ref
+            abs_iq_target = abs(iq_ref)
+            a_quad = rs_eff * rs_eff + omega_e_rad_s * omega_e_rad_s * params.lq_h * params.lq_h
+            exact_id = None
+            exact_i2 = float("inf")
             best_id = lo_init
             best_iq_abs = 0.0
             samples = 40
             for k in range(samples + 1):
                 id_cand = lo_init + ((hi_init - lo_init) * k) / samples
                 iq_cap_cur = math.sqrt(max(0.0, i_max * i_max - id_cand * id_cand))
-                vd_back = abs_we * (params.ld_h * id_cand + params.psi_f_vs)
-                rem_v2 = v_max_eff * v_max_eff - vd_back * vd_back
-                if rem_v2 <= 0.0:
+                a0 = rs_eff * id_cand
+                b0 = omega_e_rad_s * (params.ld_h * id_cand + params.psi_f_vs)
+                b_quad = sign_q * rs_eff * omega_e_rad_s * ((params.ld_h - params.lq_h) * id_cand + params.psi_f_vs)
+                c_quad = a0 * a0 + b0 * b0 - v_max_eff * v_max_eff
+                disc_q = b_quad * b_quad - a_quad * c_quad
+                if disc_q < 0.0:
                     continue
-                iq_cap_volt = math.sqrt(rem_v2) / max(1e-7, abs_we * params.lq_h)
-                iq_feas = min(iq_cap_cur, iq_cap_volt)
-                if iq_feas > best_iq_abs:
-                    best_iq_abs = iq_feas
+                sqrt_disc = math.sqrt(disc_q)
+                x_lo = max(0.0, (-b_quad - sqrt_disc) / a_quad)
+                x_hi = min(iq_cap_cur, (-b_quad + sqrt_disc) / a_quad)
+                if x_hi < x_lo - 1e-12:
+                    continue
+                if abs_iq_target >= x_lo - 1e-12 and abs_iq_target <= x_hi + 1e-12:
+                    cand_i2 = id_cand * id_cand + abs_iq_target * abs_iq_target
+                    if cand_i2 < exact_i2:
+                        exact_i2 = cand_i2
+                        exact_id = id_cand
+                iq_feas = min(abs_iq_target, x_hi)
+                if iq_feas >= x_lo - 1e-12 and x_hi > best_iq_abs:
+                    best_iq_abs = x_hi
                     best_id = id_cand
-            id_ref = best_id
-            iq_ref = sign_q * min(abs(iq_ref), best_iq_abs)
+            if exact_id is not None:
+                id_ref = exact_id
+                iq_ref = sign_q * abs_iq_target
+            else:
+                id_ref = best_id
+                iq_ref = sign_q * min(abs_iq_target, best_iq_abs)
 
     return {
         "id_ref_a": id_ref,
@@ -2179,8 +2240,8 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
         winding_temp_c=raw_params.winding_temp_c,
         magnet_temp_c=raw_params.magnet_temp_c,
         reference_temp_c=raw_params.reference_temp_c,
-        rs_temp_coeff_per_c=rs_alpha,
-        psi_temp_coeff_per_c=psi_alpha,
+        rs_temp_coeff_per_c=0.0,
+        psi_temp_coeff_per_c=0.0,
         control_mode=raw_params.control_mode,
         current_bandwidth_rad_s=raw_params.current_bandwidth_rad_s,
         kp_speed=raw_params.kp_speed,
@@ -2290,9 +2351,9 @@ def simulate_dynamic_pmsm(raw_params: DynamicPmsmParams, raw_config: DynamicPmsm
             curr_limited = bool(tgt["current_limited"])
             err_d = float(tgt["id_ref_a"]) - cur_id
             err_q = float(tgt["iq_ref_a"]) - cur_iq
-            psi_d, psi_q, *_ = evaluate_pmsm_flux(cur_id, cur_iq, psi_f, ld, lq, params.flux_map)
-            vd_cmd = kp_d * err_d + int_id - we * psi_q
-            vq_cmd = kp_q * err_q + int_iq + we * psi_d
+            psi_d, psi_q, ldd, _ldq, _lqd, lqq = evaluate_pmsm_flux(cur_id, cur_iq, psi_f, ld, lq, params.flux_map)
+            vd_cmd = (ldd * bw_i) * err_d + int_id - we * psi_q
+            vq_cmd = (lqq * bw_i) * err_q + int_iq + we * psi_d
 
         v_mag = math.hypot(vd_cmd, vq_cmd)
         v_limited = v_mag > v_max

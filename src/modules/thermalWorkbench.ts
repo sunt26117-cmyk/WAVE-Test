@@ -59,6 +59,10 @@ import {
   FocSteadyOperatingPoint,
   FocSteadyStateResult,
   FocVoltageEnvelopeRow,
+  FocMissionStage,
+  FocMissionProfileResult,
+  FocDeratingCurveResult,
+  FocDeratingLimitReason,
   RdsOnTempCurve,
   parseRdsOnTempCurveImportJson,
   createRdsOnTempCurveImportTemplate,
@@ -67,11 +71,16 @@ import {
   validateFocSpiceNetlist,
   parsePcbSpatialImportJson,
   createPcbSpatialImportTemplate,
+  summarizePcbSpatialNetwork,
+  exportPcbSpatialDocumentFromModel,
   simulateFoc6Mos,
   simulateFoc6MosSteadyState,
   simulateFoc6MosVoltageEnvelope,
   runFocStallSweep,
   runFocControlSweep,
+  createAutomotive12VMissionProfilePreset,
+  simulateFocMissionProfile,
+  computeFocThermalDeratingCurve,
 } from './focThermal';
 import { BUK7Q6R0_40H_PROFILE, createBuk7Q6R0_40HRdsCurveJson } from './focMosDeviceProfiles';
 import {
@@ -80,12 +89,17 @@ import {
   analyzeDoublePulseTest,
   generateDptDemoChannels,
   interpolateDptSwitchingLoss,
+  createDptLutImportTemplate,
+  createDptLutImportCsvTemplate,
+  parseDptLutImportText,
+  summarizeDptLutCoverage,
+  serializeDptLutToJson,
 } from './dptAnalyzer';
 import { FocThermalHandoffPayload } from './focDyno/scopeBridge';
 
 type WorkbenchTabKey = 'deconv' | 'loss' | 'soa' | 'foc' | 'dpt';
 type DeconvSubPlotKey = 'spectrum' | 'structure' | 'residual';
-type FocCanvasMode = 'tj' | 'stall' | 'sweep';
+type FocCanvasMode = 'tj' | 'stall' | 'sweep' | 'mission' | 'derating';
 
 const DEFAULT_FALLBACK_CAUER: CauerStage[] = [
   { r: 0.14, c: 0.0035, tauEst: 0.00049, layerLabel: '芯片/焊料 (<10ms)' },
@@ -202,6 +216,9 @@ export class ThermalWorkbenchController {
   private activeFocSteadyPoint: FocSteadyOperatingPoint | null = null;
   private lastFocSteadyResult: FocSteadyStateResult | null = null;
   private lastFocVoltageEnvelope: FocVoltageEnvelopeRow[] | null = null;
+  private missionStages: FocMissionStage[] = createAutomotive12VMissionProfilePreset();
+  private lastMissionResult: FocMissionProfileResult | null = null;
+  private lastDeratingResult: FocDeratingCurveResult | null = null;
 
   // P1: DPT State
   private lastDptResult: DptAnalysisResult | null = null;
@@ -213,6 +230,7 @@ export class ThermalWorkbenchController {
     this.bindEvents();
     this.populateSoaPresets();
     this.renderSoaBreakpointTable();
+    this.renderMissionStageTable();
     this.updateCauerSummaryBox();
     this.refreshFocModelAndSpice();
   }
@@ -1056,15 +1074,145 @@ export class ThermalWorkbenchController {
     document.getElementById('focInjectBtn')?.addEventListener('click', () => this.injectFocTracesToScope());
     document.getElementById('focRunSweepBtn')?.addEventListener('click', () => this.runFocControlSweepAnalysis());
     document.getElementById('focRunStallBtn')?.addEventListener('click', () => this.runFocStallAnalysis());
+
+    // Mission Profile controls
+    document.getElementById('focMissionPresetBtn')?.addEventListener('click', () => {
+      try {
+        const { ctrl } = this.readFocParams();
+        this.missionStages = createAutomotive12VMissionProfilePreset(ctrl);
+      } catch {
+        this.missionStages = createAutomotive12VMissionProfilePreset();
+      }
+      this.renderMissionStageTable();
+      this.app.showToast('已载入 12V 汽车起动-巡航-堵转-冷却 4 阶段默认任务剖面。', 'info');
+    });
+    document.getElementById('focMissionAddStageBtn')?.addEventListener('click', () => {
+      let baseVbus = 13.5;
+      let baseTamb = 25;
+      try {
+        const { ctrl } = this.readFocParams();
+        baseVbus = ctrl.vBusConstV;
+        baseTamb = ctrl.tAmbC;
+      } catch {
+        // fallback defaults
+      }
+      this.missionStages.push({
+        id: `stage_${Date.now().toString(36)}`,
+        label: `阶段 ${this.missionStages.length + 1}`,
+        mode: 'rotating',
+        durationSec: 10,
+        iqPeakA: 25,
+        electricalFrequencyHz: 150,
+        vBusV: baseVbus,
+        modDepthM: 0.75,
+        pfAngleDeg: 0,
+        tAmbC: baseTamb,
+      });
+      this.renderMissionStageTable();
+    });
+    document.getElementById('focMissionExportBtn')?.addEventListener('click', () => {
+      const payload = {
+        schema: 'wave-test-foc-mission-profile-v1',
+        repeatCycles: Math.max(1, Math.min(20, Math.round(this.readFiniteInput('focMissionCyclesInput', 3)))),
+        tjLimitC: this.readFiniteInput('focMissionTjLimitInput', 150),
+        stages: this.missionStages,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'foc-thermal-mission-profile.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 600);
+      this.app.showToast(`已导出 ${this.missionStages.length} 阶段热任务剖面 JSON。`, 'info');
+    });
+    const missionFileInp = document.getElementById('focMissionFileInput') as HTMLInputElement | null;
+    document.getElementById('focMissionImportBtn')?.addEventListener('click', () => missionFileInp?.click());
+    missionFileInp?.addEventListener('change', async () => {
+      const file = missionFileInp.files?.[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.stages) ? parsed.stages : null;
+        if (!arr || arr.length === 0) throw new Error('JSON 须包含非空 stages 数组');
+        this.missionStages = arr.map((raw: any, i: number) => ({
+          id: typeof raw.id === 'string' ? raw.id : `imp_${i + 1}`,
+          label: String(raw.label || `阶段 ${i + 1}`),
+          mode: raw.mode === 'locked_rotor' ? 'locked_rotor' : 'rotating',
+          durationSec: Math.max(0.05, Number(raw.durationSec) || 5),
+          iqPeakA: Math.max(0, Number(raw.iqPeakA) || 0),
+          idPeakA: Number.isFinite(Number(raw.idPeakA)) ? Number(raw.idPeakA) : undefined,
+          electricalFrequencyHz: Math.max(0, Number(raw.electricalFrequencyHz) || 0),
+          electricalAngleDeg: Number.isFinite(Number(raw.electricalAngleDeg)) ? Number(raw.electricalAngleDeg) : undefined,
+          vBusV: Math.max(1, Number(raw.vBusV) || 13.5),
+          modDepthM: Math.max(0, Number(raw.modDepthM) || 0.7),
+          pfAngleDeg: Number.isFinite(Number(raw.pfAngleDeg)) ? Number(raw.pfAngleDeg) : 0,
+          fswHz: Number.isFinite(Number(raw.fswHz)) ? Number(raw.fswHz) : undefined,
+          tAmbC: Number.isFinite(Number(raw.tAmbC)) ? Number(raw.tAmbC) : undefined,
+        }));
+        if (Number.isFinite(Number(parsed?.repeatCycles))) {
+          const cycEl = document.getElementById('focMissionCyclesInput') as HTMLInputElement | null;
+          if (cycEl) cycEl.value = String(Math.max(1, Math.min(20, Math.round(Number(parsed.repeatCycles)))));
+        }
+        if (Number.isFinite(Number(parsed?.tjLimitC))) {
+          const limEl = document.getElementById('focMissionTjLimitInput') as HTMLInputElement | null;
+          if (limEl) limEl.value = String(Number(parsed.tjLimitC));
+        }
+        this.renderMissionStageTable();
+        this.app.showToast(`已导入 ${this.missionStages.length} 阶段热任务剖面。`, 'info');
+      } catch (err: any) {
+        this.app.showToast(`任务剖面 JSON 导入失败：${err?.message || err}`, 'error');
+      } finally {
+        missionFileInp.value = '';
+      }
+    });
+    document.getElementById('focRunMissionBtn')?.addEventListener('click', () => this.runFocMissionProfile());
+    document.getElementById('focInjectMissionBtn')?.addEventListener('click', () => this.injectMissionResultToScope());
+
+    // Derating Curve controls
+    document.getElementById('focRunDeratingBtn')?.addEventListener('click', () => this.runFocDeratingCurve());
+    document.getElementById('focExportDeratingCsvBtn')?.addEventListener('click', () => {
+      if (!this.lastDeratingResult) {
+        this.app.showToast('请先点击“计算降额曲线”，再导出 CSV 标定表。', 'warn');
+        return;
+      }
+      const blob = new Blob([`\uFEFF${this.lastDeratingResult.csvContent}`], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `foc-thermal-derating-Tj${Math.round(this.lastDeratingResult.tjLimitC)}C.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 600);
+      this.app.showToast(`已导出 ${this.lastDeratingResult.points.length} 点温度×电压降额标定 CSV。`, 'info');
+    });
     document.getElementById('focTauSplitMsInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focTambInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focRjcOverrideInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
     document.getElementById('focRjcSpreadPctInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
-    document.getElementById('focTopologyModeSelect')?.addEventListener('change', () => this.refreshFocModelAndSpice());
-    document.getElementById('focPcbCopperOzInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
-    document.getElementById('focPcbPitchMmInput')?.addEventListener('change', () => this.refreshFocModelAndSpice());
+    document.getElementById('focTopologyModeSelect')?.addEventListener('change', () => {
+      this.refreshFocModelAndSpice();
+      this.updatePcbSpatialSummaryBar();
+    });
+    document.getElementById('focPcbCopperOzInput')?.addEventListener('change', () => {
+      this.refreshFocModelAndSpice();
+      this.updatePcbSpatialSummaryBar();
+    });
+    document.getElementById('focPcbPitchMmInput')?.addEventListener('change', () => {
+      this.refreshFocModelAndSpice();
+      this.updatePcbSpatialSummaryBar();
+    });
     document.getElementById('focPcbSpatialJsonInput')?.addEventListener('change', () => {
-      try { this.refreshFocModelAndSpice(); } catch (err) { this.app.showToast(err instanceof Error ? err.message : String(err), 'error'); }
+      try {
+        this.refreshFocModelAndSpice();
+        this.updatePcbSpatialSummaryBar();
+      } catch (err) {
+        this.updatePcbSpatialSummaryBar(err instanceof Error ? err.message : String(err));
+        this.app.showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
     });
     document.getElementById('focPcbSpatialJsonFileInput')?.addEventListener('change', async (ev) => {
       const file = (ev.target as HTMLInputElement).files?.[0];
@@ -1075,12 +1223,15 @@ export class ThermalWorkbenchController {
         const target = document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null;
         if (target) target.value = raw;
         this.refreshFocModelAndSpice();
+        this.updatePcbSpatialSummaryBar();
         this.app.showToast(`已导入 PCB 热网络：${file.name}`, 'info');
       } catch (err) {
         const target = document.getElementById('focPcbSpatialJsonInput') as HTMLTextAreaElement | null;
         if (target) target.value = '';
         this.invalidateFocCaches(true);
-        this.app.showToast(`PCB 热网络导入失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+        const msg = err instanceof Error ? err.message : String(err);
+        this.updatePcbSpatialSummaryBar(msg);
+        this.app.showToast(`PCB 热网络导入失败：${msg}`, 'error');
       }
     });
     document.getElementById('focPcbSpatialTemplateBtn')?.addEventListener('click', () => {
@@ -1088,6 +1239,19 @@ export class ThermalWorkbenchController {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a'); a.href = url; a.download = 'wave-test-pcb-thermal-template.json';
       document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    });
+    document.getElementById('focPcbSpatialExportCurrentBtn')?.addEventListener('click', () => {
+      try {
+        const model = this.getActiveFocModel();
+        const doc = exportPcbSpatialDocumentFromModel(model);
+        const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'wave-test-pcb-thermal-current.json';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+        this.app.showToast('已导出当前六区 PCB 热网络 JSON 档案。', 'info');
+      } catch (err) {
+        this.app.showToast(`导出当前六区 PCB 热网络失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
     });
     document.getElementById('focApplyBuk7ProfileBtn')?.addEventListener('click', () => {
       const setValue = (id: string, value: string) => {
@@ -1248,6 +1412,76 @@ export class ThermalWorkbenchController {
       this.useDptMatrixInFoc = false;
       this.renderDptMatrixTable();
     });
+    document.getElementById('dptImportLutBtn')?.addEventListener('click', () => {
+      const fileInput = document.getElementById('dptLutFileInput') as HTMLInputElement | null;
+      if (fileInput) {
+        fileInput.value = '';
+        fileInput.click();
+      }
+    });
+    document.getElementById('dptLutFileInput')?.addEventListener('change', async (ev) => {
+      const file = (ev.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      try {
+        const raw = await file.text();
+        const imported = parseDptLutImportText(raw);
+        this.dptMatrix = imported.points;
+        this.useDptMatrixInFoc = false;
+        this.renderDptMatrixTable();
+        this.app.showToast(
+          `已导入 ${imported.points.length} 条 4D DPT 实测点（${imported.format.toUpperCase()}）· ${imported.summary.statusText}；点击「4D LUT 插值注入 FOC」生效。`,
+          imported.summary.coversAutomotive9to16V ? 'success' : 'info'
+        );
+      } catch (err) {
+        this.app.showToast(`4D DPT 导入被拦截：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    });
+    document.getElementById('dptTemplateJsonBtn')?.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(createDptLutImportTemplate('BUK7Q6R0-40H'), null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'wave-test-dpt-4d-lut-template.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      this.app.showToast('已下载 4D DPT JSON 实测模板（空白能量字段为 null，填入实测数据后再导入）。', 'info');
+    });
+    document.getElementById('dptTemplateCsvBtn')?.addEventListener('click', () => {
+      const blob = new Blob([createDptLutImportCsvTemplate('BUK7Q6R0-40H')], {
+        type: 'text/csv;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'wave-test-dpt-4d-lut-template.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      this.app.showToast('已下载 4D DPT CSV 实测模板（覆盖 9/13.5/16V 骨架，填入实测数据后再导入）。', 'info');
+    });
+    document.getElementById('dptExportJsonBtn')?.addEventListener('click', () => {
+      if (this.dptMatrix.length === 0) {
+        this.app.showToast('当前 DPT 矩阵为空，无可导出数据。', 'warn');
+        return;
+      }
+      const blob = new Blob([serializeDptLutToJson(this.dptMatrix, 'BUK7Q6R0-40H')], {
+        type: 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'wave-test-dpt-4d-lut-export.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      this.app.showToast(`已导出当前 ${this.dptMatrix.length} 条 4D DPT 矩阵 JSON 档案。`, 'info');
+    });
 
     const stallOnlyInputIds = new Set([
       'focStallIpkInput',
@@ -1270,6 +1504,14 @@ export class ThermalWorkbenchController {
       if (target.id === 'focRgonInput' || target.id === 'focRgoffInput') {
         const confirmed = document.getElementById('focRgDesignConfirmedChk') as HTMLInputElement | null;
         if (confirmed) confirmed.checked = false;
+      }
+      if (
+        target.closest('#focMissionProfileCard') ||
+        target.closest('#focDeratingCurveCard') ||
+        target.id.startsWith('focMission') ||
+        target.id.startsWith('focDerate')
+      ) {
+        return;
       }
       if (stallOnlyInputIds.has(target.id)) {
         this.invalidateFocCaches(false);
@@ -1294,6 +1536,16 @@ export class ThermalWorkbenchController {
     });
     document.getElementById('focViewSweepBtn')?.addEventListener('click', () => {
       this.focCanvasMode = 'sweep';
+      this.syncFocViewButtons();
+      this.drawFocCanvas();
+    });
+    document.getElementById('focViewMissionBtn')?.addEventListener('click', () => {
+      this.focCanvasMode = 'mission';
+      this.syncFocViewButtons();
+      this.drawFocCanvas();
+    });
+    document.getElementById('focViewDeratingBtn')?.addEventListener('click', () => {
+      this.focCanvasMode = 'derating';
       this.syncFocViewButtons();
       this.drawFocCanvas();
     });
@@ -2910,6 +3162,32 @@ export class ThermalWorkbenchController {
     return baseModel;
   }
 
+  private updatePcbSpatialSummaryBar(errorMsg?: string): void {
+    const bar = document.getElementById('focPcbSpatialSummaryBar');
+    if (!bar) return;
+    if (errorMsg) {
+      bar.className = 'mt-1.5 font-mono tabular-nums text-[10px] text-rose-300';
+      bar.textContent = `✖ PCB 热矩阵校验阻断：${errorMsg}`;
+      return;
+    }
+    try {
+      const model = this.getActiveFocModel();
+      const s = summarizePcbSpatialNetwork(model);
+      bar.className =
+        s.statusGlyph === '●'
+          ? 'mt-1.5 font-mono tabular-nums text-[10px] text-emerald-300'
+          : 'mt-1.5 font-mono tabular-nums text-[10px] text-amber-300';
+      bar.textContent =
+        `${s.statusGlyph} ${s.statusText} · ` +
+        `Cpcb ${s.cPcbRangeJPerC[0].toFixed(2)}–${s.cPcbRangeJPerC[1].toFixed(2)} J/°C · ` +
+        `Rvert ${s.rVertRangeCPerW[0].toFixed(2)}–${s.rVertRangeCPerW[1].toFixed(2)} °C/W (并联 ${s.totalParallelRvertCPerW.toFixed(2)} °C/W) · ` +
+        `互耦 ${s.couplingLinkCount} 条 (max G=${s.maxMutualConductanceWPerC.toFixed(3)} W/°C)`;
+    } catch (err) {
+      bar.className = 'mt-1.5 font-mono tabular-nums text-[10px] text-rose-300';
+      bar.textContent = `✖ PCB 热矩阵校验失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   private computeFocInputFingerprint(): string {
     const tab = this.app.getActiveTab();
     const valOf = (id: string) => (document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null)?.value || '';
@@ -3373,6 +3651,8 @@ export class ThermalWorkbenchController {
       ['tj', 'focViewTjBtn'],
       ['stall', 'focViewStallBtn'],
       ['sweep', 'focViewSweepBtn'],
+      ['mission', 'focViewMissionBtn'],
+      ['derating', 'focViewDeratingBtn'],
     ];
     for (const [m, id] of map) {
       const btn = document.getElementById(id);
@@ -4103,7 +4383,7 @@ export class ThermalWorkbenchController {
       ctx.textAlign = 'left';
       ctx.fillStyle = th.titleText;
       ctx.fillText(`Steady worst: ${st.worstSwitch} @ ${st.worstAngleDeg}° · t_safe: ${st.tSafeSec === null ? `not crossed within ${st.transientTime[st.transientTime.length - 1].toFixed(2)}s` : `${st.tSafeSec.toFixed(2)}s @ ${st.tSafeAngleDeg}° / ${st.transientWorstSwitch}`} · I² ratio ${st.phaseSquaredRatioAtWorst.toFixed(2)}×`, pad.l + 6, pad.t - 6);
-    } else {
+    } else if (this.focCanvasMode === 'sweep') {
       if (titleEl) titleEl.innerText = 'Carrier Frequency Trade-off: SVPWM vs DPWM1 Total Loss (W)';
       const sw = this.lastFocSweep;
       if (!sw || sw.fswListHz.length === 0) {
@@ -4156,7 +4436,504 @@ export class ThermalWorkbenchController {
       ctx.textAlign = 'left';
       ctx.fillStyle = th.titleText;
       ctx.fillText('SVPWM (blue) vs DPWM1 60°-Clamp (green) Inverter Total Loss [W] vs f_sw (Hz)', pad.l + 6, pad.t - 6);
+    } else if (this.focCanvasMode === 'mission') {
+      if (titleEl) titleEl.innerText = '多阶段任务剖面循环 6-MOS Tj(t) & T_board(t)';
+      const mp = this.lastMissionResult;
+      if (!mp || mp.time.length < 2) {
+        ctx.fillStyle = th.emptyText;
+        ctx.font = '12px "IBM Plex Sans", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('请展开“多阶段任务剖面循环”并点击“运行任务剖面”', w / 2, h / 2);
+        return;
+      }
+      const t0 = mp.time[0];
+      const tSpan = Math.max(1e-6, mp.time[mp.time.length - 1] - t0);
+      let yMin = Infinity;
+      let yMax = mp.tjLimitC * 1.04;
+      for (const k of MOS_SWITCH_KEYS) {
+        const arr = mp.tj[k];
+        for (let i = 0; i < arr.length; i++) {
+          if (arr[i] < yMin) yMin = arr[i];
+          if (arr[i] > yMax) yMax = arr[i];
+        }
+      }
+      for (let i = 0; i < mp.tBoard.length; i++) {
+        if (mp.tBoard[i] < yMin) yMin = mp.tBoard[i];
+      }
+      if (!Number.isFinite(yMin)) yMin = 20;
+      const ys = Math.max(5, yMax - yMin);
+      yMin -= ys * 0.06;
+      yMax += ys * 0.08;
+
+      const xOf = (t: number) => pad.l + ((t - t0) / tSpan) * pw;
+      const yOf = (v: number) => pad.t + ph - ((v - yMin) / (yMax - yMin)) * ph;
+
+      // Stage alternating translucent bands
+      mp.stageSummaries.forEach((s, idx) => {
+        const x1 = xOf(s.tStartSec);
+        const x2 = xOf(s.tEndSec);
+        ctx.fillStyle = s.mode === 'locked_rotor'
+          ? 'rgba(244, 63, 94, 0.10)'
+          : idx % 2 === 0
+          ? 'rgba(56, 189, 248, 0.05)'
+          : 'rgba(148, 163, 184, 0.03)';
+        ctx.fillRect(x1, pad.t, Math.max(1, x2 - x1), ph);
+        if (x2 - x1 >= 34 && s.cycleIndex === 0) {
+          ctx.fillStyle = th.axisText;
+          ctx.font = '9px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(s.label.slice(0, 8), (x1 + x2) / 2, pad.t + 11);
+        }
+      });
+
+      drawGrid();
+
+      // Tj_limit dashed red line
+      if (mp.tjLimitC >= yMin && mp.tjLimitC <= yMax) {
+        ctx.strokeStyle = th.redDashed;
+        ctx.setLineDash([5, 3]);
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(pad.l, yOf(mp.tjLimitC));
+        ctx.lineTo(pad.l + pw, yOf(mp.tjLimitC));
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // T_board dashed
+      ctx.strokeStyle = th.tBoard;
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      const step = Math.max(1, Math.floor(mp.time.length / 450));
+      for (let i = 0; i < mp.time.length; i += step) {
+        const px = xOf(mp.time[i]);
+        const py = yOf(mp.tBoard[i]);
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const colors = th.focColors;
+      MOS_SWITCH_KEYS.forEach((key, idx) => {
+        ctx.strokeStyle = colors[idx];
+        ctx.lineWidth = key === mp.hottestKeyGlobal ? 2.2 : 1.2;
+        ctx.beginPath();
+        const arr = mp.tj[key];
+        for (let i = 0; i < mp.time.length; i += step) {
+          const px = xOf(mp.time[i]);
+          const py = yOf(arr[i]);
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+      });
+
+      ctx.fillStyle = th.axisText;
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'right';
+      for (let i = 0; i <= 4; i++) {
+        const val = yMax - ((yMax - yMin) * i) / 4;
+        ctx.fillText(`${val.toFixed(0)}°C`, pad.l - 6, pad.t + (ph * i) / 4 + 3);
+      }
+      ctx.textAlign = 'center';
+      for (let i = 0; i <= 5; i++) {
+        ctx.fillText(`${(t0 + (tSpan * i) / 5).toFixed(1)}s`, pad.l + (pw * i) / 5, pad.t + ph + 15);
+      }
+      ctx.textAlign = 'left';
+      ctx.fillStyle = th.titleText;
+      const ratchetTxt = mp.ratchetDeltaTjC !== null ? ` · 热棘轮 ΔTj=${mp.ratchetDeltaTjC >= 0 ? '+' : ''}${mp.ratchetDeltaTjC.toFixed(2)}°C` : '';
+      ctx.fillText(`Peak ${mp.hottestKeyGlobal}=${mp.tjPeakGlobalC.toFixed(1)}°C / Limit ${mp.tjLimitC}°C${ratchetTxt}`, pad.l + 6, pad.t - 6);
+    } else if (this.focCanvasMode === 'derating') {
+      if (titleEl) titleEl.innerText = '环境温度 × 母线电压 电流降额曲线 I_rms,max(T_amb)';
+      const dr = this.lastDeratingResult;
+      if (!dr || dr.points.length === 0) {
+        ctx.fillStyle = th.emptyText;
+        ctx.font = '12px "IBM Plex Sans", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('请展开“温度 × 电压电流降额曲线”并点击“计算降额曲线”', w / 2, h / 2);
+        return;
+      }
+      drawGrid();
+      const xMin = Math.min(...dr.tAmbPointsC);
+      const xMax = Math.max(...dr.tAmbPointsC);
+      const xSpan = Math.max(1, xMax - xMin);
+      const validI = dr.points
+        .map((p) => (p.iRmsMaxA !== null ? p.iRmsMaxA : 0))
+        .filter((v) => Number.isFinite(v));
+      const yMin = 0;
+      const yMax = Math.max(10, Math.max(...validI, 10) * 1.12);
+      const xOf = (t: number) => pad.l + ((t - xMin) / xSpan) * pw;
+      const yOf = (iVal: number) => pad.t + ph - ((iVal - yMin) / Math.max(1e-3, yMax - yMin)) * ph;
+
+      const vColors = ['#f59e0b', '#22d3ee', '#4ade80', '#f472b6', '#a78bfa'];
+      dr.vBusPointsV.forEach((vBus, vIdx) => {
+        const color = vColors[vIdx % vColors.length];
+        const pts = dr.points
+          .filter((p) => Math.abs(p.vBusV - vBus) < 1e-6)
+          .sort((a, b) => a.tAmbC - b.tAmbC);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        let started = false;
+        for (const pt of pts) {
+          if (pt.iRmsMaxA === null) {
+            started = false;
+            continue;
+          }
+          const px = xOf(pt.tAmbC);
+          const py = yOf(pt.iRmsMaxA);
+          if (!started) {
+            ctx.moveTo(px, py);
+            started = true;
+          } else {
+            ctx.lineTo(px, py);
+          }
+        }
+        ctx.stroke();
+
+        // Draw markers: filled circle for THERMAL_LIMIT, hollow square for LUT/ceiling, red X for VOLTAGE_LIMITED
+        for (const pt of pts) {
+          const px = xOf(pt.tAmbC);
+          if (pt.iRmsMaxA !== null) {
+            const py = yOf(pt.iRmsMaxA);
+            ctx.fillStyle = color;
+            ctx.strokeStyle = color;
+            if (pt.limitReason === 'THERMAL_LIMIT' || pt.limitReason === 'ZERO_MARGIN') {
+              ctx.beginPath();
+              ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+              ctx.fill();
+            } else {
+              ctx.lineWidth = 1.6;
+              ctx.strokeRect(px - 3.5, py - 3.5, 7, 7);
+            }
+          } else if (pt.limitReason === 'VOLTAGE_LIMITED') {
+            const py = yOf(0) - 6;
+            ctx.strokeStyle = th.red;
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            ctx.moveTo(px - 3.5, py - 3.5);
+            ctx.lineTo(px + 3.5, py + 3.5);
+            ctx.moveTo(px + 3.5, py - 3.5);
+            ctx.lineTo(px - 3.5, py + 3.5);
+            ctx.stroke();
+          }
+        }
+
+        // Legend label top-right
+        ctx.fillStyle = color;
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText(`● ${vBus}V`, pad.l + pw - 6 - vIdx * 58, pad.t + 12);
+      });
+
+      ctx.fillStyle = th.axisText;
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'right';
+      for (let i = 0; i <= 4; i++) {
+        const val = yMax - ((yMax - yMin) * i) / 4;
+        ctx.fillText(`${val.toFixed(1)}A`, pad.l - 6, pad.t + (ph * i) / 4 + 3);
+      }
+      ctx.textAlign = 'center';
+      dr.tAmbPointsC.forEach((tAmb) => {
+        ctx.fillText(`${tAmb}°C`, xOf(tAmb), pad.t + ph + 15);
+      });
+      ctx.textAlign = 'left';
+      ctx.fillStyle = th.titleText;
+      ctx.fillText(`Tj_limit=${dr.tjLimitC}°C · 实心圆=热受限 · 方框=LUT/上限 · 红叉=电压受限`, pad.l + 6, pad.t - 6);
     }
+  }
+
+  private renderMissionStageTable(): void {
+    const tbody = document.getElementById('focMissionStageTableBody');
+    const badge = document.getElementById('focMissionStageCountBadge');
+    if (badge) {
+      const totalDur = this.missionStages.reduce((a, s) => a + (Number.isFinite(s.durationSec) ? s.durationSec : 0), 0);
+      badge.textContent = `${this.missionStages.length} 阶段 · 单循环 ${totalDur.toFixed(1)} s`;
+    }
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    this.missionStages.forEach((stage, idx) => {
+      const tr = document.createElement('tr');
+      tr.className = 'border-t border-[#1b222c]';
+      const isLock = stage.mode === 'locked_rotor';
+      tr.innerHTML = `
+        <td class="px-1.5 py-1 text-slate-500">${idx + 1}</td>
+        <td class="px-1.5 py-1"><input data-field="label" type="text" value="${escapeHtml(stage.label)}" class="w-24 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-slate-100" /></td>
+        <td class="px-1.5 py-1">
+          <select data-field="mode" class="bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-cyan-200">
+            <option value="rotating" ${!isLock ? 'selected' : ''}>旋转</option>
+            <option value="locked_rotor" ${isLock ? 'selected' : ''}>堵转</option>
+          </select>
+        </td>
+        <td class="px-1.5 py-1"><input data-field="durationSec" type="number" step="0.5" min="0.05" value="${stage.durationSec}" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-white" /></td>
+        <td class="px-1.5 py-1"><input data-field="iqPeakA" type="number" step="1" min="0" value="${stage.iqPeakA}" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-amber-200" /></td>
+        <td class="px-1.5 py-1"><input data-field="freqOrAngle" type="number" step="5" value="${isLock ? (stage.electricalAngleDeg ?? 90) : stage.electricalFrequencyHz}" class="w-16 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-slate-200" title="${isLock ? '转子电角度 θe (°)' : '电频率 fe (Hz)'}" /></td>
+        <td class="px-1.5 py-1"><input data-field="vBusV" type="number" step="0.5" min="1" value="${stage.vBusV}" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-cyan-200" /></td>
+        <td class="px-1.5 py-1"><input data-field="modDepthM" type="number" step="0.05" min="0" max="1.1547" value="${stage.modDepthM}" class="w-14 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-slate-200" /></td>
+        <td class="px-1.5 py-1"><input data-field="tAmbC" type="number" step="5" value="${stage.tAmbC ?? 25}" class="w-12 bg-[#12161c] border border-[#222933] rounded-xs px-1 py-0.5 text-emerald-200" /></td>
+        <td class="px-1.5 py-1"><button type="button" data-action="del" class="px-1.5 py-0.5 bg-[#161b22] hover:bg-red-950/60 border border-[#222933] text-slate-400 hover:text-red-300 rounded-xs cursor-pointer">删</button></td>
+      `;
+      tr.querySelectorAll('input, select').forEach((el) => {
+        el.addEventListener('change', (ev) => {
+          const t = ev.target as HTMLInputElement | HTMLSelectElement;
+          const field = t.dataset.field;
+          const cur = this.missionStages[idx];
+          if (!cur || !field) return;
+          if (field === 'label') cur.label = t.value.trim() || `阶段 ${idx + 1}`;
+          else if (field === 'mode') {
+            cur.mode = t.value === 'locked_rotor' ? 'locked_rotor' : 'rotating';
+            if (cur.mode === 'locked_rotor' && cur.electricalAngleDeg === undefined) cur.electricalAngleDeg = 90;
+            this.renderMissionStageTable();
+            return;
+          } else if (field === 'durationSec') cur.durationSec = Math.max(0.05, Number(t.value) || 1);
+          else if (field === 'iqPeakA') cur.iqPeakA = Math.max(0, Number(t.value) || 0);
+          else if (field === 'freqOrAngle') {
+            if (cur.mode === 'locked_rotor') cur.electricalAngleDeg = Number(t.value) || 0;
+            else cur.electricalFrequencyHz = Math.max(0, Number(t.value) || 0);
+          } else if (field === 'vBusV') cur.vBusV = Math.max(1, Number(t.value) || 13.5);
+          else if (field === 'modDepthM') cur.modDepthM = Math.max(0, Number(t.value) || 0);
+          else if (field === 'tAmbC') cur.tAmbC = Number.isFinite(Number(t.value)) ? Number(t.value) : 25;
+          const badgeEl = document.getElementById('focMissionStageCountBadge');
+          if (badgeEl) {
+            const totalDur = this.missionStages.reduce((a, s) => a + s.durationSec, 0);
+            badgeEl.textContent = `${this.missionStages.length} 阶段 · 单循环 ${totalDur.toFixed(1)} s`;
+          }
+        });
+      });
+      tr.querySelector('[data-action="del"]')?.addEventListener('click', () => {
+        if (this.missionStages.length <= 1) {
+          this.app.showToast('任务剖面至少保留 1 个阶段。', 'warn');
+          return;
+        }
+        this.missionStages.splice(idx, 1);
+        this.renderMissionStageTable();
+      });
+      tbody.appendChild(tr);
+    });
+  }
+
+  private runFocMissionProfile(): void {
+    if (this.missionStages.length === 0) {
+      this.app.showToast('任务剖面阶段列表为空，请先载入预设或新增阶段。', 'warn');
+      return;
+    }
+    try {
+      this.refreshFocModelAndSpice();
+      const { mos, ctrl, model } = this.readFocParams();
+      const repeatCycles = Math.max(1, Math.min(20, Math.round(this.readFiniteInput('focMissionCyclesInput', 3))));
+      const tjLimitC = Math.max(40, this.readFiniteInput('focMissionTjLimitInput', 150));
+      const dtSec = Math.max(0.005, Math.min(1, this.readFiniteInput('focMissionDtInput', 0.05)));
+      const totalDur = this.missionStages.reduce((a, s) => a + s.durationSec, 0) * repeatCycles;
+      const maxTimelinePoints = Math.max(200, Math.min(2400, Math.round(totalDur / dtSec)));
+
+      const res = simulateFocMissionProfile({
+        model,
+        mos,
+        baseCtrl: ctrl,
+        stages: this.missionStages,
+        repeatCycles,
+        tjLimitC,
+        maxTimelinePoints,
+      });
+      this.lastMissionResult = res;
+      this.renderMissionProfileResult(res);
+      this.renderFocWarnings(res.warnings);
+      this.focCanvasMode = 'mission';
+      this.syncFocViewButtons();
+      this.drawFocCanvas();
+
+      this.app.showToast(
+        `任务剖面完成（${repeatCycles} 循环, ${res.totalDurationSec.toFixed(1)}s）：峰值 ${res.hottestKeyGlobal}=${res.tjPeakGlobalC.toFixed(1)}°C${res.exceededLimit ? ` · 超限 (${res.firstExceedTimeSec?.toFixed(2)}s)` : ' · 热安全'}`,
+        res.exceededLimit ? 'warn' : 'info'
+      );
+    } catch (err: any) {
+      this.app.showToast(`任务剖面计算失败：${err?.message || err}`, 'error');
+    }
+  }
+
+  private renderMissionProfileResult(res: FocMissionProfileResult): void {
+    const box = document.getElementById('focMissionResultBox');
+    if (box) box.classList.remove('hidden');
+    const peakEl = document.getElementById('focMissionKpiPeak');
+    const boardEl = document.getElementById('focMissionKpiBoard');
+    const ratchetEl = document.getElementById('focMissionKpiRatchet');
+    const statusEl = document.getElementById('focMissionKpiStatus');
+    if (peakEl) peakEl.textContent = `${res.tjPeakGlobalC.toFixed(2)} °C (${res.hottestKeyGlobal})`;
+    if (boardEl) boardEl.textContent = `${res.tBoardPeakC.toFixed(2)} °C`;
+    if (ratchetEl) {
+      ratchetEl.textContent =
+        res.ratchetDeltaTjC === null
+          ? '单循环 (N/A)'
+          : `${res.ratchetDeltaTjC >= 0 ? '+' : ''}${res.ratchetDeltaTjC.toFixed(2)} °C`;
+    }
+    if (statusEl) {
+      statusEl.textContent = res.exceededLimit
+        ? `越限 @ ${res.firstExceedTimeSec?.toFixed(2)}s (> ${res.tjLimitC}°C)`
+        : `通过 (余量 ${(res.tjLimitC - res.tjPeakGlobalC).toFixed(1)}°C)`;
+      statusEl.className = `font-semibold mt-0.5 ${res.exceededLimit ? 'text-rose-300' : 'text-emerald-300'}`;
+    }
+
+    const tbody = document.getElementById('focMissionSummaryTableBody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    res.stageSummaries.forEach((s, idx) => {
+      const tr = document.createElement('tr');
+      tr.className = `border-t border-[#1b222c] ${s.exceededLimit ? 'bg-rose-950/30' : ''}`;
+      const tjStart = idx === 0 ? s.tAmbC : res.stageSummaries[idx - 1].tjEndC;
+      tr.innerHTML = `
+        <td class="px-2 py-1 text-slate-200">C${s.cycleIndex + 1} · ${escapeHtml(s.label)}</td>
+        <td class="px-2 py-1 text-slate-400">${s.tStartSec.toFixed(1)}~${s.tEndSec.toFixed(1)}</td>
+        <td class="px-2 py-1 text-amber-300">${s.pInvAvgW.toFixed(2)}</td>
+        <td class="px-2 py-1 text-slate-300">${tjStart.toFixed(1)}</td>
+        <td class="px-2 py-1 ${s.exceededLimit ? 'text-rose-300 font-semibold' : 'text-pink-300'}">${s.tjPeakC.toFixed(1)}</td>
+        <td class="px-2 py-1 text-slate-200">${s.tjEndC.toFixed(1)}</td>
+        <td class="px-2 py-1 text-cyan-300">${s.hottestKey}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+
+  private injectMissionResultToScope(): void {
+    if (!this.lastMissionResult) {
+      this.runFocMissionProfile();
+      if (!this.lastMissionResult) return;
+    }
+    const mp = this.lastMissionResult;
+    const colors = ['#f472b6', '#fb7185', '#22d3ee', '#38bdf8', '#4ade80', '#facc15'];
+    const specs = MOS_SWITCH_KEYS.map((key, idx) => ({
+      replaceKey: `foc_mission_tj_${key.toLowerCase()}`,
+      name: `MP_Tj_${key}`,
+      unit: '°C',
+      t: mp.time,
+      values: mp.tj[key],
+      color: colors[idx],
+      badge: 'MP',
+      expr: `Mission(${key})`,
+      sourceIds: [] as string[],
+      pinMetrics: key === mp.hottestKeyGlobal ? (['max'] as Array<'max' | 'average'>) : undefined,
+    }));
+    specs.push({
+      replaceKey: 'foc_mission_tboard',
+      name: 'MP_Tboard',
+      unit: '°C',
+      t: mp.time,
+      values: mp.tBoard,
+      color: '#94a3b8',
+      badge: 'MP',
+      expr: 'Mission(Tboard)',
+      sourceIds: [],
+      pinMetrics: ['max'],
+    });
+    this.app.injectThermalTraces(specs as any, {
+      separateView: true,
+      toastMessage: `已注入任务剖面 6-MOS Tj(t) 与 Tboard (${mp.hottestKeyGlobal} Peak=${mp.tjPeakGlobalC.toFixed(1)}°C) 到示波器。`,
+    });
+  }
+
+  private runFocDeratingCurve(): void {
+    try {
+      this.refreshFocModelAndSpice();
+      const { mos, ctrl, model } = this.readFocParams();
+      const tjLimitC = Math.max(40, this.readFiniteInput('focDerateTjLimitInput', 150));
+      const iMaxSearchA = Math.max(5, this.readFiniteInput('focDerateImaxInput', 200));
+      const parseList = (id: string, fallback: number[]): number[] => {
+        const raw = (document.getElementById(id) as HTMLInputElement | null)?.value || '';
+        const nums = raw
+          .split(/[,;\s]+/)
+          .map((s) => Number(s.trim()))
+          .filter((v) => Number.isFinite(v));
+        return nums.length > 0 ? nums : fallback;
+      };
+      const tAmbPointsC = parseList('focDerateTambListInput', [25, 45, 65, 85, 105, 125]);
+      const vBusPointsV = parseList('focDerateVbusListInput', [9, 13.5, 16]);
+      const template: Omit<FocSteadyOperatingPoint, 'iqPeakA'> & { iqPeakA?: number } = this.activeFocSteadyPoint
+        ? {
+            mode: this.activeFocSteadyPoint.mode || 'rotating',
+            electricalFrequencyHz: this.activeFocSteadyPoint.electricalFrequencyHz || 100,
+            electricalAngleDeg: this.activeFocSteadyPoint.electricalAngleDeg,
+            idPeakA: this.activeFocSteadyPoint.idPeakA,
+          }
+        : {
+            mode: 'rotating',
+            electricalFrequencyHz: 150,
+          };
+
+      const res = computeFocThermalDeratingCurve({
+        model,
+        mos,
+        ctrl,
+        operatingPointTemplate: template,
+        tjLimitC,
+        tAmbPointsC,
+        vBusPointsV,
+        referenceVoltageV: ctrl.vBusConstV,
+        iMaxSearchA,
+      });
+      this.lastDeratingResult = res;
+      this.renderDeratingCurveResult(res);
+      this.renderFocWarnings(res.warnings);
+      this.focCanvasMode = 'derating';
+      this.syncFocViewButtons();
+      this.drawFocCanvas();
+      this.app.showToast(`降额曲线计算完成：共 ${res.points.length} 个 (Tamb × Vbus) 工况点。`, 'info');
+    } catch (err: any) {
+      this.app.showToast(`降额曲线计算失败：${err?.message || err}`, 'error');
+    }
+  }
+
+  private renderDeratingCurveResult(res: FocDeratingCurveResult): void {
+    const box = document.getElementById('focDeratingResultBox');
+    if (box) box.classList.remove('hidden');
+    const tbody = document.getElementById('focDeratingTableBody');
+    const noteEl = document.getElementById('focDeratingNote');
+    const reasonLabel: Record<FocDeratingLimitReason, string> = {
+      THERMAL_LIMIT: '结温热受限',
+      THERMAL_RUNAWAY_BOUNDARY: '热失控临界边界',
+      VOLTAGE_LIMITED: '母线电压调制受限',
+      DPT_LUT_BOUND: 'DPT 电流网格边界',
+      RDS_CURVE_BOUND: 'Rds(Tj) 曲线边界',
+      ZERO_MARGIN: '零热余量 (Tamb≥Tj_limit)',
+      SEARCH_CEILING_REACHED: '达搜索上限 (未触及热限)',
+      INVALID_INPUT: '输入异常',
+    };
+    if (tbody) {
+      tbody.innerHTML = '';
+      for (const pt of res.points) {
+        const tr = document.createElement('tr');
+        tr.className = 'border-t border-[#1b222c]';
+        const isWarn = pt.limitReason === 'VOLTAGE_LIMITED' || pt.limitReason === 'ZERO_MARGIN' || pt.limitReason === 'DPT_LUT_BOUND';
+        tr.innerHTML = `
+          <td class="px-2 py-1 text-slate-200">${pt.tAmbC.toFixed(0)}</td>
+          <td class="px-2 py-1 text-cyan-200">${pt.vBusV.toFixed(1)}</td>
+          <td class="px-2 py-1 text-cyan-300 font-semibold">${pt.iRmsMaxA !== null ? pt.iRmsMaxA.toFixed(2) : '--'}</td>
+          <td class="px-2 py-1 text-slate-300">${pt.iPeakMaxA !== null ? pt.iPeakMaxA.toFixed(2) : '--'}</td>
+          <td class="px-2 py-1 text-pink-300">${pt.tjAtMaxC !== null ? pt.tjAtMaxC.toFixed(1) : '--'}</td>
+          <td class="px-2 py-1 text-amber-300">${pt.pInverterAtMaxW !== null ? pt.pInverterAtMaxW.toFixed(2) : '--'}</td>
+          <td class="px-2 py-1 ${isWarn ? 'text-amber-300' : 'text-emerald-300'}" title="${escapeHtml(pt.note)}">${reasonLabel[pt.limitReason]}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+    if (noteEl) {
+      noteEl.textContent = `模型等级: ${res.resultQualification} · 工况模式: ${res.mode === 'locked_rotor' ? '零速堵转' : '旋转稳态'} · 目标上限 Tj_limit=${res.tjLimitC}°C（每个结果均经高精度复算确认 Tj_max ≤ Tj_limit）。`;
+    }
+  }
+
+  public appendMissionStageFromDyno(stage: FocMissionStage, openModal = true): void {
+    this.missionStages.push({ ...stage });
+    if (openModal) {
+      this.openModal();
+      this.switchTab('foc');
+      const details = document.getElementById('focMissionProfileCard') as HTMLDetailsElement | null;
+      if (details) details.open = true;
+    }
+    this.renderMissionStageTable();
+    this.app.showToast(
+      `已追加任务剖面阶段 #${this.missionStages.length}：${stage.label} (${stage.vBusV.toFixed(1)}V, Iq=${stage.iqPeakA.toFixed(1)}A, ${stage.durationSec.toFixed(1)}s)。`,
+      'info'
+    );
   }
 
   private loadFoc3PhDemoTab(): void {
@@ -4496,11 +5273,30 @@ export class ThermalWorkbenchController {
   private renderDptMatrixTable(): void {
     const tbody = document.getElementById('dptMatrixTableBody');
     const applyBtn = document.getElementById('dptApplyMatrixToFocBtn') as HTMLButtonElement | null;
+    const exportBtn = document.getElementById('dptExportJsonBtn') as HTMLButtonElement | null;
+    const covBar = document.getElementById('dptMatrixCoverageBar');
     if (applyBtn) applyBtn.disabled = this.dptMatrix.length === 0;
+    if (exportBtn) exportBtn.disabled = this.dptMatrix.length === 0;
+    if (covBar) {
+      const cov = summarizeDptLutCoverage(this.dptMatrix);
+      if (cov.pointCount === 0) {
+        covBar.className = 'text-slate-400';
+        covBar.textContent = '✖ 暂无实测 DPT 矩阵点 · 请由示波器分析保存或导入 4D 实测模板';
+      } else {
+        covBar.className = cov.coversAutomotive9to16V ? 'text-emerald-300' : 'text-amber-300';
+        covBar.textContent =
+          `${cov.statusGlyph} ${cov.statusText} · ` +
+          `${cov.pointCount} 点 · ` +
+          `Vbus ${cov.vBusRangeV![0].toFixed(1)}–${cov.vBusRangeV![1].toFixed(1)}V (${cov.uniqueVbusCount}) · ` +
+          `I ${cov.iLoadRangeA![0].toFixed(0)}–${cov.iLoadRangeA![1].toFixed(0)}A (${cov.uniqueIloadCount}) · ` +
+          `Tj ${cov.tjRangeC![0].toFixed(0)}–${cov.tjRangeC![1].toFixed(0)}°C (${cov.uniqueTjCount}) · ` +
+          `Rg ${cov.rgRangeOhm![0].toFixed(1)}–${cov.rgRangeOhm![1].toFixed(1)}Ω (${cov.uniqueRgCount})`;
+      }
+    }
     if (!tbody) return;
     if (this.dptMatrix.length === 0) {
       tbody.innerHTML =
-        '<tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」积累多电压/电流/结温/门极电阻 4D 插值表。</td></tr>';
+        '<tr><td colspan="9" class="px-2 py-2 text-center text-slate-500 font-sans">尚未保存 DPT 工况点；先运行 DPT 分析后点击「+ 保存当前点到矩阵」或点击「导入 4D DPT (JSON/CSV)」载入实测数据。</td></tr>';
       return;
     }
     tbody.innerHTML = '';

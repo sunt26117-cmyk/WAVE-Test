@@ -1,6 +1,6 @@
 import type { WaveformChannel } from '../types/models';
 
-export type ExcelMergeTimeMode = 'preserve' | 'align-start';
+export type ExcelMergeTimeMode = 'preserve' | 'align-start' | 'auto-best';
 export type ExcelTimeOriginKind = 'absolute-date' | 'clock-of-day' | 'numeric' | 'synthetic';
 
 export interface ExcelMergeSource {
@@ -142,11 +142,12 @@ function buildAuditRow(
 }
 
 /**
- * Combines independently sampled Excel traces without resampling or mutating source buffers.
- * `preserve` restores absolute Excel date-time coordinates and seconds-of-day coordinates
- * where available; numeric axes remain untouched. Coordinate domains are never mixed when
- * reporting a common overlap. `align-start` only translates each trace so its first sample is
- * t=0; it never interpolates, decimates, or changes sample values.
+ * Combines independently sampled table traces without resampling or mutating source values.
+ * - `preserve`: restores absolute Excel date-time / clock coordinates; numeric axes untouched; blocks mixed/multi-synthetic domains.
+ * - `align-start`: translates every trace so its first sample is t=0.
+ * - `auto-best`: anchors the X axis to the longest valid channel, preserves original time correspondence for
+ *   same-domain overlapping traces, and translates non-overlapping / synthetic / cross-domain traces to match
+ *   the anchor start (recording `timeShiftBaseT` and `timeShiftSec` for live Δt adjustment).
  */
 export function mergeExcelChannelsByTime(
   items: ExcelMergeSource[],
@@ -160,8 +161,29 @@ export function mergeExcelChannelsByTime(
   const palette = colors.length ? colors : DEFAULT_COLORS;
   let maxPoints = 0;
 
+  interface PreparedSourceChannel {
+    item: ExcelMergeSource;
+    sourceId: string;
+    source: WaveformChannel;
+    safeFileName: string;
+    baseOffsetSec: number;
+    baseStartSec: number;
+    baseEndSec: number;
+    durationSec: number;
+    originKind: ExcelTimeOriginKind;
+    monotonic: boolean;
+    medianDtSec: number | null;
+  }
+
+  const prepared: PreparedSourceChannel[] = [];
   items.forEach((item, itemIndex) => {
     const safeFileName = item.fileName || `Workbook ${itemIndex + 1}`;
+    const hasOrigin =
+      (item.timeOriginKind === 'absolute-date' || item.timeOriginKind === 'clock-of-day') &&
+      Number.isFinite(item.timeOriginSec);
+    const baseOffsetSec = hasOrigin ? (item.timeOriginSec as number) : 0;
+    const originKind: ExcelTimeOriginKind = item.timeOriginKind || 'numeric';
+
     item.drawOrder.forEach((sourceId) => {
       const source = item.channels[sourceId];
       if (!source) return;
@@ -173,48 +195,127 @@ export function mergeExcelChannelsByTime(
         return;
       }
 
-      const id = `${sourceId}_merged_${drawOrder.length}`;
-      const label = `[${safeFileName} · ${item.sheetName}] ${source.name}`;
-      const t = new Float64Array(source.t.length);
-      let offsetSec = 0;
-      if (timeMode === 'align-start') {
-        offsetSec = -source.t[0];
-      } else if (
-        (item.timeOriginKind === 'absolute-date' || item.timeOriginKind === 'clock-of-day') &&
-        Number.isFinite(item.timeOriginSec)
-      ) {
-        // Restore the source origin. Absolute dates become epoch seconds; clock-only values
-        // become seconds-of-day and remain explicitly ambiguous across calendar days.
-        offsetSec = item.timeOriginSec as number;
-      }
-      for (let i = 0; i < source.t.length; i++) t[i] = source.t[i] + offsetSec;
-
-      let rawT: Float64Array | undefined;
-      if (source.rawT) {
-        rawT = new Float64Array(source.rawT.length);
-        for (let i = 0; i < source.rawT.length; i++) rawT[i] = source.rawT[i] + offsetSec;
-      }
-      const cloned: WaveformChannel = {
-        ...source,
-        id,
-        name: label,
-        color: palette[drawOrder.length % palette.length] || source.color,
-        t,
-        rawT,
-      };
-      mergedChannels[id] = cloned;
-      drawOrder.push(id);
-      maxPoints = Math.max(maxPoints, cloned.v.length);
-      const originKind = timeMode === 'align-start' ? 'numeric' : (item.timeOriginKind || 'numeric');
-      audit.push(buildAuditRow(id, label, t, originKind));
+      const preAudit = buildAuditRow(sourceId, source.name, source.t, originKind);
+      const baseStartSec = source.t[0] + baseOffsetSec;
+      const baseEndSec = source.t[source.t.length - 1] + baseOffsetSec;
+      prepared.push({
+        item,
+        sourceId,
+        source,
+        safeFileName,
+        baseOffsetSec,
+        baseStartSec,
+        baseEndSec,
+        durationSec: source.t.length > 1 ? baseEndSec - baseStartSec : 0,
+        originKind,
+        monotonic: preAudit.monotonic,
+        medianDtSec: preAudit.medianDtSec,
+      });
     });
+  });
+
+  // For 'auto-best', pick the longest valid monotonic trace as the horizontal axis anchor.
+  let anchor: PreparedSourceChannel | null = null;
+  if (timeMode === 'auto-best') {
+    const candidates = prepared.filter(
+      (p) =>
+        p.source.t.length >= 2 &&
+        p.monotonic &&
+        Number.isFinite(p.baseStartSec) &&
+        Number.isFinite(p.baseEndSec) &&
+        p.durationSec > 0
+    );
+    if (candidates.length > 0) {
+      candidates.sort(
+        (a, b) =>
+          b.durationSec - a.durationSec ||
+          a.baseStartSec - b.baseStartSec ||
+          (a.medianDtSec ?? Infinity) - (b.medianDtSec ?? Infinity)
+      );
+      anchor = candidates[0];
+    }
+  }
+
+  let autoShiftedCount = 0;
+  let preservedOverlapCount = 0;
+
+  prepared.forEach((p) => {
+    const { item, sourceId, source, safeFileName, baseOffsetSec, baseStartSec, baseEndSec } = p;
+    const id = `${sourceId}_merged_${drawOrder.length}`;
+    const label = item.sheetName && item.sheetName !== 'CSV'
+      ? `[${safeFileName} · ${item.sheetName}] ${source.name}`
+      : prepared.some((other) => other.safeFileName !== safeFileName)
+      ? `[${safeFileName}] ${source.name}`
+      : source.name;
+
+    let alignShiftSec = 0;
+    if (timeMode === 'align-start') {
+      alignShiftSec = -baseStartSec;
+    } else if (timeMode === 'auto-best' && anchor && p !== anchor) {
+      const sameRealDomain =
+        p.originKind === anchor.originKind && p.originKind !== 'synthetic';
+      const hasRealOverlap =
+        sameRealDomain &&
+        Math.min(baseEndSec, anchor.baseEndSec) > Math.max(baseStartSec, anchor.baseStartSec);
+      if (hasRealOverlap) {
+        alignShiftSec = 0;
+        preservedOverlapCount++;
+      } else {
+        alignShiftSec = anchor.baseStartSec - baseStartSec;
+        if (Math.abs(alignShiftSec) > 1e-15) {
+          autoShiftedCount++;
+        }
+      }
+    }
+
+    const totalOffsetSec =
+      timeMode === 'align-start' ? -source.t[0] : baseOffsetSec + alignShiftSec;
+
+    const baseT = new Float64Array(source.t.length);
+    const t = new Float64Array(source.t.length);
+    for (let i = 0; i < source.t.length; i++) {
+      const restored = source.t[i] + (timeMode === 'align-start' ? -source.t[0] : baseOffsetSec);
+      baseT[i] = restored;
+      t[i] = source.t[i] + totalOffsetSec;
+    }
+
+    let rawT: Float64Array | undefined;
+    if (source.rawT) {
+      rawT = new Float64Array(source.rawT.length);
+      for (let i = 0; i < source.rawT.length; i++) rawT[i] = source.rawT[i] + totalOffsetSec;
+    }
+
+    const hasUserAdjustShift = timeMode === 'auto-best' && Math.abs(alignShiftSec) > 1e-15;
+    const cloned: WaveformChannel = {
+      ...source,
+      id,
+      name: label,
+      color: palette[drawOrder.length % palette.length] || source.color,
+      t,
+      rawT,
+      timeShiftSec: hasUserAdjustShift ? alignShiftSec : 0,
+      timeShiftBaseT: hasUserAdjustShift ? baseT : undefined,
+    };
+    mergedChannels[id] = cloned;
+    drawOrder.push(id);
+    maxPoints = Math.max(maxPoints, cloned.v.length);
+    const rowOriginKind: ExcelTimeOriginKind =
+      timeMode === 'align-start' || (timeMode === 'auto-best' && hasUserAdjustShift)
+        ? 'numeric'
+        : p.originKind;
+    audit.push(buildAuditRow(id, label, t, rowOriginKind));
   });
 
   const validRows = audit.filter((row) => row.sampleCount >= 2 && row.monotonic && Number.isFinite(row.startSec) && Number.isFinite(row.endSec));
   const coordinateDomains = new Set(validRows.map((row) => row.originKind));
   const oneCoordinateDomain = coordinateDomains.size <= 1;
   const syntheticTimeCannotProveOverlap = timeMode === 'preserve' && coordinateDomains.has('synthetic');
-  const overlapRows = oneCoordinateDomain && !syntheticTimeCannotProveOverlap ? validRows : [];
+  const overlapRows =
+    timeMode === 'auto-best'
+      ? validRows
+      : oneCoordinateDomain && !syntheticTimeCannotProveOverlap
+      ? validRows
+      : [];
   const commonStartSec = overlapRows.length ? Math.max(...overlapRows.map((row) => row.startSec)) : null;
   const commonEndSec = overlapRows.length ? Math.min(...overlapRows.map((row) => row.endSec)) : null;
   const commonOverlapSec = commonStartSec !== null && commonEndSec !== null ? Math.max(0, commonEndSec - commonStartSec) : 0;
@@ -222,37 +323,52 @@ export function mergeExcelChannelsByTime(
   const minimumOverlapPct = durationRows.length && commonOverlapSec > 0
     ? Math.min(...durationRows.map((row) => Math.min(100, commonOverlapSec / row.durationSec * 100)))
     : 0;
-  const hasCommonOverlap = oneCoordinateDomain && !syntheticTimeCannotProveOverlap && overlapRows.length > 0 && commonEndSec !== null && commonStartSec !== null && commonEndSec > commonStartSec;
+  const hasCommonOverlap =
+    (timeMode === 'auto-best' || (oneCoordinateDomain && !syntheticTimeCannotProveOverlap)) &&
+    overlapRows.length > 0 &&
+    commonEndSec !== null &&
+    commonStartSec !== null &&
+    commonEndSec > commonStartSec;
   const activeSourceItems = items.filter((item) => item.drawOrder.some((id) => !!item.channels[id]?.t?.length));
   const multiSourceAxis = activeSourceItems.length > 1;
-  const canMergePreservingTime = !(
-    timeMode === 'preserve' && multiSourceAxis &&
-    (!oneCoordinateDomain || syntheticTimeCannotProveOverlap)
-  );
+  const canMergePreservingTime =
+    timeMode === 'auto-best' ||
+    !(
+      timeMode === 'preserve' && multiSourceAxis &&
+      (!oneCoordinateDomain || syntheticTimeCannotProveOverlap)
+    );
 
   if (audit.some((row) => !row.monotonic)) {
     warnings.push('至少一条合并通道的时间轴不是严格递增；请回到导入预览检查重复时间戳、乱序或无效时间。');
   }
-  if (coordinateDomains.size > 1 && timeMode === 'preserve') {
-    warnings.push('合并通道包含不同时间坐标类型（绝对日期、日内时刻、数值时间或合成时间）；未计算跨类型公共重叠，不能据此认定通道已同步。');
-  } else if (syntheticTimeCannotProveOverlap) {
-    warnings.push('所选工作表缺少真实时间列，合成采样时间仅表示各文件内部样本序号/采样率；不计算跨文件公共重叠，也不宣称同步。需要比较时请确认同触发起点后选择「首样本对齐」。');
-  } else if (validRows.length > 1 && !hasCommonOverlap) {
-    warnings.push('所选通道之间没有公共时间重叠区间；仍可同屏显示，但不能对无重叠区间进行有效 Compare。');
-  }
-  if (items.some((item) => item.timeOriginKind === 'clock-of-day') && timeMode === 'preserve') {
-    warnings.push('至少一个文件只有 HH:MM:SS 时钟时间、没有日期；已保留秒/日坐标，但无法判断不同文件是否来自同一天或是否跨天。');
-  }
-  if (items.some((item) => item.timeOriginKind === 'synthetic')) {
-    warnings.push(timeMode === 'align-start'
-      ? '至少一个工作表使用合成采样时间；当前仅按首样本假定同一时刻，不证明各采集设备实际同时触发。'
-      : '至少一个工作表没有可用时间列，使用合成采样时间；该通道不能据此与其他文件建立真实同步关系。');
-  }
-  if (timeMode === 'preserve' && coordinateDomains.size === 1 && coordinateDomains.has('numeric') && validRows.length > 1) {
-    warnings.push('数值时间轴按导入的时间值计算重叠；若每个文件的 t=0 都是各自独立采集起点，数值重叠不等于实际同步，请确认共同触发基准。');
-  }
-  if (timeMode === 'align-start') {
-    warnings.push('已按用户选择将每条通道首样本平移到 t=0；未进行插值或相位校正，默认首样本代表共同对齐点。');
+  if (timeMode === 'auto-best') {
+    if (autoShiftedCount > 0) {
+      warnings.push(
+        `已按最长波形建立时间轴：${preservedOverlapCount > 0 ? '保留了时间重叠通道的原始对应，' : ''}将 ${autoShiftedCount} 条时间起点不一致/合成时钟通道自动对齐到主起点，可在右侧面板直接微调 Δt。`
+      );
+    }
+  } else {
+    if (coordinateDomains.size > 1 && timeMode === 'preserve') {
+      warnings.push('合并通道包含不同时间坐标类型（绝对日期、日内时刻、数值时间或合成时间）；未计算跨类型公共重叠，不能据此认定通道已同步。');
+    } else if (syntheticTimeCannotProveOverlap) {
+      warnings.push('所选工作表缺少真实时间列，合成采样时间仅表示各文件内部样本序号/采样率；不计算跨文件公共重叠，也不宣称同步。需要比较时请确认同触发起点后选择「首样本对齐」。');
+    } else if (validRows.length > 1 && !hasCommonOverlap) {
+      warnings.push('所选通道之间没有公共时间重叠区间；仍可同屏显示，但不能对无重叠区间进行有效 Compare。');
+    }
+    if (items.some((item) => item.timeOriginKind === 'clock-of-day') && timeMode === 'preserve') {
+      warnings.push('至少一个文件只有 HH:MM:SS 时钟时间、没有日期；已保留秒/日坐标，但无法判断不同文件是否来自同一天或是否跨天。');
+    }
+    if (items.some((item) => item.timeOriginKind === 'synthetic')) {
+      warnings.push(timeMode === 'align-start'
+        ? '至少一个工作表使用合成采样时间；当前仅按首样本假定同一时刻，不证明各采集设备实际同时触发。'
+        : '至少一个工作表没有可用时间列，使用合成采样时间；该通道不能据此与其他文件建立真实同步关系。');
+    }
+    if (timeMode === 'preserve' && coordinateDomains.size === 1 && coordinateDomains.has('numeric') && validRows.length > 1) {
+      warnings.push('数值时间轴按导入的时间值计算重叠；若每个文件的 t=0 都是各自独立采集起点，数值重叠不等于实际同步，请确认共同触发基准。');
+    }
+    if (timeMode === 'align-start') {
+      warnings.push('已按用户选择将每条通道首样本平移到 t=0；未进行插值或相位校正，默认首样本代表共同对齐点。');
+    }
   }
 
   return {

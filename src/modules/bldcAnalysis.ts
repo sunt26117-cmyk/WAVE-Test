@@ -797,35 +797,104 @@ export function analyzePwmSwitchingAndDeadTime(
   const span = mx - mn;
   if (!isFinite(span) || span <= 1e-9) return empty;
 
-  const mid = (mx + mn) / 2;
-  const hyst = span * 0.08;
-  let highSum = 0;
-  let highCnt = 0;
-  let lowSum = 0;
-  let lowCnt = 0;
-  for (let i = 0; i < n; i++) {
+  // Estimate modal high/low plateaus via 128-bin histogram so turn-on spikes don't pull mid into ringing
+  const bins = 128;
+  const bCounts = new Uint32Array(bins);
+  const bSums = new Float64Array(bins);
+  const hStep = Math.max(1, Math.floor(n / 20000));
+  let sampledCnt = 0;
+  for (let i = 0; i < n; i += hStep) {
     const v = hArr[i];
     if (!isFinite(v)) continue;
-    if (v >= mn + span * 0.72 && v <= mn + span * 0.92) {
-      highSum += v;
-      highCnt++;
-    } else if (v <= mn + span * 0.25 && v >= mn + span * 0.02) {
-      lowSum += v;
-      lowCnt++;
+    const b = Math.max(0, Math.min(bins - 1, Math.floor(((v - mn) / span) * (bins - 1))));
+    bCounts[b]++;
+    bSums[b] += v;
+    sampledCnt++;
+  }
+  const cMean = (cBin: number) => {
+    let s = 0, c = 0;
+    for (let b = Math.max(0, cBin - 1); b <= Math.min(bins - 1, cBin + 1); b++) {
+      s += bSums[b];
+      c += bCounts[b];
+    }
+    return c > 0 ? s / c : null;
+  };
+  const cCount = (cBin: number) => {
+    let c = 0;
+    for (let b = Math.max(0, cBin - 1); b <= Math.min(bins - 1, cBin + 1); b++) c += bCounts[b];
+    return c;
+  };
+  let m1 = 0, m1C = 0;
+  for (let b = 0; b < bins; b++) {
+    if (bCounts[b] > m1C) { m1C = bCounts[b]; m1 = b; }
+  }
+  const minSep = Math.max(6, Math.floor(bins * 0.08));
+  let m2 = -1, m2Score = 0;
+  for (let b = 0; b < bins; b++) {
+    if (Math.abs(b - m1) < minSep) continue;
+    const sc = cCount(b);
+    if (sc > m2Score || (sc === m2Score && bCounts[b] > (m2 >= 0 ? bCounts[m2] : -1))) {
+      m2Score = sc;
+      m2 = b;
     }
   }
-  const vTop = highCnt >= 4 ? highSum / highCnt : mx;
-  const vBase = lowCnt >= 4 ? lowSum / lowCnt : mn;
+  const avgBin = sampledCnt / bins;
+  if (m2 >= 0) {
+    const dir = m2 > m1 ? 1 : -1;
+    const minOuterCnt = Math.max(3, sampledCnt * 0.02);
+    let outerBin = -1;
+    let outerScore = 0;
+    for (let b = m2 + dir * Math.max(4, Math.floor(minSep * 0.6)); b >= 0 && b < bins; b += dir) {
+      const sc = cCount(b);
+      if (sc >= minOuterCnt && sc > avgBin * 1.6 && sc >= m2Score * 0.25) {
+        if (sc > outerScore) {
+          outerScore = sc;
+          outerBin = b;
+        }
+      }
+    }
+    if (outerBin >= 0) {
+      m2 = outerBin;
+      m2Score = outerScore;
+    }
+  }
+  let vTop = mx;
+  let vBase = mn;
+  if (
+    m2 >= 0 &&
+    sampledCnt >= 8 &&
+    cCount(m1) >= Math.max(3, sampledCnt * 0.012) &&
+    m2Score >= Math.max(2, sampledCnt * 0.008) &&
+    m2Score > avgBin * 1.35
+  ) {
+    vBase = cMean(Math.min(m1, m2)) ?? mn;
+    vTop = cMean(Math.max(m1, m2)) ?? mx;
+  } else {
+    let highSum = 0, highCnt = 0, lowSum = 0, lowCnt = 0;
+    for (let i = 0; i < n; i++) {
+      const v = hArr[i];
+      if (!isFinite(v)) continue;
+      if (v >= mn + span * 0.72 && v <= mn + span * 0.92) { highSum += v; highCnt++; }
+      else if (v <= mn + span * 0.25 && v >= mn + span * 0.02) { lowSum += v; lowCnt++; }
+    }
+    if (highCnt >= 4) vTop = highSum / highCnt;
+    if (lowCnt >= 4) vBase = lowSum / lowCnt;
+  }
+  if (!(vTop > vBase)) { vTop = mx; vBase = mn; }
   const amp = vTop - vBase;
+  const mid = (vTop + vBase) / 2;
+  const hyst = Math.max(span * 0.08, amp * 0.25);
   const overshootPct = amp > 1e-9 && mx > vTop ? ((mx - vTop) / amp) * 100 : 0;
 
   const pwmTb = inspectTimebase(tArr, 0, n - 1, DEFAULT_SAMPLING_GAP_FACTOR);
   const gapThreshold = pwmTb.gapThresholdSec;
-  const risingEvents: Array<{ t: number; idx: number; seg: number }> = [];
-  const fallingEvents: Array<{ t: number; seg: number }> = [];
+  let events: Array<{ type: 'rise' | 'fall'; t: number; idx: number; seg: number }> = [];
+  let risingEvents: Array<{ t: number; idx: number; seg: number }> = [];
+  let fallingEvents: Array<{ t: number; seg: number }> = [];
   let segId = 0;
-  let armed = false;
+  let armedHigh = false;
   let isHighState = isFinite(hArr[0]) ? hArr[0] >= mid : false;
+  let segStart = 0;
 
   for (let i = 1; i < n; i++) {
     const vp = hArr[i - 1];
@@ -838,22 +907,239 @@ export function analyzePwmSwitchingAndDeadTime(
       (Number.isFinite(gapThreshold) && dt > gapThreshold);
     if (isBreak) {
       segId++;
-      armed = false;
+      armedHigh = false;
+      segStart = i;
       if (isFinite(vc)) {
         isHighState = vc >= mid;
       }
       continue;
     }
-    if (!isHighState && vp <= mid - hyst) armed = true;
-    if (!isHighState && armed && vp < mid && vc >= mid) {
-      const f = vc - vp > 1e-15 ? (mid - vp) / (vc - vp) : 0;
-      risingEvents.push({ t: tArr[i - 1] + f * dt, idx: i, seg: segId });
+    if (!isHighState && vc <= mid - hyst) armedHigh = true;
+    if (!isHighState && (armedHigh || vp <= mid - hyst) && vc >= mid + hyst) {
+      let j = i;
+      while (j > segStart && hArr[j - 1] > mid) j--;
+      const v0 = j > segStart ? hArr[j - 1] : vp;
+      const v1 = j > segStart ? hArr[j] : vc;
+      const dtJ = j > segStart ? tArr[j] - tArr[j - 1] : dt;
+      const f = v1 - v0 > 1e-15 ? Math.max(0, Math.min(1, (mid - v0) / (v1 - v0))) : 0.5;
+      const cTime = (j > segStart ? tArr[j - 1] : tArr[i - 1]) + f * dtJ;
+      risingEvents.push({ t: cTime, idx: j, seg: segId });
+      events.push({ type: 'rise', t: cTime, idx: j, seg: segId });
       isHighState = true;
-      armed = false;
+      armedHigh = false;
+      segStart = i;
     } else if (isHighState && vc <= mid - hyst) {
-      const f = vp - vc > 1e-15 ? (vp - mid) / (vp - vc) : 0;
-      fallingEvents.push({ t: tArr[i - 1] + f * dt, seg: segId });
+      let j = i;
+      while (j > segStart && hArr[j - 1] < mid) j--;
+      const v0 = j > segStart ? hArr[j - 1] : vp;
+      const v1 = j > segStart ? hArr[j] : vc;
+      const dtJ = j > segStart ? tArr[j] - tArr[j - 1] : dt;
+      const f = v0 - v1 > 1e-15 ? Math.max(0, Math.min(1, (v0 - mid) / (v0 - v1))) : 0.5;
+      const cTime = (j > segStart ? tArr[j - 1] : tArr[i - 1]) + f * dtJ;
+      fallingEvents.push({ t: cTime, seg: segId });
+      events.push({ type: 'fall', t: cTime, idx: j, seg: segId });
       isHighState = false;
+      segStart = i;
+    }
+  }
+
+  // Prune narrow ringing bounces/glitches (turn-on dips, turn-off spikes, or intermediate Miller/dead-time shelves) before pairing rising edges
+  if (events.length >= 4) {
+    const upperQuantile = (arr: number[], q: number) => {
+      if (arr.length === 0) return 0;
+      const s = arr.slice().sort((a, b) => a - b);
+      return s[Math.min(s.length - 1, Math.ceil((s.length - 1) * q))];
+    };
+    const highRailTarget = vBase + 0.65 * amp;
+    const lowRailTarget = vBase + 0.35 * amp;
+
+    let changed = true;
+    let pass = 0;
+    while (changed && pass < 6 && events.length >= 4) {
+      changed = false;
+      pass++;
+      const highDurs: number[] = [];
+      const lowDurs: number[] = [];
+      const allDurs: number[] = [];
+      for (let k = 0; k + 1 < events.length; k++) {
+        if (events[k].seg !== events[k + 1].seg) continue;
+        const d = events[k + 1].t - events[k].t;
+        if (!(d > 0)) continue;
+        allDurs.push(d);
+        if (events[k].type === 'rise' && events[k + 1].type === 'fall') highDurs.push(d);
+        else if (events[k].type === 'fall' && events[k + 1].type === 'rise') lowDurs.push(d);
+      }
+      const refHigh = upperQuantile(highDurs, 0.85);
+      const refLow = upperQuantile(lowDurs, 0.85);
+      const refPhase = upperQuantile(allDurs, 0.85);
+      if (!(refPhase > 0)) break;
+
+      const nextEvents: typeof events = [];
+      let k = 0;
+      while (k < events.length) {
+        if (k + 1 < events.length && events[k].seg === events[k + 1].seg) {
+          const dur = events[k + 1].t - events[k].t;
+          const isHigh = events[k].type === 'rise' && events[k + 1].type === 'fall';
+          const samePolarityRef = isHigh ? refHigh : refLow;
+          const prevDur = k > 0 && events[k - 1].seg === events[k].seg ? events[k].t - events[k - 1].t : Infinity;
+          const nextDur = k + 2 < events.length && events[k + 1].seg === events[k + 2].seg ? events[k + 2].t - events[k + 1].t : Infinity;
+
+          let failsRailExcursion = false;
+          if (k > 0 && k + 1 < events.length - 1) {
+            const s0 = Math.max(0, Math.min(events[k].idx, events[k + 1].idx) - 1);
+            const s1 = Math.min(n - 1, Math.max(events[k].idx, events[k + 1].idx) + 1);
+            if (isHigh) {
+              let pMax = -Infinity;
+              for (let m = s0; m <= s1; m++) {
+                const vm = hArr[m];
+                if (isFinite(vm) && vm > pMax) pMax = vm;
+              }
+              if (isFinite(pMax) && pMax < highRailTarget) failsRailExcursion = true;
+            } else {
+              let pMin = Infinity;
+              for (let m = s0; m <= s1; m++) {
+                const vm = hArr[m];
+                if (isFinite(vm) && vm < pMin) pMin = vm;
+              }
+              if (isFinite(pMin) && pMin > lowRailTarget) failsRailExcursion = true;
+            }
+          }
+
+          const isShortPair =
+            failsRailExcursion ||
+            (samePolarityRef > 0 && dur < samePolarityRef * 0.22 && (prevDur > dur * 2.2 || nextDur > dur * 2.2)) ||
+            (dur < refPhase * 0.14 && prevDur < refPhase * 0.14 && prevDur <= nextDur) ||
+            (dur < refPhase * 0.14 && nextDur < refPhase * 0.14 && nextDur <= prevDur);
+          if (isShortPair) {
+            k += 2;
+            changed = true;
+            continue;
+          }
+        }
+        nextEvents.push(events[k]);
+        k++;
+      }
+      if (changed && nextEvents.length >= 2) {
+        events = nextEvents;
+      } else {
+        break;
+      }
+    }
+    risingEvents = events.filter((ev) => ev.type === 'rise').map((ev) => ({ t: ev.t, idx: ev.idx, seg: ev.seg }));
+    fallingEvents = events.filter((ev) => ev.type === 'fall').map((ev) => ({ t: ev.t, seg: ev.seg }));
+  }
+
+  // Collapse systematic alternating sub-cycle period-doubling [d_a, d_b, d_a, d_b] where every cycle was split in two
+  if (risingEvents.length >= 4) {
+    const pulseWidthForRise = (rIdx: number): number => {
+      const r0 = risingEvents[rIdx];
+      const r1 = risingEvents[rIdx + 1];
+      if (!r0 || !r1 || r0.seg !== r1.seg) return 0;
+      const fe = fallingEvents.find((f) => f.seg === r0.seg && f.t > r0.t && f.t < r1.t);
+      return fe ? fe.t - r0.t : (r1.t - r0.t) * 0.5;
+    };
+    const intervals: Array<{ idx: number; dt: number; width: number; seg: number }> = [];
+    for (let k = 0; k + 1 < risingEvents.length; k++) {
+      if (risingEvents[k].seg === risingEvents[k + 1].seg) {
+        const dt = risingEvents[k + 1].t - risingEvents[k].t;
+        if (dt > 0) intervals.push({ idx: k, dt, width: pulseWidthForRise(k), seg: risingEvents[k].seg });
+      }
+    }
+    if (intervals.length >= 3) {
+      const sampleDt =
+        pwmTb.dtMedian && pwmTb.dtMedian > 0
+          ? pwmTb.dtMedian
+          : n > 1
+          ? Math.abs(tArr[n - 1] - tArr[0]) / (n - 1)
+          : 0;
+      let altTriples = 0;
+      let validTriples = 0;
+      for (let k = 0; k + 2 < intervals.length; k++) {
+        const a = intervals[k];
+        const b = intervals[k + 1];
+        const c = intervals[k + 2];
+        if (a.seg !== b.seg || b.seg !== c.seg) continue;
+        validTriples++;
+        const pair1 = a.dt + b.dt;
+        const pair2 = b.dt + c.dt;
+        const pairConsistent = Math.abs(pair1 - pair2) / Math.max(pair1, pair2) <= 0.16;
+        const maxW = Math.max(a.width, b.width);
+        const minW = Math.min(a.width, b.width);
+        const maxDt = Math.max(a.dt, b.dt);
+        const minDt = Math.min(a.dt, b.dt);
+        const dtSeverelyAlternates =
+          (a.dt - b.dt) * (b.dt - c.dt) < 0 &&
+          Math.abs(a.dt - b.dt) > 2.2 * sampleDt &&
+          minDt < maxDt * 0.40 &&
+          minW < maxW * 0.65;
+        const widthAlternates =
+          (a.width - b.width) * (b.width - c.width) < 0 &&
+          maxW > 2.2 * sampleDt &&
+          minW < maxW * 0.30;
+        if (pairConsistent && (dtSeverelyAlternates || widthAlternates)) altTriples++;
+      }
+      if (validTriples >= 1 && altTriples / validTriples >= 0.65) {
+        let evenScore = 0, oddScore = 0;
+        for (let k = 0; k < intervals.length; k++) {
+          const score = intervals[k].width > 0 ? intervals[k].width : intervals[k].dt;
+          if (k % 2 === 0) evenScore += score;
+          else oddScore += score;
+        }
+        const dropOdd = evenScore >= oddScore;
+        const filtered: typeof risingEvents = [];
+        const suppressed: Array<{ t0: number; t1: number; seg: number }> = [];
+        for (let k = 0; k < risingEvents.length; k++) {
+          const shouldDrop = dropOdd ? k % 2 === 1 : k > 0 && k % 2 === 0;
+          if (shouldDrop && filtered.length > 0 && filtered[filtered.length - 1].seg === risingEvents[k].seg) {
+            const prev = filtered[filtered.length - 1];
+            suppressed.push({ t0: prev.t, t1: risingEvents[k].t, seg: risingEvents[k].seg });
+            continue;
+          }
+          filtered.push(risingEvents[k]);
+        }
+        if (filtered.length >= 2 && suppressed.length > 0) {
+          risingEvents = filtered;
+          fallingEvents = fallingEvents.filter(
+            (fe) => !suppressed.some((g) => g.seg === fe.seg && fe.t > g.t0 && fe.t <= g.t1)
+          );
+        }
+      }
+    }
+  }
+
+  // Filter out remaining sub-cycle ringing glitch splits (< 35% of dominant upper-quantile period)
+  if (risingEvents.length >= 3) {
+    const rawP: number[] = [];
+    for (let k = 0; k + 1 < risingEvents.length; k++) {
+      if (risingEvents[k].seg === risingEvents[k + 1].seg) {
+        const p = risingEvents[k + 1].t - risingEvents[k].t;
+        if (p > 0) rawP.push(p);
+      }
+    }
+    if (rawP.length >= 2) {
+      const sorted = rawP.slice().sort((a, b) => a - b);
+      const upperRef = sorted[Math.min(sorted.length - 1, Math.ceil((sorted.length - 1) * 0.80))];
+      const filtered: typeof risingEvents = [risingEvents[0]];
+      const suppressed: Array<{ t0: number; t1: number; seg: number }> = [];
+      for (let k = 1; k < risingEvents.length; k++) {
+        const prev = filtered[filtered.length - 1];
+        const curr = risingEvents[k];
+        if (curr.seg === prev.seg && curr.t - prev.t < upperRef * 0.35) {
+          const next = risingEvents[k + 1];
+          if ((next && next.seg === prev.seg && next.t - prev.t <= upperRef * 1.45) ||
+              (k === risingEvents.length - 1 && curr.t - prev.t < upperRef * 0.25)) {
+            suppressed.push({ t0: prev.t, t1: curr.t, seg: curr.seg });
+            continue;
+          }
+        }
+        filtered.push(curr);
+      }
+      if (suppressed.length > 0 && filtered.length >= 2) {
+        risingEvents = filtered;
+        fallingEvents = fallingEvents.filter(
+          (fe) => !suppressed.some((g) => g.seg === fe.seg && fe.t > g.t0 && fe.t <= g.t1)
+        );
+      }
     }
   }
 

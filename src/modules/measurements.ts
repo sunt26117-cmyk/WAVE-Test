@@ -9,6 +9,7 @@
 import {
   ChannelMeasurements,
   CustomMeasurementDefinition,
+  CycleStatSummary,
   MeasurementGate,
   MeasurementMetricKey,
   WaveformChannel,
@@ -23,7 +24,7 @@ export interface MeasurementDefinition {
   group: 'voltage' | 'timing';
   label: string;
   shortLabel: string;
-  unitType: 'signal' | 'freq' | 'time' | 'percent';
+  unitType: 'signal' | 'freq' | 'time' | 'percent' | 'slew';
 }
 
 export const MEASUREMENT_DEFINITIONS: MeasurementDefinition[] = [
@@ -37,11 +38,14 @@ export const MEASUREMENT_DEFINITIONS: MeasurementDefinition[] = [
   { key: 'vtop', group: 'voltage', label: 'Top (Vtop)', shortLabel: 'Vtop', unitType: 'signal' },
   { key: 'vbase', group: 'voltage', label: 'Base (Vbase)', shortLabel: 'Vbase', unitType: 'signal' },
   { key: 'overshoot', group: 'voltage', label: 'Overshoot (%)', shortLabel: 'Ovsh', unitType: 'percent' },
-  // Timing / Frequency
+  { key: 'undershoot', group: 'voltage', label: 'Undershoot (%)', shortLabel: 'Unsh', unitType: 'percent' },
+  // Timing / Frequency / Slew
   { key: 'frequency', group: 'timing', label: 'Frequency', shortLabel: 'Freq', unitType: 'freq' },
   { key: 'period', group: 'timing', label: 'Period', shortLabel: 'Period', unitType: 'time' },
   { key: 'riseTime', group: 'timing', label: 'Rise Time (10-90%)', shortLabel: 'Rise', unitType: 'time' },
   { key: 'fallTime', group: 'timing', label: 'Fall Time (90-10%)', shortLabel: 'Fall', unitType: 'time' },
+  { key: 'slewRateRise', group: 'timing', label: '+Slew Rate (10-90% dv/dt)', shortLabel: '+dv/dt', unitType: 'slew' },
+  { key: 'slewRateFall', group: 'timing', label: '-Slew Rate (90-10% dv/dt)', shortLabel: '-dv/dt', unitType: 'slew' },
   { key: 'posWidth', group: 'timing', label: '+Width (50%)', shortLabel: '+Width', unitType: 'time' },
   { key: 'negWidth', group: 'timing', label: '-Width (50%)', shortLabel: '-Width', unitType: 'time' },
   { key: 'dutyCycle', group: 'timing', label: 'Duty Cycle (%)', shortLabel: 'Duty', unitType: 'percent' },
@@ -54,9 +58,40 @@ export const CUSTOM_MEASUREMENT_PRESETS: Array<Omit<CustomMeasurementDefinition,
   { label: 'AC Ripple RMS', shortLabel: 'Vac_rms', expression: 'sqrt(vrms^2 - vmean^2)', unitType: 'signal' },
   { label: 'Form Factor (RMS/|Avg|)', shortLabel: 'FF', expression: 'vrms / absmean', unitType: 'ratio' },
   { label: 'Duty Spread (Max-Min)', shortLabel: 'ΔDuty', expression: 'maxduty - minduty', unitType: 'percent' },
+  { label: 'Slew Symmetry (+dv/dt ÷ -dv/dt)', shortLabel: 'SlewSym', expression: 'dvdt_rise / dvdt_fall', unitType: 'ratio' },
 ];
 
 export type MeasurementStatus = 'OK' | 'INVALID' | 'INSUFFICIENT_DATA' | 'NO_OVERLAP';
+
+/**
+ * Computes Welford numerically-stable mean, min, max, and unbiased sample standard deviation.
+ */
+export function summarizeCycleDistribution(values: number[]): CycleStatSummary | undefined {
+  let count = 0;
+  let mean = 0;
+  let m2 = 0;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (!Number.isFinite(v)) continue;
+    count++;
+    if (v < min) min = v;
+    if (v > max) max = v;
+    const delta = v - mean;
+    mean += delta / count;
+    const delta2 = v - mean;
+    m2 += delta * delta2;
+  }
+  if (count === 0) return undefined;
+  return {
+    count,
+    mean,
+    min,
+    max,
+    stdDev: count >= 2 ? Math.sqrt(Math.max(0, m2 / (count - 1))) : null,
+  };
+}
 
 export interface CustomMeasurementDetailedResult {
   value: number | null;
@@ -248,7 +283,7 @@ function estimateHistogramTopBase(
     return { vtop: max, vbase: min };
   }
 
-  const bins = 64;
+  const bins = 128;
   const counts = new Uint32Array(bins);
   const sums = new Float64Array(bins);
   const step = Math.max(1, Math.floor((endIdx - startIdx + 1) / 20000));
@@ -268,25 +303,15 @@ function estimateHistogramTopBase(
     return { vtop: max, vbase: min };
   }
 
-  const midBin = Math.floor(bins / 2);
+  const minSep = Math.max(6, Math.floor(bins * 0.08));
 
-  // Upper half modal peak (Vtop)
-  let topPeakBin = bins - 1;
-  let topMaxCount = 0;
-  for (let b = midBin; b < bins; b++) {
-    if (counts[b] > topMaxCount) {
-      topMaxCount = counts[b];
-      topPeakBin = b;
-    }
-  }
-
-  // Lower half modal peak (Vbase)
-  let basePeakBin = 0;
-  let baseMaxCount = 0;
-  for (let b = 0; b < midBin; b++) {
-    if (counts[b] > baseMaxCount) {
-      baseMaxCount = counts[b];
-      basePeakBin = b;
+  // First find strongest amplitude plateau mode across the entire span
+  let mode1Bin = 0;
+  let mode1Count = 0;
+  for (let b = 0; b < bins; b++) {
+    if (counts[b] > mode1Count) {
+      mode1Count = counts[b];
+      mode1Bin = b;
     }
   }
 
@@ -300,11 +325,94 @@ function estimateHistogramTopBase(
     return c > 0 ? s / c : null;
   };
 
+  const clusterCount = (centerBin: number): number => {
+    let c = 0;
+    for (let b = Math.max(0, centerBin - 1); b <= Math.min(bins - 1, centerBin + 1); b++) {
+      c += counts[b];
+    }
+    return c;
+  };
+
+  // Find strongest secondary plateau mode well-separated from mode1Bin using 3-bin cluster energy
+  // (immune to >100% overshoot spikes pulling max high and handles low-duty PWM down to ~1-2%)
+  let mode2Bin = -1;
+  let mode2ClusterScore = 0;
+  for (let b = 0; b < bins; b++) {
+    if (Math.abs(b - mode1Bin) < minSep) continue;
+    const sc = clusterCount(b);
+    if (sc > mode2ClusterScore || (sc === mode2ClusterScore && counts[b] > (mode2Bin >= 0 ? counts[mode2Bin] : -1))) {
+      mode2ClusterScore = sc;
+      mode2Bin = b;
+    }
+  }
+
   const avgPerBin = totalSampled / bins;
+  const minPrimaryCluster = Math.max(3, totalSampled * 0.012);
+  const minSecondaryCluster = Math.max(2, totalSampled * 0.008);
+
+  // If mode2Bin landed on an intermediate shelf (e.g. Miller plateau, dead-time Vbus/2 shelf, or ripple peak),
+  // check if there is a further-out genuine plateau rail on the same side with substantial steady-state dwell.
+  if (mode2Bin >= 0) {
+    const dir = mode2Bin > mode1Bin ? 1 : -1;
+    const minOuterRailCluster = Math.max(3, totalSampled * 0.02);
+    let outerBin = -1;
+    let outerScore = 0;
+    for (let b = mode2Bin + dir * Math.max(4, Math.floor(minSep * 0.6)); b >= 0 && b < bins; b += dir) {
+      const sc = clusterCount(b);
+      if (sc >= minOuterRailCluster && sc > avgPerBin * 1.6 && sc >= mode2ClusterScore * 0.25) {
+        if (sc > outerScore) {
+          outerScore = sc;
+          outerBin = b;
+        }
+      }
+    }
+    if (outerBin >= 0) {
+      mode2Bin = outerBin;
+      mode2ClusterScore = outerScore;
+    }
+  }
+
+  if (
+    mode2Bin >= 0 &&
+    clusterCount(mode1Bin) >= minPrimaryCluster &&
+    mode2ClusterScore >= minSecondaryCluster &&
+    mode2ClusterScore > avgPerBin * 1.35
+  ) {
+    const baseBin = Math.min(mode1Bin, mode2Bin);
+    const topBin = Math.max(mode1Bin, mode2Bin);
+    const estBase = clusterMean(baseBin) ?? min;
+    const estTop = clusterMean(topBin) ?? max;
+    if (estTop > estBase) {
+      return { vtop: estTop, vbase: estBase };
+    }
+  }
+
+  const midBin = Math.floor(bins / 2);
+
+  // Upper half modal peak (Vtop) fallback
+  let topPeakBin = bins - 1;
+  let topMaxCount = 0;
+  for (let b = midBin; b < bins; b++) {
+    if (counts[b] > topMaxCount) {
+      topMaxCount = counts[b];
+      topPeakBin = b;
+    }
+  }
+
+  // Lower half modal peak (Vbase) fallback
+  let basePeakBin = 0;
+  let baseMaxCount = 0;
+  for (let b = 0; b < midBin; b++) {
+    if (counts[b] > baseMaxCount) {
+      baseMaxCount = counts[b];
+      basePeakBin = b;
+    }
+  }
+
   const vtop =
-    topMaxCount > avgPerBin * 2.0 ? (clusterMean(topPeakBin) ?? max) : max;
+    topMaxCount > avgPerBin * 2.5 ? (clusterMean(topPeakBin) ?? max) : max;
   const vbase =
-    baseMaxCount > avgPerBin * 2.0 ? (clusterMean(basePeakBin) ?? min) : min;
+    baseMaxCount > avgPerBin * 2.5 ? (clusterMean(basePeakBin) ?? min) : min;
 
   return vtop > vbase ? { vtop, vbase } : { vtop: max, vbase: min };
 }
@@ -345,8 +453,12 @@ function emptyMeasurements(
     minDutyCycle: null,
     riseTime: null,
     fallTime: null,
+    slewRateRise: null,
+    slewRateFall: null,
     posWidth: null,
     negWidth: null,
+    cycleCount: 0,
+    cycleStats: {},
     valid,
     status,
     coveragePct: 0,
@@ -543,7 +655,7 @@ export function computeMeasurements(
     undershoot = Math.max(0, ((vbase - min) / baseAmp) * 100);
   }
 
-  // Segmented Timing analysis: Frequency, Period, +Width, -Width, Duty, Max Duty, Min Duty, Rise/Fall Time
+  // Segmented Timing analysis: Frequency, Period, +Width, -Width, Duty, Max Duty, Min Duty, Rise/Fall Time, ±dv/dt & Multi-cycle stats
   let period: number | null = null;
   let frequency: number | null = null;
   let dutyCycle: number | null = null;
@@ -551,8 +663,12 @@ export function computeMeasurements(
   let minDutyCycle: number | null = null;
   let riseTime: number | null = null;
   let fallTime: number | null = null;
+  let slewRateRise: number | null = null;
+  let slewRateFall: number | null = null;
   let posWidth: number | null = null;
   let negWidth: number | null = null;
+  let cycleCount = 0;
+  const cycleStats: Partial<Record<MeasurementMetricKey, CycleStatSummary>> = {};
   const statusNotes: string[] = [];
 
   if (gapCount > 0) {
@@ -563,14 +679,19 @@ export function computeMeasurements(
   }
 
   if (vpp > 1e-12) {
-    const midLevel = baseAmp > 1e-12 ? (vtop + vbase) / 2 : (max + min) / 2;
-    const hysteresis = 0.05 * vpp;
+    const effBase = baseAmp > 1e-12 ? vbase : min;
+    const effTop = baseAmp > 1e-12 ? vtop : max;
+    const effAmp = effTop - effBase > 1e-12 ? effTop - effBase : vpp;
+    const midLevel = (effTop + effBase) / 2;
+    // Wide plateau-anchored Schmitt band (25%..75% of plateau) rejects Miller shelves,
+    // dead-time steps, and ringing spikes without disturbing sub-sample 50% backtracking.
+    const hysteresis = 0.25 * effAmp;
     const midHigh = midLevel + hysteresis;
     const midLow = midLevel - hysteresis;
 
-    const events: Array<{ type: 'rise' | 'fall'; time: number; segmentId: number }> = [];
-    const risingEdges: Array<{ time: number; segmentId: number }> = [];
-    const fallingEdges: Array<{ time: number; segmentId: number }> = [];
+    let events: Array<{ type: 'rise' | 'fall'; time: number; segmentId: number; sampleIdx: number }> = [];
+    let risingEdges: Array<{ time: number; segmentId: number; sampleIdx: number }> = [];
+    let fallingEdges: Array<{ time: number; segmentId: number }> = [];
 
     let segmentId = 0;
     let firstValidIdx = startIdx;
@@ -619,8 +740,8 @@ export function computeMeasurements(
         const dvj = vjCurr - vjPrev;
         const frac = Math.abs(dvj) > 1e-15 ? Math.max(0, Math.min(1, (midLevel - vjPrev) / dvj)) : 0.5;
         const cTime = tjPrev + frac * (tjCurr - tjPrev);
-        risingEdges.push({ time: cTime, segmentId });
-        events.push({ type: 'rise', time: cTime, segmentId });
+        risingEdges.push({ time: cTime, segmentId, sampleIdx: j });
+        events.push({ type: 'rise', time: cTime, segmentId, sampleIdx: j });
         state = 'high';
         segStartIdx = i;
       } else if (state === 'high' && vCurr <= midLow) {
@@ -636,30 +757,319 @@ export function computeMeasurements(
         const frac = Math.abs(dvj) > 1e-15 ? Math.max(0, Math.min(1, (midLevel - vjPrev) / dvj)) : 0.5;
         const cTime = tjPrev + frac * (tjCurr - tjPrev);
         fallingEdges.push({ time: cTime, segmentId });
-        events.push({ type: 'fall', time: cTime, segmentId });
+        events.push({ type: 'fall', time: cTime, segmentId, sampleIdx: j });
         state = 'low';
         segStartIdx = i;
       }
     }
 
-    // Period only across consecutive rising edges within the SAME continuous segment
+    // Prune narrow ringing bounces/glitches (turn-on dips, turn-off spikes, or intermediate Miller/dead-time shelves)
+    // from alternating events before pairing rising edges, preventing 2x PWM frequency doubling while keeping low-duty PWM intact.
+    if (events.length >= 4) {
+      const upperQuantile = (arr: number[], q: number) => {
+        if (arr.length === 0) return 0;
+        const s = arr.slice().sort((a, b) => a - b);
+        return s[Math.min(s.length - 1, Math.ceil((s.length - 1) * q))];
+      };
+      const highRailTarget = effBase + 0.65 * effAmp;
+      const lowRailTarget = effBase + 0.35 * effAmp;
+
+      let changed = true;
+      let pass = 0;
+      while (changed && pass < 6 && events.length >= 4) {
+        changed = false;
+        pass++;
+        const highDurs: number[] = [];
+        const lowDurs: number[] = [];
+        const allDurs: number[] = [];
+        for (let k = 0; k + 1 < events.length; k++) {
+          if (events[k].segmentId !== events[k + 1].segmentId) continue;
+          const d = events[k + 1].time - events[k].time;
+          if (!(d > 0)) continue;
+          allDurs.push(d);
+          if (events[k].type === 'rise' && events[k + 1].type === 'fall') highDurs.push(d);
+          else if (events[k].type === 'fall' && events[k + 1].type === 'rise') lowDurs.push(d);
+        }
+        const refHigh = upperQuantile(highDurs, 0.85);
+        const refLow = upperQuantile(lowDurs, 0.85);
+        const refPhase = upperQuantile(allDurs, 0.85);
+        if (!(refPhase > 0)) break;
+
+        const nextEvents: typeof events = [];
+        let k = 0;
+        while (k < events.length) {
+          if (k + 1 < events.length && events[k].segmentId === events[k + 1].segmentId) {
+            const dur = events[k + 1].time - events[k].time;
+            const isHigh = events[k].type === 'rise' && events[k + 1].type === 'fall';
+            const samePolarityRef = isHigh ? refHigh : refLow;
+            const prevDur =
+              k > 0 && events[k - 1].segmentId === events[k].segmentId
+                ? events[k].time - events[k - 1].time
+                : Infinity;
+            const nextDur =
+              k + 2 < events.length && events[k + 1].segmentId === events[k + 2].segmentId
+                ? events[k + 2].time - events[k + 1].time
+                : Infinity;
+
+            // Check whether this interior half-cycle fails to reach the opposite steady-state rail region
+            let failsRailExcursion = false;
+            if (k > 0 && k + 1 < events.length - 1) {
+              const s0 = Math.max(startIdx, Math.min(events[k].sampleIdx, events[k + 1].sampleIdx) - 1);
+              const s1 = Math.min(endIdx, Math.max(events[k].sampleIdx, events[k + 1].sampleIdx) + 1);
+              if (isHigh) {
+                let pMax = -Infinity;
+                for (let m = s0; m <= s1; m++) {
+                  const vm = valAt(m);
+                  if (isFinite(vm) && vm > pMax) pMax = vm;
+                }
+                if (isFinite(pMax) && pMax < highRailTarget) failsRailExcursion = true;
+              } else {
+                let pMin = Infinity;
+                for (let m = s0; m <= s1; m++) {
+                  const vm = valAt(m);
+                  if (isFinite(vm) && vm < pMin) pMin = vm;
+                }
+                if (isFinite(pMin) && pMin > lowRailTarget) failsRailExcursion = true;
+              }
+            }
+
+            const isShortPair =
+              failsRailExcursion ||
+              (samePolarityRef > 0 && dur < samePolarityRef * 0.22 && (prevDur > dur * 2.2 || nextDur > dur * 2.2)) ||
+              (dur < refPhase * 0.14 && prevDur < refPhase * 0.14 && prevDur <= nextDur) ||
+              (dur < refPhase * 0.14 && nextDur < refPhase * 0.14 && nextDur <= prevDur);
+            if (isShortPair) {
+              k += 2;
+              changed = true;
+              continue;
+            }
+          }
+          nextEvents.push(events[k]);
+          k++;
+        }
+        if (changed && nextEvents.length >= 2) {
+          events = nextEvents;
+        } else {
+          break;
+        }
+      }
+      risingEdges = events
+        .filter((ev) => ev.type === 'rise')
+        .map((ev) => ({ time: ev.time, segmentId: ev.segmentId, sampleIdx: ev.sampleIdx }));
+      fallingEdges = events
+        .filter((ev) => ev.type === 'fall')
+        .map((ev) => ({ time: ev.time, segmentId: ev.segmentId }));
+    }
+
+    // Collapse systematic alternating sub-cycle period-doubling [d_a, d_b, d_a, d_b] where every cycle
+    // was split into a main pulse and a secondary bounce/shelf pulse (so d_a + d_b = T_true).
+    if (risingEdges.length >= 4) {
+      const pulseWidthForRise = (rIdx: number): number => {
+        const r0 = risingEdges[rIdx];
+        const r1 = risingEdges[rIdx + 1];
+        if (!r0 || !r1 || r0.segmentId !== r1.segmentId) return 0;
+        const fe = fallingEdges.find((f) => f.segmentId === r0.segmentId && f.time > r0.time && f.time < r1.time);
+        return fe ? fe.time - r0.time : (r1.time - r0.time) * 0.5;
+      };
+      const intervals: Array<{ idx: number; dt: number; width: number; seg: number }> = [];
+      for (let k = 0; k + 1 < risingEdges.length; k++) {
+        if (risingEdges[k].segmentId === risingEdges[k + 1].segmentId) {
+          const dt = risingEdges[k + 1].time - risingEdges[k].time;
+          if (dt > 0) intervals.push({ idx: k, dt, width: pulseWidthForRise(k), seg: risingEdges[k].segmentId });
+        }
+      }
+      if (intervals.length >= 3) {
+        const sampleDt =
+          integrity.timebase.dtMedian && integrity.timebase.dtMedian > 0
+            ? integrity.timebase.dtMedian
+            : endIdx > startIdx
+            ? Math.abs(t[endIdx] - t[startIdx]) / Math.max(1, endIdx - startIdx)
+            : 0;
+        let altTriples = 0;
+        let validTriples = 0;
+        for (let k = 0; k + 2 < intervals.length; k++) {
+          const a = intervals[k];
+          const b = intervals[k + 1];
+          const c = intervals[k + 2];
+          if (a.seg !== b.seg || b.seg !== c.seg) continue;
+          validTriples++;
+          const pair1 = a.dt + b.dt;
+          const pair2 = b.dt + c.dt;
+          const pairConsistent = Math.abs(pair1 - pair2) / Math.max(pair1, pair2) <= 0.16;
+          const maxW = Math.max(a.width, b.width);
+          const minW = Math.min(a.width, b.width);
+          const maxDt = Math.max(a.dt, b.dt);
+          const minDt = Math.min(a.dt, b.dt);
+          const dtSeverelyAlternates =
+            (a.dt - b.dt) * (b.dt - c.dt) < 0 &&
+            Math.abs(a.dt - b.dt) > 2.2 * sampleDt &&
+            minDt < maxDt * 0.40 &&
+            minW < maxW * 0.65;
+          const widthAlternates =
+            (a.width - b.width) * (b.width - c.width) < 0 &&
+            maxW > 2.2 * sampleDt &&
+            minW < maxW * 0.30;
+          if (pairConsistent && (dtSeverelyAlternates || widthAlternates)) {
+            altTriples++;
+          }
+        }
+        if (validTriples >= 1 && altTriples / validTriples >= 0.65) {
+          // Determine whether odd-indexed or even-indexed intervals carry the smaller secondary pulse
+          let evenScore = 0;
+          let oddScore = 0;
+          for (let k = 0; k < intervals.length; k++) {
+            const score = intervals[k].width > 0 ? intervals[k].width : intervals[k].dt;
+            if (k % 2 === 0) evenScore += score;
+            else oddScore += score;
+          }
+          const dropOddRise = evenScore >= oddScore;
+          const filteredRising: typeof risingEdges = [];
+          const suppressedRanges: Array<{ t0: number; t1: number; seg: number }> = [];
+          for (let k = 0; k < risingEdges.length; k++) {
+            const shouldDrop = dropOddRise ? k % 2 === 1 : k > 0 && k % 2 === 0;
+            if (shouldDrop && filteredRising.length > 0 && filteredRising[filteredRising.length - 1].segmentId === risingEdges[k].segmentId) {
+              const prevKept = filteredRising[filteredRising.length - 1];
+              suppressedRanges.push({ t0: prevKept.time, t1: risingEdges[k].time, seg: risingEdges[k].segmentId });
+              continue;
+            }
+            filteredRising.push(risingEdges[k]);
+          }
+          if (filteredRising.length >= 2 && suppressedRanges.length > 0) {
+            risingEdges = filteredRising;
+            const isGlitch = (seg: number, tm: number) =>
+              suppressedRanges.some((g) => g.seg === seg && tm > g.t0 && tm <= g.t1);
+            fallingEdges = fallingEdges.filter((fe) => !isGlitch(fe.segmentId, fe.time));
+            events = events.filter((ev) => !isGlitch(ev.segmentId, ev.time));
+          }
+        }
+      }
+    }
+
+    // Secondary period check: suppress remaining sub-cycle glitches using ceiling quantile (safe on >= 2 periods)
+    if (risingEdges.length >= 3) {
+      const rawPeriods: number[] = [];
+      for (let k = 0; k + 1 < risingEdges.length; k++) {
+        if (risingEdges[k].segmentId === risingEdges[k + 1].segmentId) {
+          const p = risingEdges[k + 1].time - risingEdges[k].time;
+          if (p > 0) rawPeriods.push(p);
+        }
+      }
+      if (rawPeriods.length >= 2) {
+        const sortedP = rawPeriods.slice().sort((a, b) => a - b);
+        const upperRefPeriod = sortedP[Math.min(sortedP.length - 1, Math.ceil((sortedP.length - 1) * 0.80))];
+        const minValidPeriod = upperRefPeriod * 0.35;
+        const filteredRising: typeof risingEdges = [risingEdges[0]];
+        const suppressedRiseTimes: Array<{ t0: number; t1: number; seg: number }> = [];
+        for (let k = 1; k < risingEdges.length; k++) {
+          const prevKept = filteredRising[filteredRising.length - 1];
+          const curr = risingEdges[k];
+          if (curr.segmentId === prevKept.segmentId && curr.time - prevKept.time < minValidPeriod) {
+            const next = risingEdges[k + 1];
+            const mergedMatchesUpper =
+              next &&
+              next.segmentId === prevKept.segmentId &&
+              next.time - prevKept.time <= upperRefPeriod * 1.45;
+            if (mergedMatchesUpper || (k === risingEdges.length - 1 && curr.time - prevKept.time < upperRefPeriod * 0.25)) {
+              suppressedRiseTimes.push({ t0: prevKept.time, t1: curr.time, seg: curr.segmentId });
+              continue;
+            }
+          }
+          filteredRising.push(curr);
+        }
+        if (suppressedRiseTimes.length > 0 && filteredRising.length >= 2) {
+          risingEdges = filteredRising;
+          const isGlitchEvent = (seg: number, tm: number) =>
+            suppressedRiseTimes.some((g) => g.seg === seg && tm > g.t0 && tm <= g.t1);
+          fallingEdges = fallingEdges.filter((fe) => !isGlitchEvent(fe.segmentId, fe.time));
+          events = events.filter((ev) => !isGlitchEvent(ev.segmentId, ev.time));
+        }
+      }
+    }
+
+    // Period & per-cycle amplitude stats across consecutive rising edges within the SAME continuous segment
     const segmentPeriods: number[] = [];
+    const segmentFreqs: number[] = [];
+    const cycMaxArr: number[] = [];
+    const cycMinArr: number[] = [];
+    const cycVppArr: number[] = [];
+    const cycRmsArr: number[] = [];
+    const cycOvshArr: number[] = [];
+    const cycUnshArr: number[] = [];
+
     for (let k = 0; k + 1 < risingEdges.length; k++) {
       const r0 = risingEdges[k];
       const r1 = risingEdges[k + 1];
       if (r0.segmentId === r1.segmentId && r1.time > r0.time) {
-        segmentPeriods.push(r1.time - r0.time);
+        const pSec = r1.time - r0.time;
+        segmentPeriods.push(pSec);
+        segmentFreqs.push(1 / pSec);
+
+        // O(N) non-overlapping per-cycle amplitude scan
+        const idxA = Math.max(startIdx, r0.sampleIdx);
+        const idxB = Math.min(endIdx, r1.sampleIdx);
+        if (idxB > idxA) {
+          let cMin = Infinity;
+          let cMax = -Infinity;
+          let cSqInt = 0;
+          let cDtTot = 0;
+          let cSumSq = 0;
+          let cCnt = 0;
+          for (let idx = idxA; idx <= idxB; idx++) {
+            const vCur = valAt(idx);
+            if (!isFinite(vCur)) continue;
+            if (vCur < cMin) cMin = vCur;
+            if (vCur > cMax) cMax = vCur;
+            cSumSq += vCur * vCur;
+            cCnt++;
+            if (idx > idxA) {
+              const vPrv = valAt(idx - 1);
+              const dtC = t[idx] - t[idx - 1];
+              if (isFinite(vPrv) && dtC > 0 && (!Number.isFinite(gapThreshold) || dtC <= gapThreshold)) {
+                cSqInt += ((vPrv * vPrv + vPrv * vCur + vCur * vCur) / 3) * dtC;
+                cDtTot += dtC;
+              }
+            }
+          }
+          if (cCnt >= 2 && isFinite(cMin) && isFinite(cMax)) {
+            cycMaxArr.push(cMax);
+            cycMinArr.push(cMin);
+            cycVppArr.push(cMax - cMin);
+            cycRmsArr.push(cDtTot > 0 ? Math.sqrt(Math.max(0, cSqInt / cDtTot)) : Math.sqrt(cSumSq / cCnt));
+            if (baseAmp > 1e-12) {
+              cycOvshArr.push(Math.max(0, ((cMax - vtop) / baseAmp) * 100));
+              cycUnshArr.push(Math.max(0, ((vbase - cMin) / baseAmp) * 100));
+            }
+          }
+        }
       }
     }
 
+    cycleCount = segmentPeriods.length;
     if (segmentPeriods.length >= 1) {
       period = segmentPeriods.reduce((a, b) => a + b, 0) / segmentPeriods.length;
       if (period > 0) {
         frequency = 1 / period;
       }
+      const pStat = summarizeCycleDistribution(segmentPeriods);
+      const fStat = summarizeCycleDistribution(segmentFreqs);
+      if (pStat) cycleStats.period = pStat;
+      if (fStat) cycleStats.frequency = fStat;
     } else {
       statusNotes.push('Insufficient continuous cycles in range for period/frequency detection');
     }
+
+    const maxStat = summarizeCycleDistribution(cycMaxArr);
+    const minStat = summarizeCycleDistribution(cycMinArr);
+    const vppStat = summarizeCycleDistribution(cycVppArr);
+    const rmsStat = summarizeCycleDistribution(cycRmsArr);
+    const ovshStat = summarizeCycleDistribution(cycOvshArr);
+    const unshStat = summarizeCycleDistribution(cycUnshArr);
+    if (maxStat) cycleStats.max = maxStat;
+    if (minStat) cycleStats.min = minStat;
+    if (vppStat) cycleStats.vpp = vppStat;
+    if (rmsStat) cycleStats.rms = rmsStat;
+    if (ovshStat) cycleStats.overshoot = ovshStat;
+    if (unshStat) cycleStats.undershoot = unshStat;
 
     // +Width & -Width across consecutive alternating edges within the SAME continuous segment
     const posWidths: number[] = [];
@@ -676,9 +1086,13 @@ export function computeMeasurements(
     }
     if (posWidths.length > 0) {
       posWidth = posWidths.reduce((a, b) => a + b, 0) / posWidths.length;
+      const pwStat = summarizeCycleDistribution(posWidths);
+      if (pwStat) cycleStats.posWidth = pwStat;
     }
     if (negWidths.length > 0) {
       negWidth = negWidths.reduce((a, b) => a + b, 0) / negWidths.length;
+      const nwStat = summarizeCycleDistribution(negWidths);
+      if (nwStat) cycleStats.negWidth = nwStat;
     }
 
     // Cycle-by-cycle duty cycle array across consecutive rising edges in the SAME continuous segment
@@ -711,18 +1125,23 @@ export function computeMeasurements(
       maxDutyCycle = Math.max(...cycleDuties);
       minDutyCycle = Math.min(...cycleDuties);
       dutyCycle = cycleDuties.reduce((a, b) => a + b, 0) / cycleDuties.length;
+      const dStat = summarizeCycleDistribution(cycleDuties);
+      if (dStat) cycleStats.dutyCycle = dStat;
     } else if (posWidth !== null && period !== null && period > 0) {
       dutyCycle = Math.max(0, Math.min(100, (posWidth / period) * 100));
     }
 
-    // Rise Time (10% to 90%) and Fall Time (90% to 10%) strictly within continuous segments
+    // Rise Time (10% to 90%), Fall Time (90% to 10%), and ±Slew Rate (10-90% dv/dt or di/dt) strictly within continuous segments
     const refLow = baseAmp > 1e-12 ? vbase : min;
     const refSpan = baseAmp > 1e-12 ? baseAmp : vpp;
     const v10 = refLow + 0.1 * refSpan;
     const v90 = refLow + 0.9 * refSpan;
+    const dv1090 = v90 - v10;
 
     const riseTimes: number[] = [];
     const fallTimes: number[] = [];
+    const riseSlews: number[] = [];
+    const fallSlews: number[] = [];
 
     let riseStartT: number | null = null;
     let fallStartT: number | null = null;
@@ -744,7 +1163,11 @@ export function computeMeasurements(
       }
       if (riseStartT !== null && vp < v90 && vc >= v90) {
         const t90 = tp + ((v90 - vp) / (vc - vp)) * dtSpan;
-        if (t90 > riseStartT) riseTimes.push(t90 - riseStartT);
+        const dtRise = t90 - riseStartT;
+        if (dtRise > 1e-15) {
+          riseTimes.push(dtRise);
+          riseSlews.push(dv1090 / dtRise);
+        }
         riseStartT = null;
       } else if (vc < vp) {
         riseStartT = null;
@@ -755,7 +1178,11 @@ export function computeMeasurements(
       }
       if (fallStartT !== null && vp > v10 && vc <= v10) {
         const t10 = tp + ((vp - v10) / (vp - vc)) * dtSpan;
-        if (t10 > fallStartT) fallTimes.push(t10 - fallStartT);
+        const dtFall = t10 - fallStartT;
+        if (dtFall > 1e-15) {
+          fallTimes.push(dtFall);
+          fallSlews.push(dv1090 / dtFall);
+        }
         fallStartT = null;
       } else if (vc > vp) {
         fallStartT = null;
@@ -764,9 +1191,19 @@ export function computeMeasurements(
 
     if (riseTimes.length > 0) {
       riseTime = riseTimes.reduce((a, b) => a + b, 0) / riseTimes.length;
+      slewRateRise = riseSlews.reduce((a, b) => a + b, 0) / riseSlews.length;
+      const rtStat = summarizeCycleDistribution(riseTimes);
+      const rsStat = summarizeCycleDistribution(riseSlews);
+      if (rtStat) cycleStats.riseTime = rtStat;
+      if (rsStat) cycleStats.slewRateRise = rsStat;
     }
     if (fallTimes.length > 0) {
       fallTime = fallTimes.reduce((a, b) => a + b, 0) / fallTimes.length;
+      slewRateFall = fallSlews.reduce((a, b) => a + b, 0) / fallSlews.length;
+      const ftStat = summarizeCycleDistribution(fallTimes);
+      const fsStat = summarizeCycleDistribution(fallSlews);
+      if (ftStat) cycleStats.fallTime = ftStat;
+      if (fsStat) cycleStats.slewRateFall = fsStat;
     }
   }
 
@@ -796,8 +1233,12 @@ export function computeMeasurements(
     minDutyCycle,
     riseTime,
     fallTime,
+    slewRateRise,
+    slewRateFall,
     posWidth,
     negWidth,
+    cycleCount,
+    cycleStats,
     valid: validCount >= 2,
     status: validCount >= 2 ? 'OK' : 'INSUFFICIENT_DATA',
     coveragePct,
@@ -933,10 +1374,13 @@ export function evaluateCustomMeasurementDetailed(
       vtop: meas.vtop ?? NaN,
       vbase: meas.vbase ?? NaN,
       overshoot: meas.overshoot ?? NaN,
+      undershoot: meas.undershoot ?? NaN,
       freq: meas.frequency ?? NaN,
       period: meas.period ?? NaN,
       rise: meas.riseTime ?? NaN,
       fall: meas.fallTime ?? NaN,
+      dvdt_rise: meas.slewRateRise ?? NaN,
+      dvdt_fall: meas.slewRateFall ?? NaN,
       poswidth: meas.posWidth ?? NaN,
       negwidth: meas.negWidth ?? NaN,
       duty: meas.dutyCycle ?? NaN,

@@ -56,10 +56,13 @@ export type MeasurementMetricKey =
   | 'vtop'
   | 'vbase'
   | 'overshoot'
+  | 'undershoot'
   | 'frequency'
   | 'period'
   | 'riseTime'
   | 'fallTime'
+  | 'slewRateRise'
+  | 'slewRateFall'
   | 'posWidth'
   | 'negWidth'
   | 'dutyCycle'
@@ -141,6 +144,8 @@ export interface WaveformChannel {
   compareGroupName?: string;
   compareGroupColor?: string;
   compareRole?: 'target' | 'ref' | 'diff';
+  /** Monotonic counter incremented when channel samples/timebase are mutated in-place for render cache invalidation. */
+  dataVersion?: number;
 }
 
 export type PlotMode = 'time' | 'frequency' | 'xy';
@@ -264,6 +269,14 @@ export interface TriggerConfig {
 
 export type MeasurementGate = 'view' | 'cursors' | 'entire';
 
+export interface CycleStatSummary {
+  count: number;
+  mean: number;
+  min: number;
+  max: number;
+  stdDev: number | null;
+}
+
 export interface ChannelMeasurements {
   channelId: string;
   channelName: string;
@@ -294,8 +307,14 @@ export interface ChannelMeasurements {
   minDutyCycle: number | null; // %
   riseTime: number | null; // s (10% to 90%)
   fallTime: number | null; // s (90% to 10%)
+  slewRateRise?: number | null; // unit/s (10% to 90% rising slope)
+  slewRateFall?: number | null; // unit/s (90% to 10% falling slope magnitude)
   posWidth: number | null; // s (+Width at 50%)
   negWidth: number | null; // s (-Width at 50%)
+
+  /** Complete continuous cycles detected in gated window and per-metric distribution stats. */
+  cycleCount?: number;
+  cycleStats?: Partial<Record<MeasurementMetricKey, CycleStatSummary>>;
 
   valid?: boolean;
   status?: 'OK' | 'INVALID' | 'INSUFFICIENT_DATA' | 'NO_OVERLAP';

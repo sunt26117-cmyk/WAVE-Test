@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/modules/focThermalSteady.test.ts src/modules/focSteadyHandoff.test.ts src/modules/focMosDeviceProfiles.test.ts src/modules/thermalEngine.test.ts src/modules/filter.test.ts src/modules/excelTimeAlignment.test.ts src/modules/timeSeriesModules.test.ts src/modules/engineeringAudit.test.ts src/modules/focDyno/focDyno.test.ts src/parsers/csvParser.test.ts src/parsers/excelParser.test.ts",
+    "test": "tsx --test src/modules/focThermalSteady.test.ts src/modules/focSteadyHandoff.test.ts src/modules/focMosDeviceProfiles.test.ts src/modules/thermalEngine.test.ts src/modules/filter.test.ts src/modules/excelTimeAlignment.test.ts src/modules/timeSeriesModules.test.ts src/modules/engineeringAudit.test.ts src/modules/engineeringEnhancements.test.ts src/modules/themeManager.test.ts src/modules/focDyno/focDyno.test.ts src/modules/importAndPwmFixes.test.ts src/parsers/csvParser.test.ts src/parsers/excelParser.test.ts",
     "test:foc-steady": "tsx --test src/modules/focThermalSteady.test.ts src/modules/focSteadyHandoff.test.ts"
   },
   "dependencies": {

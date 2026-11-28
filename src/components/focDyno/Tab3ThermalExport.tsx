@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Activity, AlertTriangle, Check, Copy, Download, Flame } from 'lucide-react';
+import { Activity, AlertTriangle, Check, Copy, Download, Flame, PlusCircle } from 'lucide-react';
 import { MotorParams, SVPWM_LINEAR_LIMIT } from '../../modules/focDyno/motorPhysics';
 import { MAX_EXPORT_SAMPLES, ExporterModulationMode, synthesizeSixMosWaveform } from '../../modules/focDyno/thermalExporter';
 import {
@@ -7,6 +7,7 @@ import {
   buildOscilloscopeTabFromSixMos,
   buildThermalHandoffFromSixMos,
 } from '../../modules/focDyno/scopeBridge';
+import { FocMissionStage } from '../../modules/focThermal';
 import { TabState } from '../../types/models';
 import { MultiChannelWaveChart } from './Charts';
 import { SmoothNumberInput } from './SmoothNumberInput';
@@ -18,6 +19,7 @@ interface Tab3Props {
   onChangeExportPoint: (pt: { vMeasV: number; iBusA: number; nRpm: number }) => void;
   onSendTabToScope: (tab: TabState) => void;
   onSendToSixMosThermal: (payload: FocThermalHandoffPayload) => void;
+  onAppendMissionStage?: (stage: FocMissionStage) => void;
   onNotify: (msg: string) => void;
 }
 
@@ -28,6 +30,7 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
   onChangeExportPoint,
   onSendTabToScope,
   onSendToSixMosThermal,
+  onAppendMissionStage,
   onNotify,
 }) => {
   const [tAmbC, setTAmbC] = useState(25);
@@ -102,6 +105,32 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
       return;
     }
     onSendToSixMosThermal(payload);
+  };
+
+  const handleAppendMissionStage = () => {
+    if (!onAppendMissionStage) return;
+    if (synth.error) {
+      onNotify(synth.error || '当前工况无物理实数解，无法追加任务剖面阶段。');
+      return;
+    }
+    const isStall = synth.summary.isStall || exportPoint.nRpm <= 0;
+    const stage: FocMissionStage = {
+      id: `dyno_${Date.now().toString(36)}`,
+      label: isStall
+        ? `堵转 ${synth.summary.iqPeakA.toFixed(1)}A`
+        : `${Math.round(exportPoint.nRpm)}rpm ${synth.summary.iqPeakA.toFixed(1)}A`,
+      mode: isStall ? 'locked_rotor' : 'rotating',
+      durationSec: Math.max(1, Number(durationS.toFixed(2))),
+      iqPeakA: Number(synth.summary.iqPeakA.toFixed(3)),
+      electricalFrequencyHz: Number(synth.summary.feHz.toFixed(3)),
+      electricalAngleDeg: isStall ? 90 : undefined,
+      vBusV: Number(synth.summary.vBusCapV.toFixed(3)),
+      modDepthM: Number(synth.summary.mCmd.toFixed(4)),
+      pfAngleDeg: Number(synth.summary.phiCmdDeg.toFixed(2)),
+      fswHz: params.fSwKhz * 1e3,
+      tAmbC,
+    };
+    onAppendMissionStage(stage);
   };
 
   const copyValue = (key: string, val: string) => {
@@ -187,6 +216,19 @@ export const Tab3ThermalExport: React.FC<Tab3Props> = ({
               <Flame className="h-3.5 w-3.5" />
               {synth.error ? '工况无解' : '导入恒定工况到 MOS Thermal'}
             </button>
+
+            {onAppendMissionStage && (
+              <button
+                type="button"
+                disabled={Boolean(synth.error)}
+                onClick={handleAppendMissionStage}
+                className="dyno-btn-ghost inline-flex items-center gap-1.5 rounded-sm border px-3 py-1.5 text-xs font-medium whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
+                title="将当前已标定 FOC 工况点直接追加为 MOS Thermal Tab 4 多阶段任务剖面的一个阶段"
+              >
+                <PlusCircle className="h-3.5 w-3.5 text-emerald-400" />
+                + 追加为热任务剖面阶段
+              </button>
+            )}
           </div>
         </div>
 

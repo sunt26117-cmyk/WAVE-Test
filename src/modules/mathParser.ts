@@ -19,6 +19,7 @@ export interface Token {
   type: 'number' | 'identifier' | 'operator' | 'function' | 'lparen' | 'rparen' | 'comma';
   value: string;
   numValue?: number;
+  argCount?: number;
 }
 
 const OPERATOR_PRECEDENCE: Record<string, number> = {
@@ -37,19 +38,26 @@ const RIGHT_ASSOCIATIVE: Record<string, boolean> = {
   'unary+': true,
 };
 
-const MATH_FUNCTIONS = new Set([
-  'abs',
-  'sqrt',
-  'sin',
-  'cos',
-  'tan',
-  'mean',
-  'rms',
-  'min',
-  'max',
-  'diff',
-  'deriv',
-]);
+const FUNCTION_ARITY: Record<string, { min: number; max: number }> = {
+  abs: { min: 1, max: 1 },
+  sqrt: { min: 1, max: 1 },
+  sin: { min: 1, max: 1 },
+  cos: { min: 1, max: 1 },
+  tan: { min: 1, max: 1 },
+  mean: { min: 1, max: 1 },
+  rms: { min: 1, max: 1 },
+  min: { min: 1, max: 1 },
+  max: { min: 1, max: 1 },
+  diff: { min: 1, max: 1 },
+  deriv: { min: 1, max: 1 },
+  integ: { min: 1, max: 1 },
+  movrms: { min: 2, max: 2 },
+  movavg: { min: 2, max: 2 },
+  hypot: { min: 2, max: 2 },
+  atan2: { min: 2, max: 2 },
+};
+
+const MATH_FUNCTIONS = new Set(Object.keys(FUNCTION_ARITY));
 
 /**
  * Tokenizes mathematical expression string into tokens.
@@ -207,6 +215,7 @@ export function tokenizeMath(
 export function toRPN(tokens: Token[]): Token[] {
   const output: Token[] = [];
   const operatorStack: Token[] = [];
+  const fnArgCountStack: number[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -214,7 +223,11 @@ export function toRPN(tokens: Token[]): Token[] {
     if (token.type === 'number' || token.type === 'identifier') {
       output.push(token);
     } else if (token.type === 'function') {
-      operatorStack.push(token);
+      const next = tokens[i + 1];
+      if (!next || next.type !== 'lparen') {
+        throw new Error(`函数 "${token.value}" 后必须紧跟左括号 "("`);
+      }
+      operatorStack.push({ ...token });
     } else if (token.type === 'comma') {
       while (
         operatorStack.length > 0 &&
@@ -222,9 +235,10 @@ export function toRPN(tokens: Token[]): Token[] {
       ) {
         output.push(operatorStack.pop()!);
       }
-      if (operatorStack.length === 0) {
+      if (operatorStack.length === 0 || fnArgCountStack.length === 0) {
         throw new Error('Misplaced comma in function arguments');
       }
+      fnArgCountStack[fnArgCountStack.length - 1] += 1;
     } else if (token.type === 'operator') {
       const o1 = token.value;
       const p1 = OPERATOR_PRECEDENCE[o1] || 0;
@@ -248,6 +262,11 @@ export function toRPN(tokens: Token[]): Token[] {
       }
       operatorStack.push(token);
     } else if (token.type === 'lparen') {
+      const prev = tokens[i - 1];
+      if (prev && prev.type === 'function') {
+        const next = tokens[i + 1];
+        fnArgCountStack.push(next && next.type === 'rparen' ? 0 : 1);
+      }
       operatorStack.push(token);
     } else if (token.type === 'rparen') {
       while (
@@ -265,7 +284,15 @@ export function toRPN(tokens: Token[]): Token[] {
         operatorStack.length > 0 &&
         operatorStack[operatorStack.length - 1].type === 'function'
       ) {
-        output.push(operatorStack.pop()!);
+        const fnToken = operatorStack.pop()!;
+        const argCount = fnArgCountStack.pop() ?? 1;
+        const spec = FUNCTION_ARITY[fnToken.value];
+        if (spec && (argCount < spec.min || argCount > spec.max)) {
+          const expected = spec.min === spec.max ? `${spec.min}` : `${spec.min}~${spec.max}`;
+          throw new Error(`函数 "${fnToken.value}" 需要 ${expected} 个参数，当前提供了 ${argCount} 个。`);
+        }
+        fnToken.argCount = argCount;
+        output.push(fnToken);
       }
     }
   }
@@ -694,6 +721,153 @@ export function evaluateRPN(
 
     if (token.type === 'function') {
       const fn = token.value;
+      const arity = token.argCount ?? (FUNCTION_ARITY[fn]?.min ?? 1);
+
+      // 2-argument functions
+      if (fn === 'movrms' || fn === 'movavg' || fn === 'hypot' || fn === 'atan2') {
+        if (arity !== 2) {
+          throw new Error(`函数 "${fn}" 需要 2 个参数，当前提供了 ${arity} 个。`);
+        }
+        const arg2 = stack.pop();
+        const arg1 = stack.pop();
+        if (!arg1 || !arg2) throw new Error(`Missing arguments for function "${fn}"`);
+
+        if (fn === 'hypot' || fn === 'atan2') {
+          const { scaleA, scaleB, outUnit } = resolveBinaryUnitOperation(arg1.unit, arg2.unit, '+');
+          const resUnit = fn === 'atan2' ? 'rad' : outUnit;
+          if (arg1.isScalar && arg2.isScalar) {
+            const vA = arg1.val * scaleA;
+            const vB = arg2.val * scaleB;
+            const r = fn === 'hypot' ? Math.hypot(vA, vB) : Math.atan2(vA, vB);
+            stack.push({ isScalar: true, val: Number.isFinite(r) ? r : NaN, unit: resUnit });
+          } else {
+            const res = new Float32Array(sampleCount);
+            for (let i = 0; i < sampleCount; i++) {
+              const vA = (arg1.isScalar ? arg1.val : arg1.val[i]) * scaleA;
+              const vB = (arg2.isScalar ? arg2.val : arg2.val[i]) * scaleB;
+              if (!isFinite(vA) || !isFinite(vB)) {
+                res[i] = NaN;
+              } else {
+                res[i] = fn === 'hypot' ? Math.hypot(vA, vB) : Math.atan2(vA, vB);
+              }
+            }
+            stack.push({ isScalar: false, val: res, unit: resUnit });
+          }
+          continue;
+        }
+
+        // movrms(x, winSec) / movavg(x, winSec) — O(N) non-uniform, gap-safe, drift-free prefix integral
+        if (!arg2.isScalar) {
+          throw new Error(`函数 ${fn}(x, winSec) 的第 2 个参数窗口时长必须为正标量（单位：秒）。`);
+        }
+        let winSec = arg2.val;
+        const winUnitParsed = parsePhysicalUnit(arg2.unit);
+        if (arg2.unit && winUnitParsed?.domain === 'time') {
+          winSec *= winUnitParsed.scale;
+        } else if (arg2.unit && arg2.unit !== '1' && arg2.unit.toLowerCase() !== 'pu') {
+          throw new Error(`函数 ${fn}(x, winSec) 的窗口参数单位 "${arg2.unit}" 不是无量纲秒数或时间单位。`);
+        }
+        if (!Number.isFinite(winSec) || winSec <= 0) {
+          throw new Error(`函数 ${fn}(x, winSec) 的窗口时长必须为大于 0 的有限值（当前=${arg2.val}）。`);
+        }
+
+        if (arg1.isScalar) {
+          const v = fn === 'movrms' ? Math.abs(arg1.val) : arg1.val;
+          stack.push({ isScalar: true, val: isFinite(v) ? v : NaN, unit: arg1.unit });
+          continue;
+        }
+
+        const src = arg1.val;
+        const res = new Float32Array(sampleCount);
+        res.fill(NaN);
+        const hasTime = !!baseTimeArray && baseTimeArray.length === sampleCount;
+        const safeDt = Number.isFinite(dt) && dt > 0 ? dt : 1e-4;
+        const timeAt = (idx: number): number => (hasTime ? baseTimeArray![idx] : idx * safeDt);
+
+        // Precompute exact piecewise-linear segment integrals (0 across NaNs or sampling gaps)
+        const prefInt = new Float64Array(sampleCount);
+        const prefDt = new Float64Array(sampleCount);
+        const segValid = new Uint8Array(Math.max(0, sampleCount - 1));
+        for (let i = 0; i < sampleCount - 1; i++) {
+          const v0 = src[i];
+          const v1 = src[i + 1];
+          const segDt = timeAt(i + 1) - timeAt(i);
+          if (
+            isFinite(v0) &&
+            isFinite(v1) &&
+            segDt > 0 &&
+            (!Number.isFinite(baseGapLimit) || segDt <= baseGapLimit)
+          ) {
+            segValid[i] = 1;
+            const segI =
+              fn === 'movrms'
+                ? ((v0 * v0 + v0 * v1 + v1 * v1) / 3) * segDt
+                : 0.5 * (v0 + v1) * segDt;
+            prefInt[i + 1] = prefInt[i] + segI;
+            prefDt[i + 1] = prefDt[i] + segDt;
+          } else {
+            prefInt[i + 1] = prefInt[i];
+            prefDt[i + 1] = prefDt[i];
+          }
+        }
+
+        // Monotonic left-pointer scan over [t[i] - winSec, t[i]]
+        let leftIdx = 0;
+        for (let i = 0; i < sampleCount; i++) {
+          const vi = src[i];
+          if (!isFinite(vi)) {
+            res[i] = NaN;
+            continue;
+          }
+          const ti = timeAt(i);
+          const tWinStart = ti - winSec;
+          while (leftIdx < i && timeAt(leftIdx + 1) < tWinStart) {
+            leftIdx++;
+          }
+          if (i === 0) {
+            res[i] = fn === 'movrms' ? Math.abs(vi) : vi;
+            continue;
+          }
+
+          let totalInt = 0;
+          let totalDt = 0;
+          if (leftIdx < i) {
+            const tL0 = timeAt(leftIdx);
+            const tL1 = timeAt(leftIdx + 1);
+            if (tL0 >= tWinStart) {
+              // Full segments [leftIdx .. i]
+              totalInt = prefInt[i] - prefInt[leftIdx];
+              totalDt = prefDt[i] - prefDt[leftIdx];
+            } else {
+              // Full interior segments [leftIdx+1 .. i] + partial straddling segment [tWinStart .. tL1]
+              totalInt = prefInt[i] - prefInt[leftIdx + 1];
+              totalDt = prefDt[i] - prefDt[leftIdx + 1];
+              if (segValid[leftIdx] && tL1 > tL0) {
+                const frac = Math.max(0, Math.min(1, (tWinStart - tL0) / (tL1 - tL0)));
+                const vStart = src[leftIdx] + frac * (src[leftIdx + 1] - src[leftIdx]);
+                const vEnd = src[leftIdx + 1];
+                const partDt = tL1 - tWinStart;
+                if (partDt > 0) {
+                  totalInt +=
+                    fn === 'movrms'
+                      ? ((vStart * vStart + vStart * vEnd + vEnd * vEnd) / 3) * partDt
+                      : 0.5 * (vStart + vEnd) * partDt;
+                  totalDt += partDt;
+                }
+              }
+            }
+          }
+
+          if (totalDt > 1e-18) {
+            res[i] = fn === 'movrms' ? Math.sqrt(Math.max(0, totalInt / totalDt)) : totalInt / totalDt;
+          } else {
+            res[i] = fn === 'movrms' ? Math.abs(vi) : vi;
+          }
+        }
+        stack.push({ isScalar: false, val: res, unit: arg1.unit });
+        continue;
+      }
+
       const arg = stack.pop();
       if (!arg) throw new Error(`Missing argument for function "${fn}"`);
 
@@ -815,6 +989,56 @@ export function evaluateRPN(
           }
         }
         stack.push({ isScalar: true, val: scalar, unit: arg.unit });
+      } else if (fn === 'integ') {
+        const parsedU = parsePhysicalUnit(arg.unit);
+        let unitScale = 1;
+        let outUnit = arg.unit ? `${arg.unit}·s` : 's';
+        if (parsedU) {
+          if (parsedU.domain === 'power') {
+            unitScale = parsedU.scale;
+            outUnit = 'J';
+          } else if (parsedU.domain === 'current') {
+            unitScale = parsedU.scale;
+            outUnit = 'C';
+          } else if (parsedU.domain === 'voltage') {
+            unitScale = parsedU.scale;
+            outUnit = 'V·s';
+          }
+        }
+
+        const res = new Float32Array(sampleCount);
+        res.fill(NaN);
+        const hasTime = !!baseTimeArray && baseTimeArray.length === sampleCount;
+        const safeDt = Number.isFinite(dt) && dt > 0 ? dt : 1e-4;
+        const timeAt = (idx: number): number => (hasTime ? baseTimeArray![idx] : idx * safeDt);
+
+        let acc = 0;
+        let prevFiniteIdx = -1;
+        for (let i = 0; i < sampleCount; i++) {
+          const val = (arg.isScalar ? arg.val : arg.val[i]) * unitScale;
+          if (!isFinite(val)) {
+            res[i] = NaN;
+            prevFiniteIdx = -1;
+            continue;
+          }
+          if (prevFiniteIdx === i - 1) {
+            const stepDt = timeAt(i) - timeAt(i - 1);
+            if (isFinite(stepDt) && stepDt > 0 && (!Number.isFinite(baseGapLimit) || stepDt <= baseGapLimit)) {
+              const prevVal = (arg.isScalar ? arg.val : arg.val[i - 1]) * unitScale;
+              acc += 0.5 * (prevVal + val) * stepDt;
+              res[i] = acc;
+            } else {
+              // Do not fabricate area across a sampling gap; mark gap boundary NaN and hold acc for next continuous segment
+              res[i] = NaN;
+              prevFiniteIdx = i;
+              continue;
+            }
+          } else {
+            res[i] = acc;
+          }
+          prevFiniteIdx = i;
+        }
+        stack.push({ isScalar: false, val: res, unit: outUnit });
       } else if (fn === 'diff' || fn === 'deriv') {
         const outUnit = fn === 'deriv' ? (arg.unit ? `${arg.unit}/s` : '1/s') : arg.unit;
         const res = new Float32Array(sampleCount);
@@ -913,8 +1137,30 @@ export function inferUnitFromRpn(
       continue;
     }
     if (token.type === 'function') {
-      const a = unitStack.pop() ?? { unit: '' };
       const fn = token.value;
+      if (fn === 'movrms' || fn === 'movavg' || fn === 'hypot' || fn === 'atan2') {
+        const b = unitStack.pop() ?? { unit: '' };
+        const a = unitStack.pop() ?? { unit: '' };
+        if (fn === 'hypot') {
+          const { outUnit } = resolveBinaryUnitOperation(a.unit, b.unit, '+');
+          unitStack.push({ unit: outUnit });
+        } else if (fn === 'atan2') {
+          resolveBinaryUnitOperation(a.unit, b.unit, '+');
+          unitStack.push({ unit: 'rad' });
+        } else {
+          // movrms / movavg: validate positive scalar window hint when statically known
+          if (b.scalarVal !== undefined && (!Number.isFinite(b.scalarVal) || b.scalarVal <= 0)) {
+            throw new Error(`函数 ${fn}(x, winSec) 的窗口时长必须为大于 0 的有限值。`);
+          }
+          const winU = parsePhysicalUnit(b.unit);
+          if (b.unit && winU?.domain !== 'time' && b.unit !== '1' && b.unit.toLowerCase() !== 'pu') {
+            throw new Error(`函数 ${fn}(x, winSec) 的窗口参数单位 "${b.unit}" 不是无量纲秒数或时间单位。`);
+          }
+          unitStack.push({ unit: a.unit });
+        }
+        continue;
+      }
+      const a = unitStack.pop() ?? { unit: '' };
       if (fn === 'sin' || fn === 'cos' || fn === 'tan') {
         const trig = resolveTrigArgument(a.unit, fn);
         unitStack.push({ unit: trig.outUnit });
@@ -922,6 +1168,12 @@ export function inferUnitFromRpn(
         unitStack.push({ unit: resolveSqrtUnit(a.unit) });
       } else if (fn === 'deriv') {
         unitStack.push({ unit: a.unit ? `${a.unit}/s` : '1/s' });
+      } else if (fn === 'integ') {
+        const parsedU = parsePhysicalUnit(a.unit);
+        if (parsedU?.domain === 'power') unitStack.push({ unit: 'J' });
+        else if (parsedU?.domain === 'current') unitStack.push({ unit: 'C' });
+        else if (parsedU?.domain === 'voltage') unitStack.push({ unit: 'V·s' });
+        else unitStack.push({ unit: a.unit ? `${a.unit}·s` : 's' });
       } else {
         unitStack.push({ unit: a.unit });
       }
@@ -929,6 +1181,81 @@ export function inferUnitFromRpn(
   }
 
   return unitStack.length === 1 ? unitStack[0].unit : '';
+}
+
+export interface MathExpressionPreviewResult {
+  valid: boolean;
+  inferredUnit: string;
+  referencedChannels: string[];
+  error?: string;
+}
+
+/**
+ * Lightweight syntax, channel-reference, arity, and dimensional preview for live Math modal validation.
+ */
+export function previewMathExpression(
+  expression: string,
+  channels: Record<string, WaveformChannel>,
+  drawOrder: string[]
+): MathExpressionPreviewResult {
+  const trimmed = expression.trim();
+  if (!trimmed) {
+    return { valid: false, inferredUnit: '', referencedChannels: [], error: '请输入数学表达式。' };
+  }
+  const channelAliases: Record<string, string> = {};
+  drawOrder.forEach((id, idx) => {
+    channelAliases[`CH${idx + 1}`] = id;
+  });
+
+  try {
+    const tokens = tokenizeMath(trimmed, channelAliases, channels);
+    if (tokens.length === 0) {
+      return { valid: false, inferredUnit: '', referencedChannels: [], error: '表达式为空。' };
+    }
+    const rpn = toRPN(tokens);
+    const referencedChannels: string[] = [];
+    for (const tok of tokens) {
+      if (tok.type === 'identifier') {
+        const resolved = resolveChannelByIdentifier(tok.value, channels, channelAliases);
+        if (!resolved) {
+          throw new Error(`未找到通道 "${tok.value}"`);
+        }
+        if (!referencedChannels.includes(resolved.name)) {
+          referencedChannels.push(resolved.name);
+        }
+      }
+    }
+    // Check RPN stack balance using a dry-run stack depth counter
+    let depth = 0;
+    for (const tok of rpn) {
+      if (tok.type === 'number' || tok.type === 'identifier') {
+        depth += 1;
+      } else if (tok.type === 'operator') {
+        if (tok.value === 'unary-' || tok.value === 'unary+') {
+          if (depth < 1) throw new Error(`运算符 "${tok.value}" 缺少操作数`);
+        } else {
+          if (depth < 2) throw new Error(`运算符 "${tok.value}" 缺少操作数`);
+          depth -= 1;
+        }
+      } else if (tok.type === 'function') {
+        const need = tok.argCount ?? (FUNCTION_ARITY[tok.value]?.min ?? 1);
+        if (depth < need) throw new Error(`函数 "${tok.value}" 参数不足`);
+        depth = depth - need + 1;
+      }
+    }
+    if (depth !== 1) {
+      throw new Error('表达式括号或操作数不平衡');
+    }
+    const inferredUnit = inferUnitFromRpn(rpn, channels, channelAliases);
+    return { valid: true, inferredUnit, referencedChannels };
+  } catch (err: any) {
+    return {
+      valid: false,
+      inferredUnit: '',
+      referencedChannels: [],
+      error: err?.message || '表达式语法错误',
+    };
+  }
 }
 
 /**

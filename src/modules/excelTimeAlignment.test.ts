@@ -160,3 +160,34 @@ test('A single synthetic worksheet may merge its own channels, but multiple synt
   ]);
   assert.equal(twoSources.canMergePreservingTime, false);
 });
+
+test('auto-best mode anchors longest trace, keeps overlapping timestamps, and shifts disjoint/synthetic traces with Δt metadata', () => {
+  const longA = channel('longA', [10, 11, 12, 13, 14], [1, 2, 3, 4, 5]);
+  const overlapB = channel('overlapB', [11, 12, 13], [10, 20, 30]);
+  const disjointC = channel('disjointC', [500, 501, 502], [7, 8, 9]);
+  const synthD = channel('synthD', [0, 0.5, 1.0], [2, 4, 6]);
+
+  const res = mergeExcelChannelsByTime([
+    { fileName: 'a.csv', sheetName: 'CSV', channels: { longA }, drawOrder: ['longA'], timeOriginKind: 'numeric' },
+    { fileName: 'b.csv', sheetName: 'CSV', channels: { overlapB }, drawOrder: ['overlapB'], timeOriginKind: 'numeric' },
+    { fileName: 'c.csv', sheetName: 'CSV', channels: { disjointC }, drawOrder: ['disjointC'], timeOriginKind: 'numeric' },
+    { fileName: 'd.csv', sheetName: 'CSV', channels: { synthD }, drawOrder: ['synthD'], timeOriginKind: 'synthetic' },
+  ], undefined, 'auto-best');
+
+  assert.equal(res.canMergePreservingTime, true);
+  assert.equal(res.drawOrder.length, 4);
+  // Overlapping B retains exact timestamps (Δt = 0)
+  assert.deepEqual(Array.from(res.channels[res.drawOrder[1]].t), [11, 12, 13]);
+  assert.equal(res.channels[res.drawOrder[1]].timeShiftSec, 0);
+  // Disjoint C and synthetic D align cleanly to longest anchor start (10s) with editable Δt recorded
+  assert.deepEqual(Array.from(res.channels[res.drawOrder[2]].t), [10, 11, 12]);
+  assert.equal(res.channels[res.drawOrder[2]].timeShiftSec, -490);
+  assert.deepEqual(Array.from(res.channels[res.drawOrder[3]].t), [10, 10.5, 11]);
+  assert.equal(res.channels[res.drawOrder[3]].timeShiftSec, 10);
+
+  const vp = resolveExcelMergedViewport(res);
+  assert.ok(vp);
+  assert.equal(vp!.primaryChannelId, res.drawOrder[0]);
+  assert.equal(vp!.unionStartSec, 10);
+  assert.equal(vp!.unionEndSec, 14);
+});

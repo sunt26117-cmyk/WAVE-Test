@@ -59,7 +59,7 @@ class ExcelImportModalController {
   private activeSessionIndex: number = 0;
   private mode: ExcelImportMode = 'main';
   private tabDisposition: 'separate' | 'merge' = 'separate';
-  private timeAlignment: ExcelMergeTimeMode = 'preserve';
+  private timeAlignment: ExcelMergeTimeMode = 'auto-best';
   private colors: string[] = ['#facc15', '#22d3ee', '#f472b6', '#4ade80'];
   private onConfirmCb: ((res: ExcelModalConfirmResult) => Promise<void> | void) | null = null;
   private onCancelCb: (() => void) | null = null;
@@ -70,8 +70,8 @@ class ExcelImportModalController {
     this.releaseAllSessions();
 
     this.mode = opts.mode;
-    this.tabDisposition = 'separate';
-    this.timeAlignment = 'preserve';
+    this.tabDisposition = opts.files.length > 1 ? 'merge' : 'separate';
+    this.timeAlignment = 'auto-best';
     this.colors = opts.colors.length > 0 ? opts.colors : ['#facc15', '#22d3ee', '#f472b6', '#4ade80'];
     this.onConfirmCb = opts.onConfirm;
     this.onCancelCb = opts.onCancel || null;
@@ -98,7 +98,7 @@ class ExcelImportModalController {
       this.render();
     } catch (err: any) {
       this.releaseAllSessions();
-      opts.onNotify?.(`Excel parse failed: ${err?.message || err}`, 'error');
+      opts.onNotify?.(`Excel 解析失败：${err?.message || err}`, 'error');
       opts.onCancel?.();
     }
   }
@@ -213,8 +213,9 @@ class ExcelImportModalController {
     });
 
     document.getElementById('xlsMergeTimeModeSelect')?.addEventListener('change', (e: any) => {
-      const value = String(e.target?.value || 'preserve');
-      this.timeAlignment = value === 'align-start' ? 'align-start' : 'preserve';
+      const value = String(e.target?.value || 'auto-best');
+      this.timeAlignment =
+        value === 'align-start' ? 'align-start' : value === 'preserve' ? 'preserve' : 'auto-best';
       this.renderModeFooter();
     });
 
@@ -398,10 +399,10 @@ class ExcelImportModalController {
     if (subtitleEl) {
       const modeTag =
         this.mode === 'compare'
-          ? 'Compare Group Mode · Add Selected Sheets'
+          ? '波形对比模式 · 选择要加入队列的工作表'
           : this.mode === 'batch'
-          ? `Batch Measure Mode · ${this.sessions.length} Workbook(s)`
-          : 'Auto-header (firstDataRow - 1) · Top-100 Row Preview · Multi-Sheet Import';
+          ? `批量测量模式 · 共 ${this.sessions.length} 个工作簿`
+          : '自动识别表头 · 前 100 行预览 · 支持多工作表导入';
       subtitleEl.innerText = `${session.fileName} · ${modeTag}`;
     }
 
@@ -423,8 +424,8 @@ class ExcelImportModalController {
           btn.type = 'button';
           btn.className =
             idx === this.activeSessionIndex
-              ? 'px-2 py-1 bg-cyan-600 text-slate-950 font-semibold rounded-xs text-[11px] font-mono cursor-pointer whitespace-nowrap'
-              : 'px-2 py-1 bg-[#161b22] hover:bg-[#1e2530] border border-[#222933] text-slate-300 rounded-xs text-[11px] font-mono cursor-pointer whitespace-nowrap';
+              ? 'wvp-btn-primary px-2 py-1 text-[11px] font-mono whitespace-nowrap'
+              : 'wvp-btn px-2 py-1 text-[11px] font-mono whitespace-nowrap';
           btn.innerText = `${s.fileName} (${selCount}/${s.sheets.length})`;
           btn.addEventListener('click', () => {
             this.activeSessionIndex = idx;
@@ -446,7 +447,7 @@ class ExcelImportModalController {
       0
     );
     if (checkedBadge) {
-      checkedBadge.innerText = `${totalSelectedAllFiles} selected`;
+      checkedBadge.innerText = `已选 ${totalSelectedAllFiles} 个`;
     }
 
     if (sheetListEl) {
@@ -457,23 +458,23 @@ class ExcelImportModalController {
         const item = document.createElement('div');
         item.className = `p-2 rounded-xs border cursor-pointer transition text-xs ${
           isActive
-            ? 'bg-cyan-950/35 border-cyan-500/70'
-            : 'bg-[#0c0f13] border-[#222933] hover:border-slate-600'
+            ? 'bg-accent/15 border-accent/70'
+            : 'bg-well border-line hover:border-line-strong'
         }`;
-        const hdrStr = sh.headerRow !== null ? `Hdr R${sh.headerRow + 1}` : 'No Hdr (Col A..)';
+        const hdrStr = sh.headerRow !== null ? `表头 R${sh.headerRow + 1}` : '无表头 (Col A..)';
         const statusMeta = sh.hasNumericData
-          ? `${sh.totalRows.toLocaleString()}r × ${chCount}ch · ${hdrStr} · Data R${sh.firstDataRow + 1}`
-          : `${sh.totalRows}r · Non-numeric / Empty`;
+          ? `${sh.totalRows.toLocaleString()}行 × ${chCount}通道 · ${hdrStr} · 数据 R${sh.firstDataRow + 1}`
+          : `${sh.totalRows}行 · 无数值/空表`;
 
         item.innerHTML = `
           <div class="flex items-center justify-between gap-1.5">
             <label class="flex items-center gap-2 min-w-0 flex-1 cursor-pointer">
               <input type="checkbox" class="xls-sheet-chk accent-cyan-400 cursor-pointer shrink-0" ${sh.selected ? 'checked' : ''} />
-              <span class="font-mono font-semibold truncate ${sh.hasNumericData ? 'text-slate-100' : 'text-slate-500'}" title="${escapeHtml(sh.sheetName)}">${escapeHtml(sh.sheetName)}</span>
+              <span class="font-mono font-semibold truncate ${sh.hasNumericData ? 'text-fg' : 'text-fg-muted'}" title="${escapeHtml(sh.sheetName)}">${escapeHtml(sh.sheetName)}</span>
             </label>
-            ${sh.timeSourceKind === 'excel-date' ? '<span class="px-1 py-0.2 bg-amber-950/60 border border-amber-500/40 text-amber-300 font-mono text-[9px] rounded-xs shrink-0">DATE</span>' : ''}
+            ${sh.timeSourceKind === 'excel-date' ? '<span class="px-1 py-0.2 wvp-alert-warn border font-mono text-[10px] rounded-xs shrink-0">日期</span>' : ''}
           </div>
-          <div class="text-[10px] font-mono mt-1 pl-5 truncate ${sh.hasNumericData ? 'text-slate-400' : 'text-slate-600'}">${escapeHtml(statusMeta)}</div>
+          <div class="text-[10px] font-mono mt-1 pl-5 truncate ${sh.hasNumericData ? 'text-fg-secondary' : 'text-fg-muted'}">${escapeHtml(statusMeta)}</div>
         `;
 
         const chk = item.querySelector('.xls-sheet-chk') as HTMLInputElement;
@@ -546,16 +547,16 @@ class ExcelImportModalController {
       const textSkipped = sh.columnMappings.filter((m) => m.isTextColumn).length;
       const timeBadge =
         sh.timeSourceKind === 'excel-date'
-          ? '<span class="text-amber-300">Time: Excel Date → Relative s (t₀=0)</span>'
+          ? '<span style="color:var(--warn)">时间: Excel 日期 → 相对秒 (t₀=0)</span>'
           : sh.timeSourceKind === 'clock-string'
-          ? '<span class="text-amber-300">Time: Clock String → Relative s (t₀=0)</span>'
+          ? '<span style="color:var(--warn)">时间: 时间字符串 → 相对秒 (t₀=0)</span>'
           : sh.timeColIndex >= 0
-          ? `<span class="text-cyan-300">Time: Col ${sh.columnMappings[sh.timeColIndex]?.colLetter || ''} (${sh.timeUnit})${sh.sampleRateOverrideHz ? ` · 按目标间隔抽取原始行 ${formatEng(sh.sampleRateOverrideHz, 'Sa/s', 2)}` : ' · 全量原始时间'}</span>`
-          : '<span class="text-slate-400">Time: Index / Forced Sample Rate</span>';
+          ? `<span class="text-accent">时间: 列 ${sh.columnMappings[sh.timeColIndex]?.colLetter || ''} (${sh.timeUnit})${sh.sampleRateOverrideHz ? ` · 按目标间隔抽取原始行 ${formatEng(sh.sampleRateOverrideHz, 'Sa/s', 2)}` : ' · 全量原始时间'}</span>`
+          : '<span class="text-fg-muted">时间: 索引 / 手动采样率</span>';
 
       const measuredRateStr = sh.quality?.sampleRate ? formatEng(sh.quality.sampleRate, 'Sa/s', 2) : 'N/A';
       const rateStr = sh.sampleRateOverrideHz && sh.timeColIndex >= 0
-        ? `${measuredRateStr} (target ${formatEng(sh.sampleRateOverrideHz, 'Sa/s', 2)}${sh.quality?.decimationCountEstimated ? ', preview estimate' : ''})`
+        ? `${measuredRateStr} (目标 ${formatEng(sh.sampleRateOverrideHz, 'Sa/s', 2)}${sh.quality?.decimationCountEstimated ? ', 预览估算' : ''})`
         : measuredRateStr;
       const durStr =
         sh.quality && isFinite(sh.quality.originalTimeEnd - sh.quality.originalTimeStart)
@@ -563,15 +564,15 @@ class ExcelImportModalController {
           : '--';
       const previewNotice =
         sh.totalRows > sh.previewRowCount
-          ? `Previewing first ${sh.previewRowCount} of ${sh.totalRows.toLocaleString()} rows`
-          : `${sh.totalRows} rows`;
+          ? `预览前 ${sh.previewRowCount} / 共 ${sh.totalRows.toLocaleString()} 行`
+          : `共 ${sh.totalRows} 行`;
 
       auditEl.innerHTML = `
         <span>${timeBadge}</span>
-        <span>Rate: <strong class="text-slate-100">${rateStr}</strong></span>
-        <span>Span: <strong class="text-slate-100">${durStr}</strong></span>
-        <span>Channels: <strong class="text-emerald-300">${chActive}</strong>${textSkipped > 0 ? ` <span class="text-slate-500">(${textSkipped} text skipped)</span>` : ''}</span>
-        <span class="text-slate-400 ml-auto">${previewNotice}</span>
+        <span>采样率: <strong class="text-fg">${rateStr}</strong></span>
+        <span>时长: <strong class="text-fg">${durStr}</strong></span>
+        <span>通道: <strong style="color:var(--ok)">${chActive}</strong>${textSkipped > 0 ? ` <span class="text-fg-muted">(${textSkipped} 文本列已跳过)</span>` : ''}</span>
+        <span class="text-fg-muted ml-auto">${previewNotice}</span>
       `;
     }
 
@@ -579,36 +580,36 @@ class ExcelImportModalController {
     if (!wrap) return;
 
     if (sh.totalCols === 0 || sh.previewRowCount === 0) {
-      wrap.innerHTML = '<div class="p-6 text-center text-xs font-mono text-slate-500">This worksheet is empty.</div>';
+      wrap.innerHTML = '<div class="p-6 text-center text-xs font-mono text-fg-muted">当前工作表为空。</div>';
       return;
     }
 
     let html = '<table class="min-w-full text-[11px] font-mono border-collapse tabular-nums">';
-    html += '<thead class="bg-[#161b22] text-slate-200 sticky top-0 z-10"><tr>';
-    html += '<th class="px-2 py-1.5 border border-[#222933] text-slate-400 text-center w-12">Row</th>';
+    html += '<thead class="bg-elevated text-fg sticky top-0 z-10"><tr>';
+    html += '<th class="px-2 py-1.5 border border-line text-fg-muted text-center w-12">行</th>';
 
     sh.columnMappings.forEach((col, cIdx) => {
       const isTime = col.role === 'time';
       const isIgn = col.role === 'ignore';
       const thCls = isTime
-        ? 'text-amber-300 bg-amber-950/20'
+        ? 'wvp-alert-warn'
         : isIgn
-        ? 'text-slate-500 bg-[#0d1117]'
-        : 'text-cyan-200';
+        ? 'text-fg-muted bg-well'
+        : 'text-accent';
       const textBadge = col.isTextColumn
-        ? '<span class="ml-1 px-1 bg-slate-800 text-slate-400 text-[9px] rounded-xs">TXT</span>'
+        ? '<span class="ml-1 px-1 bg-well border border-line text-fg-muted text-[10px] rounded-xs">文本</span>'
         : '';
-      html += `<th class="p-1.5 border border-[#222933] text-left align-top min-w-[132px] ${thCls}">
+      html += `<th class="p-1.5 border border-line text-left align-top min-w-[132px] ${thCls}">
         <div class="flex items-center justify-between gap-1 mb-1">
           <span class="truncate max-w-[110px]" title="${escapeHtml(col.header)}">${escapeHtml(col.colLetter)}: ${escapeHtml(col.header)}</span>${textBadge}
         </div>
         <div class="flex items-center gap-1">
-          <select class="xls-col-role-sel flex-1 min-w-0 text-[10px] bg-[#0c0f13] border border-[#2c3543] rounded-xs px-1 py-0.5 text-slate-100 cursor-pointer" data-col="${cIdx}">
-            <option value="time" ${col.role === 'time' ? 'selected' : ''}>Time</option>
-            <option value="channel" ${col.role === 'channel' ? 'selected' : ''}>Channel</option>
-            <option value="ignore" ${col.role === 'ignore' ? 'selected' : ''}>Ignore</option>
+          <select class="xls-col-role-sel flex-1 min-w-0 text-[10px] bg-input border border-line rounded-xs px-1 py-0.5 text-fg cursor-pointer" data-col="${cIdx}">
+            <option value="time" ${col.role === 'time' ? 'selected' : ''}>时间</option>
+            <option value="channel" ${col.role === 'channel' ? 'selected' : ''}>通道</option>
+            <option value="ignore" ${col.role === 'ignore' ? 'selected' : ''}>忽略</option>
           </select>
-          <button type="button" class="xls-col-ignore-all px-1.5 py-0.5 text-[10px] bg-[#161b22] hover:bg-rose-950/70 border border-[#2c3543] hover:border-rose-500/60 text-slate-300 hover:text-rose-200 rounded-xs cursor-pointer shrink-0" data-col="${cIdx}" title="在所有已选 Sheet 中忽略此列 (Ignore across all checked sheets)">⊘全表</button>
+          <button type="button" class="xls-col-ignore-all wvp-btn-danger-ghost px-1.5 py-0.5 text-[10px] border border-line shrink-0" data-col="${cIdx}" title="在所有已选工作表中忽略此列">⊘全表</button>
         </div>
       </th>`;
     });
@@ -621,24 +622,24 @@ class ExcelImportModalController {
       const isUnit = sh.hasUnitRow && r === sh.firstDataRow - 1;
       const isPreamble = r < sh.firstDataRow && !isHeader && !isUnit;
 
-      let rowCls = 'border-b border-[#1d232d] hover:bg-[#161b22]';
+      let rowCls = 'border-b border-line hover:bg-hover/60';
       let rowTag = `${r + 1}`;
       if (isHeader) {
-        rowCls = 'border-b border-cyan-600/50 bg-cyan-950/35 text-cyan-200 font-semibold';
+        rowCls = 'border-b border-accent/50 bg-accent/15 text-accent font-semibold';
         rowTag = `${r + 1} H`;
       } else if (isUnit) {
-        rowCls = 'border-b border-[#222933] bg-amber-950/20 text-amber-200';
+        rowCls = 'border-b border-line wvp-alert-warn';
         rowTag = `${r + 1} U`;
       } else if (isPreamble) {
-        rowCls = 'border-b border-[#1b2028] text-slate-500 opacity-75';
+        rowCls = 'border-b border-line text-fg-muted opacity-75';
       }
 
       html += `<tr class="${rowCls}">`;
-      html += `<td class="px-2 py-1 border-r border-[#222933] text-center text-[10px] text-slate-400 select-none whitespace-nowrap">${rowTag}</td>`;
+      html += `<td class="px-2 py-1 border-r border-line text-center text-[10px] text-fg-muted select-none whitespace-nowrap">${rowTag}</td>`;
       for (let c = 0; c < sh.totalCols; c++) {
         const val = escapeHtml(rowCells[c] ?? '');
         const isIgnoredCol = sh.columnMappings[c]?.role === 'ignore';
-        html += `<td class="px-2 py-1 border-r border-[#1f2631] whitespace-nowrap max-w-[200px] truncate ${isIgnoredCol && !isHeader ? 'text-slate-500' : ''}" title="${val}">${val}</td>`;
+        html += `<td class="px-2 py-1 border-r border-line/60 whitespace-nowrap max-w-[200px] truncate ${isIgnoredCol && !isHeader ? 'text-fg-muted' : ''}" title="${val}">${val}</td>`;
       }
       html += '</tr>';
     }
@@ -714,7 +715,7 @@ class ExcelImportModalController {
         );
         this.render();
         this.onNotifyCb?.(
-          `已将列 "${col.header}" (${col.colLetter}) 在本表及 ${count} 个已选 Sheet 中设为 Ignore。`,
+          `已将列 "${col.header}" (${col.colLetter}) 在本表及 ${count} 个已选工作表中设为忽略。`,
           'info'
         );
       });
@@ -734,39 +735,35 @@ class ExcelImportModalController {
     if (this.mode === 'main') {
       toggleWrap?.classList.remove('hidden');
       origBtn?.classList.remove('hidden');
-      if (primaryBtn) primaryBtn.innerText = 'Load + Resample';
+      if (primaryBtn) primaryBtn.innerText = '加载并重采样';
       timeModeWrap?.classList.toggle('hidden', this.tabDisposition !== 'merge');
       if (timeModeSelect) timeModeSelect.value = this.timeAlignment;
       if (hintEl) {
         hintEl.innerText =
           this.tabDisposition === 'separate'
-            ? '每个勾选的 Sheet 将打开为独立标签页'
+            ? '每个勾选的工作表将打开为独立标签页'
             : this.timeAlignment === 'align-start'
-            ? '合并通道；每条波形仅平移首样本到 t=0，不插值、不改采样值'
-            : '合并通道；保留原始时间坐标和每条通道独立采样点，不强制重采样';
+            ? '合并到同屏不同通道；按最长轴展开，首样本平移到 t=0'
+            : this.timeAlignment === 'auto-best'
+            ? '合并到同屏不同通道；按最长波形建立时间轴，时间自动对应（支持面板调节 Δt）'
+            : '合并到同屏不同通道；保留原始时间坐标，不强制重采样';
       }
       if (sepBtn && mergeBtn) {
-        sepBtn.className =
-          this.tabDisposition === 'separate'
-            ? 'px-2.5 py-1 rounded-xs bg-cyan-600 text-slate-950 font-semibold cursor-pointer'
-            : 'px-2.5 py-1 rounded-xs text-slate-300 hover:text-white cursor-pointer';
-        mergeBtn.className =
-          this.tabDisposition === 'merge'
-            ? 'px-2.5 py-1 rounded-xs bg-cyan-600 text-slate-950 font-semibold cursor-pointer'
-            : 'px-2.5 py-1 rounded-xs text-slate-300 hover:text-white cursor-pointer';
+        sepBtn.setAttribute('aria-pressed', this.tabDisposition === 'separate' ? 'true' : 'false');
+        mergeBtn.setAttribute('aria-pressed', this.tabDisposition === 'merge' ? 'true' : 'false');
       }
     } else if (this.mode === 'compare') {
       timeModeWrap?.classList.add('hidden');
       toggleWrap?.classList.add('hidden');
       origBtn?.classList.add('hidden');
-      if (primaryBtn) primaryBtn.innerText = 'Add Selected to Compare Group';
-      if (hintEl) hintEl.innerText = '所选 Sheet 通道将直接加入当前 Compare Group 队列';
+      if (primaryBtn) primaryBtn.innerText = '加入对比队列';
+      if (hintEl) hintEl.innerText = '所选工作表通道将直接加入当前对比组队列';
     } else {
       timeModeWrap?.classList.add('hidden');
       toggleWrap?.classList.add('hidden');
       origBtn?.classList.add('hidden');
-      if (primaryBtn) primaryBtn.innerText = 'Confirm & Run Batch';
-      if (hintEl) hintEl.innerText = '所有已勾选的 Excel Sheet 将统一纳入 Batch 批量测量';
+      if (primaryBtn) primaryBtn.innerText = '确认并开始批量测量';
+      if (hintEl) hintEl.innerText = '所有已勾选的 Excel 工作表将统一纳入批量测量';
     }
   }
 }
